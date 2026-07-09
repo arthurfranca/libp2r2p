@@ -10,11 +10,34 @@
   "license": "MIT",
   "author": "arthurfranca",
   "type": "module",
+  "sideEffects": false,
   "scripts": {
     "test": "node --test --experimental-test-module-mocks 'tests/**/*.test.js'",
     "test:only": "node --test --test-only --experimental-test-module-mocks 'tests/**/*.test.js'"
   },
   "exports": {
-    ".": "./index.js"
+    ".": "./index.js",
+    "./base16": "./base16/index.js",
+    "./base64": "./base64/index.js",
+    "./content-key": "./content-key/index.js",
+    "./content-key/event": "./content-key/event/index.js",
+    "./double-dh": "./double-dh/index.js",
+    "./ecdh": "./ecdh/index.js",
+    "./key": "./key/index.js",
+    "./network": "./network/index.js",
+    "./nip44-v3": "./nip44-v3/index.js",
+    "./private-channel": "./private-channel/index.js",
+    "./private-message": "./private-message/index.js",
+    "./private-messenger": "./private-messenger/index.js",
+    "./private-messenger/recovery": "./private-messenger/recovery/index.js",
+    "./relay": "./relay/index.js",
+    "./temporary-storage": "./temporary-storage/index.js",
+    "./web-storage-queue": "./web-storage-queue/index.js"
+  },
+  "dependencies": {
+    "@noble/ciphers": "2.2.0",
+    "@noble/curves": "2.2.0",
+    "@noble/hashes": "2.2.0",
+    "nostr-tools": "2.23.5"
   }
 }
