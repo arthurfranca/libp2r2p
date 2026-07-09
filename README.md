@@ -39,6 +39,28 @@ await messenger.tell({
 })
 ```
 
+### Temporary Send Storage
+
+While an outgoing private message is being assembled, the messenger keeps
+encrypted envelope rows and router chunks in `sessionStorage`. They are
+removed when the send finishes, but an interrupted browser operation can leave
+them behind until cleanup runs.
+
+`PrivateMessenger.init()` performs cleanup automatically. Call
+`PrivateMessenger.cleanupTemporaryStorage()` once during app startup when
+messenger initialization may be delayed, such as while an account is locked:
+
+```js
+import { PrivateMessenger } from 'libp2r2p/private-messenger'
+
+PrivateMessenger.cleanupTemporaryStorage()
+```
+
+Call it before any private-message send using that storage area starts. It
+does not clear persisted messages, recovery material, or channel state. Pass
+`temporaryStorageArea: localStorage` when constructing a messenger to opt into
+a different Storage area.
+
 Signers are expected to expose the Nostr-style methods used by the messenger,
 including `getPublicKey()`, `signEvent(event)`, and the NIP-44 v3 methods
 needed by private channels. For double-DH content-key use, pass a

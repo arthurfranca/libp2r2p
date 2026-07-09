@@ -39,6 +39,18 @@ if (!globalThis.localStorage) {
   }
 }
 
+if (!globalThis.sessionStorage) {
+  const data = new Map()
+  globalThis.sessionStorage = {
+    clear: () => data.clear(),
+    getItem: key => data.has(String(key)) ? data.get(String(key)) : null,
+    key: index => [...data.keys()][index] || null,
+    removeItem: key => { data.delete(String(key)) },
+    setItem: (key, value) => { data.set(String(key), String(value)) },
+    get length () { return data.size }
+  }
+}
+
 if (!globalThis.crypto) globalThis.crypto = crypto
 if (!globalThis.btoa) globalThis.btoa = s => Buffer.from(s, 'binary').toString('base64')
 if (!globalThis.atob) globalThis.atob = s => Buffer.from(s, 'base64').toString('binary')
@@ -46,6 +58,7 @@ if (!globalThis.atob) globalThis.atob = s => Buffer.from(s, 'base64').toString('
 afterEach(() => {
   NsecSigner.releaseAll()
   globalThis.localStorage.clear()
+  globalThis.sessionStorage.clear()
 })
 
 function signer () {
@@ -359,7 +372,7 @@ test('wrapEvent creates private broadcast events under relay event size limit', 
   assert.equal(wrapped[0].pubkey, await alice.getPublicKey())
   assert.ok(Number(wrapped[0].tags[0][1]) >= before + EXPIRATION_SECONDS)
   assert.ok(new TextEncoder().encode(JSON.stringify(wrapped[0])).length <= MAX_EVENT_BYTES)
-  assert.equal(globalThis.localStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+  assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
 })
 
 test('publish splits relay-targeted routers by receiver subset with separate router pubkeys', async () => {
@@ -373,6 +386,15 @@ test('publish splits relay-targeted routers by receiver subset with separate rou
   const davePubkey = await dave.getPublicKey()
   const event = eventFixture('split publish')
   const published = []
+  const temporaryWrites = []
+  const temporaryStorageArea = {
+    getItem: key => globalThis.localStorage.getItem(key),
+    removeItem: key => globalThis.localStorage.removeItem(key),
+    setItem: (key, value) => {
+      temporaryWrites.push(key)
+      globalThis.localStorage.setItem(key, value)
+    }
+  }
 
   await publish({
     senderSigner: alice,
@@ -384,6 +406,7 @@ test('publish splits relay-targeted routers by receiver subset with separate rou
     ]),
     recoveryRelays: ['wss://seed.example', 'wss://one.example'],
     event,
+    temporaryStorageArea,
     _getIykcProofs: noContentKeys,
     _publish: async (outer, relays) => {
       published.push({ outer, relays })
@@ -416,7 +439,9 @@ test('publish splits relay-targeted routers by receiver subset with separate rou
     firstLines.find(line => JSON.parse(line)[0] === carolPubkey),
     secondLines.find(line => JSON.parse(line)[0] === carolPubkey)
   )
+  assert.ok(temporaryWrites.includes(TEMPORARY_STORAGE_KEYS_KEY))
   assert.equal(globalThis.localStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+  assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
 })
 
 test('publish cleans prepared rows when grouped publishing fails', async () => {
@@ -441,7 +466,7 @@ test('publish cleans prepared rows when grouped publishing fails', async () => {
     /relay offline/
   )
 
-  assert.equal(globalThis.localStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+  assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
 })
 
 test('publishNymEvent mirrors carrier chunks to recovery relays', async () => {
@@ -463,7 +488,7 @@ test('publishNymEvent mirrors carrier chunks to recovery relays', async () => {
 
   assert.equal(published.length, 1)
   assert.deepEqual(published[0].relays, ['wss://receiver.example', 'wss://seed.example'])
-  assert.equal(globalThis.localStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+  assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
 })
 
 test('received chunk default cap is proportional to private-channel chunk size', () => {
@@ -1365,7 +1390,30 @@ test('wrapEvents cleans temporary chunks when the stream is stopped early', asyn
 
   const first = await stream.next()
   assert.equal(first.done, false)
+  assert.notEqual(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+
+  await stream.return()
+
+  assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+})
+
+test('wrapEvents uses a caller-supplied temporary storage area', async () => {
+  const alice = signer()
+  const bob = signer()
+  const bobPubkey = await bob.getPublicKey()
+  const original = eventFixture('x'.repeat(getJsonlChunkByteSize()))
+  const stream = wrapEvents({
+    senderSigner: alice,
+    receivers: [bobPubkey],
+    event: original,
+    temporaryStorageArea: globalThis.localStorage,
+    _getIykcProofs: noContentKeys
+  })
+
+  await stream.next()
+
   assert.notEqual(globalThis.localStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+  assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
 
   await stream.return()
 

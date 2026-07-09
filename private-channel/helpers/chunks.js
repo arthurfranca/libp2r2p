@@ -2,10 +2,10 @@ import { generateSecretKey, getPublicKey } from 'nostr-tools'
 import { bytesToBase64, base64ToBytes } from '../../base64/index.js'
 import { bytesToHex } from '../../base16/index.js'
 import { verifyIykcProof } from '../../content-key/event/index.js'
-import { getTemporaryItem, removeTemporaryItems, setTemporaryItem } from '../../temporary-storage/index.js'
 import * as nip44v3 from '../../nip44-v3/index.js'
 import { JSONL_CHUNK_BYTES } from './chunk-size.js'
 import { ROUTER_KIND } from '../constants/index.js'
+import { createTemporaryStorage } from '../../temporary-storage/index.js'
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
@@ -77,21 +77,21 @@ function encryptedPayload ({ messageSecretKey, event }) {
   return nip44v3.encrypt(messageSecretKey, messagePubkey, ROUTER_KIND, '', JSON.stringify(event))
 }
 
-function appendLine (chunk, line, id, chunkIndex) {
+function appendLine (chunk, line, id, chunkIndex, temporaryStorage) {
   while (line.length) {
     const available = JSONL_CHUNK_BYTES - chunk.length
     chunk = appendBytes(chunk, line.slice(0, available))
     line = line.slice(available)
     if (chunk.length === JSONL_CHUNK_BYTES) {
-      setTemporaryItem(tempKey(id, chunkIndex++), bytesToBase64(chunk))
+      temporaryStorage.setItem(tempKey(id, chunkIndex++), bytesToBase64(chunk))
       chunk = new Uint8Array()
     }
   }
   return { chunk, chunkIndex }
 }
 
-function appendRow (chunk, row, id, chunkIndex) {
-  return appendLine(chunk, encoder.encode(`${row}\n`), id, chunkIndex)
+function appendRow (chunk, row, id, chunkIndex, temporaryStorage) {
+  return appendLine(chunk, encoder.encode(`${row}\n`), id, chunkIndex, temporaryStorage)
 }
 
 function joinByteChunks (parts) {
@@ -110,8 +110,12 @@ function joinByteChunks (parts) {
   return out
 }
 
-export function readChunkContent (id, index) {
-  return getTemporaryItem(tempKey(id, index))
+function storageFor (temporaryStorage) {
+  return temporaryStorage || createTemporaryStorage()
+}
+
+export function readChunkContent (id, index, temporaryStorage) {
+  return storageFor(temporaryStorage).getItem(tempKey(id, index))
 }
 
 export function decodeChunkLines (content) {
@@ -141,23 +145,23 @@ function temporaryId () {
   return `${Date.now()}:${Math.random().toString(16).slice(2)}`
 }
 
-function cleanupPreparedRows (id, totalRows) {
+function cleanupPreparedRows (id, totalRows, temporaryStorage) {
   const keys = []
   for (let i = 0; i < totalRows; i++) keys.push(rowTempKey(id, i))
-  removeTemporaryItems(keys)
+  storageFor(temporaryStorage).removeItems(keys)
 }
 
-function setPreparedRow (id, index, row) {
-  setTemporaryItem(rowTempKey(id, index), row)
+function setPreparedRow (id, index, row, temporaryStorage) {
+  storageFor(temporaryStorage).setItem(rowTempKey(id, index), row)
 }
 
 function readPreparedRow (preparedRows, index) {
-  const row = getTemporaryItem(rowTempKey(preparedRows.id, index))
+  const row = storageFor(preparedRows.temporaryStorage).getItem(rowTempKey(preparedRows.id, index))
   if (typeof row !== 'string') throw new Error('MISSING_PREPARED_ROW')
   return row
 }
 
-async function prepareEnvelopeRowsOnce ({ id, senderSigner, receivers, receiverContentKeys = {}, event, rowScope = '' }) {
+async function prepareEnvelopeRowsOnce ({ id, senderSigner, receivers, receiverContentKeys = {}, event, rowScope = '', temporaryStorage }) {
   const useDoubleDh = typeof senderSigner?.nip44EncryptDoubleDH === 'function'
   let foundOwnContentPubkey = false
   let usedOwnContentPubkey = ''
@@ -167,7 +171,7 @@ async function prepareEnvelopeRowsOnce ({ id, senderSigner, receivers, receiverC
   const receiverPubkeys = []
   const receiverRowIndexesByPubkey = {}
 
-  setPreparedRow(id, 0, buildPayloadRow(encryptedPayload({ messageSecretKey, event })))
+  setPreparedRow(id, 0, buildPayloadRow(encryptedPayload({ messageSecretKey, event })), temporaryStorage)
 
   for (const receiver of receivers) {
     const row = receiverRecord(receiver, useDoubleDh ? receiverContentKeys : {})
@@ -191,7 +195,7 @@ async function prepareEnvelopeRowsOnce ({ id, senderSigner, receivers, receiverC
       ciphertext = await senderSigner.nip44v3Encrypt(row.receiverPubkey, ROUTER_KIND, rowScope, bytesToBase64(encoder.encode(messageSeckey)))
     }
     const rowIndex = rowIndexes.length + 1
-    setPreparedRow(id, rowIndex, buildRecipientRow(row, ciphertext))
+    setPreparedRow(id, rowIndex, buildRecipientRow(row, ciphertext), temporaryStorage)
     rowIndexes.push(rowIndex)
     receiverPubkeys.push(row.receiverPubkey)
     if (row.receiverPubkey && receiverRowIndexesByPubkey[row.receiverPubkey] === undefined) {
@@ -205,18 +209,20 @@ async function prepareEnvelopeRowsOnce ({ id, senderSigner, receivers, receiverC
     rowIndexes,
     receiverPubkeys,
     receiverRowIndexesByPubkey,
-    ownContentPubkey: usedOwnContentPubkey
+    ownContentPubkey: usedOwnContentPubkey,
+    temporaryStorage
   }
 }
 
-export async function prepareEnvelopeRows (options) {
+export async function prepareEnvelopeRows ({ temporaryStorageArea, ...options } = {}) {
+  const temporaryStorage = createTemporaryStorage({ storageArea: temporaryStorageArea })
   const maxRows = (options.receivers?.length || 0) + 1
   for (let attempt = 0; attempt < 2; attempt++) {
     const id = temporaryId()
     try {
-      return await prepareEnvelopeRowsOnce({ ...options, id })
+      return await prepareEnvelopeRowsOnce({ ...options, id, temporaryStorage })
     } catch (err) {
-      cleanupPreparedRows(id, maxRows)
+      cleanupPreparedRows(id, maxRows, temporaryStorage)
       if (err?.message === 'INCONSISTENT_IMKC_PUBKEY' && attempt === 0) continue
       throw err
     }
@@ -225,7 +231,7 @@ export async function prepareEnvelopeRows (options) {
 
 export function cleanupEnvelopeRows (preparedRows) {
   if (!preparedRows?.id || !Number.isSafeInteger(preparedRows.totalRows)) return
-  cleanupPreparedRows(preparedRows.id, preparedRows.totalRows)
+  cleanupPreparedRows(preparedRows.id, preparedRows.totalRows, preparedRows.temporaryStorage)
 }
 
 export function preparedRowIndexesForReceivers (preparedRows, receivers) {
@@ -243,18 +249,19 @@ export function preparedRowIndexesForReceivers (preparedRows, receivers) {
 }
 
 export function writeChunksFromPreparedRows (preparedRows, rowIndexes = preparedRows?.rowIndexes || []) {
+  const temporaryStorage = storageFor(preparedRows?.temporaryStorage)
   const id = temporaryId()
   let chunk = new Uint8Array()
   let chunkIndex = 0
   try {
-    ;({ chunk, chunkIndex } = appendRow(chunk, readPreparedRow(preparedRows, 0), id, chunkIndex))
+    ;({ chunk, chunkIndex } = appendRow(chunk, readPreparedRow(preparedRows, 0), id, chunkIndex, temporaryStorage))
     for (const rowIndex of rowIndexes) {
-      ;({ chunk, chunkIndex } = appendRow(chunk, readPreparedRow(preparedRows, rowIndex), id, chunkIndex))
+      ;({ chunk, chunkIndex } = appendRow(chunk, readPreparedRow(preparedRows, rowIndex), id, chunkIndex, temporaryStorage))
     }
-    if (chunk.length || chunkIndex === 0) setTemporaryItem(tempKey(id, chunkIndex++), bytesToBase64(chunk))
+    if (chunk.length || chunkIndex === 0) temporaryStorage.setItem(tempKey(id, chunkIndex++), bytesToBase64(chunk))
     return { id, total: chunkIndex, ownContentPubkey: preparedRows.ownContentPubkey || '' }
   } catch (err) {
-    cleanupChunks(id, chunkIndex + 1)
+    cleanupChunks(id, chunkIndex + 1, temporaryStorage)
     throw err
   }
 }
@@ -268,8 +275,8 @@ export async function writeChunks (options) {
   }
 }
 
-export function cleanupChunks (id, total) {
+export function cleanupChunks (id, total, temporaryStorage) {
   const keys = []
   for (let i = 0; i < total; i++) keys.push(tempKey(id, i))
-  removeTemporaryItems(keys)
+  storageFor(temporaryStorage).removeItems(keys)
 }

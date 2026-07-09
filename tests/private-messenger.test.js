@@ -11,17 +11,26 @@ import {
   ROUTER_SEED_RECORD_TYPE,
   SEEDER_PRESENCE_CODE
 } from '../private-messenger/index.js'
+import { TEMPORARY_STORAGE_KEYS_KEY } from '../temporary-storage/index.js'
 
 const data = new Map()
+const sessionData = new Map()
 globalThis.localStorage = {
   clear: () => data.clear(),
   getItem: key => data.has(String(key)) ? data.get(String(key)) : null,
   removeItem: key => { data.delete(String(key)) },
   setItem: (key, value) => { data.set(String(key), String(value)) }
 }
+globalThis.sessionStorage = {
+  clear: () => sessionData.clear(),
+  getItem: key => sessionData.has(String(key)) ? sessionData.get(String(key)) : null,
+  removeItem: key => { sessionData.delete(String(key)) },
+  setItem: (key, value) => { sessionData.set(String(key), String(value)) }
+}
 
 afterEach(() => {
   globalThis.localStorage.clear()
+  globalThis.sessionStorage.clear()
 })
 
 function signer (pubkey) {
@@ -92,6 +101,38 @@ function fakePrivateMessage () {
     clearChannelState: channel => cleared.push(channel)
   }
 }
+
+test('private messenger cleanup uses session storage by default and configured storage on init', async () => {
+  globalThis.sessionStorage.setItem('tmp.session', 'encrypted')
+  globalThis.sessionStorage.setItem(TEMPORARY_STORAGE_KEYS_KEY, JSON.stringify(['tmp.session']))
+  globalThis.localStorage.setItem('permanent', 'keep')
+
+  PrivateMessenger.cleanupTemporaryStorage()
+
+  assert.equal(globalThis.sessionStorage.getItem('tmp.session'), null)
+  assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+  assert.equal(globalThis.localStorage.getItem('permanent'), 'keep')
+
+  globalThis.localStorage.setItem('tmp.local', 'encrypted')
+  globalThis.localStorage.setItem(TEMPORARY_STORAGE_KEYS_KEY, JSON.stringify(['tmp.local']))
+  PrivateMessenger.cleanupTemporaryStorage({ storageArea: globalThis.localStorage })
+
+  assert.equal(globalThis.localStorage.getItem('tmp.local'), null)
+  assert.equal(globalThis.localStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+
+  globalThis.localStorage.setItem('tmp.local', 'encrypted')
+  globalThis.localStorage.setItem(TEMPORARY_STORAGE_KEYS_KEY, JSON.stringify(['tmp.local']))
+  await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    temporaryStorageArea: globalThis.localStorage
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  assert.equal(globalThis.localStorage.getItem('tmp.local'), null)
+  assert.equal(globalThis.localStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+})
 
 function fakeRelayListUpdates () {
   const subscriptions = []
@@ -293,7 +334,10 @@ test('private messenger reports content key usage changes for sent and received 
 
 test('private messenger delegates send helpers with scoped signers and relays', async () => {
   const pm = fakePrivateMessage()
-  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    temporaryStorageArea: globalThis.localStorage
+  }).init({
     userSigner: signer('user'),
     contentKeySigner: signer('content'),
     nymSigner: signer('global-nym'),
@@ -316,6 +360,7 @@ test('private messenger delegates send helpers with scoped signers and relays', 
     assert.equal(sent.options.privateChannelSigner.getPublicKey(), 'channel')
     assert.deepEqual(sent.options.relays, ['wss://relay.example'])
     assert.equal(sent.options.expirationSeconds, 7 * 24 * 60 * 60)
+    assert.equal(sent.options.temporaryStorageArea, globalThis.localStorage)
   }
   assert.equal(pm.sent[5].options.event.id, 'signed-id')
   assert.equal(pm.sent[6].options.nymSigner.getPublicKey(), 'global-nym')

@@ -215,6 +215,7 @@ test('ask publishes an ask rumor and watch dispatches the reply with its questio
     privateChannelReaderPubkey: 'reader-channel',
     receiverPubkey: 'receiver',
     relays: ['wss://relay.example'],
+    temporaryStorageArea: globalThis.localStorage,
     message: { code: 'PING', payload: { ok: true } },
     _publish: async options => {
       published = options
@@ -229,6 +230,7 @@ test('ask publishes an ask rumor and watch dispatches the reply with its questio
   assert.equal(published.receiverTag, 'receiver')
   assert.deepEqual(published.receivers, ['receiver'])
   assert.equal(published.privateChannelReaderPubkey, 'reader-channel')
+  assert.equal(published.temporaryStorageArea, globalThis.localStorage)
   assert.deepEqual(JSON.parse(published.event.content), { ok: true })
   assert.deepEqual(published.event.tags, [['r', 'receiver'], ['h', 'PING']])
   assert.equal(result.question.pubkey, senderPubkey)

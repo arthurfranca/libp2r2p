@@ -40,6 +40,7 @@ import * as privateMessage from '../private-message/index.js'
 import { bytesToBase64 } from '../base64/index.js'
 import { getRelaysByPubkey, pickRelaysForPubkeys, subscribeRelayListUpdates } from '../relay/index.js'
 import * as privateChannel from '../private-channel/index.js'
+import { cleanupTemporaryStorage as cleanupTemporaryChannelStorage } from '../temporary-storage/index.js'
 import { createQueue } from '../web-storage-queue/index.js'
 import { DEFAULT_STALE_CHANNEL_SECONDS } from './constants/index.js'
 import {
@@ -110,6 +111,10 @@ function parseJson (raw, fallback) {
 }
 
 export class PrivateMessenger {
+  static cleanupTemporaryStorage ({ storageArea = globalThis.sessionStorage } = {}) {
+    cleanupTemporaryChannelStorage({ storageArea })
+  }
+
   constructor ({
     offlineRecoverySeconds = DEFAULT_OFFLINE_RECOVERY_SECONDS,
     staleChannelSeconds = DEFAULT_STALE_CHANNEL_SECONDS,
@@ -120,6 +125,7 @@ export class PrivateMessenger {
     maxDynamicRecoverySeeders = DEFAULT_MAX_DYNAMIC_RECOVERY_SEEDERS,
     messageQueueMaxBytes = DEFAULT_MESSAGE_QUEUE_MAX_BYTES,
     seedQueueMaxBytes = DEFAULT_SEED_QUEUE_MAX_BYTES,
+    temporaryStorageArea = globalThis.sessionStorage,
     useContentKeys = true,
     onContentKeyChange,
     onMessageQueued,
@@ -143,6 +149,7 @@ export class PrivateMessenger {
     this.maxDynamicRecoverySeeders = maxDynamicRecoverySeeders
     this.messageQueueMaxBytes = messageQueueMaxBytes
     this.seedQueueMaxBytes = seedQueueMaxBytes
+    this.temporaryStorageArea = temporaryStorageArea
     this.useContentKeys = useContentKeys
     this.onContentKeyChange = onContentKeyChange
     this.onMessageQueued = onMessageQueued
@@ -177,6 +184,7 @@ export class PrivateMessenger {
 
   async init ({ userSigner, contentKeySigner, nymSigner, channels = [], relays = [], mode = 'leecher' }) {
     if (!userSigner?.getPublicKey) throw new Error('USER_SIGNER_REQUIRED')
+    PrivateMessenger.cleanupTemporaryStorage({ storageArea: this.temporaryStorageArea })
     this.userSigner = userSigner
     this.contentKeySigner = contentKeySigner || null
     this.nymSigner = nymSigner || null
@@ -753,6 +761,7 @@ export class PrivateMessenger {
       receiverPubkey,
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
+      temporaryStorageArea: this.temporaryStorageArea,
       message,
       code,
       payload,
@@ -776,6 +785,7 @@ export class PrivateMessenger {
       receiverPubkey,
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
+      temporaryStorageArea: this.temporaryStorageArea,
       message,
       code,
       payload,
@@ -797,6 +807,7 @@ export class PrivateMessenger {
       receiverPubkey,
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
+      temporaryStorageArea: this.temporaryStorageArea,
       message,
       code,
       payload,
@@ -818,6 +829,7 @@ export class PrivateMessenger {
       receiverPubkeys,
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
+      temporaryStorageArea: this.temporaryStorageArea,
       message,
       code,
       payload,
@@ -839,6 +851,7 @@ export class PrivateMessenger {
       receiverPubkeys,
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
+      temporaryStorageArea: this.temporaryStorageArea,
       rumor,
       _getIykcProofs: this.contentKeyLookup()
     })
@@ -856,6 +869,7 @@ export class PrivateMessenger {
       receiverPubkeys,
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
+      temporaryStorageArea: this.temporaryStorageArea,
       event,
       _getIykcProofs: this.contentKeyLookup()
     })
@@ -904,6 +918,7 @@ export class PrivateMessenger {
       receiverPubkeys,
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
+      temporaryStorageArea: this.temporaryStorageArea,
       code: SEEDER_PRESENCE_CODE,
       payload: {},
       _getIykcProofs: this.contentKeyLookup()
