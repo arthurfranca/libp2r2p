@@ -1,0 +1,20 @@
+{
+  "name": "libp2r2p",
+  "version": "0.0.1",
+  "description": "Peer-to-relay-to-peer",
+  "keywords": [
+    "p2r2p",
+    "p2p",
+    "nostr"
+  ],
+  "license": "MIT",
+  "author": "arthurfranca",
+  "type": "module",
+  "scripts": {
+    "test": "node --test --experimental-test-module-mocks 'tests/**/*.test.js'",
+    "test:only": "node --test --test-only --experimental-test-module-mocks 'tests/**/*.test.js'"
+  },
+  "exports": {
+    ".": "./index.js"
+  }
+}
