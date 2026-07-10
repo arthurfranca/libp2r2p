@@ -36,6 +36,18 @@ function setJson (key, value) {
   globalThis.localStorage.setItem(key, JSON.stringify(value))
 }
 
+function setStoredItem (key, item) {
+  let byteSize = 0
+  let raw = ''
+  while (true) {
+    raw = JSON.stringify({ b: byteSize, i: item })
+    const nextByteSize = new TextEncoder().encode(raw).length
+    if (nextByteSize === byteSize) break
+    byteSize = nextByteSize
+  }
+  globalThis.localStorage.setItem(key, raw)
+}
+
 function assertQueueState (expected) {
   const state = JSON.parse(globalThis.localStorage.getItem('test:queue'))
   for (const [key, value] of Object.entries(expected)) assert.equal(state[key], value)
@@ -91,12 +103,22 @@ test('queue trims a tail reserved before its item was persisted', () => {
 
 test('queue repairs stale tail and skips missing head items', () => {
   setJson('test:queue', { head: 0, tail: 2 })
-  setJson('test:queue:item:1', { id: 1, value: 'second' })
+  setStoredItem('test:queue:item:1', { value: 'second' })
 
   const queue = createQueue({ prefix: 'test' })
 
-  assert.deepEqual(queue.shift(), { id: 1, value: 'second' })
+  assert.deepEqual(queue.shift(), { value: 'second' })
   assert.equal(queue.shift(), null)
+})
+
+test('queue drops persisted rows outside the compact envelope format', () => {
+  setJson('test:queue', { head: 0, tail: 1 })
+  setJson('test:queue:item:0', { value: 'old-direct-row' })
+
+  const queue = createQueue({ prefix: 'test' })
+
+  assert.equal(queue.shift(), null)
+  assert.equal(globalThis.localStorage.getItem('test:queue'), null)
 })
 
 test('queue repairs a failed enqueue that only persisted the tail reservation', () => {
@@ -136,7 +158,7 @@ test('queue repairs a failed shift that only persisted the head advance', () => 
 
   const recovered = createQueue({ prefix: 'test' })
 
-  assert.deepEqual(recovered.shift(), { id: 0, value: 'first' })
+  assert.deepEqual(recovered.shift(), { value: 'first' })
   assert.equal(recovered.shift(), null)
 })
 
@@ -172,7 +194,7 @@ test('queue repairs a failed pop that only persisted the tail retreat', () => {
 
   const recovered = createQueue({ prefix: 'test' })
 
-  assert.deepEqual(recovered.pop(), { id: 0, value: 'last' })
+  assert.deepEqual(recovered.pop(), { value: 'last' })
   assert.equal(recovered.pop(), null)
 })
 
@@ -389,7 +411,7 @@ test('queue rejects unknown eviction policies', () => {
 })
 
 test('setAt evicts to fit without evicting the item being replaced', () => {
-  const queue = createQueue({ prefix: 'test', maxBytes: 450, evictionPolicy: 'fifo' })
+  const queue = createQueue({ prefix: 'test', maxBytes: 400, evictionPolicy: 'fifo' })
   queue.push({ value: 'a'.repeat(120) })
   queue.push({ value: 'b'.repeat(120) })
 
@@ -433,7 +455,7 @@ test('queue enforces maxBytes when opening an existing queue', () => {
 
 test('queue retries once with a lower session byte limit after quota errors', () => {
   const storageArea = createQuotaStorageArea({ failOnItemWrite: 2 })
-  const queue = createQueue({ prefix: 'test', storageArea, maxBytes: 450 })
+  const queue = createQueue({ prefix: 'test', storageArea, maxBytes: 300 })
 
   queue.push({ value: 'evicted-after-quota'.repeat(5) })
   queue.push({ value: 'survives-quota-retry'.repeat(5) })

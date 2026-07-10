@@ -23,7 +23,7 @@
 // await messenger.broadcastNymRumor({ rumor: { kind, tags: [], content } })
 // await messenger.broadcastNymEvent({ event: signedNostrEvent })
 // await messenger.update({ channels: [{ signer: privateChannelSigner, relays, seeders: nextOptionalSeederPubkeys }] })
-// messenger.clearChannel(channelPubkey)
+// await messenger.clearChannel(channelPubkey)
 //
 // Missed-message recovery:
 // - Each watched channel stores lastSeenAt/lastWatchedAt in localStorage.
@@ -32,7 +32,7 @@
 // - Ranges older than 7 days are ignored; channel state not watched for 45 days is pruned.
 // - Seeders announce presence every 10min and are used for the relay-uncovered left edge of a missed range.
 // - Configured seeders are all asked; auto-discovered seeders are capped to the 8 most recently active.
-// - Seeder/watchtower channels store reconstructed router events in a separate web-storage queue and auto-reply to recovery asks.
+// - Seeder/watchtower channels store reconstructed router events in a separate IndexedDB queue and auto-reply to recovery asks.
 // - Seeder replies stream compact routers with createMissingMessageReplyPacker({ messenger, question }).update(seed), then finalize(optionalLastSeed).
 // - For other event-list replies, use createEventReplyPacker({ messenger, question, code }).update(event).
 
@@ -41,7 +41,7 @@ import { bytesToBase64 } from '../base64/index.js'
 import { getRelaysByPubkey, pickRelaysForPubkeys, subscribeRelayListUpdates } from '../relay/index.js'
 import * as privateChannel from '../private-channel/index.js'
 import { cleanupTemporaryStorage as cleanupTemporaryChannelStorage } from '../temporary-storage/index.js'
-import { createQueue } from '../web-storage-queue/index.js'
+import { createQueue } from '../idb-queue/index.js'
 import { DEFAULT_STALE_CHANNEL_SECONDS } from './constants/index.js'
 import {
   compactSeedNymCarriers,
@@ -56,7 +56,6 @@ import {
   SEEDER_PRESENCE_CODE
 } from './recovery/index.js'
 
-export { createQueue } from '../web-storage-queue/index.js'
 export { DEFAULT_STALE_CHANNEL_SECONDS } from './constants/index.js'
 export {
   compactSeedNymCarriers,
@@ -77,8 +76,23 @@ const DEFAULT_RELOAD_GAP_DELAY_MS = 500
 const DEFAULT_SEEDER_PRESENCE_INTERVAL_MS = 10 * 60 * 1000
 const DEFAULT_SEEDER_ONLINE_SECONDS = 20 * 60
 const DEFAULT_MAX_DYNAMIC_RECOVERY_SEEDERS = 8
-const DEFAULT_MESSAGE_QUEUE_MAX_BYTES = 1024 * 1024 // 1 MiB
-const DEFAULT_SEED_QUEUE_MAX_BYTES = 3 * 1024 * 1024 // 3 MiB
+const DEFAULT_MESSAGE_QUEUE_MAX_BYTES = 16 * 1024 * 1024 // 16 MiB
+const DEFAULT_SEED_QUEUE_MAX_BYTES = 64 * 1024 * 1024 // 64 MiB
+const SEED_KEY = '__p2r2pSeedKey'
+const SEED_TIME = '__p2r2pSeedTime'
+const MESSAGE_QUEUE_INDEXES = {
+  byChannel: 'channelPubkey',
+  byChannelTypeEventId: {
+    keyPath: ['channelPubkey', 'type', 'event.id'],
+    unique: true
+  }
+}
+const SEED_QUEUE_INDEXES = {
+  byChannel: 'channelPubkey',
+  bySeedKey: { keyPath: SEED_KEY, unique: true },
+  byChannelTime: ['channelPubkey', SEED_TIME],
+  byTime: SEED_TIME
+}
 const encoder = new TextEncoder()
 const noContentKeys = async () => ({})
 
@@ -126,6 +140,7 @@ export class PrivateMessenger {
     messageQueueMaxBytes = DEFAULT_MESSAGE_QUEUE_MAX_BYTES,
     seedQueueMaxBytes = DEFAULT_SEED_QUEUE_MAX_BYTES,
     temporaryStorageArea = globalThis.sessionStorage,
+    _indexedDB = globalThis.indexedDB,
     useContentKeys = true,
     onContentKeyChange,
     onMessageQueued,
@@ -150,6 +165,7 @@ export class PrivateMessenger {
     this.messageQueueMaxBytes = messageQueueMaxBytes
     this.seedQueueMaxBytes = seedQueueMaxBytes
     this.temporaryStorageArea = temporaryStorageArea
+    this._indexedDB = _indexedDB
     this.useContentKeys = useContentKeys
     this.onContentKeyChange = onContentKeyChange
     this.onMessageQueued = onMessageQueued
@@ -180,6 +196,7 @@ export class PrivateMessenger {
     this.relayListRefreshPromise = null
     this.stopOnline = null
     this.stopOffline = null
+    this.queueOperationTail = Promise.resolve()
   }
 
   async init ({ userSigner, contentKeySigner, nymSigner, channels = [], relays = [], mode = 'leecher' }) {
@@ -191,11 +208,35 @@ export class PrivateMessenger {
     this.userPubkey = await userSigner.getPublicKey()
     this.contentKeyPubkey = await this.contentKeySigner?.getPublicKey?.() || ''
     this.prefix = `libp2r2p:private-messenger:${this.userPubkey}`
-    this.queue = createQueue({ prefix: this.prefix, maxBytes: this.messageQueueMaxBytes, evictionPolicy: 'fifo' })
-    this.seedQueue = createQueue({ prefix: `${this.prefix}:seeds`, maxBytes: this.seedQueueMaxBytes, evictionPolicy: 'fifo' })
-    this.cleanupStaleChannels()
+    this.queue = await createQueue({
+      prefix: this.prefix,
+      indexes: MESSAGE_QUEUE_INDEXES,
+      maxBytes: this.messageQueueMaxBytes,
+      evictionPolicy: 'fifo',
+      indexedDB: this._indexedDB
+    })
+    this.seedQueue = await createQueue({
+      prefix: `${this.prefix}:seeds`,
+      indexes: SEED_QUEUE_INDEXES,
+      maxBytes: this.seedQueueMaxBytes,
+      evictionPolicy: 'fifo',
+      indexedDB: this._indexedDB
+    })
+    await this.cleanupStaleChannels()
     await this.update({ userSigner, contentKeySigner, nymSigner: this.nymSigner, channels, relays, mode })
     return this
+  }
+
+  runQueueOperation (operation) {
+    const run = this.queueOperationTail.then(operation)
+    this.queueOperationTail = run.catch(err => {
+      try { this.onError?.(err) } catch {}
+    })
+    return run
+  }
+
+  queueIncoming (operation) {
+    return this.runQueueOperation(operation).catch(() => undefined)
   }
 
   debug (action, detail = {}) {
@@ -241,7 +282,7 @@ export class PrivateMessenger {
     }
     for (const channel of nextChannels) this.channels.set(channel.pubkey, channel)
 
-    this.cleanupStaleChannels()
+    await this.cleanupStaleChannels()
     await this.watch()
     await this.reconcilePresencePublishers()
     return this
@@ -528,13 +569,13 @@ export class PrivateMessenger {
         privateChannelReaderSigner: channel.readerSigner,
         privateChannelReaderPubkey: channel.readerPubkey,
         mode: channel.mode,
-        onAsk: message => this.handleAsk(pubkey, message),
-        onReply: message => this.handleReply(pubkey, message),
-        onTell: message => this.handleTell(pubkey, message),
-        onYell: message => this.handleYell(pubkey, message),
-        onNym: message => this.handleNym(pubkey, message),
-        onMessage: message => this.handleMessage(pubkey, message),
-        onSeed: seed => this.enqueueSeed(pubkey, seed),
+        onAsk: message => this.queueIncoming(() => this.handleAsk(pubkey, message)),
+        onReply: message => this.queueIncoming(() => this.handleReply(pubkey, message)),
+        onTell: message => this.queueIncoming(() => this.handleTell(pubkey, message)),
+        onYell: message => this.queueIncoming(() => this.handleYell(pubkey, message)),
+        onNym: message => this.queueIncoming(() => this.handleNym(pubkey, message)),
+        onMessage: message => this.queueIncoming(() => this.handleMessage(pubkey, message)),
+        onSeed: seed => this.queueIncoming(() => this.enqueueSeed(pubkey, seed)),
         onContentKeyUsage: usage => this.handleContentKeyUsage(pubkey, usage),
         receivedChunkTtlMs: this.offlineRecoverySeconds * 1000,
         onError: err => this.onError?.(err)
@@ -620,92 +661,98 @@ export class PrivateMessenger {
   }
 
   async handleAsk (channelPubkey, message) {
-    try {
-      this.trackSeederActivity(channelPubkey, message)
-      if (storesRecoverySeeds(this.channels.get(channelPubkey)?.mode) && messageCode(message) === MISSING_MESSAGES_ASK_CODE) {
-        await this.replyWithStoredSeeds(channelPubkey, message)
-        return
-      }
-      this.enqueueRumor('ask', channelPubkey, message)
-    } catch (err) {
-      console.warn('private-messenger ask handling failed', err?.message ?? err)
+    this.trackSeederActivity(channelPubkey, message)
+    if (storesRecoverySeeds(this.channels.get(channelPubkey)?.mode) && messageCode(message) === MISSING_MESSAGES_ASK_CODE) {
+      await this.replyWithStoredSeeds(channelPubkey, message)
+      return
     }
+    await this.enqueueRumor('ask', channelPubkey, message)
   }
 
   async handleReply (channelPubkey, message) {
-    try {
-      this.trackSeederActivity(channelPubkey, message)
-      if (messageCode(message) === MISSING_MESSAGES_REPLY_CODE) {
-        await this.consumeMissingMessagesReply(channelPubkey, message)
-        return
-      }
-      this.enqueueRumor('reply', channelPubkey, message)
-    } catch (err) {
-      console.warn('private-messenger reply handling failed', err?.message ?? err)
-    }
-  }
-
-  handleTell (channelPubkey, message) {
     this.trackSeederActivity(channelPubkey, message)
-    this.enqueueRumor('tell', channelPubkey, message)
+    if (messageCode(message) === MISSING_MESSAGES_REPLY_CODE) {
+      await this.consumeMissingMessagesReply(channelPubkey, message)
+      return
+    }
+    await this.enqueueRumor('reply', channelPubkey, message)
   }
 
-  handleYell (channelPubkey, message) {
+  async handleTell (channelPubkey, message) {
+    this.trackSeederActivity(channelPubkey, message)
+    await this.enqueueRumor('tell', channelPubkey, message)
+  }
+
+  async handleYell (channelPubkey, message) {
     this.trackSeederActivity(channelPubkey, message)
     if (messageCode(message) === SEEDER_PRESENCE_CODE) return
-    this.enqueueRumor('yell', channelPubkey, message)
+    await this.enqueueRumor('yell', channelPubkey, message)
   }
 
-  handleNym (channelPubkey, message) {
-    this.enqueueRumor('nym', channelPubkey, message)
+  async handleNym (channelPubkey, message) {
+    await this.enqueueRumor('nym', channelPubkey, message)
   }
 
-  handleMessage (channelPubkey, message) {
+  async handleMessage (channelPubkey, message) {
     if (eventType(message.event) !== 'message') return
     this.trackSeederActivity(channelPubkey, message)
-    this.enqueueRumor('message', channelPubkey, message)
+    await this.enqueueRumor('message', channelPubkey, message)
   }
 
-  enqueueRumor (type, channelPubkey, message) {
+  async enqueueRumor (type, channelPubkey, message) {
     const channel = this.channels.get(channelPubkey)
     if (channel?.mode === 'watchtower' && type !== 'ask') return
     this.markSeen(channelPubkey, message.outer?.created_at || message.event?.created_at || nowSeconds())
     const eventId = message.event?.id || ''
-    if (eventId && this.queue.some(item => item.channelPubkey === channelPubkey && item.type === type && item.event?.id === eventId)) {
+    const dedupeKey = eventId ? [channelPubkey, type, eventId] : null
+    if (dedupeKey && await this.queue.someBy('byChannelTypeEventId', dedupeKey)) {
       this.debug('dedupe', debugMessageInfo(type, channelPubkey, message))
       return
     }
-    this.queue.enqueue({
-      type,
-      channelPubkey,
-      receivedAt: nowSeconds(),
-      event: message.event,
-      payload: message.payload,
-      question: message.question || null,
-      questionId: message.questionId || null,
-      outer: message.outer || null,
-      meta: message.meta || null
-    })
+    try {
+      await this.queue.enqueue({
+        type,
+        channelPubkey,
+        receivedAt: nowSeconds(),
+        event: message.event,
+        payload: message.payload,
+        question: message.question || null,
+        questionId: message.questionId || null,
+        outer: message.outer || null,
+        meta: message.meta || null
+      })
+    } catch (err) {
+      // The unique index closes the small cross-instance race after `someBy`.
+      if (dedupeKey && err?.name === 'ConstraintError') {
+        this.debug('dedupe', debugMessageInfo(type, channelPubkey, message))
+        return
+      }
+      throw err
+    }
     this.debug('enqueue', debugMessageInfo(type, channelPubkey, message))
     this.onMessageQueued?.()
   }
 
-  enqueueSeed (channelPubkey, seed) {
+  async enqueueSeed (channelPubkey, seed) {
     const receivedAt = nowSeconds()
     if (seed.recordType === NYM_CARRIER_SEED_RECORD_TYPE || seed.carriers?.length) {
       const carriers = compactSeedNymCarriers(seed.carriers)
-      this.markSeen(channelPubkey, nymCarrierRecordTime({ carriers }) || seed.outer?.created_at || receivedAt)
-      const seedKey = nymCarrierSeedKey({ channelPubkey, carriers })
-      if (seedKey && this.seedQueue.some(item => item.recordType === NYM_CARRIER_SEED_RECORD_TYPE && nymCarrierSeedKey(item) === seedKey)) return
-      this.seedQueue.enqueue({
+      const recordTime = nymCarrierRecordTime({ carriers }) || seed.outer?.created_at || receivedAt
+      this.markSeen(channelPubkey, recordTime)
+      const key = nymCarrierSeedKey({ channelPubkey, carriers })
+      const seedKey = key ? `nym:${key}` : ''
+      if (seedKey && await this.seedQueue.someBy('bySeedKey', seedKey)) return
+      await this.seedQueue.enqueue({
         type: 'seed',
         recordType: NYM_CARRIER_SEED_RECORD_TYPE,
         channelPubkey,
         receivedAt,
         carriers,
-        meta: { channelPubkey: seed.channelPubkey }
+        meta: { channelPubkey: seed.channelPubkey },
+        [SEED_KEY]: seedKey || undefined,
+        [SEED_TIME]: recordTime
       })
-      this.pruneStoredSeeds(channelPubkey)
+      await this.pruneStoredSeeds(channelPubkey)
       return
     }
 
@@ -715,16 +762,11 @@ export class PrivateMessenger {
       const rowTime = row.lastSeenAt || row.router?.created_at || receivedAt
       newest = Math.max(newest, rowTime)
       const rowKey = routerSeedRowKey({ ...row, channelPubkey })
-      let previous = null
-      this.seedQueue.removeWhere(item => {
-        if (item.recordType !== ROUTER_SEED_RECORD_TYPE) return false
-        if (routerSeedRowKey(item) !== rowKey) return false
-        previous = item
-        return true
-      })
+      const seedKey = `router:${rowKey}`
+      const [previous] = await this.seedQueue.removeBy('bySeedKey', seedKey)
       const firstSeenAt = Math.min(previous?.firstSeenAt ?? rowTime, row.firstSeenAt ?? rowTime)
       const lastSeenAt = Math.max(previous?.lastSeenAt ?? rowTime, row.lastSeenAt ?? rowTime)
-      this.seedQueue.enqueue({
+      await this.seedQueue.enqueue({
         ...row,
         type: 'seed',
         recordType: ROUTER_SEED_RECORD_TYPE,
@@ -732,21 +774,24 @@ export class PrivateMessenger {
         receivedAt,
         firstSeenAt,
         lastSeenAt,
-        meta: { channelPubkey: seed.channelPubkey }
+        meta: { channelPubkey: seed.channelPubkey },
+        [SEED_KEY]: seedKey,
+        [SEED_TIME]: lastSeenAt || rowTime
       })
     }
     this.markSeen(channelPubkey, newest)
-    this.pruneStoredSeeds(channelPubkey)
+    await this.pruneStoredSeeds(channelPubkey)
   }
 
-  messages () {
+  async * messages () {
     // seedQueue is retained replay material for recovery replies, not an app-message stream.
-    return this.queue.items()
+    for await (const item of this.queue.items()) yield withoutQueueMetadata(item)
   }
 
-  nextMessage () {
+  async nextMessage () {
     // seedQueue is retained replay material for recovery replies, not an app-message stream.
-    return this.queue.shift()
+    await this.queueOperationTail
+    return withoutQueueMetadata(await this.queue.shift())
   }
 
   async ask ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content }) {
@@ -1070,8 +1115,7 @@ export class PrivateMessenger {
       until
     })
 
-    for await (const seed of this.seedQueue.storedItems()) {
-      if (seed.channelPubkey !== channelPubkey) continue
+    for await (const seed of this.seedQueue.storedItemsBy('byChannel', channelPubkey)) {
       await packer.update(seed)
     }
     await packer.finalize()
@@ -1087,7 +1131,7 @@ export class PrivateMessenger {
       if (!record) continue
       const recovered = await this.messageFromBackfillRecord(channelPubkey, record)
       if (!recovered) continue
-      this.enqueueRumor(recovered.type, channelPubkey, {
+      await this.enqueueRumor(recovered.type, channelPubkey, {
         event: recovered.event,
         outer: recovered.outer,
         meta: { ...(recovered.meta || {}), channelPubkey, recoveredFromSeeder: message.event?.pubkey || '' },
@@ -1182,9 +1226,9 @@ export class PrivateMessenger {
             mode: channel.mode,
             modeByPubkey: { [pubkey]: channel.mode },
             receivedChunkTtlMs: this.offlineRecoverySeconds * 1000,
-            onEvent: (event, outer, meta) => this.enqueueRumor(eventType(event), pubkey, { event, outer, meta, payload: parseEventContent(event) }),
-            onNymEvent: (event, outer, meta) => this.enqueueRumor('nym', pubkey, { event, outer, meta, payload: parseEventContent(event) }),
-            onSeedEvent: seed => this.enqueueSeed(pubkey, seed),
+            onEvent: (event, outer, meta) => this.queueIncoming(() => this.enqueueRumor(eventType(event), pubkey, { event, outer, meta, payload: parseEventContent(event) })),
+            onNymEvent: (event, outer, meta) => this.queueIncoming(() => this.enqueueRumor('nym', pubkey, { event, outer, meta, payload: parseEventContent(event) })),
+            onSeedEvent: seed => this.queueIncoming(() => this.enqueueSeed(pubkey, seed)),
             onContentKeyUsage: usage => this.handleContentKeyUsage(pubkey, usage),
             onError: err => { throw err }
           }) || []
@@ -1203,36 +1247,50 @@ export class PrivateMessenger {
     }
   }
 
-  clearChannel (pubkey) {
-    this.unwatch(pubkey)
-    this._privateMessage.clearChannelState?.(pubkey)
-    this.channels.delete(pubkey)
-    this.removeChannelState(pubkey)
-    this.queue.removeWhere(item => item.channelPubkey === pubkey)
-    this.seedQueue.removeWhere(item => item.channelPubkey === pubkey)
-    this.ensureRelayListWatcher()
+  async clearChannel (pubkey) {
+    return this.runQueueOperation(async () => {
+      this.unwatch(pubkey)
+      this._privateMessage.clearChannelState?.(pubkey)
+      this.channels.delete(pubkey)
+      this.removeChannelState(pubkey)
+      await this.queue.removeBy('byChannel', pubkey)
+      await this.seedQueue.removeBy('byChannel', pubkey)
+      this.ensureRelayListWatcher()
+    })
   }
 
-  clearQueue () {
-    this.queue.clear()
+  async clearQueue () {
+    return this.runQueueOperation(() => this.queue.clear())
   }
 
-  cleanupStaleChannels () {
+  async cleanupStaleChannels () {
     if (!this.prefix) return
-    const state = this.readState()
-    const cutoff = nowSeconds() - this.staleChannelSeconds
-    for (const [pubkey, channel] of Object.entries(state.channels)) {
-      if ((channel.lastWatchedAt || 0) >= cutoff) continue
-      delete state.channels[pubkey]
-      this.queue?.removeWhere(item => item.channelPubkey === pubkey)
-      this.seedQueue?.removeWhere(item => item.channelPubkey === pubkey)
-    }
-    this.writeState(state)
+    return this.runQueueOperation(async () => {
+      const state = this.readState()
+      const cutoff = nowSeconds() - this.staleChannelSeconds
+      for (const [pubkey, channel] of Object.entries(state.channels)) {
+        if ((channel.lastWatchedAt || 0) >= cutoff) continue
+        delete state.channels[pubkey]
+        await this.queue?.removeBy('byChannel', pubkey)
+        await this.seedQueue?.removeBy('byChannel', pubkey)
+      }
+      this.writeState(state)
+    })
   }
 
-  pruneStoredSeeds (channelPubkey) {
+  async pruneStoredSeeds (channelPubkey) {
+    if (!this.seedQueue) return
     const cutoff = nowSeconds() - this.offlineRecoverySeconds
-    this.seedQueue?.removeWhere(item => {
+    const keyRange = globalThis.IDBKeyRange
+    if (channelPubkey && keyRange?.bound) {
+      await this.seedQueue.removeBy('byChannelTime', keyRange.bound([channelPubkey, 0], [channelPubkey, cutoff], false, true))
+      return
+    }
+    if (!channelPubkey && keyRange?.upperBound) {
+      await this.seedQueue.removeBy('byTime', keyRange.upperBound(cutoff, true))
+      return
+    }
+    await this.seedQueue.removeWhere(item => {
       if (channelPubkey && item.channelPubkey !== channelPubkey) return false
       return (seedRecordTime(item) || item.receivedAt || 0) < cutoff
     })
@@ -1324,6 +1382,16 @@ function nymCarrierSeedKey (record) {
   if (!carriers.length) return ''
   const ids = carriers.map(carrier => carrier.id || '').join(',')
   return `${record.channelPubkey || ''}:${carriers[0]?.pubkey || ''}:${ids}`
+}
+
+function withoutQueueMetadata (item) {
+  if (!item) return null
+  const {
+    [SEED_KEY]: ignoredSeedKey,
+    [SEED_TIME]: ignoredSeedTime,
+    ...value
+  } = item
+  return value
 }
 
 function seedRecordTime (record) {

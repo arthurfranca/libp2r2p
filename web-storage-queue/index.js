@@ -1,7 +1,6 @@
 const encoder = new TextEncoder()
-const ITEM_WRAPPER = 'web-storage-queue:item:v1'
-const DEFAULT_EVICTION_SLACK_RATIO = 0.1
-const MAX_EVICTION_SLACK_BYTES = 64 * 1024 // 64 KiB
+const DEFAULT_EVICTION_HEADROOM_RATIO = 0.1
+const MAX_EVICTION_HEADROOM_BYTES = 64 * 1024 // 64 KiB
 
 export function createQueue ({
   prefix,
@@ -9,6 +8,7 @@ export function createQueue ({
   maxBytes,
   evictionPolicy = 'opposite-end' // 'opposite-end' = push evicts from head, unshift evicts from tail
 } = {}) {
+  if (!prefix) throw new Error('QUEUE_PREFIX_REQUIRED')
   const stateKey = `${prefix}:queue`
   const operationKey = `${prefix}:queue:operation`
   const itemPrefix = `${prefix}:queue:item:`
@@ -57,14 +57,15 @@ export function createQueue ({
     return 'head'
   }
 
-  function evictionSlackBytes () {
+  function evictionHeadroomBytes () {
     if (!hasByteLimit()) return 0
-    return Math.min(Math.max(1, Math.floor(sessionMaxBytes * DEFAULT_EVICTION_SLACK_RATIO)), MAX_EVICTION_SLACK_BYTES)
+    // Evict a little below the limit so the next write has room for estimate overhead.
+    return Math.min(Math.max(1, Math.floor(sessionMaxBytes * DEFAULT_EVICTION_HEADROOM_RATIO)), MAX_EVICTION_HEADROOM_BYTES)
   }
 
   function targetBytesAfterWrite (requiredBytes) {
     if (!hasByteLimit()) return Infinity
-    return Math.max(requiredBytes, sessionMaxBytes - evictionSlackBytes())
+    return Math.max(requiredBytes, sessionMaxBytes - evictionHeadroomBytes())
   }
 
   function isQuotaExceeded (err) {
@@ -82,6 +83,7 @@ export function createQueue ({
   }
 
   function recoverHead (state) {
+    // Reconcile head reservations and left-behind items after interrupted writes.
     let recovered = state
     while (storage().getItem(itemKey(recovered.head - 1))) {
       recovered = { ...recovered, head: recovered.head - 1 }
@@ -94,6 +96,7 @@ export function createQueue ({
   }
 
   function recoverTail (state) {
+    // Reconcile tail reservations and left-behind items after interrupted writes.
     let recovered = state
     while (storage().getItem(itemKey(recovered.tail))) {
       recovered = { ...recovered, tail: recovered.tail + 1 }
@@ -107,12 +110,11 @@ export function createQueue ({
 
   function readStoredItemFromRaw (raw) {
     if (!raw) return null
+    // Invalid or pre-envelope rows are holes, never caller payloads.
     try {
       const parsed = JSON.parse(raw)
-      if (parsed?.__type === ITEM_WRAPPER && parsed.item && Number.isSafeInteger(parsed.byteSize)) {
-        return { item: parsed.item, byteSize: parsed.byteSize }
-      }
-      return { item: parsed, byteSize: byteLength(raw) }
+      if (parsed?.i && Number.isSafeInteger(parsed.b)) return { item: parsed.i, byteSize: parsed.b }
+      return { item: null, byteSize: byteLength(raw) }
     } catch {
       return { item: null, byteSize: byteLength(raw) }
     }
@@ -123,6 +125,7 @@ export function createQueue ({
   }
 
   function recoverUsage (state) {
+    // Rebuild the cached total because item and state writes are separate.
     let usedBytes = 0
     for (let id = state.head; id < state.tail; id++) {
       const stored = readStoredItem(id)
@@ -160,6 +163,7 @@ export function createQueue ({
   }
 
   function evictOneFromHead (state, options = {}) {
+    // Keep a pending positional-write slot out of eviction while freeing capacity.
     const protectedIds = protectedIdsFrom(options)
     trimHead(state, protectedIds)
     for (let id = state.head; id < state.tail; id++) {
@@ -177,6 +181,7 @@ export function createQueue ({
   }
 
   function evictOneFromTail (state, options = {}) {
+    // Keep a pending positional-write slot out of eviction while freeing capacity.
     const protectedIds = protectedIdsFrom(options)
     trimTail(state, protectedIds)
     for (let id = state.tail - 1; id >= state.head; id--) {
@@ -207,6 +212,7 @@ export function createQueue ({
     if (!hasByteLimit()) return state
     const { direction = 'head' } = options
     if (requiredBytes > sessionMaxBytes) throw new Error('QUEUE_ITEM_TOO_LARGE')
+    // Make room for the write and retain eviction headroom for the next one.
     const targetBytes = targetBytesAfterWrite(requiredBytes)
     while (state.usedBytes + requiredBytes > targetBytes) {
       const evicted = direction === 'tail'
@@ -224,6 +230,7 @@ export function createQueue ({
   }
 
   function readState () {
+    // localStorage has no transactions, so repair durable invariants before use.
     let parsed = {}
     try {
       parsed = JSON.parse(storage().getItem(stateKey) || '{}')
@@ -247,12 +254,13 @@ export function createQueue ({
     if (!Number.isSafeInteger(index) || index < 0 || index > max) throw new Error('QUEUE_INDEX_OUT_OF_RANGE')
   }
 
-  function itemForStorage (id, item) {
-    const storedItem = { id, ...item }
+  function itemForStorage (item) {
+    // The storage key controls queue order; this compact envelope caches size.
+    const storedItem = { ...item }
     let byteSize = 0
     let raw = ''
     while (true) {
-      raw = JSON.stringify({ __type: ITEM_WRAPPER, byteSize, item: storedItem })
+      raw = JSON.stringify({ b: byteSize, i: storedItem })
       const nextByteSize = byteLength(raw)
       if (nextByteSize === byteSize) break
       byteSize = nextByteSize
@@ -265,6 +273,7 @@ export function createQueue ({
       storage().setItem(key, raw)
     } catch (err) {
       if (!isQuotaExceeded(err) || !hasByteLimit()) throw err
+      // Actual browser quota can be lower than the configured logical budget.
       lowerSessionMaxBytes(requiredBytes)
       if (options.evict === false) throw err
       evictToFit(state, requiredBytes, options)
@@ -274,7 +283,7 @@ export function createQueue ({
 
   function writeItem (id, item, state, options = {}) {
     const previous = readStoredItem(id)
-    const stored = itemForStorage(id, item)
+    const stored = itemForStorage(item)
     const previousByteSize = previous?.byteSize || 0
     const delta = stored.byteSize - previousByteSize
     if (hasByteLimit() && stored.byteSize > sessionMaxBytes) throw new Error('QUEUE_ITEM_TOO_LARGE')
@@ -326,6 +335,7 @@ export function createQueue ({
   }
 
   function recoverOperation (state) {
+    // Positional moves span keys, so resume their journal before using the queue.
     const operation = normalizedOperation(readOperation())
     if (!operation) {
       clearOperation()
@@ -342,6 +352,7 @@ export function createQueue ({
     writeState(state)
 
     while (current.cursor > current.slot) {
+      // Persist progress after each move so a reload can resume at this cursor.
       moveItem(current.cursor - 1, current.cursor)
       current = { ...current, cursor: current.cursor - 1 }
       writeOperation(current)
@@ -359,6 +370,7 @@ export function createQueue ({
     writeState(state, { keepEmpty: true })
 
     while (current.cursor < current.tail) {
+      // Persist progress after each move so a reload can resume at this cursor.
       moveItem(current.cursor + 1, current.cursor)
       current = { ...current, cursor: current.cursor + 1 }
       writeOperation(current)
@@ -379,14 +391,15 @@ export function createQueue ({
     const state = readState()
     const direction = evictionDirectionFor('push')
     let id = state.tail
-    let stored = itemForStorage(id, item)
+    let stored = itemForStorage(item)
     if (hasByteLimit() && stored.byteSize > sessionMaxBytes) throw new Error('QUEUE_ITEM_TOO_LARGE')
     if (direction === 'tail') {
       evictToFit(state, stored.byteSize, { direction })
       id = state.tail
-      stored = itemForStorage(id, item)
+      stored = itemForStorage(item)
       if (hasByteLimit() && stored.byteSize > sessionMaxBytes) throw new Error('QUEUE_ITEM_TOO_LARGE')
     }
+    // Reserve the tail first; recoverTail trims it if writing the item fails.
     state.tail = id + 1
     writeState(state)
     writeItem(id, item, state, {
@@ -401,14 +414,15 @@ export function createQueue ({
     const state = readState()
     const direction = evictionDirectionFor('unshift')
     let id = state.head - 1
-    let stored = itemForStorage(id, item)
+    let stored = itemForStorage(item)
     if (hasByteLimit() && stored.byteSize > sessionMaxBytes) throw new Error('QUEUE_ITEM_TOO_LARGE')
     if (direction === 'head') {
       evictToFit(state, stored.byteSize, { direction })
       id = state.head - 1
-      stored = itemForStorage(id, item)
+      stored = itemForStorage(item)
       if (hasByteLimit() && stored.byteSize > sessionMaxBytes) throw new Error('QUEUE_ITEM_TOO_LARGE')
     }
+    // Reserve the head first; recoverHead trims it if writing the item fails.
     state.head = id
     writeState(state)
     writeItem(id, item, state, {
@@ -424,6 +438,7 @@ export function createQueue ({
     while (state.head < state.tail) {
       const key = itemKey(state.head)
       const stored = readStoredItem(state.head)
+      // Advance first; recoverHead restores the item if its deletion fails.
       state.head++
       writeState(state, { keepEmpty: true })
       storage().removeItem(key)
@@ -441,6 +456,7 @@ export function createQueue ({
       const id = state.tail - 1
       const key = itemKey(id)
       const stored = readStoredItem(id)
+      // Retreat first; recoverTail restores the item if its deletion fails.
       state.tail--
       writeState(state, { keepEmpty: true })
       storage().removeItem(key)
@@ -471,17 +487,18 @@ export function createQueue ({
     assertIndex(index, length, { allowEnd: true })
 
     let slot = state.head + index
-    let stored = itemForStorage(slot, item)
+    let stored = itemForStorage(item)
     if (hasByteLimit() && stored.byteSize > sessionMaxBytes) throw new Error('QUEUE_ITEM_TOO_LARGE')
     evictToFit(state, stored.byteSize, { direction: evictionDirectionFor('insertAt', { index, length }) })
     const nextLength = lengthFromState(state)
     const nextIndex = Math.min(index, nextLength)
     slot = state.head + nextIndex
-    stored = itemForStorage(slot, item)
+    stored = itemForStorage(item)
     if (hasByteLimit() && stored.byteSize > sessionMaxBytes) throw new Error('QUEUE_ITEM_TOO_LARGE')
     evictToFit(state, stored.byteSize, { direction: evictionDirectionFor('insertAt', { index: nextIndex, length: nextLength }) })
     state.tail++
     writeState(state)
+    // Store a resume cursor before shifting rows across multiple keys.
     writeOperation({
       type: 'insert',
       head: state.head,
@@ -520,6 +537,7 @@ export function createQueue ({
     state.tail--
     if (stored) state.usedBytes = Math.max(0, state.usedBytes - stored.byteSize)
     writeState(state, { keepEmpty: true })
+    // Store a resume cursor before compacting rows across multiple keys.
     writeOperation({
       type: 'remove',
       head: state.head,
@@ -573,6 +591,7 @@ export function createQueue ({
   }
 
   function removeWhere (predicate) {
+    if (typeof predicate !== 'function') throw new Error('QUEUE_PREDICATE_REQUIRED')
     const state = readState()
     // Bulk predicate removal leaves holes on purpose; shift/pop skip them, and
     // callers that need contiguous positions can use removeAt for compaction.

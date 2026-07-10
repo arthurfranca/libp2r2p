@@ -25,13 +25,14 @@ const messenger = await createPrivateMessenger({
     relays: ['wss://relay.example'],
     mode: 'leecher'
   }],
-  onMessageQueued: () => {
-    for (const message of messenger.messages()) {
-      console.log(message.type, message.payload)
-    }
-  },
   onError: err => console.warn('private messenger failed', err)
 })
+
+void (async () => {
+  for await (const message of messenger.messages()) {
+    console.log(message.type, message.payload)
+  }
+})()
 
 await messenger.tell({
   receiverPubkey,
@@ -67,15 +68,22 @@ needed by private channels. For double-DH content-key use, pass a
 `contentKeySigner` or a signer implementation that handles content keys
 internally.
 
-Messages are stored in the messenger queue until consumed:
+Messages are stored in a bounded, durable IndexedDB queue until consumed:
 
 ```js
-for (const message of messenger.messages()) {
-  if (message.type === 'message') {
-    console.log(message.payload)
+async function handleMessages () {
+  for await (const message of messenger.messages()) {
+    if (message.type === 'message') {
+      console.log(message.payload)
+    }
   }
 }
+
+void handleMessages()
 ```
+
+For one-at-a-time consumption, use `await messenger.nextMessage()`. Queue
+clearing is asynchronous too: `await messenger.clearChannel(channelPubkey)`.
 
 Use explicit subpath imports for bundle size. The package root re-exports the
 main messenger API for convenience, but applications that only need one piece

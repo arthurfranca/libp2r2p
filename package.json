@@ -23,6 +23,8 @@
     "./content-key/event": "./content-key/event/index.js",
     "./double-dh": "./double-dh/index.js",
     "./ecdh": "./ecdh/index.js",
+    "./idb": "./idb/index.js",
+    "./idb-queue": "./idb-queue/index.js",
     "./key": "./key/index.js",
     "./network": "./network/index.js",
     "./nip44-v3": "./nip44-v3/index.js",
@@ -39,5 +41,8 @@
     "@noble/curves": "2.2.0",
     "@noble/hashes": "2.2.0",
     "nostr-tools": "2.23.5"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "6.2.5"
   }
 }

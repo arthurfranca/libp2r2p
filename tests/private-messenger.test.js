@@ -1,5 +1,6 @@
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
+import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { ASK_KIND, REPLY_KIND, TELL_KIND } from '../private-message/index.js'
 import {
   createEventReplyPacker,
@@ -28,9 +29,17 @@ globalThis.sessionStorage = {
   setItem: (key, value) => { sessionData.set(String(key), String(value)) }
 }
 
+function resetIndexedDb () {
+  globalThis.indexedDB = new IDBFactory()
+  globalThis.IDBKeyRange = IDBKeyRange
+}
+
+resetIndexedDb()
+
 afterEach(() => {
   globalThis.localStorage.clear()
   globalThis.sessionStorage.clear()
+  resetIndexedDb()
 })
 
 function signer (pubkey) {
@@ -134,6 +143,78 @@ test('private messenger cleanup uses session storage by default and configured s
   assert.equal(globalThis.localStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
 })
 
+test('private messenger defaults to larger bounded IndexedDB queues', () => {
+  const messenger = new PrivateMessenger({ _privateMessage: fakePrivateMessage() })
+
+  assert.equal(messenger.messageQueueMaxBytes, 16 * 1024 * 1024)
+  assert.equal(messenger.seedQueueMaxBytes, 64 * 1024 * 1024)
+})
+
+test('private messenger persists queued messages in IndexedDB across instances', async () => {
+  const indexedDB = new IDBFactory()
+  const firstPrivateMessage = fakePrivateMessage()
+  const first = await new PrivateMessenger({
+    _privateMessage: firstPrivateMessage,
+    _indexedDB: indexedDB
+  }).init({
+    userSigner: signer('durable-user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  await firstPrivateMessage.watchCalls[0].onTell({
+    event: { id: 'durable-id', kind: TELL_KIND, pubkey: 'alice', created_at: 10, tags: [['r', 'durable-user']], content: 'hi' },
+    outer: { id: 'durable-outer', created_at: 10 },
+    meta: { channelPubkey: 'channel' },
+    payload: { payload: 'hi' }
+  })
+  first.close()
+
+  const second = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _indexedDB: indexedDB
+  }).init({
+    userSigner: signer('durable-user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  assert.equal((await second.nextMessage()).event.id, 'durable-id')
+  assert.equal(await second.nextMessage(), null)
+})
+
+test('private messenger leaves legacy localStorage queue records untouched', async () => {
+  const prefix = 'libp2r2p:private-messenger:legacy-user'
+  const stateKey = `${prefix}:queue`
+  const itemKey = `${prefix}:queue:item:0`
+  const seedStateKey = `${prefix}:seeds:queue`
+  const seedItemKey = `${prefix}:seeds:queue:item:0`
+  const oldState = JSON.stringify({ head: 0, tail: 1, usedBytes: 42 })
+  const oldItem = JSON.stringify({ id: 0, value: 'manual-cleanup' })
+  globalThis.localStorage.setItem(stateKey, oldState)
+  globalThis.localStorage.setItem(itemKey, oldItem)
+  globalThis.localStorage.setItem(seedStateKey, oldState)
+  globalThis.localStorage.setItem(seedItemKey, oldItem)
+
+  await new PrivateMessenger({ _privateMessage: fakePrivateMessage() }).init({
+    userSigner: signer('legacy-user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  assert.equal(globalThis.localStorage.getItem(stateKey), oldState)
+  assert.equal(globalThis.localStorage.getItem(itemKey), oldItem)
+  assert.equal(globalThis.localStorage.getItem(seedStateKey), oldState)
+  assert.equal(globalThis.localStorage.getItem(seedItemKey), oldItem)
+})
+
+test('private messenger rejects initialization when IndexedDB is unavailable', async () => {
+  await assert.rejects(
+    new PrivateMessenger({ _privateMessage: fakePrivateMessage(), _indexedDB: null }).init({
+      userSigner: signer('no-idb-user'),
+      channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+    }),
+    /IDB_UNAVAILABLE/
+  )
+})
+
 function fakeRelayListUpdates () {
   const subscriptions = []
   return {
@@ -172,7 +253,7 @@ test('private messenger watches channels and queues received leecher rumors', as
     tell: { id: 'tell-id' }
   })
 
-  const item = messenger.nextMessage()
+  const item = (await messenger.nextMessage())
   assert.equal(item.type, 'tell')
   assert.equal(item.channelPubkey, 'channel')
   assert.equal(item.event.id, 'tell-id')
@@ -188,7 +269,7 @@ test('private messenger watches channels and queues received leecher rumors', as
     reply: { id: 'reply-id' }
   })
 
-  const reply = messenger.nextMessage()
+  const reply = (await messenger.nextMessage())
   assert.equal(reply.type, 'reply')
   assert.equal(reply.question, null)
   assert.equal(reply.questionId, 'question-id')
@@ -201,7 +282,7 @@ test('private messenger watches channels and queues received leecher rumors', as
     payload: ['raw-payload', 'not-a-private-message-code']
   })
 
-  const raw = messenger.nextMessage()
+  const raw = (await messenger.nextMessage())
   assert.equal(raw.type, 'message')
   assert.equal(raw.event.id, 'raw-id')
   assert.deepEqual(raw.payload, ['raw-payload', 'not-a-private-message-code'])
@@ -236,11 +317,11 @@ test('private messenger queues nym messages without dispatching helper kinds', a
     nym: { id: 'nym-ask-id' }
   })
 
-  const item = messenger.nextMessage()
+  const item = (await messenger.nextMessage())
   assert.equal(item.type, 'nym')
   assert.equal(item.event.kind, ASK_KIND)
   assert.equal(item.event.pubkey, 'nym')
-  assert.equal(messenger.nextMessage(), null)
+  assert.equal((await messenger.nextMessage()), null)
 })
 
 test('private messenger skips duplicate pending app messages by channel type and event id', async () => {
@@ -260,8 +341,11 @@ test('private messenger skips duplicate pending app messages by channel type and
   pm.watchCalls[0].onTell(message)
   pm.watchCalls[0].onTell({ ...message, outer: { id: 'outer-duplicate-id', created_at: 12 } })
 
-  assert.equal(messenger.nextMessage().event.id, 'tell-id')
-  assert.equal(messenger.nextMessage(), null)
+  const queued = await messenger.nextMessage()
+  assert.equal(queued.event.id, 'tell-id')
+  assert.equal(Object.hasOwn(queued, '__p2r2pMessageDedupeKey'), false)
+  assert.equal(Object.hasOwn(queued, 'id'), false)
+  assert.equal((await messenger.nextMessage()), null)
   assert.equal(messenger.readState().channels.channel.lastSeenAt, 12)
 })
 
@@ -488,7 +572,7 @@ test('private messenger reload-gap fetch uses all local read relays when channel
   await scheduled()
 
   assert.deepEqual(fetches[0].relays, userReadRelays)
-  assert.equal(messenger.nextMessage(), null)
+  assert.equal((await messenger.nextMessage()), null)
 })
 
 test('private messenger refreshes NIP-65-derived watch relays from relay-list updates', async () => {
@@ -548,7 +632,7 @@ test('private messenger refreshes NIP-65-derived watch relays from relay-list up
   assert.deepEqual(fetches[0].relays, ['wss://user.old-two.example', 'wss://user.new.example'])
   assert.ok(fetches[0].since <= now - 20)
   assert.ok(fetches[0].until >= now)
-  assert.equal(messenger.nextMessage().event.id, 'missed-id')
+  assert.equal((await messenger.nextMessage()).event.id, 'missed-id')
   assert.deepEqual(messenger.readState().channels.derived.relays, ['wss://user.old-two.example', 'wss://user.new.example'])
   assert.deepEqual(messenger.readState().channels.explicit.relays, ['wss://explicit.example'])
 })
@@ -669,7 +753,7 @@ test('private messenger reader-only channels watch and drain but reject sends', 
     tell: { id: 'tell-id' }
   })
 
-  assert.equal(messenger.nextMessage().event.id, 'tell-id')
+  assert.equal((await messenger.nextMessage()).event.id, 'tell-id')
   await assert.rejects(
     () => messenger.tell({ channelPubkey: 'channel', receiverPubkey: 'alice', payload: 'note' }),
     /PRIVATE_CHANNEL_WRITER_REQUIRED/
@@ -823,11 +907,11 @@ test('clearChannel removes queued items and channel state without clearing other
   messenger.queue.enqueue({ type: 'tell', channelPubkey: 'one', event: { id: 'one' } })
   messenger.queue.enqueue({ type: 'tell', channelPubkey: 'two', event: { id: 'two' } })
 
-  messenger.clearChannel('one')
+  await messenger.clearChannel('one')
 
-  const item = messenger.nextMessage()
+  const item = (await messenger.nextMessage())
   assert.equal(item.channelPubkey, 'two')
-  assert.equal(messenger.nextMessage(), null)
+  assert.equal((await messenger.nextMessage()), null)
   assert.equal(messenger.channels.has('one'), false)
   assert.equal(messenger.readState().channels.one, undefined)
   assert.ok(messenger.readState().channels.two)
@@ -872,7 +956,7 @@ test('watch schedules reload-gap recovery and fetches missing channel window', a
   assert.ok(fetches[0].since <= now - 10)
   assert.ok(fetches[0].until >= now)
   assert.equal(fetches[0].receivedChunkTtlMs, 7 * 24 * 60 * 60 * 1000)
-  assert.equal(messenger.nextMessage().event.id, 'ask-id')
+  assert.equal((await messenger.nextMessage()).event.id, 'ask-id')
   assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [])
 })
 
@@ -912,7 +996,7 @@ test('reader-only channels fetch reload gaps with the reader signer', async () =
   assert.equal(fetches.length, 1)
   assert.equal(fetches[0].privateChannelSigner, null)
   assert.equal(fetches[0].privateChannelReaderSigner.getPublicKey(), 'reader')
-  assert.equal(messenger.nextMessage().event.id, 'missed-id')
+  assert.equal((await messenger.nextMessage()).event.id, 'missed-id')
 })
 
 test('seeder channels publish presence immediately and on interval', async () => {
@@ -956,7 +1040,7 @@ test('seeder channels store router seeds separately, consume messages, and answe
   const userRow = JSON.stringify(['user', 'ciphertext'])
   const otherRow = JSON.stringify(['other', 'ciphertext'])
 
-  pm.watchCalls[0].onSeed({
+  await pm.watchCalls[0].onSeed({
     channelPubkey: 'channel',
     outer: { id: 'outer-id', kind: 3560, pubkey: 'channel', created_at: now },
     router: {
@@ -967,7 +1051,7 @@ test('seeder channels store router seeds separately, consume messages, and answe
       content: jsonlContent(payloadRow(), userRow, otherRow)
     }
   })
-  pm.watchCalls[0].onSeed({
+  await pm.watchCalls[0].onSeed({
     channelPubkey: 'channel',
     outer: { id: 'outer-duplicate-id', kind: 3560, pubkey: 'channel', created_at: now + 100 },
     router: {
@@ -994,10 +1078,10 @@ test('seeder channels store router seeds separately, consume messages, and answe
     tell: { id: 'tell-id' }
   })
 
-  const item = messenger.nextMessage()
+  const item = (await messenger.nextMessage())
   assert.equal(item.type, 'tell')
   assert.equal(item.event.id, 'tell-id')
-  assert.equal(messenger.nextMessage(), null)
+  assert.equal((await messenger.nextMessage()), null)
 
   await pm.watchCalls[0].onAsk({
     event: {
@@ -1023,7 +1107,7 @@ test('seeder channels store router seeds separately, consume messages, and answe
   assert.equal(records[0].router.kind, 26300)
   assert.equal(Buffer.from(records[0].router.content, 'base64').toString(), `${payloadRow()}\n${userRow}\n`)
   assert.deepEqual(records[0].router.tags, [['f', 'alice'], ['c', '0', '1']])
-  assert.equal(messenger.nextMessage(), null)
+  assert.equal((await messenger.nextMessage()), null)
 })
 
 test('router seed rows dedupe by proven inner id without content-key pubkey', async () => {
@@ -1036,7 +1120,7 @@ test('router seed rows dedupe by proven inner id without content-key pubkey', as
   const oldContentRow = JSON.stringify(['user', 'old-ciphertext', 'old-content-key', 'old-proof'])
   const newContentRow = JSON.stringify(['user', 'new-ciphertext', 'new-content-key', 'new-proof'])
 
-  pm.watchCalls[0].onSeed({
+  await pm.watchCalls[0].onSeed({
     channelPubkey: 'channel',
     outer: { id: 'outer-id', kind: 3560, pubkey: 'channel', created_at: now },
     router: {
@@ -1090,7 +1174,7 @@ test('watchtower channels store router seeds without consuming normal messages',
     tell: { id: 'tell-id' }
   })
 
-  assert.equal(messenger.nextMessage(), null)
+  assert.equal((await messenger.nextMessage()), null)
 
   await pm.watchCalls[0].onAsk({
     event: {
@@ -1114,7 +1198,7 @@ test('watchtower channels store router seeds without consuming normal messages',
   assert.equal(records.length, 1)
   assert.equal(records[0].recordType, ROUTER_SEED_RECORD_TYPE)
   assert.equal(Buffer.from(records[0].router.content, 'base64').toString(), `${payloadRow()}\n${userRow}\n`)
-  assert.equal(messenger.nextMessage(), null)
+  assert.equal((await messenger.nextMessage()), null)
 })
 
 test('missing-message asks without stored seeds do not send empty replies', async () => {
@@ -1183,7 +1267,7 @@ test('recovery asks online seeders for the relay-uncovered left edge', async () 
     yell: { id: 'presence-id' }
   })
 
-  assert.equal(messenger.nextMessage(), null)
+  assert.equal((await messenger.nextMessage()), null)
 
   await scheduled()
 
@@ -1192,7 +1276,7 @@ test('recovery asks online seeders for the relay-uncovered left edge', async () 
   assert.equal(ask.options.receiverPubkey, 'seeder')
   assert.ok(ask.options.payload.since <= now - 20)
   assert.equal(ask.options.payload.until, now - 5)
-  assert.equal(messenger.nextMessage().event.id, 'relay-id')
+  assert.equal((await messenger.nextMessage()).event.id, 'relay-id')
 })
 
 test('recovery asks all configured seeders but caps discovered seeders', async () => {
@@ -1245,7 +1329,7 @@ test('missing-message replies ignore raw event rows', async () => {
     reply: { id: 'reply-id' }
   })
 
-  assert.equal(messenger.nextMessage(), null)
+  assert.equal((await messenger.nextMessage()), null)
 })
 
 test('missing-message replies can recover router-only seed records', async () => {
@@ -1309,8 +1393,8 @@ test('missing-message replies can recover router-only seed records', async () =>
   assert.equal(unwrapCall.privateChannelReaderPubkey, 'reader')
   assert.equal(syntheticRouter.content, jsonlContent(payloadRow(), userRow))
   assert.deepEqual(syntheticRouter.tags, [['f', 'alice'], ['c', '0', '1']])
-  assert.equal(messenger.nextMessage().event.id, 'missed-id')
-  assert.equal(messenger.nextMessage(), null)
+  assert.equal((await messenger.nextMessage()).event.id, 'missed-id')
+  assert.equal((await messenger.nextMessage()), null)
 })
 
 test('nym carrier seeds are replied to and recovered as nym queue items', async () => {
@@ -1383,11 +1467,11 @@ test('nym carrier seeds are replied to and recovered as nym queue items', async 
     reply: { id: 'reply-id' }
   })
 
-  const item = messenger.nextMessage()
+  const item = (await messenger.nextMessage())
   assert.equal(item.type, 'nym')
   assert.equal(item.event.kind, ASK_KIND)
   assert.equal(item.meta.recoveredFromSeeder, 'seeder')
-  assert.equal(messenger.nextMessage(), null)
+  assert.equal((await messenger.nextMessage()), null)
 })
 
 test('missing-message reply packer streams compact seed routers only', async () => {
