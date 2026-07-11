@@ -1,5 +1,7 @@
 import { SimplePool } from 'nostr-tools/pool'
 import { freeRelays, seedRelays } from '../constants/index.js'
+import { firstFulfillment, publishSummary, settlePublishPromise } from '../helpers/publish.js'
+import { maybeUnref } from '../helpers/timer.js'
 
 export { freeRelays, seedRelays } from '../constants/index.js'
 
@@ -9,62 +11,6 @@ const PUBLISH_FIRST_FULFILLMENT_TIMEOUT_MS = 3000
 const PUBLISH_SETTLEMENT_TIMEOUT_MS = 30000
 
 export const pool = new SimplePool()
-
-function maybeUnref (timer) {
-  timer?.unref?.()
-  return timer
-}
-
-function publishTimeoutError () {
-  return new Error('PUBLISH_TIMEOUT')
-}
-
-function firstFulfillment (promises, timeoutMs) {
-  return new Promise((resolve) => {
-    let settled = false
-    let rejected = 0
-    const finish = (success) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve(success)
-    }
-    const timer = maybeUnref(setTimeout(() => finish(false), timeoutMs))
-    for (const promise of promises) {
-      Promise.resolve(promise).then(
-        () => finish(true),
-        () => {
-          rejected++
-          if (rejected === promises.length) finish(false)
-        }
-      )
-    }
-  })
-}
-
-function settlePublishPromise (promise, timeoutMs) {
-  let timer = null
-  const publishPromise = Promise.resolve(promise).then(
-    () => ({ status: 'fulfilled' }),
-    reason => ({ status: 'rejected', reason })
-  ).finally(() => clearTimeout(timer))
-  const timeoutPromise = new Promise(resolve => {
-    timer = maybeUnref(setTimeout(() => resolve({ status: 'rejected', reason: publishTimeoutError() }), timeoutMs))
-  })
-  return Promise.race([publishPromise, timeoutPromise])
-}
-
-function publishSummary (settlements, relays) {
-  const fulfilled = settlements.filter(r => r.status === 'fulfilled').length
-  return {
-    success: fulfilled > 0,
-    total: relays.length,
-    fulfilled,
-    errors: settlements
-      .map((r, i) => r.status === 'rejected' ? { relay: relays[i], reason: r.reason } : null)
-      .filter(Boolean)
-  }
-}
 
 export async function publish (event, relays, {
   firstFulfillmentTimeoutMs = PUBLISH_FIRST_FULFILLMENT_TIMEOUT_MS,
