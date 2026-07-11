@@ -12,11 +12,15 @@ const connectOverrides = new Map()
 // Per-URL publish overrides: async (event) => void (throw to simulate error, hang to simulate timeout)
 const publishOverrides = new Map()
 
+// Per-URL send overrides: async (message, relay) => void (used for AUTH replies).
+const sendOverrides = new Map()
+
 class FakeRelay {
   constructor (url) {
     this.url = url
     this.subscriptions = []
     this.ws = { readyState: 1 }
+    this.publishTimeout = 100
     relayRegistry.set(url, this)
   }
 
@@ -46,8 +50,18 @@ class FakeRelay {
     if (fn) await fn(event)
   }
 
+  async send (message) {
+    this.sentMessages ??= []
+    this.sentMessages.push(message)
+    const fn = sendOverrides.get(this.url)
+    if (fn) await fn(message, this)
+  }
+
+  _onmessage (_message) {}
+
   async close () {
     this.ws.readyState = 3
+    this.onclose?.()
   }
 }
 
@@ -88,6 +102,10 @@ function startCollecting (gen) {
 let _nextId = 1
 function makeEvent ({ id, kind = 0, created_at = 100 } = {}) {
   return { id: id ?? String(_nextId++), kind, created_at, tags: [], content: '' }
+}
+
+function receiveRelayMessage (relay, message) {
+  relay._onmessage({ data: JSON.stringify(message) })
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -1183,6 +1201,7 @@ describe('RelayPool.sendEvent', () => {
     relayRegistry.clear()
     connectOverrides.clear()
     publishOverrides.clear()
+    sendOverrides.clear()
     nostr = new RelayPool()
   })
 
@@ -1269,6 +1288,200 @@ describe('RelayPool.sendEvent', () => {
       success: true,
       outcome: 'muted'
     }])
+  })
+
+  it('retries auth-required publishes after sending the caller AUTH event', async () => {
+    const authRequests = []
+    let publishCount = 0
+    publishOverrides.set('wss://r1', () => {
+      publishCount++
+      if (publishCount === 1) {
+        receiveRelayMessage(relayRegistry.get('wss://r1'), ['AUTH', 'challenge-one'])
+        throw new Error('auth-required: sign in first')
+      }
+    })
+    sendOverrides.set('wss://r1', (message, relay) => {
+      const [type, authEvent] = JSON.parse(message)
+      assert.equal(type, 'AUTH')
+      receiveRelayMessage(relay, ['OK', authEvent.id, true, ''])
+    })
+
+    const early = await nostr.sendEvent(makeEvent({ id: 'publish-one' }), ['wss://r1'], {
+      getAuthEvent: request => {
+        authRequests.push(request)
+        return { id: 'auth-one', kind: 22242, pubkey: 'alice' }
+      }
+    })
+    const full = await early.promise
+
+    assert.equal(publishCount, 2)
+    assert.deepEqual(authRequests, [{ relay: 'wss://r1', challenge: 'challenge-one' }])
+    assert.deepEqual(full.succeededRelays, ['wss://r1'])
+  })
+
+  it('leaves auth-required publishes failed when no getAuthEvent is supplied', async () => {
+    let publishCount = 0
+    publishOverrides.set('wss://r1', () => {
+      publishCount++
+      receiveRelayMessage(relayRegistry.get('wss://r1'), ['AUTH', 'challenge-one'])
+      throw new Error('auth-required: sign in first')
+    })
+
+    const early = await nostr.sendEvent(makeEvent({ id: 'publish-one' }), ['wss://r1'])
+    const full = await early.promise
+
+    assert.equal(publishCount, 1)
+    assert.equal(relayRegistry.get('wss://r1').sentMessages?.length ?? 0, 0)
+    assert.equal(full.errors[0].reason.message, 'auth-required: sign in first')
+  })
+
+  it('authenticates once after restricted so the current caller can retry', async () => {
+    let publishCount = 0
+    publishOverrides.set('wss://r1', () => {
+      publishCount++
+      if (publishCount === 1) {
+        receiveRelayMessage(relayRegistry.get('wss://r1'), ['AUTH', 'shared-challenge'])
+        throw new Error('restricted: another identity is not allowed')
+      }
+    })
+    sendOverrides.set('wss://r1', (message, relay) => {
+      const [, authEvent] = JSON.parse(message)
+      receiveRelayMessage(relay, ['OK', authEvent.id, true, ''])
+    })
+
+    const early = await nostr.sendEvent(makeEvent({ id: 'publish-one' }), ['wss://r1'], {
+      getAuthEvent: ({ relay, challenge }) => ({
+        id: 'auth-current-caller', kind: 22242, pubkey: 'current', relay, challenge
+      })
+    })
+    const full = await early.promise
+
+    assert.equal(publishCount, 2)
+    assert.deepEqual(full.succeededRelays, ['wss://r1'])
+  })
+
+  it('does not retry again when a post-auth publish remains restricted', async () => {
+    let publishCount = 0
+    let authCount = 0
+    publishOverrides.set('wss://r1', () => {
+      publishCount++
+      if (publishCount === 1) receiveRelayMessage(relayRegistry.get('wss://r1'), ['AUTH', 'challenge-one'])
+      throw new Error('restricted: still not allowed')
+    })
+    sendOverrides.set('wss://r1', (message, relay) => {
+      authCount++
+      const [, authEvent] = JSON.parse(message)
+      receiveRelayMessage(relay, ['OK', authEvent.id, true, ''])
+    })
+
+    const early = await nostr.sendEvent(makeEvent({ id: 'publish-one' }), ['wss://r1'], {
+      getAuthEvent: () => ({ id: 'auth-one', kind: 22242, pubkey: 'alice' })
+    })
+    const full = await early.promise
+
+    assert.equal(publishCount, 2)
+    assert.equal(authCount, 1)
+    assert.equal(full.errors[0].reason.message, 'restricted: still not allowed')
+  })
+
+  it('keeps multiple caller auth events on the same relay connection', async () => {
+    const authenticatedPubkeys = new Set()
+    const authEventIds = []
+    publishOverrides.set('wss://r1', event => {
+      if (authenticatedPubkeys.has(event.pubkey)) return
+      receiveRelayMessage(relayRegistry.get('wss://r1'), ['AUTH', 'shared-challenge'])
+      throw new Error('auth-required: sign in first')
+    })
+    sendOverrides.set('wss://r1', (message, relay) => {
+      const [, authEvent] = JSON.parse(message)
+      authEventIds.push(authEvent.id)
+      authenticatedPubkeys.add(authEvent.pubkey)
+      receiveRelayMessage(relay, ['OK', authEvent.id, true, ''])
+    })
+
+    const first = await nostr.sendEvent({ ...makeEvent({ id: 'publish-alice' }), pubkey: 'alice' }, ['wss://r1'], {
+      getAuthEvent: () => ({ id: 'auth-alice', kind: 22242, pubkey: 'alice' })
+    })
+    await first.promise
+    const relay = relayRegistry.get('wss://r1')
+
+    const second = await nostr.sendEvent({ ...makeEvent({ id: 'publish-bob' }), pubkey: 'bob' }, ['wss://r1'], {
+      getAuthEvent: () => ({ id: 'auth-bob', kind: 22242, pubkey: 'bob' })
+    })
+    await second.promise
+
+    assert.equal(relayRegistry.get('wss://r1'), relay)
+    assert.deepEqual(authEventIds, ['auth-alice', 'auth-bob'])
+  })
+
+  it('fails auth cleanly when no relay challenge was received', async () => {
+    let authCalls = 0
+    publishOverrides.set('wss://r1', () => { throw new Error('restricted: not allowed') })
+
+    const early = await nostr.sendEvent(makeEvent({ id: 'publish-one' }), ['wss://r1'], {
+      getAuthEvent: () => {
+        authCalls++
+        return { id: 'auth-one', kind: 22242 }
+      }
+    })
+    const full = await early.promise
+
+    assert.equal(authCalls, 0)
+    assert.equal(full.errors[0].reason.message, 'AUTH_CHALLENGE_MISSING')
+  })
+
+  it('does not retry the event when the relay rejects its AUTH event', async () => {
+    let publishCount = 0
+    publishOverrides.set('wss://r1', () => {
+      publishCount++
+      receiveRelayMessage(relayRegistry.get('wss://r1'), ['AUTH', 'challenge-one'])
+      throw new Error('auth-required: sign in first')
+    })
+    sendOverrides.set('wss://r1', (message, relay) => {
+      const [, authEvent] = JSON.parse(message)
+      receiveRelayMessage(relay, ['OK', authEvent.id, false, 'restricted: AUTH is not allowed'])
+    })
+
+    const early = await nostr.sendEvent(makeEvent({ id: 'publish-one' }), ['wss://r1'], {
+      getAuthEvent: () => ({ id: 'auth-one', kind: 22242, pubkey: 'alice' })
+    })
+    const full = await early.promise
+
+    assert.equal(publishCount, 1)
+    assert.equal(full.errors[0].reason.message, 'restricted: AUTH is not allowed')
+  })
+
+  it('does not mistake an AUTH rejection for a duplicate published event', async () => {
+    let publishCount = 0
+    publishOverrides.set('wss://r1', () => {
+      publishCount++
+      receiveRelayMessage(relayRegistry.get('wss://r1'), ['AUTH', 'challenge-one'])
+      throw new Error('auth-required: sign in first')
+    })
+    sendOverrides.set('wss://r1', (message, relay) => {
+      const [, authEvent] = JSON.parse(message)
+      receiveRelayMessage(relay, ['OK', authEvent.id, false, 'duplicate: auth already exists'])
+    })
+
+    const early = await nostr.sendEvent(makeEvent({ id: 'publish-one' }), ['wss://r1'], {
+      getAuthEvent: () => ({ id: 'auth-one', kind: 22242, pubkey: 'alice' })
+    })
+    const full = await early.promise
+
+    assert.equal(publishCount, 1)
+    assert.equal(full.success, false)
+    assert.equal(full.errors[0].reason.message, 'duplicate: auth already exists')
+  })
+
+  it('does not authenticate while reading relay events', async () => {
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1'])
+    await tick()
+    const relay = relayRegistry.get('wss://r1')
+    receiveRelayMessage(relay, ['AUTH', 'read-challenge'])
+    relay.subscriptions[0].handlers.oneose()
+    await resultPromise
+
+    assert.equal(relay.sentMessages?.length ?? 0, 0)
   })
 
   it('reports failed relays with their reasons', async () => {

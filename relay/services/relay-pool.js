@@ -1,6 +1,6 @@
-import { Relay } from 'nostr-tools/relay'
 import { firstFulfillment, publishSummary, settlePublishPromise } from '../helpers/publish.js'
 import { maybeUnref } from '../helpers/timer.js'
+import { Nip42Relay } from './nip42-relay.js'
 
 const SEND_FIRST_FULFILLMENT_TIMEOUT_MS = 3000
 const SEND_SETTLEMENT_TIMEOUT_MS = 30000
@@ -56,6 +56,17 @@ function notifyRelayResult (onRelayResult, result) {
   }
 }
 
+function requiresNip42Auth (reason) {
+  return reason.message.startsWith('auth-required:') || reason.message.startsWith('restricted:')
+}
+
+class Nip42AuthenticationError extends Error {
+  constructor (reason) {
+    super(reason.message, { cause: reason })
+    this.name = 'Nip42AuthenticationError'
+  }
+}
+
 // Interacts with Nostr relays
 export class RelayPool {
   #relays = new Map()
@@ -77,7 +88,7 @@ export class RelayPool {
       return relay
     }
 
-    const relay = new Relay(url)
+    const relay = new Nip42Relay(url)
     this.#relays.set(url, relay)
 
     await relay.connect()
@@ -124,6 +135,27 @@ export class RelayPool {
   async disconnectAll () {
     for (const url of this.#relays.keys()) {
       await this.disconnect(url)
+    }
+  }
+
+  // NIP-42 retries happen inside one relay attempt, so sendEvent still reports
+  // exactly one terminal outcome for each relay URL.
+  async #publishEvent (relay, event, getAuthEvent) {
+    try {
+      await relay.publish(event)
+      return 'published'
+    } catch (error) {
+      const reason = error instanceof Error ? error : new Error(String(error))
+      if (!getAuthEvent || !requiresNip42Auth(reason)) throw reason
+
+      try {
+        await relay.authenticate(getAuthEvent)
+      } catch (error) {
+        const authReason = error instanceof Error ? error : new Error(String(error))
+        throw new Nip42AuthenticationError(authReason)
+      }
+      await relay.publish(event)
+      return 'published'
     }
   }
 
@@ -638,11 +670,13 @@ export class RelayPool {
 
   // Returns after the first acknowledgement window. onRelayResult receives one
   // { relay, success, outcome, reason? } result per relay as it settles; outcome
-  // is published, duplicate, muted, failed, or timed-out.
+  // is published, duplicate, muted, failed, or timed-out. getAuthEvent is used
+  // only after auth-required or restricted publish failures, then retries once.
   // Await `promise` for the complete report, including every relay outcome.
   async sendEvent (event, relays, {
     firstFulfillmentTimeoutMs = SEND_FIRST_FULFILLMENT_TIMEOUT_MS,
     settlementTimeoutMs = SEND_SETTLEMENT_TIMEOUT_MS,
+    getAuthEvent,
     onRelayResult
   } = {}) {
     const urls = relays || []
@@ -660,10 +694,10 @@ export class RelayPool {
     const sendPromises = urls.map(async (url) => {
       try {
         const relay = await this.#getRelay(url)
-        await relay.publish(eventToSend)
-        return 'published'
+        return await this.#publishEvent(relay, eventToSend, getAuthEvent)
       } catch (err) {
         const reason = err instanceof Error ? err : new Error(String(err))
+        if (reason instanceof Nip42AuthenticationError) throw reason
         if (reason.message.startsWith('duplicate:')) return 'duplicate'
         if (reason.message.startsWith('mute:')) {
           console.info([url, reason.message].filter(Boolean).join(' - '))
@@ -697,6 +731,6 @@ export class RelayPool {
   }
 }
 
-// Connections are not authenticated, so one shared pool is enough for callers
-// that do not need explicit connection ownership.
+// NIP-42 permits multiple pubkeys to authenticate on one connection, so callers
+// can share a RelayPool without splitting connections by authenticated identity.
 export const relayPool = new RelayPool()
