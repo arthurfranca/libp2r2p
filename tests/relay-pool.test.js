@@ -1188,25 +1188,42 @@ describe('RelayPool.sendEvent', () => {
 
   it('returns after the first accepted relay and keeps a full settlement promise', async () => {
     const delayed = deferred()
+    const relayResults = []
     publishOverrides.set('wss://r2', () => delayed.promise)
     const event = { id: 'ev1', kind: 1, created_at: 100, tags: [], content: '' }
     const early = await nostr.sendEvent(event, ['wss://r1', 'wss://r2'], {
       firstFulfillmentTimeoutMs: 100,
-      settlementTimeoutMs: 1000
+      settlementTimeoutMs: 1000,
+      onRelayResult: result => relayResults.push(result)
     })
 
     assert.equal(early.result, null)
     assert.equal(early.total, 2)
     assert.equal(early.success, true)
+    assert.deepEqual(relayResults, [{
+      relay: 'wss://r1',
+      success: true,
+      outcome: 'published'
+    }])
 
-    delayed.resolve()
+    delayed.reject(new Error('relay failed'))
     const full = await early.promise
     assert.equal(full.result, null)
     assert.equal(full.success, true)
     assert.equal(full.total, 2)
-    assert.equal(full.fulfilled, 2)
-    assert.deepEqual(full.succeededRelays, ['wss://r1', 'wss://r2'])
-    assert.deepEqual(full.errors, [])
+    assert.equal(full.fulfilled, 1)
+    assert.deepEqual(full.succeededRelays, ['wss://r1'])
+    assert.equal(full.errors.length, 1)
+    assert.deepEqual(relayResults.map(({ reason, ...result }) => result), [{
+      relay: 'wss://r1',
+      success: true,
+      outcome: 'published'
+    }, {
+      relay: 'wss://r2',
+      success: false,
+      outcome: 'failed'
+    }])
+    assert.equal(relayResults[1].reason.message, 'relay failed')
   })
 
   it('strips event.meta before publishing', async () => {
@@ -1219,23 +1236,39 @@ describe('RelayPool.sendEvent', () => {
   })
 
   it('treats duplicate: error as success', async () => {
+    const relayResults = []
     publishOverrides.set('wss://r1', () => { throw new Error('duplicate: already have this event') })
     const event = { id: 'ev1', kind: 1, created_at: 100, tags: [], content: '' }
-    const early = await nostr.sendEvent(event, ['wss://r1'])
+    const early = await nostr.sendEvent(event, ['wss://r1'], {
+      onRelayResult: result => relayResults.push(result)
+    })
     const full = await early.promise
     assert.ok(early.success)
     assert.deepEqual(full.succeededRelays, ['wss://r1'])
     assert.equal(full.errors.length, 0)
+    assert.deepEqual(relayResults, [{
+      relay: 'wss://r1',
+      success: true,
+      outcome: 'duplicate'
+    }])
   })
 
   it('treats mute: error as success', async () => {
+    const relayResults = []
     publishOverrides.set('wss://r1', () => { throw new Error('mute: author blocked') })
     const event = { id: 'ev1', kind: 1, created_at: 100, tags: [], content: '' }
-    const early = await nostr.sendEvent(event, ['wss://r1'])
+    const early = await nostr.sendEvent(event, ['wss://r1'], {
+      onRelayResult: result => relayResults.push(result)
+    })
     const full = await early.promise
     assert.ok(early.success)
     assert.deepEqual(full.succeededRelays, ['wss://r1'])
     assert.equal(full.errors.length, 0)
+    assert.deepEqual(relayResults, [{
+      relay: 'wss://r1',
+      success: true,
+      outcome: 'muted'
+    }])
   })
 
   it('reports failed relays with their reasons', async () => {
@@ -1281,11 +1314,13 @@ describe('RelayPool.sendEvent', () => {
   })
 
   it('records a settlement timeout without cancelling the underlying publish', async () => {
+    const relayResults = []
     publishOverrides.set('wss://r1', () => new Promise(() => {}))
     const event = { id: 'ev1', kind: 1, created_at: 100, tags: [], content: '' }
     const early = await nostr.sendEvent(event, ['wss://r1'], {
       firstFulfillmentTimeoutMs: 10,
-      settlementTimeoutMs: 10
+      settlementTimeoutMs: 10,
+      onRelayResult: result => relayResults.push(result)
     })
     const full = await early.promise
 
@@ -1293,6 +1328,9 @@ describe('RelayPool.sendEvent', () => {
     assert.equal(full.success, false)
     assert.equal(full.errors.length, 1)
     assert.equal(full.errors[0].reason.message, 'PUBLISH_TIMEOUT')
+    assert.equal(relayResults.length, 1)
+    assert.equal(relayResults[0].outcome, 'timed-out')
+    assert.equal(relayResults[0].reason.message, 'PUBLISH_TIMEOUT')
   })
 
   it('returns an immediately settled failure report when given no relays', async () => {

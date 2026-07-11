@@ -29,18 +29,27 @@ export function firstFulfillment (promises, timeoutMs) {
   })
 }
 
-// Gives each relay a bounded entry in the final report without cancelling the
+// Gives each relay one bounded terminal result without cancelling the
 // underlying publish, which may still complete after the reporting deadline.
-export function settlePublishPromise (promise, timeoutMs) {
-  let timer = null
-  const publishPromise = Promise.resolve(promise).then(
-    () => ({ status: 'fulfilled' }),
-    reason => ({ status: 'rejected', reason })
-  ).finally(() => clearTimeout(timer))
-  const timeoutPromise = new Promise(resolve => {
-    timer = maybeUnref(setTimeout(() => resolve({ status: 'rejected', reason: publishTimeoutError() }), timeoutMs))
+export function settlePublishPromise (promise, timeoutMs, { onSettled } = {}) {
+  return new Promise((resolve) => {
+    let settled = false
+    const settle = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      onSettled?.(result)
+      resolve(result)
+    }
+    const timer = maybeUnref(setTimeout(() => {
+      settle({ status: 'rejected', outcome: 'timed-out', reason: publishTimeoutError() })
+    }, timeoutMs))
+
+    Promise.resolve(promise).then(
+      value => settle({ status: 'fulfilled', value }),
+      reason => settle({ status: 'rejected', outcome: 'failed', reason })
+    )
   })
-  return Promise.race([publishPromise, timeoutPromise])
 }
 
 // Turns ordered relay settlements into a stable, caller-facing report. Failed

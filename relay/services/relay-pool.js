@@ -28,6 +28,34 @@ function makeEarlyCloseChecker (filter, onSatisfied) {
   }
 }
 
+function relayResultForSettlement (relay, settlement) {
+  if (settlement.status === 'fulfilled') {
+    return {
+      relay,
+      success: true,
+      outcome: settlement.value || 'published'
+    }
+  }
+
+  return {
+    relay,
+    success: false,
+    outcome: settlement.outcome || 'failed',
+    reason: settlement.reason
+  }
+}
+
+function notifyRelayResult (onRelayResult, result) {
+  if (!onRelayResult) return
+  try {
+    Promise.resolve(onRelayResult(result)).catch(error => {
+      console.error('RelayPool onRelayResult failed:', error)
+    })
+  } catch (error) {
+    console.error('RelayPool onRelayResult failed:', error)
+  }
+}
+
 // Interacts with Nostr relays
 export class RelayPool {
   #relays = new Map()
@@ -608,11 +636,14 @@ export class RelayPool {
     }
   }
 
-  // Returns after the first acknowledgement window. Await `promise` for the
-  // complete report, including every successful relay and final error.
+  // Returns after the first acknowledgement window. onRelayResult receives one
+  // { relay, success, outcome, reason? } result per relay as it settles; outcome
+  // is published, duplicate, muted, failed, or timed-out.
+  // Await `promise` for the complete report, including every relay outcome.
   async sendEvent (event, relays, {
     firstFulfillmentTimeoutMs = SEND_FIRST_FULFILLMENT_TIMEOUT_MS,
-    settlementTimeoutMs = SEND_SETTLEMENT_TIMEOUT_MS
+    settlementTimeoutMs = SEND_SETTLEMENT_TIMEOUT_MS,
+    onRelayResult
   } = {}) {
     const urls = relays || []
     if (!urls.length) {
@@ -630,19 +661,27 @@ export class RelayPool {
       try {
         const relay = await this.#getRelay(url)
         await relay.publish(eventToSend)
+        return 'published'
       } catch (err) {
         const reason = err instanceof Error ? err : new Error(String(err))
-        if (reason.message.startsWith('duplicate:')) return
+        if (reason.message.startsWith('duplicate:')) return 'duplicate'
         if (reason.message.startsWith('mute:')) {
           console.info([url, reason.message].filter(Boolean).join(' - '))
-          return
+          return 'muted'
         }
         throw reason
       }
     })
 
+    // Resolves after every relay settles (or reaches the settlement timeout) as
+    // { result: null, success, total, fulfilled, succeededRelays, errors },
+    // where errors contains { relay, reason } entries for failed relays.
     const promise = Promise
-      .all(sendPromises.map(promise => settlePublishPromise(promise, settlementTimeoutMs)))
+      .all(sendPromises.map((promise, index) => settlePublishPromise(promise, settlementTimeoutMs, {
+        onSettled: settlement => {
+          notifyRelayResult(onRelayResult, relayResultForSettlement(urls[index], settlement))
+        }
+      })))
       .then(settlements => publishSummary(settlements, urls, {
         result: null,
         includeSucceededRelays: true
