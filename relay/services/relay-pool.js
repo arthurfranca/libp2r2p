@@ -71,6 +71,10 @@ function countTimeoutError () {
   return new Error('COUNT_TIMEOUT')
 }
 
+function getEventsTimeoutError () {
+  return new Error('GET_EVENTS_TIMEOUT')
+}
+
 function isCountResponse (payload) {
   return Number.isSafeInteger(payload?.count) && payload.count >= 0
 }
@@ -294,195 +298,128 @@ export class RelayPool {
     })
   }
 
-  // Get events from a list of relays
-  async getEvents (filter, relays, { timeout = 5000, callback, signal } = {}) {
+  // Collects a one-shot relay read. The first EOSE with events opens a short
+  // grace window; null disables either timer so callers can wait naturally.
+  async getEvents (filter, relays, { timeout = 5000, timeoutAfterFirstEose = 500, callback, signal } = {}) {
+    const urls = relays || []
+    if (!urls.length) return { result: [], errors: [], success: false }
+    if (signal?.aborted) throw new Error('Aborted')
+
+    const subscriptions = new Map()
+    const pending = new Set(urls)
+    const normalCloseUrls = new Set()
+    const errors = []
     const events = []
-    const promises = relays.map(async (url) => {
-      let sub
-      let isClosed = false
-      const p = Promise.withResolvers()
-      const t = Promise.withResolvers()
+    let completed = 0
+    let isResolved = false
+    let eoseTimer = null
+    let timeoutTimer = null
 
-      // Handle abort signal
-      if (signal?.aborted) throw new Error('Aborted')
+    return await new Promise((resolve, reject) => {
+      const closeSubscriptions = () => {
+        for (const sub of subscriptions.values()) sub.close()
+        subscriptions.clear()
+      }
+
+      const cleanup = () => {
+        clearTimeout(timeoutTimer)
+        clearTimeout(eoseTimer)
+        signal?.removeEventListener('abort', onAbort)
+        closeSubscriptions()
+      }
+
+      const finish = () => {
+        if (isResolved) return
+        isResolved = true
+        cleanup()
+        resolve({
+          result: events,
+          errors,
+          success: events.length > 0 || completed > 0
+        })
+      }
+
+      const finishIfComplete = () => {
+        if (pending.size === 0) finish()
+      }
+
+      const settleRelay = (url, reason) => {
+        if (isResolved || !pending.delete(url)) return
+        subscriptions.delete(url)
+        if (reason) {
+          errors.push({ reason, relay: url })
+          if (callback) callback({ type: 'error', error: reason, relay: url })
+        } else {
+          completed++
+        }
+        finishIfComplete()
+      }
+
       const onAbort = () => {
-        if (isClosed) return
-        isClosed = true
-        sub?.close()
-        t.reject(new Error('Aborted'))
+        if (isResolved) return
+        isResolved = true
+        cleanup()
+        reject(new Error('Aborted'))
       }
+
+      const timeoutPending = () => {
+        if (isResolved) return
+        for (const url of pending) {
+          errors.push({ reason: getEventsTimeoutError(), relay: url })
+        }
+        finish()
+      }
+
       signal?.addEventListener('abort', onAbort, { once: true })
+      if (timeout !== null) timeoutTimer = maybeUnref(setTimeout(timeoutPending, timeout))
 
-      let timer = null
-      if (timeout !== null) {
-        timer = maybeUnref(setTimeout(() => {
-          if (isClosed) return
-          isClosed = true
-          sub?.close()
-          t.reject(new Error(`timeout: ${url}`))
-        }, timeout))
-      }
+      for (const url of urls) {
+        this.#getRelay(url).then(relay => {
+          if (isResolved || !pending.has(url)) return
+          let hasEvents = false
+          let sub
 
-      ;(async () => {
-        try {
-          const relay = await this.#getRelay(url)
-          if (isClosed) return
-
-          // Shared resolve path: EOSE, early close (limit/ids satisfied), or normal close
-          const resolveRelay = () => {
-            if (isClosed) return
-            isClosed = true
-            sub?.close()
-            p.resolve()
+          // Actual EOSE and filter satisfaction share the same graceful close path.
+          const handleEose = () => {
+            if (isResolved || !pending.has(url)) return
+            // nostr-tools reports "closed by caller" through onclose(). This is a
+            // successful local completion, not a relay failure.
+            normalCloseUrls.add(url)
+            sub.close()
+            if (hasEvents && timeoutAfterFirstEose !== null && !eoseTimer && !isResolved) {
+              eoseTimer = maybeUnref(setTimeout(finish, timeoutAfterFirstEose))
+            }
           }
 
-          const checkEarlyClose = makeEarlyCloseChecker(filter, resolveRelay)
-
+          const checkEarlyClose = makeEarlyCloseChecker(filter, handleEose)
           sub = relay.subscribe([filter], {
             onevent: (event) => {
+              if (isResolved || !pending.has(url)) return
+              hasEvents = true
               event.meta = { relay: url }
               events.push(event)
               if (callback) callback({ type: 'event', event, relay: url })
               checkEarlyClose(event)
             },
-            oninvalidevent: (event) => {
-              checkEarlyClose(event)
+            oninvalidevent: () => {
+              if (!isResolved && pending.has(url)) checkEarlyClose()
             },
-            onclose: err => {
-              if (isClosed) return
-              isClosed = true
-              let reason
-              if (err !== undefined) {
-                reason = err instanceof Error ? err : new Error(String(err))
-                if (callback) callback({ type: 'error', error: reason, relay: url })
-              }
-              // May have closed normally, without error
-              reason ? p.reject(reason) : p.resolve()
+            onclose: error => {
+              const reason = normalCloseUrls.delete(url) || error === undefined
+                ? null
+                : error instanceof Error ? error : new Error(String(error))
+              settleRelay(url, reason)
             },
-            oneose: resolveRelay
+            oneose: handleEose
           })
-        } catch (err) {
-          if (callback) callback({ type: 'error', error: err, relay: url })
-          p.reject(err)
-        }
-      })()
-
-      try {
-        await Promise.race([p.promise, t.promise])
-      } finally {
-        clearTimeout(timer)
-        signal?.removeEventListener('abort', onAbort)
+          if (isResolved || !pending.has(url)) sub.close()
+          else subscriptions.set(url, sub)
+        }).catch(error => {
+          const reason = error instanceof Error ? error : new Error(String(error))
+          settleRelay(url, reason)
+        })
       }
     })
-
-    const results = await Promise.allSettled(promises)
-    const rejectedResults = results.filter(v => v.status === 'rejected')
-
-    return {
-      result: events,
-      errors: rejectedResults.map(v => ({ reason: v.reason, relay: relays[results.indexOf(v)] })),
-      success: events.length > 0 || results.length !== rejectedResults.length
-    }
-  }
-
-  // The first EOSE with events opens a short grace window; null disables either
-  // timer so callers can wait for every relay naturally.
-  async getEventsAsap (filter, relays, { timeout = 5000, timeoutAfterFirstEose = 500, callback, signal } = {}) {
-    const subs = new Map()
-    const errors = []
-    const events = []
-    let closedRelaySubs = 0
-    let isResolved = false
-    let eoseTimer = null
-    const p = Promise.withResolvers()
-
-    const finalize = () => {
-      if (isResolved) return
-      isResolved = true
-      clearTimeout(timer)
-      if (eoseTimer) clearTimeout(eoseTimer)
-      signal?.removeEventListener('abort', onAbort)
-      subs.forEach(sub => sub.close())
-      p.resolve({
-        result: events,
-        errors,
-        success: events.length > 0 || relays.length !== errors.length
-      })
-    }
-
-    // Handle abort
-    const onAbort = () => {
-      if (isResolved) return
-      isResolved = true
-      clearTimeout(timer)
-      if (eoseTimer) clearTimeout(eoseTimer)
-      subs.forEach(sub => sub.close())
-      p.reject(new Error('Aborted'))
-    }
-
-    if (signal?.aborted) return Promise.reject(new Error('Aborted'))
-    signal?.addEventListener('abort', onAbort, { once: true })
-
-    let timer = null
-    if (timeout !== null) timer = maybeUnref(setTimeout(finalize, timeout))
-
-    const markClosedAndMaybeFinish = () => {
-      closedRelaySubs += 1
-      if (!isResolved && closedRelaySubs >= relays.length) {
-        finalize()
-      }
-    }
-
-    for (const url of relays) {
-      this.#getRelay(url).then(relay => {
-        if (isResolved) return
-        let hasEvents = false
-
-        // Shared EOSE path: actual EOSE or early close (limit/ids satisfied)
-        const handleEose = () => {
-          if (!subs.has(url)) return // already closed
-          sub.close()
-          if (hasEvents && timeoutAfterFirstEose !== null && !eoseTimer && !isResolved) {
-            eoseTimer = maybeUnref(setTimeout(finalize, timeoutAfterFirstEose))
-          }
-        }
-
-        const checkEarlyClose = makeEarlyCloseChecker(filter, handleEose)
-
-        const sub = relay.subscribe([filter], {
-          onevent: (event) => {
-            if (isResolved) return
-            hasEvents = true
-            event.meta = { relay: url }
-            events.push(event)
-            if (callback) callback({ type: 'event', event, relay: url })
-            checkEarlyClose(event)
-          },
-          oninvalidevent: (event) => {
-            if (isResolved) return
-            checkEarlyClose(event)
-          },
-          onclose: (err) => {
-            subs.delete(url)
-            if (err !== undefined) {
-              const reason = err instanceof Error ? err : new Error(String(err))
-              errors.push({ reason, relay: url })
-              if (callback) callback({ type: 'error', error: reason, relay: url })
-            }
-            markClosedAndMaybeFinish()
-          },
-          oneose: handleEose
-        })
-        subs.set(url, sub)
-      }).catch(error => {
-        errors.push({ reason: error, relay: url })
-        if (callback) callback({ type: 'error', error, relay: url })
-        console.error(`Nostr relay error at ${url}: ${error}`)
-        markClosedAndMaybeFinish()
-      })
-    }
-
-    return p.promise
   }
 
   async * getEventsGenerator (filter, relays, options = {}) {
@@ -514,35 +451,6 @@ export class RelayPool {
     return await methodPromise
   }
 
-  async * getEventsAsapGenerator (filter, relays, options = {}) {
-    const queue = []
-    let p = Promise.withResolvers()
-    let isDone = false
-
-    const userCallback = options.callback
-    const callback = item => {
-      queue.push(item)
-      if (userCallback) userCallback(item)
-      p.resolve()
-      p = Promise.withResolvers()
-    }
-
-    const methodPromise = this.getEventsAsap(filter, relays, { ...options, callback })
-      .catch(err => { if (err?.message !== 'Aborted') console.error('Error in getEventsAsap:', err) })
-      .finally(() => {
-        isDone = true
-        p.resolve()
-      })
-
-    // eslint-disable-next-line no-unmodified-loop-condition
-    while (!isDone || queue.length > 0) {
-      if (queue.length > 0) yield queue.shift()
-      else await p.promise
-    }
-
-    return await methodPromise
-  }
-
   // Yields live nostr events from the given relays. Stops naturally when filter.until
   // is set and the wall clock reaches that timestamp. Also stops on signal abort or
   // for-await loop exit (break/return/throw — all trigger the finally block).
@@ -556,15 +464,13 @@ export class RelayPool {
   //    initial gap boundary if no events have been seen yet.
   //
   // Initial fetching of stored events is the responsibility of getEventsFeedGenerator.
-  // Reconnect gap fills delegate to getEventsAsapGenerator (when timeoutAfterFirstReconnectGapEose
-  // is set, default 500ms) or getEventsGenerator (when null). Both are injectable.
+  // Reconnect gap fills delegate to getEventsGenerator, whose EOSE grace can be null.
   // Reconnect gap events are deduplicated against live events.
   async * getLiveEventsGenerator (filter, relays, {
     signal,
     timeoutForReconnectGap = 5000,
     timeoutAfterFirstReconnectGapEose = 500,
-    _gapAsapGenerator = (...args) => this.getEventsAsapGenerator(...args),
-    _gapFetchGenerator = (...args) => this.getEventsGenerator(...args)
+    _gapEventsGenerator = (...args) => this.getEventsGenerator(...args)
   } = {}) {
     const queue = []
     let p = Promise.withResolvers()
@@ -624,9 +530,11 @@ export class RelayPool {
     const runReconnectGapFill = (url, gapSince, now) => {
       const gapUntil = filterUntil !== null ? Math.min(now, filterUntil) : now
       const gapFilter = { ...baseFilter, since: gapSince, until: gapUntil }
-      const gapGen = timeoutAfterFirstReconnectGapEose !== null
-        ? _gapAsapGenerator(gapFilter, [url], { timeout: timeoutForReconnectGap, timeoutAfterFirstEose: timeoutAfterFirstReconnectGapEose, signal: gapAc.signal })
-        : _gapFetchGenerator(gapFilter, [url], { timeout: timeoutForReconnectGap, signal: gapAc.signal })
+      const gapGen = _gapEventsGenerator(gapFilter, [url], {
+        timeout: timeoutForReconnectGap,
+        timeoutAfterFirstEose: timeoutAfterFirstReconnectGapEose,
+        signal: gapAc.signal
+      })
       return (async () => {
         for await (const item of gapGen) {
           if (item?.type === 'event') pushEvent(item.event, url)
@@ -715,10 +623,9 @@ export class RelayPool {
   //   concurrently, yields stored events first, then flushes buffered live events (deduped
   //   against stored ones), then yields live events indefinitely. With limit:0 the relay
   //   sends no stored events, so the fetch is skipped and only the live sub runs.
-  // - live:false + timeoutAfterFirstEose set: one-shot fetch via getEventsAsapGenerator —
-  //   short-circuits once the fastest relay with events has EOSEd.
-  // - live:false + timeoutAfterFirstEose:null: one-shot fetch via getEventsGenerator —
-  //   waits for all relays to EOSE naturally.
+  // - live:false: one-shot fetch via getEventsGenerator. timeoutAfterFirstEose
+  //   short-circuits after the fastest relay with events EOSEs, or waits for all
+  //   relays when null.
   //
   // All underlying generators are injectable for testing.
   async * getEventsFeedGenerator (filter, relays, {
@@ -727,13 +634,10 @@ export class RelayPool {
     timeout = 5000,
     timeoutAfterFirstEose = 500,
     _liveGenerator = (...args) => this.getLiveEventsGenerator(...args),
-    _asapGenerator = (...args) => this.getEventsAsapGenerator(...args),
-    _fetchGenerator = (...args) => this.getEventsGenerator(...args)
+    _eventsGenerator = (...args) => this.getEventsGenerator(...args)
   } = {}) {
     if (!live) {
-      const gen = timeoutAfterFirstEose !== null
-        ? _asapGenerator(filter, relays, { timeout, timeoutAfterFirstEose, signal })
-        : _fetchGenerator(filter, relays, { timeout, signal })
+      const gen = _eventsGenerator(filter, relays, { timeout, timeoutAfterFirstEose, signal })
       for await (const item of gen) {
         if (item?.type === 'event') yield item.event
       }
@@ -772,9 +676,7 @@ export class RelayPool {
 
     try {
       // Yield stored events from the initial one-shot fetch
-      const fetchGen = timeoutAfterFirstEose !== null
-        ? _asapGenerator(filter, relays, { timeout, timeoutAfterFirstEose, signal })
-        : _fetchGenerator(filter, relays, { timeout, signal })
+      const fetchGen = _eventsGenerator(filter, relays, { timeout, timeoutAfterFirstEose, signal })
 
       const seenIds = new Set()
       for await (const item of fetchGen) {

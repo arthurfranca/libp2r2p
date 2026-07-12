@@ -34,10 +34,10 @@ class FakeRelay {
       filters,
       handlers,
       isClosed: false,
-      close () {
+      close (reason = 'closed by caller') {
         if (this.isClosed) return
         this.isClosed = true
-        handlers.onclose?.()
+        handlers.onclose?.(reason)
       }
     }
     this.subscriptions.push(sub)
@@ -237,14 +237,14 @@ describe('RelayPool.getLiveEventsGenerator', () => {
   it('reconnect opens a gap fill sub using lastSeenAt as since', async () => {
     const ac = new AbortController()
     let capturedArgs
-    async function * mockGapAsap (f, r, o) {
+    async function * mockGapEvents (f, r, o) {
       capturedArgs = { f, r, o }
     }
 
     const { promise } = startCollecting(nostr.getLiveEventsGenerator(
       { kinds: [0] },
       ['wss://r1'],
-      { signal: ac.signal, _gapAsapGenerator: mockGapAsap }
+      { signal: ac.signal, _gapEventsGenerator: mockGapEvents }
     ))
 
     await tick()
@@ -259,7 +259,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     await new Promise(resolve => setTimeout(resolve, 1100))
     await tick()
 
-    assert.ok(capturedArgs, '_gapAsapGenerator should have been called on reconnect')
+    assert.ok(capturedArgs, '_gapEventsGenerator should have been called on reconnect')
     assert.equal(capturedArgs.f.since, 750, 'reconnect gap fill uses lastSeenAt as since')
     assert.ok(capturedArgs.f.until > 0)
     assert.deepEqual(capturedArgs.r, ['wss://r1'])
@@ -271,12 +271,12 @@ describe('RelayPool.getLiveEventsGenerator', () => {
   it('reconnect uses filter.since as gap baseline when no events have been seen', async () => {
     const ac = new AbortController()
     let capturedSince
-    async function * mockGapAsap (f) { capturedSince = f.since }
+    async function * mockGapEvents (f) { capturedSince = f.since }
 
     const { promise } = startCollecting(nostr.getLiveEventsGenerator(
       { kinds: [0], since: 500 },
       ['wss://r1'],
-      { signal: ac.signal, _gapAsapGenerator: mockGapAsap }
+      { signal: ac.signal, _gapEventsGenerator: mockGapEvents }
     ))
 
     await tick()
@@ -351,12 +351,12 @@ describe('RelayPool.getLiveEventsGenerator', () => {
       const until = Math.floor(Date.now() / 1000) + 60
       const ac = new AbortController()
       let capturedUntil
-      async function * mockGapAsap (f) { capturedUntil = f.until }
+      async function * mockGapEvents (f) { capturedUntil = f.until }
 
       const { promise } = startCollecting(nostr.getLiveEventsGenerator(
         { kinds: [0], since: 100, until },
         ['wss://r1'],
-        { signal: ac.signal, _gapAsapGenerator: mockGapAsap }
+        { signal: ac.signal, _gapEventsGenerator: mockGapEvents }
       ))
 
       await tick()
@@ -409,11 +409,11 @@ describe('RelayPool.getLiveEventsGenerator', () => {
   })
 
   describe('reconnect gap fill routing — injectable generators', () => {
-    it('forwards renamed reconnect timeouts to _gapAsapGenerator', async () => {
+    it('forwards renamed reconnect timeouts to _gapEventsGenerator', async () => {
       const ac = new AbortController()
       let asapCalled = false
       let options
-      async function * mockGapAsap (_filter, _relays, nextOptions) {
+      async function * mockGapEvents (_filter, _relays, nextOptions) {
         asapCalled = true
         options = nextOptions
       }
@@ -425,7 +425,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
           signal: ac.signal,
           timeoutForReconnectGap: 4321,
           timeoutAfterFirstReconnectGapEose: 321,
-          _gapAsapGenerator: mockGapAsap
+          _gapEventsGenerator: mockGapEvents
         }
       ))
 
@@ -441,15 +441,15 @@ describe('RelayPool.getLiveEventsGenerator', () => {
       await promise
     })
 
-    it('uses _gapFetchGenerator when timeoutAfterFirstReconnectGapEose is null', async () => {
+    it('forwards null EOSE grace to _gapEventsGenerator', async () => {
       const ac = new AbortController()
-      let fetchCalled = false
-      async function * mockGapFetch () { fetchCalled = true }
+      let options
+      async function * mockGapEvents (_filter, _relays, nextOptions) { options = nextOptions }
 
       const { promise } = startCollecting(nostr.getLiveEventsGenerator(
         { kinds: [0], since: 100 },
         ['wss://r1'],
-        { signal: ac.signal, timeoutAfterFirstReconnectGapEose: null, _gapFetchGenerator: mockGapFetch }
+        { signal: ac.signal, timeoutAfterFirstReconnectGapEose: null, _gapEventsGenerator: mockGapEvents }
       ))
 
       await tick()
@@ -457,7 +457,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
       await new Promise(resolve => setTimeout(resolve, 1100))
       await tick()
 
-      assert.ok(fetchCalled)
+      assert.equal(options.timeoutAfterFirstEose, null)
       ac.abort()
       await promise
     })
@@ -468,7 +468,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
       const gapEvent = makeEvent({ id: 'gap1', created_at: 50 })
       let resolveGap
 
-      async function * mockGapAsap () {
+      async function * mockGapEvents () {
         yield { type: 'event', event: gapEvent, relay: 'wss://r1' }
         await new Promise(resolve => { resolveGap = resolve })
       }
@@ -476,7 +476,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
       const { events, promise } = startCollecting(nostr.getLiveEventsGenerator(
         { kinds: [0], since: 1 },
         ['wss://r1'],
-        { signal: ac.signal, _gapAsapGenerator: mockGapAsap }
+        { signal: ac.signal, _gapEventsGenerator: mockGapEvents }
       ))
 
       await tick()
@@ -510,7 +510,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
       const dupEvent = makeEvent({ id: 'dup', created_at: 150 })
       let resolveGap
 
-      async function * mockGapAsap () {
+      async function * mockGapEvents () {
         yield { type: 'event', event: dupEvent, relay: 'wss://r1' }
         await new Promise(resolve => { resolveGap = resolve })
       }
@@ -518,7 +518,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
       const { events, promise } = startCollecting(nostr.getLiveEventsGenerator(
         { kinds: [0], since: 1 },
         ['wss://r1'],
-        { signal: ac.signal, _gapAsapGenerator: mockGapAsap }
+        { signal: ac.signal, _gapEventsGenerator: mockGapEvents }
       ))
 
       await tick()
@@ -564,7 +564,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
         // stays open
         await new Promise(resolve => { resolveFetch = resolve })
       }
-      async function * mockAsap () {
+      async function * mockEvents () {
         callOrder.push('fetch')
       }
 
@@ -573,7 +573,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
         nostr.getEventsFeedGenerator({ since: 100 }, ['wss://r1'], {
           signal: ac.signal,
           _liveGenerator: mockLive,
-          _asapGenerator: mockAsap
+          _eventsGenerator: mockEvents
         })
       )
 
@@ -595,7 +595,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
         await new Promise(resolve => { resolveFetch = resolve })
         yield liveEvent
       }
-      async function * mockAsap () {
+      async function * mockEvents () {
         yield { type: 'event', event: storedEvent, relay: 'wss://r1' }
       }
 
@@ -604,7 +604,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
         nostr.getEventsFeedGenerator({ since: 1 }, ['wss://r1'], {
           signal: ac.signal,
           _liveGenerator: mockLive,
-          _asapGenerator: mockAsap
+          _eventsGenerator: mockEvents
         })
       )
 
@@ -629,7 +629,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
         await new Promise(resolve => { resolveLive = resolve })
       }
       // Fetch also returns the same event (overlap around the time boundary)
-      async function * mockAsap () {
+      async function * mockEvents () {
         yield { type: 'event', event: sharedEvent, relay: 'wss://r1' }
       }
 
@@ -638,7 +638,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
         nostr.getEventsFeedGenerator({ since: 1 }, ['wss://r1'], {
           signal: ac.signal,
           _liveGenerator: mockLive,
-          _asapGenerator: mockAsap
+          _eventsGenerator: mockEvents
         })
       )
 
@@ -650,64 +650,45 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       assert.equal(events.filter(e => e.id === 'shared').length, 1, 'duplicate should appear once')
     })
 
-    it('uses _asapGenerator for initial fetch when timeoutAfterFirstEose is set', async () => {
-      let asapCalled = false
-      let fetchCalled = false
+    it('uses _eventsGenerator for initial fetch with either EOSE grace setting', async () => {
+      const calls = []
+      async function * mockLive () { await new Promise(() => {}) }
+      async function * mockEvents (_filter, _relays, options) { calls.push(options) }
 
-      async function * mockLive () { /* stays silent */ await new Promise(() => {}) }
-      async function * mockAsap () { asapCalled = true }
-      async function * mockFetch () { fetchCalled = true }
-
-      const ac = new AbortController()
+      const asapAbort = new AbortController()
       startCollecting(nostr.getEventsFeedGenerator({ since: 100 }, ['wss://r1'], {
-        signal: ac.signal,
+        signal: asapAbort.signal,
         timeoutAfterFirstEose: 500,
         _liveGenerator: mockLive,
-        _asapGenerator: mockAsap,
-        _fetchGenerator: mockFetch
+        _eventsGenerator: mockEvents
       }))
-
       await tick()
-      assert.ok(asapCalled)
-      assert.ok(!fetchCalled)
-      ac.abort()
-    })
+      asapAbort.abort()
 
-    it('uses _fetchGenerator for initial fetch when timeoutAfterFirstEose is null', async () => {
-      let asapCalled = false
-      let fetchCalled = false
-
-      async function * mockLive () { await new Promise(() => {}) }
-      async function * mockAsap () { asapCalled = true }
-      async function * mockFetch () { fetchCalled = true }
-
-      const ac = new AbortController()
+      const fullAbort = new AbortController()
       startCollecting(nostr.getEventsFeedGenerator({ since: 100 }, ['wss://r1'], {
-        signal: ac.signal,
+        signal: fullAbort.signal,
         timeoutAfterFirstEose: null,
         _liveGenerator: mockLive,
-        _asapGenerator: mockAsap,
-        _fetchGenerator: mockFetch
+        _eventsGenerator: mockEvents
       }))
-
       await tick()
-      assert.ok(!asapCalled)
-      assert.ok(fetchCalled)
-      ac.abort()
+      assert.deepEqual(calls.map(call => call.timeoutAfterFirstEose), [500, null])
+      fullAbort.abort()
     })
 
     it('skips initial fetch and delegates directly to _liveGenerator when filter.limit === 0', async () => {
       let fetchCalled = false
       let liveCalled = false
       async function * mockLive () { liveCalled = true; yield makeEvent({ id: 'e1' }) }
-      async function * mockAsap () { fetchCalled = true }
+      async function * mockEvents () { fetchCalled = true }
 
       const ac = new AbortController()
       const { events, promise } = startCollecting(
         nostr.getEventsFeedGenerator({ limit: 0 }, ['wss://r1'], {
           signal: ac.signal,
           _liveGenerator: mockLive,
-          _asapGenerator: mockAsap
+          _eventsGenerator: mockEvents
         })
       )
 
@@ -720,13 +701,13 @@ describe('RelayPool.getEventsFeedGenerator', () => {
     it('triggers initial fetch even with no since and no limit', async () => {
       let fetchCalled = false
       async function * mockLive () { await new Promise(() => {}) }
-      async function * mockAsap () { fetchCalled = true }
+      async function * mockEvents () { fetchCalled = true }
 
       const ac = new AbortController()
       startCollecting(nostr.getEventsFeedGenerator({}, ['wss://r1'], {
         signal: ac.signal,
         _liveGenerator: mockLive,
-        _asapGenerator: mockAsap
+        _eventsGenerator: mockEvents
       }))
 
       await tick()
@@ -737,13 +718,13 @@ describe('RelayPool.getEventsFeedGenerator', () => {
     it('triggers initial fetch for filter.limit > 0', async () => {
       let fetchCalled = false
       async function * mockLive () { await new Promise(() => {}) }
-      async function * mockAsap () { fetchCalled = true }
+      async function * mockEvents () { fetchCalled = true }
 
       const ac = new AbortController()
       startCollecting(nostr.getEventsFeedGenerator({ limit: 3 }, ['wss://r1'], {
         signal: ac.signal,
         _liveGenerator: mockLive,
-        _asapGenerator: mockAsap
+        _eventsGenerator: mockEvents
       }))
 
       await tick()
@@ -751,10 +732,10 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       ac.abort()
     })
 
-    it('passes timeout and timeoutAfterFirstEose to _asapGenerator', async () => {
+    it('passes timeout and timeoutAfterFirstEose to _eventsGenerator', async () => {
       let capturedOpts
       async function * mockLive () { await new Promise(() => {}) }
-      async function * mockAsap (_f, _r, o) { capturedOpts = o }
+      async function * mockEvents (_f, _r, o) { capturedOpts = o }
 
       const ac = new AbortController()
       startCollecting(nostr.getEventsFeedGenerator({ since: 100 }, ['wss://r1'], {
@@ -762,7 +743,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
         timeout: 3000,
         timeoutAfterFirstEose: 200,
         _liveGenerator: mockLive,
-        _asapGenerator: mockAsap
+        _eventsGenerator: mockEvents
       }))
 
       await tick()
@@ -774,11 +755,11 @@ describe('RelayPool.getEventsFeedGenerator', () => {
 
   // ── live:false ──────────────────────────────────────────────────────────────
 
-  describe('live:false + timeoutAfterFirstEose set', () => {
-    it('delegates to _asapGenerator with correct args', async () => {
+  describe('live:false', () => {
+    it('delegates to _eventsGenerator with regular EOSE grace', async () => {
       const ac = new AbortController()
       let capturedArgs
-      async function * mockAsap (f, r, o) {
+      async function * mockEvents (f, r, o) {
         capturedArgs = { f, r, o }
         yield { type: 'event', event: makeEvent({ id: 'e1' }), relay: 'wss://r1' }
       }
@@ -786,7 +767,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       const { events, promise } = startCollecting(
         nostr.getEventsFeedGenerator({ kinds: [0], since: 100 }, ['wss://r1'], {
           live: false, timeout: 3000, timeoutAfterFirstEose: 200,
-          signal: ac.signal, _asapGenerator: mockAsap
+          signal: ac.signal, _eventsGenerator: mockEvents
         })
       )
 
@@ -799,26 +780,23 @@ describe('RelayPool.getEventsFeedGenerator', () => {
     })
 
     it('skips non-event items', async () => {
-      async function * mockAsap () {
+      async function * mockEvents () {
         yield { type: 'error', error: new Error('oops'), relay: 'wss://r1' }
         yield { type: 'event', event: makeEvent({ id: 'e1' }), relay: 'wss://r1' }
       }
       const { events, promise } = startCollecting(
         nostr.getEventsFeedGenerator({}, ['wss://r1'], {
-          live: false, timeoutAfterFirstEose: 500, _asapGenerator: mockAsap
+          live: false, timeoutAfterFirstEose: 500, _eventsGenerator: mockEvents
         })
       )
       await promise
       assert.equal(events.length, 1)
       assert.equal(events[0].id, 'e1')
     })
-  })
-
-  describe('live:false + timeoutAfterFirstEose:null', () => {
-    it('delegates to _fetchGenerator with correct args', async () => {
+    it('forwards null EOSE grace to _eventsGenerator', async () => {
       const ac = new AbortController()
       let capturedArgs
-      async function * mockFetch (f, r, o) {
+      async function * mockEvents (f, r, o) {
         capturedArgs = { f, r, o }
         yield { type: 'event', event: makeEvent({ id: 'e1' }), relay: 'wss://r1' }
       }
@@ -826,24 +804,25 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       const { events, promise } = startCollecting(
         nostr.getEventsFeedGenerator({ kinds: [0] }, ['wss://r1'], {
           live: false, timeout: 4000, timeoutAfterFirstEose: null,
-          signal: ac.signal, _fetchGenerator: mockFetch
+          signal: ac.signal, _eventsGenerator: mockEvents
         })
       )
 
       await promise
       assert.equal(capturedArgs.o.timeout, 4000)
+      assert.equal(capturedArgs.o.timeoutAfterFirstEose, null)
       assert.equal(capturedArgs.o.signal, ac.signal)
       assert.equal(events.length, 1)
     })
 
     it('skips non-event items', async () => {
-      async function * mockFetch () {
+      async function * mockEvents () {
         yield { type: 'error', error: new Error('oops'), relay: 'wss://r1' }
         yield { type: 'event', event: makeEvent({ id: 'e1' }), relay: 'wss://r1' }
       }
       const { events, promise } = startCollecting(
         nostr.getEventsFeedGenerator({}, ['wss://r1'], {
-          live: false, timeoutAfterFirstEose: null, _fetchGenerator: mockFetch
+          live: false, timeoutAfterFirstEose: null, _eventsGenerator: mockEvents
         })
       )
       await promise
@@ -886,13 +865,56 @@ describe('RelayPool.getEvents', () => {
     assert.equal(result[0].meta.relay, 'wss://r1')
   })
 
-  it('adds relay error on timeout', async () => {
+  it('adds timeout errors for relays still pending at the overall deadline', async () => {
     const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1'], { timeout: 30 })
     const { result, errors, success } = await resultPromise
     assert.equal(result.length, 0)
     assert.equal(errors.length, 1)
-    assert.ok(errors[0].reason.message.includes('timeout'))
+    assert.equal(errors[0].reason.message, 'GET_EVENTS_TIMEOUT')
     assert.ok(!success)
+  })
+
+  it('retains completed relay success while reporting only pending timeout errors', async () => {
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1', 'wss://r2'], {
+      timeout: 30,
+      timeoutAfterFirstEose: null
+    })
+    await tick()
+    relayRegistry.get('wss://r1').subscriptions[0].handlers.oneose()
+
+    const { errors, success } = await resultPromise
+    assert.ok(success)
+    assert.deepEqual(errors.map(({ relay, reason }) => [relay, reason.message]), [
+      ['wss://r2', 'GET_EVENTS_TIMEOUT']
+    ])
+  })
+
+  it('does not create a deadline when timeout is null', async () => {
+    let resolved = false
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1'], {
+      timeout: null,
+      timeoutAfterFirstEose: null
+    })
+    resultPromise.then(() => { resolved = true })
+
+    await tick()
+    await new Promise(resolve => setTimeout(resolve, 10))
+    assert.ok(!resolved, 'null should not coerce to an immediate deadline')
+
+    relayRegistry.get('wss://r1').subscriptions[0].handlers.oneose()
+    assert.ok((await resultPromise).success)
+  })
+
+  it('ignores events that arrive after the result has timed out', async () => {
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1'], { timeout: 10 })
+    await tick()
+    const sub = relayRegistry.get('wss://r1').subscriptions[0]
+    const result = await resultPromise
+
+    sub.handlers.onevent(makeEvent({ id: 'late' }))
+    await tick()
+    assert.equal(result.result.length, 0)
+    assert.equal(result.errors[0].reason.message, 'GET_EVENTS_TIMEOUT')
   })
 
   it('adds relay error when relay closes with an error', async () => {
@@ -949,14 +971,19 @@ describe('RelayPool.getEvents', () => {
     assert.ok(items.some(i => i.type === 'event' && i.event.id === 'e1' && i.relay === 'wss://r1'))
   })
 
-  it('returns errors (does not throw) when signal is aborted', async () => {
+  it('rejects when signal is aborted', async () => {
     const ac = new AbortController()
     const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1'], { signal: ac.signal })
     await tick()
     ac.abort()
-    const { result, errors } = await resultPromise
-    assert.equal(result.length, 0)
-    assert.ok(errors.some(e => e.reason.message === 'Aborted'))
+    await assert.rejects(resultPromise, /Aborted/)
+  })
+
+  it('returns immediately with an unsuccessful empty result when no relays are given', async () => {
+    assert.deepEqual(
+      await nostr.getEvents({ kinds: [0] }, []),
+      { result: [], errors: [], success: false }
+    )
   })
 
   describe('early close', () => {
@@ -997,7 +1024,7 @@ describe('RelayPool.getEvents', () => {
   })
 })
 
-describe('RelayPool.getEventsAsap', () => {
+describe('RelayPool.getEvents EOSE grace', () => {
   let nostr
 
   beforeEach(() => {
@@ -1008,7 +1035,7 @@ describe('RelayPool.getEventsAsap', () => {
   })
 
   it('collects events and resolves when all relay subs close', async () => {
-    const resultPromise = nostr.getEventsAsap({ kinds: [0] }, ['wss://r1'])
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1'])
     await tick()
     const sub = relayRegistry.get('wss://r1').subscriptions[0]
     sub.handlers.onevent(makeEvent({ id: 'e1' }))
@@ -1021,7 +1048,7 @@ describe('RelayPool.getEventsAsap', () => {
   })
 
   it('sets event.meta.relay', async () => {
-    const resultPromise = nostr.getEventsAsap({ kinds: [0] }, ['wss://r1'])
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1'])
     await tick()
     relayRegistry.get('wss://r1').subscriptions[0].handlers.onevent(makeEvent({ id: 'e1' }))
     relayRegistry.get('wss://r1').subscriptions[0].handlers.oneose()
@@ -1030,7 +1057,7 @@ describe('RelayPool.getEventsAsap', () => {
   })
 
   it('starts short timer after first relay with events EOSEs, finalizes before second relay', async () => {
-    const resultPromise = nostr.getEventsAsap({ kinds: [0] }, ['wss://r1', 'wss://r2'], {
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1', 'wss://r2'], {
       timeoutAfterFirstEose: 50
     })
     await tick()
@@ -1044,7 +1071,7 @@ describe('RelayPool.getEventsAsap', () => {
 
   it('does not start short timer when first EOSE has no events', async () => {
     let resolved = false
-    const resultPromise = nostr.getEventsAsap({ kinds: [0] }, ['wss://r1', 'wss://r2'], {
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1', 'wss://r2'], {
       timeoutAfterFirstEose: 50,
       timeout: 500
     })
@@ -1060,7 +1087,7 @@ describe('RelayPool.getEventsAsap', () => {
 
   it('waits for every relay when timeoutAfterFirstEose is null', async () => {
     let resolved = false
-    const resultPromise = nostr.getEventsAsap({ kinds: [0] }, ['wss://r1', 'wss://r2'], {
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1', 'wss://r2'], {
       timeout: 100,
       timeoutAfterFirstEose: null
     })
@@ -1078,23 +1105,24 @@ describe('RelayPool.getEventsAsap', () => {
     assert.equal(result.length, 1)
   })
 
-  it('resolves on overall timeout with empty result', async () => {
-    const resultPromise = nostr.getEventsAsap({ kinds: [0] }, ['wss://r1'], { timeout: 30 })
-    const { result, success } = await resultPromise
+  it('returns terminal timeout errors on overall timeout', async () => {
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1'], { timeout: 30 })
+    const { result, errors, success } = await resultPromise
     assert.equal(result.length, 0)
-    assert.ok(success) // no relay error, just empty
+    assert.equal(errors[0].reason.message, 'GET_EVENTS_TIMEOUT')
+    assert.ok(!success)
   })
 
   it('rejects when signal is aborted', async () => {
     const ac = new AbortController()
-    const resultPromise = nostr.getEventsAsap({ kinds: [0] }, ['wss://r1'], { signal: ac.signal })
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1'], { signal: ac.signal })
     await tick()
     ac.abort()
     await assert.rejects(resultPromise, /Aborted/)
   })
 
   it('early close: resolves after filter.limit events without EOSE', async () => {
-    const resultPromise = nostr.getEventsAsap({ kinds: [0], limit: 1 }, ['wss://r1'])
+    const resultPromise = nostr.getEvents({ kinds: [0], limit: 1 }, ['wss://r1'])
     await tick()
     const sub = relayRegistry.get('wss://r1').subscriptions[0]
     sub.handlers.onevent(makeEvent({ id: 'e1' }))
@@ -1105,7 +1133,7 @@ describe('RelayPool.getEventsAsap', () => {
 
   it('early close via limit/ids triggers timeoutAfterFirstEose for remaining relays', async () => {
     // With 2 relays: r1 satisfies limit:1 → handleEose runs → 50ms timer → finalize
-    const resultPromise = nostr.getEventsAsap({ kinds: [0], limit: 1 }, ['wss://r1', 'wss://r2'], {
+    const resultPromise = nostr.getEvents({ kinds: [0], limit: 1 }, ['wss://r1', 'wss://r2'], {
       timeoutAfterFirstEose: 50
     })
     await tick()
@@ -1118,7 +1146,7 @@ describe('RelayPool.getEventsAsap', () => {
 
   it('single relay: resolves immediately on EOSE without waiting for timeoutAfterFirstEose', async () => {
     let resolved = false
-    const resultPromise = nostr.getEventsAsap({ kinds: [0] }, ['wss://r1'], {
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1'], {
       timeoutAfterFirstEose: 500
     })
     resultPromise.then(() => { resolved = true })
@@ -1132,7 +1160,7 @@ describe('RelayPool.getEventsAsap', () => {
 
   it('single relay: early close also resolves immediately', async () => {
     let resolved = false
-    const resultPromise = nostr.getEventsAsap({ kinds: [0], limit: 1 }, ['wss://r1'], {
+    const resultPromise = nostr.getEvents({ kinds: [0], limit: 1 }, ['wss://r1'], {
       timeoutAfterFirstEose: 500
     })
     resultPromise.then(() => { resolved = true })
@@ -1144,7 +1172,7 @@ describe('RelayPool.getEventsAsap', () => {
   })
 
   it('adds errors when relay closes with an error', async () => {
-    const resultPromise = nostr.getEventsAsap({ kinds: [0] }, ['wss://r1'])
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1'])
     await tick()
     relayRegistry.get('wss://r1').subscriptions[0].handlers.onclose(new Error('dropped'))
     const { errors, success } = await resultPromise
@@ -1410,48 +1438,12 @@ describe('RelayPool.getEventsGenerator', () => {
     await promise
     assert.equal(items.length, 1)
   })
-})
 
-describe('RelayPool.getEventsAsapGenerator', () => {
-  let nostr
-
-  beforeEach(() => {
-    _nextId = 1
-    relayRegistry.clear()
-    connectOverrides.clear()
-    nostr = new RelayPool()
-  })
-
-  it('yields event items', async () => {
+  it('completes when getEvents reaches its overall timeout', async () => {
     const { events: items, promise } = startCollecting(
-      nostr.getEventsAsapGenerator({ kinds: [0] }, ['wss://r1'])
+      nostr.getEventsGenerator({ kinds: [0] }, ['wss://r1'], { timeout: 30 })
     )
-    await tick()
-    const sub = relayRegistry.get('wss://r1').subscriptions[0]
-    sub.handlers.onevent(makeEvent({ id: 'e1' }))
-    sub.handlers.oneose()
     await promise
-    assert.equal(items.length, 1)
-    assert.equal(items[0].type, 'event')
-    assert.equal(items[0].event.id, 'e1')
-    assert.equal(items[0].relay, 'wss://r1')
-  })
-
-  it('yields error items when relay closes with error', async () => {
-    const { events: items, promise } = startCollecting(
-      nostr.getEventsAsapGenerator({ kinds: [0] }, ['wss://r1'])
-    )
-    await tick()
-    relayRegistry.get('wss://r1').subscriptions[0].handlers.onclose(new Error('kaboom'))
-    await promise
-    assert.ok(items.some(i => i.type === 'error'))
-  })
-
-  it('completes once getEventsAsap resolves', async () => {
-    const { events: items, promise } = startCollecting(
-      nostr.getEventsAsapGenerator({ kinds: [0] }, ['wss://r1'], { timeout: 30 })
-    )
-    await promise // resolves on timeout
     assert.equal(items.length, 0)
   })
 })
