@@ -12,7 +12,7 @@ const connectOverrides = new Map()
 // Per-URL publish overrides: async (event) => void (throw to simulate error, hang to simulate timeout)
 const publishOverrides = new Map()
 
-// Per-URL send overrides: async (message, relay) => void (used for AUTH replies).
+// Per-URL send overrides: async (message, relay) => void (used for control replies).
 const sendOverrides = new Map()
 
 class FakeRelay {
@@ -106,6 +106,28 @@ function makeEvent ({ id, kind = 0, created_at = 100 } = {}) {
 
 function receiveRelayMessage (relay, message) {
   relay._onmessage({ data: JSON.stringify(message) })
+}
+
+function countRequest (relay) {
+  const message = relay.sentMessages?.map(JSON.parse).find(message => message[0] === 'COUNT')
+  assert.ok(message, 'expected a COUNT request')
+  return message
+}
+
+function receiveCount (relay, payload) {
+  const [, id] = countRequest(relay)
+  receiveRelayMessage(relay, ['COUNT', id, payload])
+}
+
+function closeCount (relay, reason) {
+  const [, id] = countRequest(relay)
+  receiveRelayMessage(relay, ['CLOSED', id, reason])
+}
+
+function hll (entries = {}) {
+  const registers = new Uint8Array(256)
+  for (const [index, value] of Object.entries(entries)) registers[Number(index)] = value
+  return [...registers].map(value => value.toString(16).padStart(2, '0')).join('')
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -1098,6 +1120,178 @@ describe('RelayPool.getEventsAsap', () => {
     assert.equal(errors.length, 1)
     assert.ok(errors[0].reason.message.includes('dropped'))
     assert.ok(!success) // all relays errored
+  })
+})
+
+describe('RelayPool.countEvents', () => {
+  let nostr
+
+  beforeEach(() => {
+    relayRegistry.clear()
+    connectOverrides.clear()
+    sendOverrides.clear()
+    nostr = new RelayPool()
+  })
+
+  it('sends one NIP-45 filter and returns a single relay count immediately', async () => {
+    const filter = { kinds: [1], '#p': ['pubkey'] }
+    let resolved = false
+    const resultPromise = nostr.countEvents(filter, ['wss://r1'], { timeoutAfterFirstCount: 500 })
+    resultPromise.then(() => { resolved = true })
+
+    await tick()
+    const relay = relayRegistry.get('wss://r1')
+    const request = countRequest(relay)
+    assert.equal(request[0], 'COUNT')
+    assert.match(request[1], /^p2r2p-count:\d+$/)
+    assert.deepEqual(request.slice(2), [filter])
+
+    receiveCount(relay, { count: 4, approximate: true })
+    await tick()
+    assert.ok(resolved, 'a sole relay should not wait for the grace timer')
+    assert.deepEqual(await resultPromise, {
+      count: 4,
+      approximate: true,
+      errors: [],
+      success: true
+    })
+  })
+
+  it('keeps zero as a valid count', async () => {
+    const resultPromise = nostr.countEvents({ kinds: [1] }, ['wss://r1'])
+    await tick()
+    receiveCount(relayRegistry.get('wss://r1'), { count: 0 })
+
+    assert.deepEqual(await resultPromise, {
+      count: 0,
+      approximate: false,
+      errors: [],
+      success: true
+    })
+  })
+
+  it('waits after a plain first count for a higher count and later HLL', async () => {
+    let resolved = false
+    const resultPromise = nostr.countEvents({ kinds: [1] }, ['wss://r1', 'wss://r2'], {
+      timeout: 500,
+      timeoutAfterFirstCount: 100
+    })
+    resultPromise.then(() => { resolved = true })
+
+    await tick()
+    receiveCount(relayRegistry.get('wss://r1'), { count: 4 })
+    await tick()
+    assert.ok(!resolved, 'the first plain count should open the grace window')
+
+    receiveCount(relayRegistry.get('wss://r2'), { count: 7, hll: hll({ 3: 1 }) })
+    const result = await resultPromise
+    assert.equal(result.count, 7)
+    assert.equal(result.approximate, false)
+    assert.equal(result.hll, hll({ 3: 1 }))
+    assert.equal(result.hllCount, 1)
+    assert.equal(result.errors.length, 0)
+    assert.ok(result.success)
+  })
+
+  it('waits after an invalid HLL but does not return it', async () => {
+    const resultPromise = nostr.countEvents({ kinds: [1] }, ['wss://r1', 'wss://r2'], {
+      timeout: 500,
+      timeoutAfterFirstCount: 20
+    })
+    await tick()
+    receiveCount(relayRegistry.get('wss://r1'), { count: 2, hll: '' })
+
+    const result = await resultPromise
+    assert.equal(result.count, 2)
+    assert.ok(!('hll' in result))
+    assert.ok(!('hllCount' in result))
+    assert.equal(result.errors.length, 0)
+  })
+
+  it('merges HLL replies and returns as soon as all relays settle', async () => {
+    let resolved = false
+    const resultPromise = nostr.countEvents({ kinds: [1] }, ['wss://r1', 'wss://r2'], {
+      timeoutAfterFirstCount: 500
+    })
+    resultPromise.then(() => { resolved = true })
+
+    await tick()
+    receiveCount(relayRegistry.get('wss://r1'), { count: 5, approximate: true, hll: hll({ 0: 1, 1: 2 }) })
+    receiveCount(relayRegistry.get('wss://r2'), { count: 5, hll: hll({ 0: 4, 2: 3 }) })
+    await tick()
+    assert.ok(resolved, 'all relay replies should finish before the grace timer')
+
+    const result = await resultPromise
+    assert.equal(result.count, 5)
+    assert.equal(result.approximate, false)
+    assert.equal(result.hll, hll({ 0: 4, 1: 2, 2: 3 }))
+    assert.equal(result.hllCount, 3)
+  })
+
+  it('reports malformed COUNT payloads as relay errors', async () => {
+    const resultPromise = nostr.countEvents({ kinds: [1] }, ['wss://r1'])
+    await tick()
+    receiveCount(relayRegistry.get('wss://r1'), { count: 'four' })
+
+    const result = await resultPromise
+    assert.equal(result.count, null)
+    assert.equal(result.success, false)
+    assert.equal(result.errors.length, 1)
+    assert.equal(result.errors[0].reason.message, 'INVALID_COUNT_RESPONSE')
+  })
+
+  it('reports connection failures and COUNT refusals without authenticating', async () => {
+    connectOverrides.set('wss://r1', () => { throw new Error('connection failed') })
+    const failedConnection = await nostr.countEvents({ kinds: [1] }, ['wss://r1'])
+    assert.equal(failedConnection.errors[0].reason.message, 'connection failed')
+
+    const refusalPromise = nostr.countEvents({ kinds: [1] }, ['wss://r2'])
+    await tick()
+    const relay = relayRegistry.get('wss://r2')
+    closeCount(relay, 'auth-required: cannot count private events')
+    const refusal = await refusalPromise
+    assert.equal(refusal.errors[0].reason.message, 'auth-required: cannot count private events')
+    assert.deepEqual(relay.sentMessages.map(JSON.parse).map(message => message[0]), ['COUNT'])
+  })
+
+  it('reports unresolved relays at the overall timeout', async () => {
+    const result = await nostr.countEvents({ kinds: [1] }, ['wss://r1', 'wss://r2'], { timeout: 20 })
+
+    assert.equal(result.count, null)
+    assert.equal(result.success, false)
+    assert.deepEqual(result.errors.map(({ relay, reason }) => [relay, reason.message]), [
+      ['wss://r1', 'COUNT_TIMEOUT'],
+      ['wss://r2', 'COUNT_TIMEOUT']
+    ])
+  })
+
+  it('rejects caller aborts and ignores late COUNT replies', async () => {
+    const ac = new AbortController()
+    const aborted = nostr.countEvents({ kinds: [1] }, ['wss://r1'], { signal: ac.signal })
+    await tick()
+    ac.abort()
+    await assert.rejects(aborted, /Aborted/)
+
+    const resultPromise = nostr.countEvents({ kinds: [1] }, ['wss://r2', 'wss://r3'], {
+      timeoutAfterFirstCount: 20
+    })
+    await tick()
+    const r2 = relayRegistry.get('wss://r2')
+    const r3 = relayRegistry.get('wss://r3')
+    const [, r3RequestId] = countRequest(r3)
+    receiveCount(r2, { count: 3 })
+    const result = await resultPromise
+
+    receiveRelayMessage(r3, ['COUNT', r3RequestId, { count: 99 }])
+    await tick()
+    assert.equal(result.count, 3)
+  })
+
+  it('requires exactly one filter', async () => {
+    await assert.rejects(
+      nostr.countEvents([{ kinds: [1] }], ['wss://r1']),
+      /COUNT_FILTER_REQUIRED/
+    )
   })
 })
 

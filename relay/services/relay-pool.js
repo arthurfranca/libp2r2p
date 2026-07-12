@@ -1,7 +1,10 @@
+import { decodeHll, encodeHll, estimateHllCount, mergeHll } from '../helpers/hll.js'
 import { firstFulfillment, publishSummary, settlePublishPromise } from '../helpers/publish.js'
 import { maybeUnref } from '../helpers/timer.js'
-import { Nip42Relay } from './nip42-relay.js'
+import { RelayConnection } from './relay-connection.js'
 
+const COUNT_TIMEOUT_MS = 5000
+const COUNT_TIMEOUT_AFTER_FIRST_COUNT_MS = 500
 const SEND_FIRST_FULFILLMENT_TIMEOUT_MS = 3000
 const SEND_SETTLEMENT_TIMEOUT_MS = 30000
 
@@ -60,6 +63,18 @@ function requiresNip42Auth (reason) {
   return reason.message.startsWith('auth-required:') || reason.message.startsWith('restricted:')
 }
 
+function countResponseError () {
+  return new Error('INVALID_COUNT_RESPONSE')
+}
+
+function countTimeoutError () {
+  return new Error('COUNT_TIMEOUT')
+}
+
+function isCountResponse (payload) {
+  return Number.isSafeInteger(payload?.count) && payload.count >= 0
+}
+
 class Nip42AuthenticationError extends Error {
   constructor (reason) {
     super(reason.message, { cause: reason })
@@ -88,7 +103,7 @@ export class RelayPool {
       return relay
     }
 
-    const relay = new Nip42Relay(url)
+    const relay = new RelayConnection(url)
     this.#relays.set(url, relay)
 
     await relay.connect()
@@ -157,6 +172,123 @@ export class RelayPool {
       await relay.publish(event)
       return 'published'
     }
+  }
+
+  // Collects COUNT replies only until they are useful: the first usable reply
+  // opens a short window for a higher count or a mergeable HLL from peers.
+  async countEvents (filter, relays, {
+    timeout = COUNT_TIMEOUT_MS,
+    timeoutAfterFirstCount = COUNT_TIMEOUT_AFTER_FIRST_COUNT_MS,
+    signal
+  } = {}) {
+    if (!filter || typeof filter !== 'object' || Array.isArray(filter)) {
+      throw new Error('COUNT_FILTER_REQUIRED')
+    }
+    if (signal?.aborted) throw new Error('Aborted')
+
+    const urls = [...new Set(relays || [])]
+    if (!urls.length) {
+      return { count: null, approximate: false, errors: [], success: false }
+    }
+
+    const countController = new AbortController()
+    const pending = new Set(urls)
+    const errors = []
+    let count = null
+    let approximate = false
+    let registers = null
+    let isResolved = false
+    let graceTimer = null
+    let timeoutTimer = null
+
+    return await new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timeoutTimer)
+        clearTimeout(graceTimer)
+        signal?.removeEventListener('abort', onAbort)
+        countController.abort()
+      }
+
+      const finish = ({ timedOut = false, aborted = false } = {}) => {
+        if (isResolved) return
+        isResolved = true
+
+        if (timedOut) {
+          for (const relay of pending) errors.push({ relay, reason: countTimeoutError() })
+        }
+        cleanup()
+        if (aborted) {
+          reject(new Error('Aborted'))
+          return
+        }
+
+        const result = {
+          count,
+          approximate,
+          errors,
+          success: count !== null
+        }
+        if (registers) {
+          result.hll = encodeHll(registers)
+          result.hllCount = estimateHllCount(registers)
+        }
+        resolve(result)
+      }
+
+      const onAbort = () => finish({ aborted: true })
+      signal?.addEventListener('abort', onAbort, { once: true })
+      timeoutTimer = maybeUnref(setTimeout(() => finish({ timedOut: true }), timeout))
+
+      const settleRelay = (relay) => pending.delete(relay)
+      const finishIfComplete = () => {
+        if (pending.size === 0) finish()
+      }
+
+      const handleResponse = (relay, payload) => {
+        if (isResolved || !settleRelay(relay)) return
+        if (!isCountResponse(payload)) {
+          errors.push({ relay, reason: countResponseError() })
+          finishIfComplete()
+          return
+        }
+
+        // Prefer an exact count when equal relay counts disagree on approximate.
+        if (count === null || payload.count > count || (payload.count === count && approximate && payload.approximate !== true)) {
+          count = payload.count
+          approximate = payload.approximate === true
+        }
+
+        const hll = decodeHll(payload.hll)
+        if (hll) {
+          if (!registers) registers = new Uint8Array(hll.length)
+          mergeHll(registers, hll)
+        }
+
+        if (count !== null && !graceTimer && pending.size > 0) {
+          graceTimer = maybeUnref(setTimeout(finish, timeoutAfterFirstCount))
+        }
+        finishIfComplete()
+      }
+
+      const handleError = (relay, error) => {
+        if (isResolved || !settleRelay(relay)) return
+        const reason = error instanceof Error ? error : new Error(String(error))
+        errors.push({ relay, reason })
+        finishIfComplete()
+      }
+
+      for (const relay of urls) {
+        this.#getRelay(relay)
+          .then(async connection => {
+            if (isResolved) return null
+            return await connection.countWithHll([filter], { signal: countController.signal })
+          })
+          .then(
+            payload => { if (payload !== null) handleResponse(relay, payload) },
+            error => handleError(relay, error)
+          )
+      }
+    })
   }
 
   // Get events from a list of relays
