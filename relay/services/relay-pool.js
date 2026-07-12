@@ -176,6 +176,7 @@ export class RelayPool {
 
   // Collects COUNT replies only until they are useful: the first usable reply
   // opens a short window for a higher count or a mergeable HLL from peers.
+  // Pass null for timeoutAfterFirstCount to wait only for the overall timeout.
   async countEvents (filter, relays, {
     timeout = COUNT_TIMEOUT_MS,
     timeoutAfterFirstCount = COUNT_TIMEOUT_AFTER_FIRST_COUNT_MS,
@@ -264,7 +265,7 @@ export class RelayPool {
           mergeHll(registers, hll)
         }
 
-        if (count !== null && !graceTimer && pending.size > 0) {
+        if (count !== null && timeoutAfterFirstCount !== null && !graceTimer && pending.size > 0) {
           graceTimer = maybeUnref(setTimeout(finish, timeoutAfterFirstCount))
         }
         finishIfComplete()

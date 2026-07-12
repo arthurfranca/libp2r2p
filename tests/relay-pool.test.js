@@ -1208,6 +1208,27 @@ describe('RelayPool.countEvents', () => {
     assert.equal(result.errors.length, 0)
   })
 
+  it('uses only the overall timeout when timeoutAfterFirstCount is null', async () => {
+    let resolved = false
+    const resultPromise = nostr.countEvents({ kinds: [1] }, ['wss://r1', 'wss://r2'], {
+      timeout: 30,
+      timeoutAfterFirstCount: null
+    })
+    resultPromise.then(() => { resolved = true })
+
+    await tick()
+    receiveCount(relayRegistry.get('wss://r1'), { count: 4 })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    assert.ok(!resolved, 'null should not coerce to a zero-millisecond grace timer')
+
+    const result = await resultPromise
+    assert.equal(result.count, 4)
+    assert.ok(result.success)
+    assert.deepEqual(result.errors.map(({ relay, reason }) => [relay, reason.message]), [
+      ['wss://r2', 'COUNT_TIMEOUT']
+    ])
+  })
+
   it('merges HLL replies and returns as soon as all relays settle', async () => {
     let resolved = false
     const resultPromise = nostr.countEvents({ kinds: [1] }, ['wss://r1', 'wss://r2'], {
