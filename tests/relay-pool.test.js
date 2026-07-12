@@ -409,15 +409,24 @@ describe('RelayPool.getLiveEventsGenerator', () => {
   })
 
   describe('reconnect gap fill routing — injectable generators', () => {
-    it('uses _gapAsapGenerator by default (gapTimeoutAfterFirstEose set)', async () => {
+    it('forwards renamed reconnect timeouts to _gapAsapGenerator', async () => {
       const ac = new AbortController()
       let asapCalled = false
-      async function * mockGapAsap () { asapCalled = true }
+      let options
+      async function * mockGapAsap (_filter, _relays, nextOptions) {
+        asapCalled = true
+        options = nextOptions
+      }
 
       const { promise } = startCollecting(nostr.getLiveEventsGenerator(
         { kinds: [0], since: 100 },
         ['wss://r1'],
-        { signal: ac.signal, _gapAsapGenerator: mockGapAsap }
+        {
+          signal: ac.signal,
+          timeoutForReconnectGap: 4321,
+          timeoutAfterFirstReconnectGapEose: 321,
+          _gapAsapGenerator: mockGapAsap
+        }
       ))
 
       await tick()
@@ -426,11 +435,13 @@ describe('RelayPool.getLiveEventsGenerator', () => {
       await tick()
 
       assert.ok(asapCalled)
+      assert.equal(options.timeout, 4321)
+      assert.equal(options.timeoutAfterFirstEose, 321)
       ac.abort()
       await promise
     })
 
-    it('uses _gapFetchGenerator when gapTimeoutAfterFirstEose is null', async () => {
+    it('uses _gapFetchGenerator when timeoutAfterFirstReconnectGapEose is null', async () => {
       const ac = new AbortController()
       let fetchCalled = false
       async function * mockGapFetch () { fetchCalled = true }
@@ -438,7 +449,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
       const { promise } = startCollecting(nostr.getLiveEventsGenerator(
         { kinds: [0], since: 100 },
         ['wss://r1'],
-        { signal: ac.signal, gapTimeoutAfterFirstEose: null, _gapFetchGenerator: mockGapFetch }
+        { signal: ac.signal, timeoutAfterFirstReconnectGapEose: null, _gapFetchGenerator: mockGapFetch }
       ))
 
       await tick()
@@ -1047,6 +1058,26 @@ describe('RelayPool.getEventsAsap', () => {
     await resultPromise
   })
 
+  it('waits for every relay when timeoutAfterFirstEose is null', async () => {
+    let resolved = false
+    const resultPromise = nostr.getEventsAsap({ kinds: [0] }, ['wss://r1', 'wss://r2'], {
+      timeout: 100,
+      timeoutAfterFirstEose: null
+    })
+    resultPromise.then(() => { resolved = true })
+
+    await tick()
+    const first = relayRegistry.get('wss://r1').subscriptions[0]
+    first.handlers.onevent(makeEvent({ id: 'e1' }))
+    first.handlers.oneose()
+    await new Promise(resolve => setTimeout(resolve, 10))
+    assert.ok(!resolved, 'null should disable the post-EOSE grace timer')
+
+    relayRegistry.get('wss://r2').subscriptions[0].handlers.oneose()
+    const { result } = await resultPromise
+    assert.equal(result.length, 1)
+  })
+
   it('resolves on overall timeout with empty result', async () => {
     const resultPromise = nostr.getEventsAsap({ kinds: [0] }, ['wss://r1'], { timeout: 30 })
     const { result, success } = await resultPromise
@@ -1227,6 +1258,23 @@ describe('RelayPool.countEvents', () => {
     assert.deepEqual(result.errors.map(({ relay, reason }) => [relay, reason.message]), [
       ['wss://r2', 'COUNT_TIMEOUT']
     ])
+  })
+
+  it('does not create an overall COUNT timer when timeout is null', async () => {
+    let resolved = false
+    const resultPromise = nostr.countEvents({ kinds: [1] }, ['wss://r1', 'wss://r2'], {
+      timeout: null,
+      timeoutAfterFirstCount: null
+    })
+    resultPromise.then(() => { resolved = true })
+
+    await tick()
+    await new Promise(resolve => setTimeout(resolve, 10))
+    assert.ok(!resolved, 'null should not coerce to an immediate overall timeout')
+
+    receiveCount(relayRegistry.get('wss://r1'), { count: 4 })
+    receiveCount(relayRegistry.get('wss://r2'), { count: 7 })
+    assert.equal((await resultPromise).count, 7)
   })
 
   it('merges HLL replies and returns as soon as all relays settle', async () => {
@@ -1426,8 +1474,8 @@ describe('RelayPool.sendEvent', () => {
     publishOverrides.set('wss://r2', () => delayed.promise)
     const event = { id: 'ev1', kind: 1, created_at: 100, tags: [], content: '' }
     const early = await nostr.sendEvent(event, ['wss://r1', 'wss://r2'], {
-      firstFulfillmentTimeoutMs: 100,
-      settlementTimeoutMs: 1000,
+      timeoutUntilFirstFulfillment: 100,
+      timeout: 1000,
       onRelayResult: result => relayResults.push(result)
     })
 
@@ -1725,40 +1773,95 @@ describe('RelayPool.sendEvent', () => {
     assert.equal(full.errors[0].relay, 'wss://r2')
   })
 
-  it('can time out before acknowledgement and still settle successfully later', async () => {
+  it('turns an unsuccessful first-fulfillment timeout into an operation timeout', async () => {
     const delayed = deferred()
     publishOverrides.set('wss://r1', () => delayed.promise)
     const event = { id: 'ev1', kind: 1, created_at: 100, tags: [], content: '' }
     const early = await nostr.sendEvent(event, ['wss://r1'], {
-      firstFulfillmentTimeoutMs: 10,
-      settlementTimeoutMs: 1000
+      timeoutUntilFirstFulfillment: 10,
+      timeout: 1000
     })
 
     assert.equal(early.success, false)
-    delayed.resolve()
     const full = await early.promise
-    assert.equal(full.success, true)
-    assert.deepEqual(full.succeededRelays, ['wss://r1'])
+    assert.equal(full.success, false)
+    assert.deepEqual(full.succeededRelays, [])
+    assert.equal(full.errors[0].reason.message, 'PUBLISH_TIMEOUT')
+
+    delayed.resolve()
   })
 
-  it('records a settlement timeout without cancelling the underlying publish', async () => {
+  it('uses the overall timeout when timeoutUntilFirstFulfillment is null', async () => {
     const relayResults = []
     publishOverrides.set('wss://r1', () => new Promise(() => {}))
+    const pending = nostr.sendEvent(makeEvent({ id: 'ev1' }), ['wss://r1'], {
+      timeout: 20,
+      timeoutUntilFirstFulfillment: null,
+      onRelayResult: result => relayResults.push(result)
+    })
+    let returned = false
+    pending.then(() => { returned = true })
+
+    await new Promise(resolve => setTimeout(resolve, 10))
+    assert.ok(!returned, 'null should disable only the early fulfillment timer')
+
+    const early = await pending
+    const full = await early.promise
+    assert.equal(early.success, false)
+    assert.equal(full.success, false)
+    assert.equal(relayResults.length, 1)
+    assert.equal(relayResults[0].outcome, 'timed-out')
+  })
+
+  it('allows an overall timeout to be disabled', async () => {
+    const delayed = deferred()
+    publishOverrides.set('wss://r1', () => delayed.promise)
+    const pending = nostr.sendEvent(makeEvent({ id: 'ev1' }), ['wss://r1'], {
+      timeout: null,
+      timeoutUntilFirstFulfillment: null
+    })
+    let returned = false
+    pending.then(() => { returned = true })
+
+    await tick()
+    assert.ok(!returned, 'disabled timers should not be coerced to zero')
+    delayed.resolve()
+
+    const early = await pending
+    const full = await early.promise
+    assert.equal(early.success, true)
+    assert.equal(full.success, true)
+  })
+
+  it('records an operation timeout without cancelling the underlying publish', async () => {
+    const relayResults = []
+    const first = deferred()
+    const second = deferred()
+    publishOverrides.set('wss://r1', () => first.promise)
+    publishOverrides.set('wss://r2', () => second.promise)
     const event = { id: 'ev1', kind: 1, created_at: 100, tags: [], content: '' }
-    const early = await nostr.sendEvent(event, ['wss://r1'], {
-      firstFulfillmentTimeoutMs: 10,
-      settlementTimeoutMs: 10,
+    const early = await nostr.sendEvent(event, ['wss://r1', 'wss://r2'], {
+      timeoutUntilFirstFulfillment: null,
+      timeout: 10,
       onRelayResult: result => relayResults.push(result)
     })
     const full = await early.promise
 
     assert.equal(early.success, false)
     assert.equal(full.success, false)
-    assert.equal(full.errors.length, 1)
-    assert.equal(full.errors[0].reason.message, 'PUBLISH_TIMEOUT')
-    assert.equal(relayResults.length, 1)
-    assert.equal(relayResults[0].outcome, 'timed-out')
-    assert.equal(relayResults[0].reason.message, 'PUBLISH_TIMEOUT')
+    assert.deepEqual(full.errors.map(({ relay, reason }) => [relay, reason.message]), [
+      ['wss://r1', 'PUBLISH_TIMEOUT'],
+      ['wss://r2', 'PUBLISH_TIMEOUT']
+    ])
+    assert.deepEqual(relayResults.map(({ relay, outcome }) => [relay, outcome]), [
+      ['wss://r1', 'timed-out'],
+      ['wss://r2', 'timed-out']
+    ])
+
+    first.resolve()
+    second.reject(new Error('late failure'))
+    await tick()
+    assert.equal(relayResults.length, 2, 'late outcomes must not alter the finalized report')
   })
 
   it('returns an immediately settled failure report when given no relays', async () => {

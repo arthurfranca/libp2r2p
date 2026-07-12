@@ -1,27 +1,30 @@
 import { SimplePool } from 'nostr-tools/pool'
 import { freeRelays, seedRelays } from '../constants/index.js'
-import { firstFulfillment, publishSummary, settlePublishPromise } from '../helpers/publish.js'
+import { createPublishSettlements, firstFulfillment, publishSummary } from '../helpers/publish.js'
 import { maybeUnref } from '../helpers/timer.js'
 
 export { freeRelays, seedRelays } from '../constants/index.js'
 
 const POST_EOSE_GRACE_MS = 500
 const HARD_TIMEOUT_MS = 5000
-const PUBLISH_FIRST_FULFILLMENT_TIMEOUT_MS = 3000
-const PUBLISH_SETTLEMENT_TIMEOUT_MS = 30000
+const PUBLISH_TIMEOUT_UNTIL_FIRST_FULFILLMENT_MS = 3000
+const PUBLISH_TIMEOUT_MS = 30000
 
 export const pool = new SimplePool()
 
 export async function publish (event, relays, {
-  firstFulfillmentTimeoutMs = PUBLISH_FIRST_FULFILLMENT_TIMEOUT_MS,
-  settlementTimeoutMs = PUBLISH_SETTLEMENT_TIMEOUT_MS
+  timeout = PUBLISH_TIMEOUT_MS,
+  timeoutUntilFirstFulfillment = PUBLISH_TIMEOUT_UNTIL_FIRST_FULFILLMENT_MS
 } = {}) {
   if (!relays?.length) throw new Error('NO_RELAYS')
   const publishPromises = pool.publish(relays, event)
-  const promise = Promise
-    .all(publishPromises.map(promise => settlePublishPromise(promise, settlementTimeoutMs)))
+  const settlement = createPublishSettlements(publishPromises, timeout)
+  const promise = settlement.promise
     .then(settlements => publishSummary(settlements, relays))
-  const success = await firstFulfillment(publishPromises, firstFulfillmentTimeoutMs)
+  const success = await firstFulfillment(publishPromises, timeoutUntilFirstFulfillment, {
+    fallback: promise.then(report => report.success)
+  })
+  if (!success) settlement.timeout()
 
   return {
     total: relays.length,

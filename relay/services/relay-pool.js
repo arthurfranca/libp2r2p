@@ -1,12 +1,12 @@
 import { decodeHll, encodeHll, estimateHllCount, mergeHll } from '../helpers/hll.js'
-import { firstFulfillment, publishSummary, settlePublishPromise } from '../helpers/publish.js'
+import { createPublishSettlements, firstFulfillment, publishSummary } from '../helpers/publish.js'
 import { maybeUnref } from '../helpers/timer.js'
 import { RelayConnection } from './relay-connection.js'
 
 const COUNT_TIMEOUT_MS = 5000
 const COUNT_TIMEOUT_AFTER_FIRST_COUNT_MS = 500
-const SEND_FIRST_FULFILLMENT_TIMEOUT_MS = 3000
-const SEND_SETTLEMENT_TIMEOUT_MS = 30000
+const SEND_TIMEOUT_UNTIL_FIRST_FULFILLMENT_MS = 3000
+const SEND_TIMEOUT_MS = 30000
 
 // Returns a function that should be called for each received event (valid or invalid).
 // Calls onSatisfied() and stops counting once the filter is fully satisfied per relay:
@@ -176,7 +176,7 @@ export class RelayPool {
 
   // Collects COUNT replies only until they are useful: the first usable reply
   // opens a short window for a higher count or a mergeable HLL from peers.
-  // Pass null for timeoutAfterFirstCount to wait only for the overall timeout.
+  // null disables either timer: no grace waits for all relays or the deadline.
   async countEvents (filter, relays, {
     timeout = COUNT_TIMEOUT_MS,
     timeoutAfterFirstCount = COUNT_TIMEOUT_AFTER_FIRST_COUNT_MS,
@@ -238,7 +238,9 @@ export class RelayPool {
 
       const onAbort = () => finish({ aborted: true })
       signal?.addEventListener('abort', onAbort, { once: true })
-      timeoutTimer = maybeUnref(setTimeout(() => finish({ timedOut: true }), timeout))
+      if (timeout !== null) {
+        timeoutTimer = maybeUnref(setTimeout(() => finish({ timedOut: true }), timeout))
+      }
 
       const settleRelay = (relay) => pending.delete(relay)
       const finishIfComplete = () => {
@@ -311,12 +313,15 @@ export class RelayPool {
       }
       signal?.addEventListener('abort', onAbort, { once: true })
 
-      const timer = maybeUnref(setTimeout(() => {
-        if (isClosed) return
-        isClosed = true
-        sub?.close()
-        t.reject(new Error(`timeout: ${url}`))
-      }, timeout))
+      let timer = null
+      if (timeout !== null) {
+        timer = maybeUnref(setTimeout(() => {
+          if (isClosed) return
+          isClosed = true
+          sub?.close()
+          t.reject(new Error(`timeout: ${url}`))
+        }, timeout))
+      }
 
       ;(async () => {
         try {
@@ -380,7 +385,8 @@ export class RelayPool {
     }
   }
 
-  // First to reply with EOSE and events should trigger a short timeout for the rest
+  // The first EOSE with events opens a short grace window; null disables either
+  // timer so callers can wait for every relay naturally.
   async getEventsAsap (filter, relays, { timeout = 5000, timeoutAfterFirstEose = 500, callback, signal } = {}) {
     const subs = new Map()
     const errors = []
@@ -417,9 +423,8 @@ export class RelayPool {
     if (signal?.aborted) return Promise.reject(new Error('Aborted'))
     signal?.addEventListener('abort', onAbort, { once: true })
 
-    const timer = maybeUnref(setTimeout(() => {
-      finalize()
-    }, timeout))
+    let timer = null
+    if (timeout !== null) timer = maybeUnref(setTimeout(finalize, timeout))
 
     const markClosedAndMaybeFinish = () => {
       closedRelaySubs += 1
@@ -437,7 +442,7 @@ export class RelayPool {
         const handleEose = () => {
           if (!subs.has(url)) return // already closed
           sub.close()
-          if (hasEvents && !eoseTimer && !isResolved) {
+          if (hasEvents && timeoutAfterFirstEose !== null && !eoseTimer && !isResolved) {
             eoseTimer = maybeUnref(setTimeout(finalize, timeoutAfterFirstEose))
           }
         }
@@ -551,13 +556,13 @@ export class RelayPool {
   //    initial gap boundary if no events have been seen yet.
   //
   // Initial fetching of stored events is the responsibility of getEventsFeedGenerator.
-  // Reconnect gap fills delegate to getEventsAsapGenerator (when gapTimeoutAfterFirstEose
+  // Reconnect gap fills delegate to getEventsAsapGenerator (when timeoutAfterFirstReconnectGapEose
   // is set, default 500ms) or getEventsGenerator (when null). Both are injectable.
   // Reconnect gap events are deduplicated against live events.
   async * getLiveEventsGenerator (filter, relays, {
     signal,
-    gapTimeout = 5000,
-    gapTimeoutAfterFirstEose = 500,
+    timeoutForReconnectGap = 5000,
+    timeoutAfterFirstReconnectGapEose = 500,
     _gapAsapGenerator = (...args) => this.getEventsAsapGenerator(...args),
     _gapFetchGenerator = (...args) => this.getEventsGenerator(...args)
   } = {}) {
@@ -619,9 +624,9 @@ export class RelayPool {
     const runReconnectGapFill = (url, gapSince, now) => {
       const gapUntil = filterUntil !== null ? Math.min(now, filterUntil) : now
       const gapFilter = { ...baseFilter, since: gapSince, until: gapUntil }
-      const gapGen = gapTimeoutAfterFirstEose !== null
-        ? _gapAsapGenerator(gapFilter, [url], { timeout: gapTimeout, timeoutAfterFirstEose: gapTimeoutAfterFirstEose, signal: gapAc.signal })
-        : _gapFetchGenerator(gapFilter, [url], { timeout: gapTimeout, signal: gapAc.signal })
+      const gapGen = timeoutAfterFirstReconnectGapEose !== null
+        ? _gapAsapGenerator(gapFilter, [url], { timeout: timeoutForReconnectGap, timeoutAfterFirstEose: timeoutAfterFirstReconnectGapEose, signal: gapAc.signal })
+        : _gapFetchGenerator(gapFilter, [url], { timeout: timeoutForReconnectGap, signal: gapAc.signal })
       return (async () => {
         for await (const item of gapGen) {
           if (item?.type === 'event') pushEvent(item.event, url)
@@ -801,14 +806,17 @@ export class RelayPool {
     }
   }
 
-  // Returns after the first acknowledgement window. onRelayResult receives one
+  // Returns after the first acknowledgement window. timeout is one deadline for
+  // the whole operation, while timeoutUntilFirstFulfillment controls only this
+  // initial return and closes pending reports when it fails. null disables either
+  // timer independently. onRelayResult receives one
   // { relay, success, outcome, reason? } result per relay as it settles; outcome
   // is published, duplicate, muted, failed, or timed-out. getAuthEvent is used
   // only after auth-required or restricted publish failures, then retries once.
   // Await `promise` for the complete report, including every relay outcome.
   async sendEvent (event, relays, {
-    firstFulfillmentTimeoutMs = SEND_FIRST_FULFILLMENT_TIMEOUT_MS,
-    settlementTimeoutMs = SEND_SETTLEMENT_TIMEOUT_MS,
+    timeout = SEND_TIMEOUT_MS,
+    timeoutUntilFirstFulfillment = SEND_TIMEOUT_UNTIL_FIRST_FULFILLMENT_MS,
     getAuthEvent,
     onRelayResult
   } = {}) {
@@ -824,36 +832,48 @@ export class RelayPool {
     const eventToSend = event.meta ? { ...event } : event
     if (eventToSend.meta) delete eventToSend.meta
 
-    const sendPromises = urls.map(async (url) => {
-      try {
-        const relay = await this.#getRelay(url)
-        return await this.#publishEvent(relay, eventToSend, getAuthEvent)
-      } catch (err) {
-        const reason = err instanceof Error ? err : new Error(String(err))
-        if (reason instanceof Nip42AuthenticationError) throw reason
-        if (reason.message.startsWith('duplicate:')) return 'duplicate'
-        if (reason.message.startsWith('mute:')) {
-          console.info([url, reason.message].filter(Boolean).join(' - '))
-          return 'muted'
-        }
-        throw reason
+    const sendDeferreds = urls.map(() => Promise.withResolvers())
+    const sendPromises = sendDeferreds.map(({ promise }) => promise)
+
+    // Starts before connection work so every relay shares one real deadline.
+    const settlement = createPublishSettlements(sendPromises, timeout, {
+      onSettled: (settlement, index) => {
+        notifyRelayResult(onRelayResult, relayResultForSettlement(urls[index], settlement))
       }
     })
 
-    // Resolves after every relay settles (or reaches the settlement timeout) as
+    // Resolves after every relay settles (or reaches the operation timeout) as
     // { result: null, success, total, fulfilled, succeededRelays, errors },
     // where errors contains { relay, reason } entries for failed relays.
-    const promise = Promise
-      .all(sendPromises.map((promise, index) => settlePublishPromise(promise, settlementTimeoutMs, {
-        onSettled: settlement => {
-          notifyRelayResult(onRelayResult, relayResultForSettlement(urls[index], settlement))
-        }
-      })))
+    const promise = settlement.promise
       .then(settlements => publishSummary(settlements, urls, {
         result: null,
         includeSucceededRelays: true
       }))
-    const success = await firstFulfillment(sendPromises, firstFulfillmentTimeoutMs)
+
+    urls.forEach((url, index) => {
+      const deferred = sendDeferreds[index]
+      ;(async () => {
+        try {
+          const relay = await this.#getRelay(url)
+          return await this.#publishEvent(relay, eventToSend, getAuthEvent)
+        } catch (err) {
+          const reason = err instanceof Error ? err : new Error(String(err))
+          if (reason instanceof Nip42AuthenticationError) throw reason
+          if (reason.message.startsWith('duplicate:')) return 'duplicate'
+          if (reason.message.startsWith('mute:')) {
+            console.info([url, reason.message].filter(Boolean).join(' - '))
+            return 'muted'
+          }
+          throw reason
+        }
+      })().then(deferred.resolve, deferred.reject)
+    })
+
+    const success = await firstFulfillment(sendPromises, timeoutUntilFirstFulfillment, {
+      fallback: promise.then(report => report.success)
+    })
+    if (!success) settlement.timeout()
 
     return {
       result: null,

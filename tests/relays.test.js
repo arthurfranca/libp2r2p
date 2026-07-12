@@ -25,8 +25,8 @@ test('publish returns after the first relay fulfills and keeps full settlement p
   pool.publish = () => [first.promise, second.promise]
 
   const pending = publish({ id: 'event' }, ['wss://a.example', 'wss://b.example'], {
-    firstFulfillmentTimeoutMs: 1000,
-    settlementTimeoutMs: 1000
+    timeoutUntilFirstFulfillment: 1000,
+    timeout: 1000
   })
   let returned = false
   pending.then(() => { returned = true })
@@ -50,25 +50,25 @@ test('publish returns after the first relay fulfills and keeps full settlement p
   assert.equal(full.errors[0].reason.message, 'relay failed')
 })
 
-test('publish can return before any relay fulfills and still settle successfully later', async () => {
+test('an unsuccessful first-fulfillment window closes pending relay reports', async () => {
   const first = deferred()
   pool.publish = () => [first.promise]
 
   const early = await publish({ id: 'event' }, ['wss://a.example'], {
-    firstFulfillmentTimeoutMs: 10,
-    settlementTimeoutMs: 1000
+    timeoutUntilFirstFulfillment: 10,
+    timeout: 1000
   })
 
   assert.equal(early.success, false)
-  first.resolve()
-
   const full = await early.promise
-  assert.deepEqual(full, {
-    success: true,
-    total: 1,
-    fulfilled: 1,
-    errors: []
-  })
+  assert.equal(full.success, false)
+  assert.equal(full.total, 1)
+  assert.equal(full.fulfilled, 0)
+  assert.equal(full.errors.length, 1)
+  assert.equal(full.errors[0].relay, 'wss://a.example')
+  assert.equal(full.errors[0].reason.message, 'PUBLISH_TIMEOUT')
+
+  first.resolve()
 })
 
 test('publish full settlement promise times out slow relay acknowledgements', async () => {
@@ -77,8 +77,8 @@ test('publish full settlement promise times out slow relay acknowledgements', as
   pool.publish = () => [first.promise, second.promise]
 
   const pending = publish({ id: 'event' }, ['wss://a.example', 'wss://b.example'], {
-    firstFulfillmentTimeoutMs: 1000,
-    settlementTimeoutMs: 10
+    timeoutUntilFirstFulfillment: 1000,
+    timeout: 10
   })
   first.resolve()
   const early = await pending
