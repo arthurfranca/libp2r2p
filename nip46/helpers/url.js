@@ -21,7 +21,7 @@ export function normalizeBunkerPointer (pointer) {
   }
 }
 
-/** Parses a direct NIP-46 bunker URL without performing a network lookup. */
+// Parses a direct NIP-46 bunker URL without performing a network lookup.
 export function parseBunkerUrl (input) {
   try {
     const url = new URL(input)
@@ -36,7 +36,7 @@ export function parseBunkerUrl (input) {
   }
 }
 
-/** Serializes a direct NIP-46 bunker pointer without any network lookup. */
+// Serializes a direct NIP-46 bunker pointer without any network lookup.
 export function toBunkerUrl (pointer) {
   const normalized = normalizeBunkerPointer(pointer)
   if (!normalized) throw new Error('INVALID_BUNKER_POINTER')
@@ -46,7 +46,7 @@ export function toBunkerUrl (pointer) {
   return url.toString()
 }
 
-/** Builds a NIP-46 client-initiated connection URI. */
+// Builds a NIP-46 client-initiated connection URI.
 export function createNostrConnectURI ({
   clientPubkey,
   relays,

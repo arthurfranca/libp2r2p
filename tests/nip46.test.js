@@ -5,7 +5,9 @@ import { decrypt, encrypt, getConversationKey } from 'nostr-tools/nip44'
 import {
   BunkerSigner,
   createNostrConnectURI,
+  Nip46Client,
   NIP46_KIND,
+  Nip46ServerSession,
   parseBunkerUrl,
   toBunkerUrl
 } from '../nip46/index.js'
@@ -84,6 +86,32 @@ class FakeRelayPool {
 
   async sendEvent (event, relays, options) {
     this.sent.push({ event, relays, options })
+    return {
+      success: true,
+      promise: Promise.resolve({ success: true, errors: [] })
+    }
+  }
+}
+
+function matchesFilter (event, filter) {
+  if (filter.kinds?.length && !filter.kinds.includes(event.kind)) return false
+  if (filter.authors?.length && !filter.authors.includes(event.pubkey)) return false
+  for (const [key, values] of Object.entries(filter)) {
+    if (!key.startsWith('#')) continue
+    if (!event.tags.some(tag => tag[0] === key.slice(1) && values.includes(tag[1]))) return false
+  }
+  return true
+}
+
+class LoopbackRelayPool extends FakeRelayPool {
+  async sendEvent (event, relays, options) {
+    this.sent.push({ event, relays, options })
+    queueMicrotask(() => {
+      for (const entry of this.streams) {
+        if (!entry.relays.some(relay => relays.includes(relay))) continue
+        if (matchesFilter(event, entry.filter)) entry.stream.emit(event)
+      }
+    })
     return {
       success: true,
       promise: Promise.resolve({ success: true, errors: [] })
@@ -171,6 +199,18 @@ test('waits for the live listener before publishing a connect request', async ()
     remoteSecretKey,
     clientPubkey: getPublicKey(clientSecretKey),
     response: { id: request.id, result: 'ack' }
+  }))
+  await tick()
+  const switchRequest = requestPayload({
+    sent: relayPool.sent[1],
+    remotePubkey: remoteSignerPubkey,
+    clientSecretKey
+  })
+  assert.equal(switchRequest.method, 'switch_relays')
+  relayPool.streams[0].stream.emit(responseEvent({
+    remoteSecretKey,
+    clientPubkey: getPublicKey(clientSecretKey),
+    response: { id: switchRequest.id, result: 'null' }
   }))
   await connecting
   await signer.close()
@@ -398,7 +438,6 @@ test('discovers and validates a client-initiated connection URI', async () => {
   const uri = createNostrConnectURI({ clientPubkey, relays: RELAYS, secret: 'connection-secret' })
   const creating = BunkerSigner.fromURI(clientSecretKey, uri, {
     relayPool,
-    skipRelaySwitch: true,
     timeout: 100
   })
 
@@ -412,6 +451,18 @@ test('discovers and validates a client-initiated connection URI', async () => {
     remoteSecretKey,
     clientPubkey,
     response: { id: 'connected', result: 'connection-secret' }
+  }))
+
+  await tick()
+  const switchRequest = requestPayload({
+    sent: relayPool.sent[0],
+    remotePubkey: remoteSignerPubkey,
+    clientSecretKey
+  })
+  relayPool.streams[1].stream.emit(responseEvent({
+    remoteSecretKey,
+    clientPubkey,
+    response: { id: switchRequest.id, result: 'null' }
   }))
 
   const signer = await creating
@@ -460,7 +511,6 @@ test('times out or aborts a client-initiated connection that has no matching sec
   await assert.rejects(
     BunkerSigner.fromURI(clientSecretKey, uri, {
       relayPool: new FakeRelayPool(),
-      skipRelaySwitch: true,
       timeout: 10
     }),
     /NIP46_CONNECTION_TIMEOUT/
@@ -469,7 +519,6 @@ test('times out or aborts a client-initiated connection that has no matching sec
   const controller = new AbortController()
   const pending = BunkerSigner.fromURI(clientSecretKey, uri, {
     relayPool: new FakeRelayPool(),
-    skipRelaySwitch: true,
     timeout: null,
     signal: controller.signal
   })
@@ -488,4 +537,132 @@ test('close rejects a pending NIP-46 request', async () => {
   await tick()
   await signer.close()
   await assert.rejects(pending, /NIP46_CLOSED/)
+})
+
+test('public client and server roles support bidirectional custom RPC and relay switching', async () => {
+  const relayPool = new LoopbackRelayPool()
+  const serverSecretKey = generateSecretKey()
+  const clientSecretKey = generateSecretKey()
+  const serverPubkey = getPublicKey(serverSecretKey)
+  const connected = []
+  const serverRequests = []
+  const clientRequests = []
+  const server = new Nip46ServerSession(serverSecretKey, {
+    relays: RELAYS,
+    secret: 'one-use-secret',
+    relayPool,
+    onConnect: value => connected.push(value),
+    onRequest: ({ method, params }) => {
+      serverRequests.push({ method, params })
+      if (method !== 'server_echo') throw new Error('unsupported custom method')
+      return JSON.stringify(params)
+    }
+  })
+  await server.start({ timeout: 100 })
+
+  const client = new Nip46Client(clientSecretKey, pointer(serverPubkey), {
+    relayPool,
+    onRequest: ({ method, params }) => {
+      clientRequests.push({ method, params })
+      if (method !== 'client_echo') throw new Error('unsupported custom method')
+      return params[0]
+    }
+  })
+  await client.connect({
+    requestedPermissions: ['server_echo'],
+    clientMetadata: { name: 'Pairing client' },
+    timeout: 100
+  })
+
+  assert.equal(server.clientPubkey, client.clientPubkey)
+  assert.deepEqual(connected, [{
+    peerPubkey: client.clientPubkey,
+    requestedPermissions: ['server_echo'],
+    clientMetadata: { name: 'Pairing client' }
+  }])
+  await client.ping({ timeout: 100 })
+  assert.equal(
+    await client.sendRequest('server_echo', ['one', 'two'], { timeout: 100 }),
+    JSON.stringify(['one', 'two'])
+  )
+  assert.equal(await server.sendRequest('client_echo', ['back'], { timeout: 100 }), 'back')
+  assert.deepEqual(serverRequests, [{ method: 'server_echo', params: ['one', 'two'] }])
+  assert.deepEqual(clientRequests, [{ method: 'client_echo', params: ['back'] }])
+
+  await server.updateRelays(['wss://new.example'])
+  assert.equal(await server.sendRequest('client_echo', ['before-switch'], { timeout: 100 }), 'before-switch')
+  assert.equal(await client.switchRelays({ timeout: 100 }), true)
+  assert.deepEqual(client.pointer.relays, ['wss://new.example'])
+  assert.deepEqual(server.relays, ['wss://new.example'])
+  assert.equal(await server.sendRequest('client_echo', ['after-switch'], { timeout: 100 }), 'after-switch')
+  assert.deepEqual(clientRequests, [
+    { method: 'client_echo', params: ['back'] },
+    { method: 'client_echo', params: ['before-switch'] },
+    { method: 'client_echo', params: ['after-switch'] }
+  ])
+
+  await client.logout({ timeout: 100 })
+  await server.close()
+})
+
+test('server session keeps an invalid secret from consuming its single client slot', async () => {
+  const relayPool = new LoopbackRelayPool()
+  const serverSecretKey = generateSecretKey()
+  const serverPubkey = getPublicKey(serverSecretKey)
+  const server = new Nip46ServerSession(serverSecretKey, {
+    relays: RELAYS,
+    secret: 'correct-secret',
+    relayPool
+  })
+  await server.start({ timeout: 100 })
+
+  const invalid = new Nip46Client(generateSecretKey(), {
+    remoteSignerPubkey: serverPubkey,
+    relays: RELAYS,
+    secret: 'wrong-secret'
+  }, { relayPool })
+  await assert.rejects(invalid.connect({ timeout: 100 }), /NIP46_INVALID_SECRET/)
+  assert.equal(server.clientPubkey, null)
+  await invalid.close()
+
+  const accepted = new Nip46Client(generateSecretKey(), {
+    remoteSignerPubkey: serverPubkey,
+    relays: RELAYS,
+    secret: 'correct-secret'
+  }, { relayPool })
+  await accepted.connect({ timeout: 100 })
+
+  const rejected = new Nip46Client(generateSecretKey(), {
+    remoteSignerPubkey: serverPubkey,
+    relays: RELAYS,
+    secret: 'correct-secret'
+  }, { relayPool })
+  await assert.rejects(rejected.connect({ timeout: 100 }), /NIP46_ALREADY_CONNECTED/)
+
+  await rejected.close()
+  await accepted.close()
+  await server.close()
+})
+
+test('generic client removes pending requests after timeout and abort', async () => {
+  const clientSecretKey = generateSecretKey()
+  const remoteSignerPubkey = getPublicKey(generateSecretKey())
+  const client = new Nip46Client(clientSecretKey, pointer(remoteSignerPubkey), {
+    relayPool: new FakeRelayPool()
+  })
+
+  await assert.rejects(
+    client.sendRequest('never_replies', [], { timeout: 5 }),
+    /NIP46_REQUEST_TIMEOUT/
+  )
+
+  const controller = new AbortController()
+  const pending = client.sendRequest('also_never_replies', [], {
+    timeout: null,
+    signal: controller.signal
+  })
+  await tick()
+  controller.abort()
+  await assert.rejects(pending, /Aborted/)
+  await client.close()
 })

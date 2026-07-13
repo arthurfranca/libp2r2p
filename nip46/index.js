@@ -1,3 +1,5 @@
 export { NIP46_KIND } from './constants/index.js'
 export { createNostrConnectURI, parseBunkerUrl, toBunkerUrl } from './helpers/url.js'
 export { BunkerSigner } from './services/bunker-signer.js'
+export { Nip46Client } from './services/client.js'
+export { Nip46ServerSession } from './services/server-session.js'
