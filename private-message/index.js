@@ -1,6 +1,5 @@
 import { getEventHash, validateEvent, verifyEvent } from 'nostr-tools'
 import * as privateChannel from '../private-channel/index.js'
-import { onOnline } from '../network/index.js'
 
 export const ASK_KIND = 7329
 export const REPLY_KIND = 7330
@@ -11,7 +10,6 @@ const PRIVATE_MESSAGE_KINDS = [ASK_KIND, REPLY_KIND, TELL_KIND]
 
 const watchesByChannel = new Map()
 const subsByRelay = new Map()
-let stopOnlineWatcher = null
 
 function nowSeconds () {
   return Math.floor(Date.now() / 1000)
@@ -170,12 +168,6 @@ function dispatchContentKeyUsage (usage) {
   watchCallbacks(usage.channelPubkey).onContentKeyUsage?.(usage)
 }
 
-function recordSeen (channelPubkey, createdAt) {
-  const watch = watchesByChannel.get(channelPubkey)
-  if (!watch) return
-  watch.lastSeenAt = Math.max(watch.lastSeenAt || 0, createdAt || 0)
-}
-
 function handleChunk (chunk) {
   watchCallbacks(chunk.channelPubkey).onChunk?.(chunk)
 }
@@ -286,15 +278,12 @@ function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, graceful
       liveOnly: true,
       onChunk: handleChunk,
       onEvent: (event, outer, meta) => {
-        recordSeen(meta.channelPubkey, outer.created_at)
         dispatchWatchedEvent(event, outer, meta)
       },
       onNymEvent: (event, outer, meta) => {
-        recordSeen(meta.channelPubkey, outer.created_at)
         dispatchWatchedNymEvent(event, outer, meta)
       },
       onSeedEvent: (seed) => {
-        recordSeen(seed.channelPubkey, seed.outer.created_at)
         dispatchSeedEvent(seed)
       },
       onContentKeyUsage: dispatchContentKeyUsage,
@@ -304,52 +293,6 @@ function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, graceful
     subsByRelay.set(relay, { channels: new Set(channels), sub })
     if (current) closeSubscription(current.sub, gracefulClose)
   }
-}
-
-async function recoverWatchedChannels ({ _fetch = privateChannel.fetch } = {}) {
-  for (const [channelPubkey, watch] of watchesByChannel) {
-    await _fetch({
-      receiverSigner: watch.receiverSigner,
-      iykcSigner: watch.iykcSigner,
-      privateChannelSigner: watch.privateChannelSigner,
-      privateChannelSignersByPubkey: { [channelPubkey]: watch.privateChannelSigner },
-      privateChannelReaderSigner: watch.privateChannelReaderSigner,
-      privateChannelReaderSignersByPubkey: { [channelPubkey]: watch.privateChannelReaderSigner },
-      privateChannelReaderPubkey: watch.privateChannelReaderPubkey,
-      privateChannelReaderPubkeysByPubkey: { [channelPubkey]: watch.privateChannelReaderPubkey },
-      privateChannelPubkeys: [channelPubkey],
-      receiverPubkey: watch.receiverPubkey,
-      relays: watch.relays,
-      since: Math.max(0, (watch.lastSeenAt || watch.since || nowSeconds()) - 1),
-      mode: watch.mode,
-      modeByPubkey: { [channelPubkey]: watch.mode },
-      receivedChunkTtlMs: watch.receivedChunkTtlMs,
-      receivedChunkMaxBytes: watch.receivedChunkMaxBytes,
-      receivedChunkStorageArea: watch.receivedChunkStorageArea,
-      ignoredGroupTtlMs: watch.ignoredGroupTtlMs,
-      ignoredGroupMaxEntries: watch.ignoredGroupMaxEntries,
-      onChunk: handleChunk,
-      onEvent: (event, outer, meta) => {
-        watch.lastSeenAt = Math.max(watch.lastSeenAt || 0, outer.created_at || 0)
-        dispatchWatchedEvent(event, outer, meta)
-      },
-      onNymEvent: (event, outer, meta) => {
-        watch.lastSeenAt = Math.max(watch.lastSeenAt || 0, outer.created_at || 0)
-        dispatchWatchedNymEvent(event, outer, meta)
-      },
-      onSeedEvent: dispatchSeedEvent,
-      onContentKeyUsage: dispatchContentKeyUsage,
-      onError: err => watch.callbacks.onError?.(err)
-    })
-  }
-}
-
-function ensureOnlineRecovery () {
-  if (stopOnlineWatcher || typeof window === 'undefined') return
-  stopOnlineWatcher = onOnline(async () => {
-    rebuildSubscriptions()
-    await recoverWatchedChannels()
-  })
 }
 
 export async function watch ({
@@ -402,8 +345,7 @@ export async function watch ({
       ignoredGroupTtlMs,
       ignoredGroupMaxEntries,
       callbacks,
-      since,
-      lastSeenAt: since
+      since
     }
     const current = watchesByChannel.get(channel)
     if (
@@ -427,7 +369,6 @@ export async function watch ({
   }
 
   if (changed) rebuildSubscriptions({ _subscribe })
-  ensureOnlineRecovery()
   return () => unwatch(channelList)
 }
 
@@ -435,10 +376,6 @@ export function unwatch (channels) {
   const channelList = channels ? uniq(Array.isArray(channels) ? channels : [channels]) : [...watchesByChannel.keys()]
   for (const channel of channelList) watchesByChannel.delete(channel)
   rebuildSubscriptions({ gracefulClose: false })
-  if (!watchesByChannel.size && stopOnlineWatcher) {
-    stopOnlineWatcher()
-    stopOnlineWatcher = null
-  }
 }
 
 export function clearChannelState (channelPubkey) {

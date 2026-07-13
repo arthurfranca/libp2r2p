@@ -288,6 +288,77 @@ test('private messenger watches channels and queues received leecher rumors', as
   assert.deepEqual(raw.payload, ['raw-payload', 'not-a-private-message-code'])
 })
 
+test('private messenger pauses live watches offline, restarts them before durable recovery, and keeps presence running', async () => {
+  const originalWindow = globalThis.window
+  const originalDateNow = Date.now
+  const events = new EventTarget()
+  const pm = fakePrivateMessage()
+  const order = []
+  const clearedIntervals = []
+  const originalWatch = pm.watch
+  let now = 1_000_000
+
+  globalThis.window = {
+    addEventListener: (...args) => events.addEventListener(...args),
+    removeEventListener: (...args) => events.removeEventListener(...args)
+  }
+  Date.now = () => now
+  pm.watch = async options => {
+    order.push(`watch:${options.channels[0]}`)
+    return originalWatch(options)
+  }
+
+  let messenger
+  try {
+    messenger = await new PrivateMessenger({
+      _privateMessage: pm,
+      _privateChannel: {
+        fetch: async () => {
+          order.push('recover')
+          return []
+        }
+      },
+      _setInterval: () => 'presence-timer',
+      _clearInterval: timer => clearedIntervals.push(timer)
+    }).init({
+      userSigner: signer('user'),
+      channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'], mode: 'seeder' }]
+    })
+    order.length = 0
+
+    events.dispatchEvent(new Event('offline'))
+    assert.deepEqual(pm.stopped, ['channel'])
+    assert.equal(messenger.stopByChannel.size, 0)
+    assert.equal(messenger.presenceTimers.get('channel'), 'presence-timer')
+    assert.deepEqual(clearedIntervals, [])
+    assert.ok(messenger.readState().channels.channel.openOfflineStart)
+
+    now += 1_000
+    events.dispatchEvent(new Event('online'))
+    for (let attempt = 0; attempt < 20 && !order.includes('recover'); attempt++) {
+      await new Promise(resolve => setImmediate(resolve))
+    }
+    assert.deepEqual(order, ['watch:channel', 'recover'])
+
+    const message = {
+      event: { id: 'offline-duplicate', kind: TELL_KIND, pubkey: 'alice', created_at: 1001, tags: [['r', 'user']], content: 'hi' },
+      outer: { id: 'offline-outer', created_at: 1001 },
+      meta: { channelPubkey: 'channel' },
+      payload: { payload: 'hi' },
+      tell: { id: 'offline-duplicate' }
+    }
+    await pm.watchCalls[0].onTell(message)
+    await pm.watchCalls[1].onTell(message)
+    assert.equal((await messenger.nextMessage()).event.id, 'offline-duplicate')
+    assert.equal(await messenger.nextMessage(), null)
+  } finally {
+    messenger?.close()
+    Date.now = originalDateNow
+    if (originalWindow === undefined) delete globalThis.window
+    else globalThis.window = originalWindow
+  }
+})
+
 test('private messenger forwards watch errors to the configured error handler', async () => {
   const pm = fakePrivateMessage()
   const errors = []

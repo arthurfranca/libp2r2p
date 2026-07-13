@@ -6,6 +6,7 @@ import { deriveDoubleDhConversationKey } from '../double-dh/index.js'
 import {
   EXPIRATION_SECONDS,
   eventFromNymCarriers,
+  fetch,
   getJsonlChunkByteSize,
   getNymCarrierChunkSize,
   MAX_EVENT_BYTES,
@@ -25,7 +26,74 @@ import { makeContentKeyEvent, parseContentKeyEvent, verifyContentKeyProof } from
 import { TEMPORARY_STORAGE_KEYS_KEY } from '../temporary-storage/index.js'
 import { bytesToBase64, base64ToBytes } from '../base64/index.js'
 import { bytesToHex, hexToBytes } from '../base16/index.js'
-import { pool } from '../relay/services/index.js'
+import { relayPool } from '../relay/index.js'
+
+const originalEventsFeedGenerator = relayPool.getEventsFeedGenerator
+const originalLiveEventsGenerator = relayPool.getLiveEventsGenerator
+let mockedSubscribeMany = null
+
+// Adapts the old callback fixture style to the async-generator RelayPool API.
+// Resolving onevent waits until private-channel has consumed that event.
+function createMockEventsGenerator (subscribeMany) {
+  return (filter, relays, { signal } = {}) => {
+    const pending = []
+    let wake = Promise.withResolvers()
+    let current = null
+    let closed = false
+    let subscription
+
+    const close = () => {
+      if (closed) return
+      closed = true
+      current?.resolve()
+      current = null
+      for (const entry of pending.splice(0)) entry.resolve()
+      subscription?.close?.()
+      wake.resolve()
+    }
+    const handlers = {
+      onevent: event => new Promise(resolve => {
+        if (closed) return resolve()
+        pending.push({ event, resolve })
+        wake.resolve()
+        wake = Promise.withResolvers()
+      })
+    }
+    subscription = subscribeMany(relays, filter, handlers)
+    signal?.addEventListener('abort', close, { once: true })
+
+    return {
+      async next () {
+        current?.resolve()
+        current = null
+        while (!closed && pending.length === 0) await wake.promise
+        if (closed) return { done: true }
+        current = pending.shift()
+        return { value: current.event, done: false }
+      },
+      async return () {
+        close()
+        return { done: true }
+      },
+      [Symbol.asyncIterator] () { return this }
+    }
+  }
+}
+
+const pool = {
+  get subscribeMany () {
+    return mockedSubscribeMany
+  },
+  set subscribeMany (subscribeMany) {
+    mockedSubscribeMany = subscribeMany
+    relayPool.getEventsFeedGenerator = subscribeMany
+      ? createMockEventsGenerator(subscribeMany)
+      : originalEventsFeedGenerator
+    relayPool.getLiveEventsGenerator = subscribeMany
+      ? createMockEventsGenerator(subscribeMany)
+      : originalLiveEventsGenerator
+  }
+}
 
 if (!globalThis.localStorage) {
   const data = new Map()
@@ -56,6 +124,7 @@ if (!globalThis.btoa) globalThis.btoa = s => Buffer.from(s, 'binary').toString('
 if (!globalThis.atob) globalThis.atob = s => Buffer.from(s, 'base64').toString('binary')
 
 afterEach(() => {
+  pool.subscribeMany = null
   NsecSigner.releaseAll()
   globalThis.localStorage.clear()
   globalThis.sessionStorage.clear()
@@ -444,6 +513,49 @@ test('publish splits relay-targeted routers by receiver subset with separate rou
   assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
 })
 
+test('publish sends wrapped events through RelayPool.sendEvent', async () => {
+  const originalSendEvent = relayPool.sendEvent
+  const published = []
+  relayPool.sendEvent = async (outer, relays) => {
+    published.push({ outer, relays })
+    return { success: true, total: relays.length, promise: Promise.resolve({ success: true }) }
+  }
+
+  try {
+    const alice = signer()
+    const bob = signer()
+    await publish({
+      senderSigner: alice,
+      receivers: [await bob.getPublicKey()],
+      event: eventFixture('relay pool publish'),
+      relays: ['wss://relay.example'],
+      _getIykcProofs: noContentKeys
+    })
+  } finally {
+    relayPool.sendEvent = originalSendEvent
+  }
+
+  assert.equal(published.length, 1)
+  assert.equal(published[0].outer.kind, PRIVATE_BROADCAST_KIND)
+  assert.deepEqual(published[0].relays, ['wss://relay.example'])
+})
+
+test('fetch uses complete RelayPool reads for private-channel recovery', async () => {
+  let call
+  const events = await fetch({
+    relays: ['wss://relay.example'],
+    _getEvents: async (filter, relays, options) => {
+      call = { filter, relays, options }
+      return { result: [] }
+    }
+  })
+
+  assert.deepEqual(events, [])
+  assert.deepEqual(call.relays, ['wss://relay.example'])
+  assert.deepEqual(call.options, { timeout: 5000, timeoutAfterFirstEose: null })
+  assert.deepEqual(call.filter.kinds, [PRIVATE_BROADCAST_KIND])
+})
+
 test('publish cleans prepared rows when grouped publishing fails', async () => {
   const alice = signer()
   const bob = signer()
@@ -605,6 +717,50 @@ test('subscribe can read channel events with only a reader signer', async () => 
   } finally {
     pool.subscribeMany = originalSubscribeMany
   }
+})
+
+test('live-only subscribe closes its RelayPool stream', async () => {
+  const sender = signer()
+  const bob = signer()
+  const bobPubkey = await bob.getPublicKey()
+  const channelPubkey = await sender.getPublicKey()
+  const original = eventFixture('live subscription')
+  const [wrapped] = await wrapEvent({
+    senderSigner: sender,
+    receivers: [bobPubkey],
+    event: original,
+    _getIykcProofs: noContentKeys
+  })
+  const received = []
+  let aborted = false
+
+  const subscription = subscribe({
+    receiverSigner: bob,
+    privateChannelSigner: sender,
+    privateChannelPubkey: channelPubkey,
+    receiverPubkey: bobPubkey,
+    relays: ['wss://relay.example'],
+    liveOnly: true,
+    onEvent: event => received.push(event),
+    _liveEventsGenerator: (_filter, _relays, { signal }) => (async function * () {
+      yield wrapped
+      await new Promise(resolve => signal.addEventListener('abort', () => {
+        aborted = true
+        resolve()
+      }, { once: true }))
+    })()
+  })
+
+  for (let attempt = 0; attempt < 20 && received.length === 0; attempt++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  assert.deepEqual(received, [unwrappedFixture(original, await sender.getPublicKey())])
+
+  subscription.close()
+  for (let attempt = 0; attempt < 20 && !aborted; attempt++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  assert.ok(aborted)
 })
 
 test('subscribe can read reader-targeted channel events with the writer signer', async () => {

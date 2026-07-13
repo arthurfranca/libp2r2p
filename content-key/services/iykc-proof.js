@@ -1,6 +1,5 @@
 import { CONTENT_KEY_KIND, parseContentKeyEvent } from '../event/index.js'
-import { pickRelaysForPubkeys, getRelaysByPubkey } from '../../relay/index.js'
-import { fetchEvents } from '../../relay/services/index.js'
+import { pickRelaysForPubkeys, getRelaysByPubkey, relayPool } from '../../relay/index.js'
 
 const QUERY_CACHE_MS = 40 * 60 * 1000
 const IYKC_CACHE_MAX_ITEMS = 10000
@@ -8,6 +7,8 @@ const HEX_PUBKEY = /^[0-9a-f]{64}$/i
 const contentKeysByPubkey = Object.create(null)
 const iykcCacheTimersByPubkey = Object.create(null)
 const iykcCacheAddedAtByPubkey = Object.create(null)
+
+const getEvents = (...args) => relayPool.getEvents(...args)
 
 function hasCachedKey (cache, key) {
   return Object.prototype.hasOwnProperty.call(cache, key)
@@ -70,11 +71,11 @@ export function clearContentKeyCache () {
 }
 
 export async function getIykcProofs (pubkeys, {
-  _fetchEvents = fetchEvents,
+  _getEvents = getEvents,
   _getRelaysByPubkey = getRelaysByPubkey,
   cacheMs = QUERY_CACHE_MS
 } = {}) {
-  const pubkeyList = uniquePubkeys(pubkeys, { requireHex: _fetchEvents === fetchEvents })
+  const pubkeyList = uniquePubkeys(pubkeys, { requireHex: _getEvents === getEvents })
   if (!pubkeyList.length) return {}
 
   const out = {}
@@ -89,15 +90,21 @@ export async function getIykcProofs (pubkeys, {
   }
   if (!missingPubkeys.length) return out
 
-  const relaysByPubkey = await _getRelaysByPubkey(missingPubkeys, { _fetchEvents, cacheMs })
+  const relaysByPubkey = await _getRelaysByPubkey(missingPubkeys, { _getEvents, cacheMs })
   const relayToAuthors = pickRelaysForPubkeys(missingPubkeys, relaysByPubkey)
   const eventGroups = await Promise.all(
     [...relayToAuthors.entries()]
-      .map(([relay, authors]) => _fetchEvents({
-        kinds: [CONTENT_KEY_KIND],
-        authors,
-        limit: authors.length
-      }, [relay]))
+      .map(async ([relay, authors]) => {
+        const { result } = await _getEvents({
+          kinds: [CONTENT_KEY_KIND],
+          authors,
+          limit: authors.length
+        }, [relay], {
+          timeout: 5000,
+          timeoutAfterFirstEose: null
+        })
+        return result
+      })
   )
 
   const latestByPubkey = {}

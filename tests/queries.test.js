@@ -47,9 +47,10 @@ test('pickRelaysForPubkeys covers pubkeys with shared relay preference', () => {
 test('getRelaysByPubkey fetches latest relay lists and falls back when absent', async () => {
   const calls = []
   const relays = await getRelaysByPubkey(['alice', 'bob'], {
-    _fetchEvents: async (filter, relayUrls) => {
+    _getEvents: async (filter, relayUrls, options) => {
       calls.push({ filter, relayUrls })
-      return [relayListEvent('alice', 9, [['r', 'wss://alice.example', 'write']])]
+      assert.deepEqual(options, { timeout: 5000, timeoutAfterFirstEose: null })
+      return { result: [relayListEvent('alice', 9, [['r', 'wss://alice.example', 'write']])] }
     }
   })
 
@@ -69,31 +70,32 @@ test('getIykcProofs finds latest content-key events through relay routing', asyn
 
   const found = await getIykcProofs([userPubkey], {
     _getRelaysByPubkey: async () => ({ [userPubkey]: { write: ['wss://one.example'] } }),
-    _fetchEvents: async () => [olderEvent, newerEvent]
+    _getEvents: async () => ({ result: [olderEvent, newerEvent] })
   })
 
   assert.equal(found[userPubkey].iykcPubkey, await newer.getPublicKey())
 })
 
-test('subscribeRelayListUpdates only reports watched relay-type changes', () => {
+test('subscribeRelayListUpdates only reports watched relay-type changes', async () => {
   const changes = []
-  const closed = []
-  const pool = {
-    subscribeMany: (_relays, _filter, handlers) => {
-      handlers.onevent(relayListEvent('alice', 1, [['r', 'wss://read.example', 'read']]))
-      handlers.onevent(relayListEvent('alice', 2, [['r', 'wss://write.example', 'write']]))
-      return { close: () => closed.push(true) }
-    }
+  let aborted = false
+  async function * events (_filter, _relays, { signal }) {
+    signal.addEventListener('abort', () => { aborted = true }, { once: true })
+    yield relayListEvent('alice', 1, [['r', 'wss://read.example', 'read']])
+    yield relayListEvent('alice', 2, [['r', 'wss://write.example', 'write']])
+    await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))
   }
 
   const stop = subscribeRelayListUpdates(['alice'], {
     relayType: 'write',
     onChange: change => changes.push(change),
-    _pool: pool
+    _eventsFeedGenerator: events
   })
+  await new Promise(resolve => setImmediate(resolve))
   stop()
+  await new Promise(resolve => setImmediate(resolve))
 
   assert.equal(changes.length, 1)
   assert.deepEqual(changes[0].relays, { read: [], write: ['wss://write.example'] })
-  assert.deepEqual(closed, [true])
+  assert.ok(aborted)
 })

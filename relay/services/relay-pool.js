@@ -1,8 +1,10 @@
 import { decodeHll, encodeHll, estimateHllCount, mergeHll } from '../helpers/hll.js'
 import { createPublishSettlements, firstFulfillment, publishSummary } from '../helpers/publish.js'
 import { maybeUnref } from '../helpers/timer.js'
+import { normalizeURL } from 'nostr-tools/utils'
 import { RelayConnection } from './relay-connection.js'
 
+const CONNECTION_TIMEOUT_MS = 3000
 const COUNT_TIMEOUT_MS = 5000
 const COUNT_TIMEOUT_AFTER_FIRST_COUNT_MS = 500
 const SEND_TIMEOUT_UNTIL_FIRST_FULFILLMENT_MS = 3000
@@ -75,6 +77,22 @@ function getEventsTimeoutError () {
   return new Error('GET_EVENTS_TIMEOUT')
 }
 
+function normalizedRelayUrls (relays) {
+  const urls = []
+  const seen = new Set()
+
+  for (const relay of relays || []) {
+    const normalizedUrl = normalizeURL(relay)
+    if (seen.has(normalizedUrl)) continue
+    seen.add(normalizedUrl)
+    // Keep the caller's first spelling in reports and metadata while using the
+    // canonical spelling for pooled connection ownership.
+    urls.push(relay)
+  }
+
+  return urls
+}
+
 function isCountResponse (payload) {
   return Number.isSafeInteger(payload?.count) && payload.count >= 0
 }
@@ -93,66 +111,78 @@ export class RelayPool {
   #liveSubCounts = new Map() // url -> number of active live subscriptions
   #timeout = 30000 // 30 seconds
 
-  // Get a relay connection, creating one if it doesn't exist
+  #scheduleIdleDisconnect (url) {
+    clearTimeout(this.#relayTimeouts.get(url))
+    this.#relayTimeouts.set(url, maybeUnref(setTimeout(() => this.disconnect(url), this.#timeout)))
+  }
+
+  // Opens a normalized pooled connection. Failed connects are evicted so a later
+  // retry creates a fresh RelayConnection instead of reusing broken socket state.
   async #getRelay (url) {
-    if (this.#relays.has(url)) {
-      // Only reset idle timeout when no live subscriptions are holding this relay open
-      if (!this.#liveSubCounts.get(url)) {
-        clearTimeout(this.#relayTimeouts.get(url))
-        this.#relayTimeouts.set(url, maybeUnref(setTimeout(() => this.disconnect(url), this.#timeout)))
+    const normalizedUrl = normalizeURL(url)
+    let relay = this.#relays.get(normalizedUrl)
+    if (!relay) {
+      relay = new RelayConnection(normalizedUrl)
+      this.#relays.set(normalizedUrl, relay)
+    }
+
+    try {
+      // nostr-tools cancels its socket attempt when this deadline elapses.
+      await relay.connect({ timeout: CONNECTION_TIMEOUT_MS })
+    } catch (error) {
+      if (this.#relays.get(normalizedUrl) === relay) {
+        this.#relays.delete(normalizedUrl)
+        clearTimeout(this.#relayTimeouts.get(normalizedUrl))
+        this.#relayTimeouts.delete(normalizedUrl)
       }
-      const relay = this.#relays.get(url)
-      // Reconnect if needed to avoid SendingOnClosedConnection errors
-      await relay.connect()
-      return relay
+      try {
+        await relay.close()
+      } catch {}
+      throw error
     }
 
-    const relay = new RelayConnection(url)
-    this.#relays.set(url, relay)
-
-    await relay.connect()
-
-    if (!this.#liveSubCounts.get(url)) {
-      this.#relayTimeouts.set(url, maybeUnref(setTimeout(() => this.disconnect(url), this.#timeout)))
-    }
-
+    // Only reset idle timeout when no live subscriptions are holding this relay open.
+    if (!this.#liveSubCounts.get(normalizedUrl)) this.#scheduleIdleDisconnect(normalizedUrl)
     return relay
   }
 
   #incrementLiveSub (url) {
-    this.#liveSubCounts.set(url, (this.#liveSubCounts.get(url) ?? 0) + 1)
+    const normalizedUrl = normalizeURL(url)
+    this.#liveSubCounts.set(normalizedUrl, (this.#liveSubCounts.get(normalizedUrl) ?? 0) + 1)
     // Cancel any pending idle timeout — this relay must stay open
-    clearTimeout(this.#relayTimeouts.get(url))
-    this.#relayTimeouts.delete(url)
+    clearTimeout(this.#relayTimeouts.get(normalizedUrl))
+    this.#relayTimeouts.delete(normalizedUrl)
   }
 
   #decrementLiveSub (url) {
-    const next = (this.#liveSubCounts.get(url) ?? 1) - 1
+    const normalizedUrl = normalizeURL(url)
+    const next = (this.#liveSubCounts.get(normalizedUrl) ?? 1) - 1
     if (next <= 0) {
-      this.#liveSubCounts.delete(url)
+      this.#liveSubCounts.delete(normalizedUrl)
       // No more live subscriptions — start the idle timer if the relay is still pooled
-      if (this.#relays.has(url)) {
-        this.#relayTimeouts.set(url, maybeUnref(setTimeout(() => this.disconnect(url), this.#timeout)))
+      if (this.#relays.has(normalizedUrl)) {
+        this.#scheduleIdleDisconnect(normalizedUrl)
       }
     } else {
-      this.#liveSubCounts.set(url, next)
+      this.#liveSubCounts.set(normalizedUrl, next)
     }
   }
 
   // Disconnect from a relay
   async disconnect (url) {
-    if (this.#relays.has(url)) {
-      const relay = this.#relays.get(url)
-      if (relay.ws.readyState < 2) await relay.close()?.catch(console.log)
-      this.#relays.delete(url)
-      clearTimeout(this.#relayTimeouts.get(url))
-      this.#relayTimeouts.delete(url)
+    const normalizedUrl = normalizeURL(url)
+    if (this.#relays.has(normalizedUrl)) {
+      const relay = this.#relays.get(normalizedUrl)
+      if (relay.ws?.readyState < 2) await relay.close()?.catch(console.log)
+      this.#relays.delete(normalizedUrl)
+      clearTimeout(this.#relayTimeouts.get(normalizedUrl))
+      this.#relayTimeouts.delete(normalizedUrl)
     }
   }
 
   // Disconnect from all relays
   async disconnectAll () {
-    for (const url of this.#relays.keys()) {
+    for (const url of [...this.#relays.keys()]) {
       await this.disconnect(url)
     }
   }
@@ -191,7 +221,7 @@ export class RelayPool {
     }
     if (signal?.aborted) throw new Error('Aborted')
 
-    const urls = [...new Set(relays || [])]
+    const urls = normalizedRelayUrls(relays)
     if (!urls.length) {
       return { count: null, approximate: false, errors: [], success: false }
     }
@@ -299,9 +329,10 @@ export class RelayPool {
   }
 
   // Collects a one-shot relay read. The first EOSE with events opens a short
-  // grace window; null disables either timer so callers can wait naturally.
+  // grace window; null disables that window so callers wait for every relay or
+  // the operation deadline. Event ids are deduplicated across relay responses.
   async getEvents (filter, relays, { timeout = 5000, timeoutAfterFirstEose = 500, callback, signal } = {}) {
-    const urls = relays || []
+    const urls = normalizedRelayUrls(relays)
     if (!urls.length) return { result: [], errors: [], success: false }
     if (signal?.aborted) throw new Error('Aborted')
 
@@ -310,6 +341,7 @@ export class RelayPool {
     const normalCloseUrls = new Set()
     const errors = []
     const events = []
+    const eventIds = new Set()
     let completed = 0
     let isResolved = false
     let eoseTimer = null
@@ -396,9 +428,14 @@ export class RelayPool {
             onevent: (event) => {
               if (isResolved || !pending.has(url)) return
               hasEvents = true
-              event.meta = { relay: url }
-              events.push(event)
-              if (callback) callback({ type: 'event', event, relay: url })
+              // Keep filter-limit accounting per relay, but only expose one copy of
+              // a matching event when several relays return the same id.
+              if (!event?.id || !eventIds.has(event.id)) {
+                if (event?.id) eventIds.add(event.id)
+                event.meta = { relay: url }
+                events.push(event)
+                if (callback) callback({ type: 'event', event, relay: url })
+              }
               checkEarlyClose(event)
             },
             oninvalidevent: () => {
@@ -451,31 +488,23 @@ export class RelayPool {
     return await methodPromise
   }
 
-  // Yields live nostr events from the given relays. Stops naturally when filter.until
-  // is set and the wall clock reaches that timestamp. Also stops on signal abort or
-  // for-await loop exit (break/return/throw — all trigger the finally block).
-  //
-  // Handles two concerns:
-  // 1. Live stream: a limit:0 sub keeps the relay connection open so future events are
-  //    delivered in real time. filter.until is forwarded to the relay so it can enforce
-  //    the boundary server-side too.
-  // 2. Reconnect gap fill: on each disconnect, fetches events missed since the last event
-  //    seen, with exponential backoff (1s → 5 min cap). filter.since is used as the
-  //    initial gap boundary if no events have been seen yet.
-  //
-  // Initial fetching of stored events is the responsibility of getEventsFeedGenerator.
-  // Reconnect gap fills delegate to getEventsGenerator, whose EOSE grace can be null.
-  // Reconnect gap events are deduplicated against live events.
+  // Yields strictly live Nostr events. Each initial limit:0 subscription must reach
+  // EOSE, fail, or close before anything is exposed, so stored responses cannot leak
+  // into a live feed. Reconnects fill their own relay gap before buffered live events.
   async * getLiveEventsGenerator (filter, relays, {
     signal,
     timeoutForReconnectGap = 5000,
     timeoutAfterFirstReconnectGapEose = 500,
     _gapEventsGenerator = (...args) => this.getEventsGenerator(...args)
   } = {}) {
+    const urls = normalizedRelayUrls(relays)
     const queue = []
     let p = Promise.withResolvers()
     let isDone = false
     const liveSubs = new Map() // url → live sub
+    const retryTimers = new Map()
+    const initialPending = new Set(urls)
+    let initialReady = false
 
     // Internal abort controller to cancel any in-flight reconnect gap fills on teardown
     const gapAc = new AbortController()
@@ -491,7 +520,7 @@ export class RelayPool {
     // lastSeenAt: the highest created_at received so far; used as since on reconnect gap fill
     let lastSeenAt = (filter.since > 0) ? filter.since : null
 
-    // Bounded dedup set to handle overlap between reconnect gap fill and live sub
+    // Bounded dedup set to handle overlap between reconnect gap fill and live sub.
     const seenIds = new Set()
 
     let untilTimer = null
@@ -500,15 +529,19 @@ export class RelayPool {
       isDone = true
       clearTimeout(untilTimer)
       gapAc.abort()
+      for (const timer of retryTimers.values()) clearTimeout(timer)
+      retryTimers.clear()
       liveSubs.forEach(sub => sub.close())
       liveSubs.clear()
       p.resolve()
     }
 
     const pushEvent = (event, url) => {
-      if (isDone || seenIds.has(event.id)) return
-      if (seenIds.size >= 500) seenIds.delete(seenIds.values().next().value) // evict oldest
-      seenIds.add(event.id)
+      if (isDone || (event.id && seenIds.has(event.id))) return
+      if (event.id) {
+        if (seenIds.size >= 500) seenIds.delete(seenIds.values().next().value) // evict oldest
+        seenIds.add(event.id)
+      }
       if (event.created_at > (lastSeenAt ?? 0)) lastSeenAt = event.created_at
       event.meta = { relay: url }
       queue.push(event)
@@ -519,10 +552,25 @@ export class RelayPool {
     if (signal?.aborted) return
     signal?.addEventListener('abort', teardown, { once: true })
 
+    const markInitialSettled = (url) => {
+      if (!initialPending.delete(url) || initialPending.size > 0 || initialReady) return
+      initialReady = true
+    }
+
+    const scheduleReconnect = (url, reconnectDelay) => {
+      if (isDone || retryTimers.has(url)) return
+      const nextDelay = Math.min(reconnectDelay * 2, 5 * 60_000)
+      const timer = maybeUnref(setTimeout(() => {
+        retryTimers.delete(url)
+        subscribeToRelay(url, lastSeenAt, nextDelay)
+      }, reconnectDelay))
+      retryTimers.set(url, timer)
+    }
+
     // Schedule teardown when the wall clock reaches filter.until
     if (filterUntil !== null) {
       const msUntil = filterUntil * 1000 - Date.now()
-      untilTimer = maybeUnref(setTimeout(teardown, msUntil))
+      untilTimer = maybeUnref(setTimeout(teardown, Math.max(0, msUntil)))
     }
 
     // Runs a reconnect gap fill for a single relay and returns a promise that resolves
@@ -551,30 +599,36 @@ export class RelayPool {
       this.#getRelay(url).then(relay => {
         if (isDone) return
 
-        // Buffer live events while a reconnect gap fill is running so stored events
-        // are yielded first. Flushed (with dedup) once gap fill completes.
+        // Buffer post-EOSE live events while a reconnect gap fill is running so
+        // the historical gap is yielded before newer socket events.
         let liveBuffer = (gapSince !== null && gapSince > 0) ? [] : null
+        let liveEose = false
+        let liveSub
 
         // Open the live sub first so the relay starts buffering incoming events
         // before we scan its database for the reconnect gap fill.
         // Forward until to the relay so it can enforce the boundary server-side.
         const liveFilter = { ...baseFilter, since: now, limit: 0 }
         if (filterUntil !== null) liveFilter.until = filterUntil
-        const liveSub = relay.subscribe([liveFilter], {
+        liveSub = relay.subscribe([liveFilter], {
           onevent: (event) => {
+            // A limit:0 relay may still send retained events before EOSE. Do not
+            // expose them from a strictly-live stream.
+            if (!liveEose || !initialReady) return
             if (liveBuffer) liveBuffer.push(event)
             else pushEvent(event, url)
           },
           onclose: () => {
-            liveSubs.delete(url)
+            if (liveSubs.get(url) === liveSub) liveSubs.delete(url)
+            else if (liveSubs.has(url)) return
+            markInitialSettled(url)
             if (isDone) return
-            const delay = reconnectDelay
-            setTimeout(
-              () => subscribeToRelay(url, lastSeenAt, Math.min(reconnectDelay * 2, 5 * 60_000)),
-              delay
-            )
+            scheduleReconnect(url, reconnectDelay)
           },
-          oneose: () => { /* keep open for live events */ }
+          oneose: () => {
+            liveEose = true
+            markInitialSettled(url)
+          }
         })
         if (isDone) { liveSub.close(); return }
         liveSubs.set(url, liveSub)
@@ -588,17 +642,19 @@ export class RelayPool {
           })
         }
       }).catch(err => {
+        markInitialSettled(url)
         if (isDone) return
         console.error(`Live subscription error at ${url}:`, err)
-        const delay = reconnectDelay
-        setTimeout(
-          () => subscribeToRelay(url, lastSeenAt, Math.min(reconnectDelay * 2, 5 * 60_000)),
-          delay
-        )
+        scheduleReconnect(url, reconnectDelay)
       })
     }
 
-    for (const url of relays) {
+    if (!urls.length) {
+      initialReady = true
+      return
+    }
+
+    for (const url of urls) {
       this.#incrementLiveSub(url)
       subscribeToRelay(url, null) // no initial gap fill — that's getEventsFeedGenerator's job
     }
@@ -611,7 +667,7 @@ export class RelayPool {
       }
     } finally {
       signal?.removeEventListener('abort', teardown)
-      for (const url of relays) this.#decrementLiveSub(url)
+      for (const url of urls) this.#decrementLiveSub(url)
       teardown()
     }
   }
@@ -722,7 +778,7 @@ export class RelayPool {
     getAuthEvent,
     onRelayResult
   } = {}) {
-    const urls = relays || []
+    const urls = normalizedRelayUrls(relays)
     if (!urls.length) {
       const promise = Promise.resolve(publishSummary([], urls, {
         result: null,

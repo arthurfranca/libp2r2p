@@ -28,11 +28,13 @@ const messenger = await createPrivateMessenger({
   onError: err => console.warn('private messenger failed', err)
 })
 
-void (async () => {
+async function logMessages () {
   for await (const message of messenger.messages()) {
     console.log(message.type, message.payload)
   }
-})()
+}
+
+logMessages().catch(err => console.warn('private messenger messages failed', err))
 
 await messenger.tell({
   receiverPubkey,
@@ -79,7 +81,7 @@ async function handleMessages () {
   }
 }
 
-void handleMessages()
+handleMessages().catch(err => console.warn('private messenger messages failed', err))
 ```
 
 For one-at-a-time consumption, use `await messenger.nextMessage()`. Queue

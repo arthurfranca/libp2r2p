@@ -1048,18 +1048,32 @@ export class PrivateMessenger {
     }, this.reloadGapDelayMs)
   }
 
+  // Browser-offline recovery owns durable gaps. Stop only the child live reads;
+  // unwatch() would also stop seeder-presence publishing and alter channel state.
+  #pauseLiveWatches () {
+    for (const stop of this.stopByChannel.values()) stop?.()
+    this.stopByChannel.clear()
+  }
+
+  async #resumeLiveWatches () {
+    const channelPubkeys = [...this.channels.keys()]
+    await this.watch(channelPubkeys, { scheduleReloadGap: false })
+    return channelPubkeys
+  }
+
   ensureNetworkWatchers () {
     if (typeof window === 'undefined') return
     if (!this.stopOffline) {
       const offline = () => {
         const state = this.readState()
         const start = Math.max(0, nowSeconds() - this.offlineSkewSeconds)
-        for (const pubkey of this.stopByChannel.keys()) {
+        for (const pubkey of this.channels.keys()) {
           const current = state.channels[pubkey] || {}
           current.openOfflineStart ||= start
           state.channels[pubkey] = current
         }
         this.writeState(state)
+        this.#pauseLiveWatches()
       }
       window.addEventListener('offline', offline)
       this.stopOffline = () => window.removeEventListener('offline', offline)
@@ -1067,8 +1081,8 @@ export class PrivateMessenger {
     if (!this.stopOnline) {
       const online = async () => {
         this.closeOpenOfflineRanges()
-        await this.watch([...this.stopByChannel.keys()])
-        await this.recoverOfflineRanges()
+        const channelPubkeys = await this.#resumeLiveWatches()
+        await this.recoverOfflineRanges(channelPubkeys)
       }
       window.addEventListener('online', online)
       this.stopOnline = () => window.removeEventListener('online', online)

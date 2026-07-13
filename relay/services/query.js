@@ -1,5 +1,5 @@
 import { freeRelays, seedRelays } from '../constants/index.js'
-import { fetchEvents, parseRelayListEvent, pool } from './index.js'
+import { relayPool } from './relay-pool.js'
 
 const QUERY_CACHE_MS = 40 * 60 * 1000
 const RELAY_CACHE_MAX_ITEMS = 500
@@ -8,6 +8,9 @@ const relaysByPubkey = Object.create(null)
 const relayCacheTimersByPubkey = Object.create(null)
 const relayCacheAddedAtByPubkey = Object.create(null)
 const relayCacheEventCreatedAtByPubkey = Object.create(null)
+
+const getEvents = (...args) => relayPool.getEvents(...args)
+const getEventsFeedGenerator = (...args) => relayPool.getEventsFeedGenerator(...args)
 
 function hasCachedKey (cache, key) {
   return Object.prototype.hasOwnProperty.call(cache, key)
@@ -23,6 +26,21 @@ function cloneRelays (relays) {
     read: [...(relays?.read || [])],
     write: [...(relays?.write || [])]
   }
+}
+
+// NIP-65 relay-list tags without a marker apply to both read and write use.
+function parseRelayListEvent (event) {
+  const out = { read: [], write: [] }
+  if (!event || event.kind !== 10002) return out
+  for (const tag of event.tags) {
+    if (tag[0] !== 'r' || typeof tag[1] !== 'string') continue
+    if (tag[2] === 'read') out.read.push(tag[1])
+    else if (tag[2] === 'write') out.write.push(tag[1])
+    else { out.read.push(tag[1]); out.write.push(tag[1]) }
+  }
+  out.read = [...new Set(out.read)]
+  out.write = [...new Set(out.write)]
+  return out
 }
 
 function uniquePubkeys (pubkeys, { requireHex = false } = {}) {
@@ -126,35 +144,47 @@ export function subscribeRelayListUpdates (pubkeys, {
   onChange,
   relays = seedRelays,
   cacheMs = QUERY_CACHE_MS,
-  _pool = pool
+  _eventsFeedGenerator = getEventsFeedGenerator
 } = {}) {
-  const authors = uniquePubkeys(pubkeys, { requireHex: _pool === pool })
+  const authors = uniquePubkeys(pubkeys, { requireHex: _eventsFeedGenerator === getEventsFeedGenerator })
   if (!authors.length) return () => {}
 
   let closed = false
-  const sub = _pool.subscribeMany(relays, {
-    kinds: [10002],
-    authors
-  }, {
-    onevent (event) {
-      if (closed || !authors.includes(event.pubkey)) return
-      const update = cacheRelayListEvent(event, { cacheMs })
-      if (!update || !relayTypeChanged(update.changes, relayType)) return
-      onChange?.({
-        ...update,
-        relayType
-      })
+  const controller = new AbortController()
+
+  async function consumeRelayListUpdates () {
+    try {
+      for await (const event of _eventsFeedGenerator({
+        kinds: [10002],
+        authors
+      }, relays, {
+        signal: controller.signal,
+        timeout: 5000,
+        timeoutAfterFirstEose: null
+      })) {
+        if (closed || !authors.includes(event.pubkey)) continue
+        const update = cacheRelayListEvent(event, { cacheMs })
+        if (!update || !relayTypeChanged(update.changes, relayType)) continue
+        onChange?.({
+          ...update,
+          relayType
+        })
+      }
+    } catch (error) {
+      if (!closed && error?.message !== 'Aborted') console.error('relay-list watch failed:', error)
     }
-  })
+  }
+
+  consumeRelayListUpdates()
 
   return () => {
     closed = true
-    sub?.close?.()
+    controller.abort()
   }
 }
 
-export async function getRelaysByPubkey (pubkeys, { _fetchEvents = fetchEvents, cacheMs = QUERY_CACHE_MS } = {}) {
-  const pubkeyList = uniquePubkeys(pubkeys, { requireHex: _fetchEvents === fetchEvents })
+export async function getRelaysByPubkey (pubkeys, { _getEvents = getEvents, cacheMs = QUERY_CACHE_MS } = {}) {
+  const pubkeyList = uniquePubkeys(pubkeys, { requireHex: _getEvents === getEvents })
   if (!pubkeyList.length) return {}
 
   const out = {}
@@ -165,11 +195,14 @@ export async function getRelaysByPubkey (pubkeys, { _fetchEvents = fetchEvents, 
   }
   if (!missingPubkeys.length) return out
 
-  const events = await _fetchEvents({
+  const { result: events } = await _getEvents({
     kinds: [10002],
     authors: missingPubkeys,
     limit: missingPubkeys.length
-  }, seedRelays)
+  }, seedRelays, {
+    timeout: 5000,
+    timeoutAfterFirstEose: null
+  })
 
   const latestByPubkey = {}
   for (const event of events) {

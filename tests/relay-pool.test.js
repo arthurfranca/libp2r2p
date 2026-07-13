@@ -6,14 +6,19 @@ import assert from 'node:assert/strict'
 // Keyed by URL; populated by FakeRelay constructor, cleared in beforeEach.
 const relayRegistry = new Map()
 
-// Per-URL connect overrides: async () => void (throw to simulate error, hang to simulate timeout)
+// Per-URL connect overrides: throw to simulate error or hang to simulate timeout.
 const connectOverrides = new Map()
 
-// Per-URL publish overrides: async (event) => void (throw to simulate error, hang to simulate timeout)
+// Per-URL publish overrides: throw to simulate error or hang to simulate timeout.
 const publishOverrides = new Map()
 
-// Per-URL send overrides: async (message, relay) => void (used for control replies).
+// Per-URL send overrides are used for control replies.
 const sendOverrides = new Map()
+let autoEoseForLiveSubscriptions = true
+
+function overrideFor (overrides, url) {
+  return overrides.get(url) ?? overrides.get(url.endsWith('/') ? url.slice(0, -1) : `${url}/`)
+}
 
 class FakeRelay {
   constructor (url) {
@@ -22,10 +27,13 @@ class FakeRelay {
     this.ws = { readyState: 1 }
     this.publishTimeout = 100
     relayRegistry.set(url, this)
+    // RelayPool canonicalizes URLs; retain the test's terse lookup spelling.
+    if (url.endsWith('/')) relayRegistry.set(url.slice(0, -1), this)
   }
 
-  async connect () {
-    const fn = connectOverrides.get(this.url)
+  async connect (options) {
+    this.connectOptions = options
+    const fn = overrideFor(connectOverrides, this.url)
     if (fn) await fn()
   }
 
@@ -41,19 +49,22 @@ class FakeRelay {
       }
     }
     this.subscriptions.push(sub)
+    if (autoEoseForLiveSubscriptions && filters[0]?.limit === 0) {
+      queueMicrotask(() => handlers.oneose?.())
+    }
     return sub
   }
 
   async publish (event) {
     this.lastPublishedEvent = event
-    const fn = publishOverrides.get(this.url)
+    const fn = overrideFor(publishOverrides, this.url)
     if (fn) await fn(event)
   }
 
   async send (message) {
     this.sentMessages ??= []
     this.sentMessages.push(message)
-    const fn = sendOverrides.get(this.url)
+    const fn = overrideFor(sendOverrides, this.url)
     if (fn) await fn(message, this)
   }
 
@@ -143,6 +154,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     _nextId = 1
     relayRegistry.clear()
     connectOverrides.clear()
+    autoEoseForLiveSubscriptions = true
     nostr = new RelayPool()
   })
 
@@ -168,6 +180,31 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     assert.equal(events[1].id, 'e2')
   })
 
+  it('discards initial events until every initial live subscription reaches EOSE', async () => {
+    autoEoseForLiveSubscriptions = false
+    const ac = new AbortController()
+    const { events, promise } = startCollecting(
+      nostr.getLiveEventsGenerator({ kinds: [0] }, ['wss://r1', 'wss://r2'], { signal: ac.signal })
+    )
+
+    await tick()
+    const first = relayRegistry.get('wss://r1').subscriptions[0]
+    const second = relayRegistry.get('wss://r2').subscriptions[0]
+    first.handlers.onevent(makeEvent({ id: 'retained-first' }))
+    first.handlers.oneose()
+    first.handlers.onevent(makeEvent({ id: 'between-eoses' }))
+    await tick()
+    assert.deepEqual(events, [])
+
+    second.handlers.oneose()
+    first.handlers.onevent(makeEvent({ id: 'live-after-eose' }))
+    await tick()
+
+    ac.abort()
+    await promise
+    assert.deepEqual(events.map(event => event.id), ['live-after-eose'])
+  })
+
   it('opens only a live sub (limit:0, since:now) — no initial fetch', async () => {
     const ac = new AbortController()
     startCollecting(nostr.getLiveEventsGenerator(
@@ -183,6 +220,14 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     assert.equal(relay.subscriptions[0].filters[0].limit, 0)
     assert.ok(relay.subscriptions[0].filters[0].since > 0)
 
+    ac.abort()
+  })
+
+  it('uses the private three-second deadline while opening a relay connection', async () => {
+    const ac = new AbortController()
+    startCollecting(nostr.getLiveEventsGenerator({ kinds: [0] }, ['wss://r1'], { signal: ac.signal }))
+    await tick()
+    assert.equal(relayRegistry.get('wss://r1').connectOptions.timeout, 3000)
     ac.abort()
   })
 
@@ -232,6 +277,57 @@ describe('RelayPool.getLiveEventsGenerator', () => {
 
     ac.abort()
     await promise
+  })
+
+  it('retries a failed initial connection with a fresh relay instance', async () => {
+    let attempts = 0
+    const originalConsoleError = console.error
+    connectOverrides.set('wss://r1', () => {
+      attempts++
+      if (attempts === 1) throw new Error('connection failed')
+    })
+    console.error = () => {}
+    try {
+      const ac = new AbortController()
+      const { promise } = startCollecting(
+        nostr.getLiveEventsGenerator({ kinds: [0] }, ['wss://r1'], { signal: ac.signal })
+      )
+
+      await new Promise(resolve => setTimeout(resolve, 1100))
+      await tick()
+      assert.equal(attempts, 2)
+      assert.equal(relayRegistry.get('wss://r1').subscriptions.length, 1)
+
+      ac.abort()
+      await promise
+    } finally {
+      console.error = originalConsoleError
+    }
+  })
+
+  it('evicts a failed connection and cancels its retry when the stream stops', async () => {
+    let attempts = 0
+    const originalConsoleError = console.error
+    connectOverrides.set('wss://r1', () => {
+      attempts++
+      throw new Error('connection failed')
+    })
+    console.error = () => {}
+    try {
+      const ac = new AbortController()
+      const { promise } = startCollecting(
+        nostr.getLiveEventsGenerator({ kinds: [0] }, ['wss://r1'], { signal: ac.signal })
+      )
+
+      await tick()
+      assert.equal(attempts, 1)
+      ac.abort()
+      await promise
+      await new Promise(resolve => setTimeout(resolve, 1100))
+      assert.equal(attempts, 1)
+    } finally {
+      console.error = originalConsoleError
+    }
   })
 
   it('reconnect opens a gap fill sub using lastSeenAt as since', async () => {
@@ -939,6 +1035,22 @@ describe('RelayPool.getEvents', () => {
     assert.equal(errors.length, 0)
   })
 
+  it('deduplicates matching event ids across relays without changing relay completion', async () => {
+    const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1', 'wss://r2'], {
+      timeoutAfterFirstEose: null
+    })
+    await tick()
+    relayRegistry.get('wss://r1').subscriptions[0].handlers.onevent(makeEvent({ id: 'same-id' }))
+    relayRegistry.get('wss://r1').subscriptions[0].handlers.oneose()
+    relayRegistry.get('wss://r2').subscriptions[0].handlers.onevent(makeEvent({ id: 'same-id' }))
+    relayRegistry.get('wss://r2').subscriptions[0].handlers.oneose()
+
+    const { result, errors, success } = await resultPromise
+    assert.deepEqual(result.map(event => event.id), ['same-id'])
+    assert.deepEqual(errors, [])
+    assert.ok(success)
+  })
+
   it('success:true when at least one relay succeeds', async () => {
     const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1', 'wss://r2'])
     await tick()
@@ -1570,7 +1682,7 @@ describe('RelayPool.sendEvent', () => {
     const full = await early.promise
 
     assert.equal(publishCount, 2)
-    assert.deepEqual(authRequests, [{ relay: 'wss://r1', challenge: 'challenge-one' }])
+    assert.deepEqual(authRequests, [{ relay: 'wss://r1/', challenge: 'challenge-one' }])
     assert.deepEqual(full.succeededRelays, ['wss://r1'])
   })
 
