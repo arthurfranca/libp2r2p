@@ -180,7 +180,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     assert.equal(events[1].id, 'e2')
   })
 
-  it('discards initial events until every initial live subscription reaches EOSE', async () => {
+  it('discards pre-EOSE events per relay without holding another relay back', async () => {
     autoEoseForLiveSubscriptions = false
     const ac = new AbortController()
     const { events, promise } = startCollecting(
@@ -194,15 +194,65 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     first.handlers.oneose()
     first.handlers.onevent(makeEvent({ id: 'between-eoses' }))
     await tick()
-    assert.deepEqual(events, [])
+    assert.deepEqual(events.map(event => event.id), ['between-eoses'])
 
+    second.handlers.onevent(makeEvent({ id: 'retained-second' }))
     second.handlers.oneose()
-    first.handlers.onevent(makeEvent({ id: 'live-after-eose' }))
+    second.handlers.onevent(makeEvent({ id: 'live-after-eose' }))
     await tick()
 
     ac.abort()
     await promise
-    assert.deepEqual(events.map(event => event.id), ['live-after-eose'])
+    assert.deepEqual(events.map(event => event.id), ['between-eoses', 'live-after-eose'])
+  })
+
+  it('reports relays that reach EOSE during the first-EOSE grace period', async () => {
+    autoEoseForLiveSubscriptions = false
+    const ac = new AbortController()
+    const stream = nostr.getLiveEventsGenerator(
+      { kinds: [0] },
+      ['wss://r1', 'wss://r2', 'wss://r3'],
+      { signal: ac.signal, timeoutAfterFirstEose: 20 }
+    )
+    const { promise } = startCollecting(stream)
+
+    await tick()
+    relayRegistry.get('wss://r1').subscriptions[0].handlers.oneose()
+    await new Promise(resolve => setTimeout(resolve, 5))
+    relayRegistry.get('wss://r2').subscriptions[0].handlers.oneose()
+
+    const report = await stream.ready
+    assert.deepEqual(report.relays, ['wss://r1', 'wss://r2'])
+    assert.deepEqual(report.errors, [])
+    assert.deepEqual(stream.readyRelays, ['wss://r1', 'wss://r2'])
+
+    ac.abort()
+    await promise
+  })
+
+  it('waits for every initial relay when the first-EOSE grace is null', async () => {
+    autoEoseForLiveSubscriptions = false
+    const ac = new AbortController()
+    const stream = nostr.getLiveEventsGenerator(
+      { kinds: [0] },
+      ['wss://r1', 'wss://r2'],
+      { signal: ac.signal, timeoutAfterFirstEose: null }
+    )
+    const { promise } = startCollecting(stream)
+    let resolved = false
+    stream.ready.then(() => { resolved = true })
+
+    await tick()
+    relayRegistry.get('wss://r1').subscriptions[0].handlers.oneose()
+    await tick()
+    assert.equal(resolved, false)
+
+    relayRegistry.get('wss://r2').subscriptions[0].handlers.oneose()
+    const report = await stream.ready
+    assert.deepEqual(report.relays, ['wss://r1', 'wss://r2'])
+
+    ac.abort()
+    await promise
   })
 
   it('opens only a live sub (limit:0, since:now) — no initial fetch', async () => {
@@ -274,6 +324,34 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     await tick()
 
     assert.equal(relay.subscriptions.length, 2, 'new live sub opened after reconnect')
+
+    ac.abort()
+    await promise
+  })
+
+  it('removes a disconnected relay from readyRelays until its replacement reaches EOSE', async () => {
+    autoEoseForLiveSubscriptions = false
+    const ac = new AbortController()
+    const stream = nostr.getLiveEventsGenerator(
+      { kinds: [0] },
+      ['wss://r1'],
+      { signal: ac.signal, timeoutAfterFirstEose: 0 }
+    )
+    const { promise } = startCollecting(stream)
+
+    await tick()
+    const relay = relayRegistry.get('wss://r1')
+    relay.subscriptions[0].handlers.oneose()
+    await stream.ready
+    assert.deepEqual(stream.readyRelays, ['wss://r1'])
+
+    relay.subscriptions[0].handlers.onclose()
+    assert.deepEqual(stream.readyRelays, [])
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    await tick()
+
+    relay.subscriptions[1].handlers.oneose()
+    assert.deepEqual(stream.readyRelays, ['wss://r1'])
 
     ac.abort()
     await promise

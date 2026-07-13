@@ -488,15 +488,36 @@ export class RelayPool {
     return await methodPromise
   }
 
-  // Yields strictly live Nostr events. Each initial limit:0 subscription must reach
-  // EOSE, fail, or close before anything is exposed, so stored responses cannot leak
-  // into a live feed. Reconnects fill their own relay gap before buffered live events.
-  async * getLiveEventsGenerator (filter, relays, {
+  // Returns a strictly-live stream. `ready` reports the first initial EOSE window,
+  // while `readyRelays` follows relays that are currently past their own EOSE.
+  getLiveEventsGenerator (filter, relays, options = {}) {
+    const ready = Promise.withResolvers()
+    const readyRelays = new Set()
+    const stream = this.#getLiveEventsGenerator(filter, relays, options, { ready, readyRelays })
+
+    Object.defineProperties(stream, {
+      ready: {
+        enumerable: false,
+        value: ready.promise
+      },
+      readyRelays: {
+        enumerable: false,
+        get: () => Object.freeze([...readyRelays])
+      }
+    })
+
+    return stream
+  }
+
+  // Each relay becomes live after its own EOSE. This prevents a slow peer from
+  // suppressing already-live events from another relay.
+  async * #getLiveEventsGenerator (filter, relays, {
     signal,
+    timeoutAfterFirstEose = 500,
     timeoutForReconnectGap = 5000,
     timeoutAfterFirstReconnectGapEose = 500,
     _gapEventsGenerator = (...args) => this.getEventsGenerator(...args)
-  } = {}) {
+  } = {}, { ready, readyRelays }) {
     const urls = normalizedRelayUrls(relays)
     const queue = []
     let p = Promise.withResolvers()
@@ -504,7 +525,9 @@ export class RelayPool {
     const liveSubs = new Map() // url → live sub
     const retryTimers = new Map()
     const initialPending = new Set(urls)
-    let initialReady = false
+    const initialErrors = []
+    let readyTimer = null
+    let isReady = false
 
     // Internal abort controller to cancel any in-flight reconnect gap fills on teardown
     const gapAc = new AbortController()
@@ -524,10 +547,21 @@ export class RelayPool {
     const seenIds = new Set()
 
     let untilTimer = null
+    const finishReady = () => {
+      if (isReady) return
+      isReady = true
+      clearTimeout(readyTimer)
+      ready.resolve(Object.freeze({
+        relays: Object.freeze([...readyRelays]),
+        errors: Object.freeze([...initialErrors])
+      }))
+    }
+
     const teardown = () => {
       if (isDone) return
       isDone = true
       clearTimeout(untilTimer)
+      finishReady()
       gapAc.abort()
       for (const timer of retryTimers.values()) clearTimeout(timer)
       retryTimers.clear()
@@ -549,12 +583,30 @@ export class RelayPool {
       p = Promise.withResolvers()
     }
 
-    if (signal?.aborted) return
+    if (signal?.aborted) {
+      finishReady()
+      return
+    }
     signal?.addEventListener('abort', teardown, { once: true })
 
-    const markInitialSettled = (url) => {
-      if (!initialPending.delete(url) || initialPending.size > 0 || initialReady) return
-      initialReady = true
+    const maybeFinishInitialReady = () => {
+      if (initialPending.size === 0) finishReady()
+    }
+
+    const markInitialEose = (url) => {
+      readyRelays.add(url)
+      if (isReady) return
+      initialPending.delete(url)
+      if (timeoutAfterFirstEose !== null && !readyTimer) {
+        readyTimer = maybeUnref(setTimeout(finishReady, timeoutAfterFirstEose))
+      }
+      maybeFinishInitialReady()
+    }
+
+    const markInitialError = (url, reason) => {
+      if (!initialPending.delete(url)) return
+      initialErrors.push({ relay: url, reason })
+      maybeFinishInitialReady()
     }
 
     const scheduleReconnect = (url, reconnectDelay) => {
@@ -614,20 +666,27 @@ export class RelayPool {
           onevent: (event) => {
             // A limit:0 relay may still send retained events before EOSE. Do not
             // expose them from a strictly-live stream.
-            if (!liveEose || !initialReady) return
+            if (!liveEose) return
             if (liveBuffer) liveBuffer.push(event)
             else pushEvent(event, url)
           },
-          onclose: () => {
+          onclose: error => {
             if (liveSubs.get(url) === liveSub) liveSubs.delete(url)
             else if (liveSubs.has(url)) return
-            markInitialSettled(url)
+            readyRelays.delete(url)
+            if (!liveEose && !isDone) {
+              const reason = error instanceof Error
+                ? error
+                : new Error(error ? String(error) : 'LIVE_SUBSCRIPTION_CLOSED')
+              markInitialError(url, reason)
+            }
             if (isDone) return
             scheduleReconnect(url, reconnectDelay)
           },
           oneose: () => {
+            if (isDone || (liveSubs.has(url) && liveSubs.get(url) !== liveSub)) return
             liveEose = true
-            markInitialSettled(url)
+            markInitialEose(url)
           }
         })
         if (isDone) { liveSub.close(); return }
@@ -642,15 +701,17 @@ export class RelayPool {
           })
         }
       }).catch(err => {
-        markInitialSettled(url)
+        readyRelays.delete(url)
+        const reason = err instanceof Error ? err : new Error(String(err))
+        markInitialError(url, reason)
         if (isDone) return
-        console.error(`Live subscription error at ${url}:`, err)
+        console.error(`Live subscription error at ${url}:`, reason)
         scheduleReconnect(url, reconnectDelay)
       })
     }
 
     if (!urls.length) {
-      initialReady = true
+      finishReady()
       return
     }
 

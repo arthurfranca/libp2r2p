@@ -28,6 +28,7 @@
     "./key": "./key/index.js",
     "./network": "./network/index.js",
     "./nip44-v3": "./nip44-v3/index.js",
+    "./nip46": "./nip46/index.js",
     "./private-channel": "./private-channel/index.js",
     "./private-message": "./private-message/index.js",
     "./private-messenger": "./private-messenger/index.js",
