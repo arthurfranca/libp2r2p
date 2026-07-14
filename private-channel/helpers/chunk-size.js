@@ -30,7 +30,8 @@ function outerEventByteLengthForChunk (jsonlByteLength) {
   return eventByteLength({
     kind: PRIVATE_BROADCAST_KIND,
     created_at: MAX_TIME_SECONDS,
-    tags: [['expiration', String(MAX_TIME_SECONDS)]],
+    // Reserve the deletion capability tag used by high-level private sends.
+    tags: [['s', SAMPLE_PUBKEY], ['expiration', String(MAX_TIME_SECONDS)]],
     content: 'A'.repeat(contentByteLength),
     pubkey: SAMPLE_PUBKEY,
     id: SAMPLE_PUBKEY,

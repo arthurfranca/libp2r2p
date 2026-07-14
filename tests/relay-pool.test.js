@@ -1661,7 +1661,6 @@ describe('RelayPool.sendEvent', () => {
       onRelayResult: result => relayResults.push(result)
     })
 
-    assert.equal(early.result, null)
     assert.equal(early.total, 2)
     assert.equal(early.success, true)
     assert.deepEqual(relayResults, [{
@@ -1672,7 +1671,6 @@ describe('RelayPool.sendEvent', () => {
 
     delayed.reject(new Error('relay failed'))
     const full = await early.promise
-    assert.equal(full.result, null)
     assert.equal(full.success, true)
     assert.equal(full.total, 2)
     assert.equal(full.fulfilled, 1)
@@ -2050,7 +2048,6 @@ describe('RelayPool.sendEvent', () => {
     const early = await nostr.sendEvent({ id: 'ev1' }, [])
     const full = await early.promise
     assert.deepEqual(early, {
-      result: null,
       total: 0,
       success: false,
       promise: early.promise
@@ -2060,7 +2057,6 @@ describe('RelayPool.sendEvent', () => {
       total: 0,
       fulfilled: 0,
       errors: [],
-      result: null,
       succeededRelays: []
     })
   })

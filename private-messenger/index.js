@@ -112,6 +112,11 @@ function uniq (values) {
   return [...new Set((values || []).filter(Boolean))]
 }
 
+function normalizeAutoDeletionCapability (value) {
+  if (typeof value !== 'boolean') throw new Error('AUTO_DELETION_CAPABILITY_BOOLEAN_REQUIRED')
+  return value
+}
+
 function isPlainObject (value) {
   return value && typeof value === 'object' && !Array.isArray(value)
 }
@@ -140,6 +145,7 @@ export class PrivateMessenger {
     messageQueueMaxBytes = DEFAULT_MESSAGE_QUEUE_MAX_BYTES,
     seedQueueMaxBytes = DEFAULT_SEED_QUEUE_MAX_BYTES,
     temporaryStorageArea = globalThis.sessionStorage,
+    autoDeletionCapability = true,
     _indexedDB = globalThis.indexedDB,
     useContentKeys = true,
     onContentKeyChange,
@@ -165,6 +171,7 @@ export class PrivateMessenger {
     this.messageQueueMaxBytes = messageQueueMaxBytes
     this.seedQueueMaxBytes = seedQueueMaxBytes
     this.temporaryStorageArea = temporaryStorageArea
+    this.autoDeletionCapability = normalizeAutoDeletionCapability(autoDeletionCapability)
     this._indexedDB = _indexedDB
     this.useContentKeys = useContentKeys
     this.onContentKeyChange = onContentKeyChange
@@ -304,6 +311,9 @@ export class PrivateMessenger {
       const mode = channel.mode || defaults.mode || 'leecher'
       if (!signer && storesRecoverySeeds(mode)) throw new Error('PRIVATE_CHANNEL_WRITER_REQUIRED')
       const readerPubkey = channel.readerPubkey || channel.privateChannelReaderPubkey || await readerSigner?.getPublicKey?.() || pubkey
+      const autoDeletionCapability = channel.autoDeletionCapability === undefined
+        ? undefined
+        : normalizeAutoDeletionCapability(channel.autoDeletionCapability)
       out.push({
         pubkey,
         signer,
@@ -314,7 +324,8 @@ export class PrivateMessenger {
         sendRelays: uniq(hasChannelSendRelays ? channel.sendRelays : []),
         usesNip65WatchRelays: !hasChannelRelays && !hasDefaultRelays,
         mode,
-        seeders: uniq(channel.seeders)
+        seeders: uniq(channel.seeders),
+        autoDeletionCapability
       })
     }
     return out
@@ -794,7 +805,7 @@ export class PrivateMessenger {
     return withoutQueueMetadata(await this.queue.shift())
   }
 
-  async ask ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content }) {
+  async ask ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [receiverPubkey], relays, relayToReceivers })
     this.debugSend('ask', channelPubkey, { code, receiverPubkey })
@@ -807,6 +818,8 @@ export class PrivateMessenger {
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
       temporaryStorageArea: this.temporaryStorageArea,
+      deletionPubkey,
+      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       message,
       code,
       payload,
@@ -816,7 +829,7 @@ export class PrivateMessenger {
     })
   }
 
-  async reply ({ channelPubkey = this.defaultChannelPubkey(), question, receiverPubkey, relays, relayToReceivers, message, code, payload, error, content }) {
+  async reply ({ channelPubkey = this.defaultChannelPubkey(), question, receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const resolvedReceiverPubkey = receiverPubkey || question?.pubkey || ''
     const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [resolvedReceiverPubkey], relays, relayToReceivers })
@@ -831,6 +844,8 @@ export class PrivateMessenger {
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
       temporaryStorageArea: this.temporaryStorageArea,
+      deletionPubkey,
+      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       message,
       code,
       payload,
@@ -840,7 +855,7 @@ export class PrivateMessenger {
     })
   }
 
-  async tell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content }) {
+  async tell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [receiverPubkey], relays, relayToReceivers })
     this.debugSend('tell', channelPubkey, { code, receiverPubkey })
@@ -853,6 +868,8 @@ export class PrivateMessenger {
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
       temporaryStorageArea: this.temporaryStorageArea,
+      deletionPubkey,
+      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       message,
       code,
       payload,
@@ -862,7 +879,7 @@ export class PrivateMessenger {
     })
   }
 
-  async yell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, message, code, payload, error, content }) {
+  async yell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
     this.debugSend('yell', channelPubkey, { code, receiverPubkeys })
@@ -875,6 +892,8 @@ export class PrivateMessenger {
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
       temporaryStorageArea: this.temporaryStorageArea,
+      deletionPubkey,
+      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       message,
       code,
       payload,
@@ -884,7 +903,7 @@ export class PrivateMessenger {
     })
   }
 
-  async broadcastRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor }) {
+  async broadcastRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
     this.debugSend('broadcastRumor', channelPubkey, { receiverPubkeys })
@@ -897,12 +916,14 @@ export class PrivateMessenger {
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
       temporaryStorageArea: this.temporaryStorageArea,
+      deletionPubkey,
+      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       rumor,
       _getIykcProofs: this.contentKeyLookup()
     })
   }
 
-  async broadcastEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event }) {
+  async broadcastEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
     this.debugSend('broadcastEvent', channelPubkey, { receiverPubkeys })
@@ -915,12 +936,14 @@ export class PrivateMessenger {
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
       temporaryStorageArea: this.temporaryStorageArea,
+      deletionPubkey,
+      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       event,
       _getIykcProofs: this.contentKeyLookup()
     })
   }
 
-  async broadcastNymRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, nymSigner }) {
+  async broadcastNymRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, nymSigner, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const resolvedNymSigner = this.requireNymSigner(channel, nymSigner)
     const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
@@ -931,11 +954,13 @@ export class PrivateMessenger {
       privateChannelReaderPubkey: channel.readerPubkey,
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
+      deletionPubkey,
+      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       rumor
     })
   }
 
-  async broadcastNymEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, nymSigner }) {
+  async broadcastNymEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, nymSigner, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const resolvedNymSigner = this.requireNymSigner(channel, nymSigner)
     const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
@@ -946,6 +971,8 @@ export class PrivateMessenger {
       privateChannelReaderPubkey: channel.readerPubkey,
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
+      deletionPubkey,
+      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       event
     })
   }
@@ -964,6 +991,7 @@ export class PrivateMessenger {
       ...routing,
       expirationSeconds: this.offlineRecoverySeconds,
       temporaryStorageArea: this.temporaryStorageArea,
+      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       code: SEEDER_PRESENCE_CODE,
       payload: {},
       _getIykcProofs: this.contentKeyLookup()
@@ -1026,6 +1054,10 @@ export class PrivateMessenger {
     const channel = this.requireChannel(pubkey)
     if (!channel.signer) throw new Error('PRIVATE_CHANNEL_WRITER_REQUIRED')
     return channel
+  }
+
+  autoDeletionCapabilityFor (channel) {
+    return channel.autoDeletionCapability ?? this.autoDeletionCapability
   }
 
   requireNymSigner (channel, override) {

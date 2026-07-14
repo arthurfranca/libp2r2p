@@ -17,6 +17,7 @@ import {
   watch,
   yell
 } from '../private-message/index.js'
+import { keypairFromSeckey } from '../key/index.js'
 
 const data = new Map()
 globalThis.localStorage = {
@@ -145,7 +146,7 @@ test('ask requires watching the sender private channel first', async () => {
       receiverPubkey: 'receiver',
       relays: ['wss://relay.example'],
       message: { code: 'PING' },
-      _publish: async () => ({ results: [] })
+      _publish: async () => []
     }),
     /PRIVATE_MESSAGE_NOT_WATCHING/
   )
@@ -169,7 +170,7 @@ test('ask from a reader-only channel requires a writer signer', async () => {
       receiverPubkey: 'receiver',
       relays: ['wss://relay.example'],
       message: { code: 'PING' },
-      _publish: async () => ({ results: [] })
+      _publish: async () => []
     }),
     /PRIVATE_CHANNEL_WRITER_REQUIRED/
   )
@@ -219,7 +220,7 @@ test('ask publishes an ask rumor and watch dispatches the reply with its questio
     message: { code: 'PING', payload: { ok: true } },
     _publish: async options => {
       published = options
-      return { results: [{ success: true }] }
+      return [{ success: true }]
     }
   })
 
@@ -235,6 +236,8 @@ test('ask publishes an ask rumor and watch dispatches the reply with its questio
   assert.deepEqual(published.event.tags, [['r', 'receiver'], ['h', 'PING']])
   assert.equal(result.question.pubkey, senderPubkey)
   assert.equal(result.question.id, getEventHash({ ...published.event, pubkey: senderPubkey }))
+  assert.deepEqual(result.delivery.reports, [{ success: true }])
+  assert.equal(keypairFromSeckey(result.delivery.deletionSeckey).pubkey, published.deletionPubkey)
   assert.throws(() => getEventHash(published.event), /wrong or missing properties/)
 
   calls[0].onEvent({
@@ -258,7 +261,7 @@ test('reply tell and yell publish recognizable private message rumors', async ()
   const bobPubkey = pubkeyFixture(3)
   const _publish = async options => {
     published.push(options)
-    return { results: [] }
+    return []
   }
   const question = {
     id: 'question-id',
@@ -320,6 +323,85 @@ test('reply tell and yell publish recognizable private message rumors', async ()
   assert.deepEqual(signedResult.event, signedEvent)
 })
 
+test('private message sends share one deletion capability and return delivery reports', async () => {
+  const published = []
+  const reports = [{ success: true, total: 1 }, { success: false, total: 1 }]
+  const _publish = async options => {
+    published.push(options)
+    return reports
+  }
+
+  const generated = await tell({
+    senderSigner: signer(pubkeyFixture(3)),
+    receiverPubkey: 'alice',
+    relays: ['wss://relay.example'],
+    payload: 'managed',
+    _publish
+  })
+
+  assert.deepEqual(generated.delivery.reports, reports)
+  assert.equal(keypairFromSeckey(generated.delivery.deletionSeckey).pubkey, published[0].deletionPubkey)
+  assert.equal('results' in generated, false)
+  assert.equal('deletionPubkey' in generated, false)
+  assert.equal('deletionSeckey' in generated, false)
+
+  const supplied = await tell({
+    senderSigner: signer(pubkeyFixture(3)),
+    receiverPubkey: 'alice',
+    relays: ['wss://relay.example'],
+    payload: 'caller-managed',
+    deletionPubkey: 'A'.repeat(64),
+    _publish
+  })
+  assert.equal(published[1].deletionPubkey, 'a'.repeat(64))
+  assert.deepEqual(supplied.delivery, { reports })
+
+  const untagged = await tell({
+    senderSigner: signer(pubkeyFixture(3)),
+    receiverPubkey: 'alice',
+    relays: ['wss://relay.example'],
+    payload: 'unlinkable',
+    autoDeletionCapability: false,
+    _publish
+  })
+  assert.equal(published[2].deletionPubkey, undefined)
+  assert.deepEqual(untagged.delivery, { reports })
+
+  await assert.rejects(
+    () => tell({
+      senderSigner: signer(pubkeyFixture(3)),
+      receiverPubkey: 'alice',
+      relays: ['wss://relay.example'],
+      payload: 'bad key',
+      deletionPubkey: 'not-a-pubkey',
+      _publish
+    }),
+    /INVALID_DELETION_PUBKEY/
+  )
+  await assert.rejects(
+    () => tell({
+      senderSigner: signer(pubkeyFixture(3)),
+      receiverPubkey: 'alice',
+      relays: ['wss://relay.example'],
+      payload: 'bad secret',
+      deletionSeckey: 'b'.repeat(64),
+      _publish
+    }),
+    /DELETION_SECKEY_NOT_ACCEPTED/
+  )
+  await assert.rejects(
+    () => tell({
+      senderSigner: signer(pubkeyFixture(3)),
+      receiverPubkey: 'alice',
+      relays: ['wss://relay.example'],
+      payload: 'bad policy',
+      autoDeletionCapability: 'yes',
+      _publish
+    }),
+    /AUTO_DELETION_CAPABILITY_BOOLEAN_REQUIRED/
+  )
+})
+
 test('broadcastRumor validates normalized unsigned rumors before publishing', async () => {
   let published = false
 
@@ -370,9 +452,10 @@ test('nym broadcasts publish through the nym channel path without receivers', as
   const nymPubkey = pubkeyFixture(6)
   const channelPubkey = pubkeyFixture(7)
   const authorEvent = finalizeEvent({ kind: 9002, created_at: 30, tags: [], content: 'signed by another key' }, generateSecretKey())
+  const reports = [{ success: true, total: 1 }]
   const _publish = async options => {
     published.push(options)
-    return { results: [] }
+    return reports
   }
 
   const rumorResult = await broadcastNymRumor({
@@ -397,9 +480,13 @@ test('nym broadcasts publish through the nym channel path without receivers', as
   assert.equal(published[0].event.id, undefined)
   assert.equal(rumorResult.rumor.pubkey, nymPubkey)
   assert.equal(rumorResult.rumor.id, getEventHash({ ...published[0].event, pubkey: nymPubkey }))
+  assert.deepEqual(rumorResult.delivery.reports, reports)
+  assert.equal(keypairFromSeckey(rumorResult.delivery.deletionSeckey).pubkey, published[0].deletionPubkey)
   assert.deepEqual(published[1].event, authorEvent)
   assert.notEqual(published[1].event.pubkey, nymPubkey)
   assert.deepEqual(eventResult.event, authorEvent)
+  assert.deepEqual(eventResult.delivery.reports, reports)
+  assert.equal(keypairFromSeckey(eventResult.delivery.deletionSeckey).pubkey, published[1].deletionPubkey)
 })
 
 test('parseRumorContent only reads h tags for private message kinds', () => {

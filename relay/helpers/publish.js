@@ -79,7 +79,7 @@ export function createPublishSettlements (promises, timeout, { onSettled } = {})
 
 // Turns ordered relay settlements into a stable, caller-facing report. Failed
 // relays retain their Error while optional successful URLs make acknowledgements visible.
-export function publishSummary (settlements, relays, { result, includeSucceededRelays = false } = {}) {
+export function publishSummary (settlements, relays, { includeSucceededRelays = false } = {}) {
   const succeededRelays = []
   const errors = []
 
@@ -94,7 +94,6 @@ export function publishSummary (settlements, relays, { result, includeSucceededR
     fulfilled: succeededRelays.length,
     errors
   }
-  if (result !== undefined) summary.result = result
   if (includeSucceededRelays) summary.succeededRelays = succeededRelays
   return summary
 }

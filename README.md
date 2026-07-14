@@ -42,6 +42,90 @@ await messenger.tell({
 })
 ```
 
+### Deleting Private Broadcasts
+
+By default, each high-level private-message send creates one fresh deletion
+keypair for its logical message. Every outer kind `3560` event produced for that
+send, including router chunks, recipient subsets, and nym carriers, carries the
+same public key in its `s` tag. The result always contains `delivery.reports`.
+When libp2r2p generated the keypair, it also contains
+`delivery.deletionSeckey`; the public key can be derived from that secret.
+
+This shared `s` value deliberately makes the outer events for one logical send
+linkable to relay operators and other observers. Disable automatic capabilities
+when that tradeoff is not acceptable. The messenger-wide setting defaults to
+`true`, and a channel setting takes precedence:
+
+```js
+const messenger = await createPrivateMessenger({
+  userSigner,
+  autoDeletionCapability: false,
+  channels: [{
+    signer: privateChannelSigner,
+    relays: ['wss://relay.example'],
+    autoDeletionCapability: true
+  }]
+})
+```
+
+With automatic capabilities disabled and no caller-supplied key, the outer
+events have no `s` tag. They are not deliberately linkable through this
+extension, but cannot later be deleted with it. A caller that already owns a
+deletion key can supply its public key on an individual send; libp2r2p then
+does not generate or return a key. Use a fresh caller-owned key for each
+logical message unless cross-message linkability is intentional:
+
+```js
+import { generateKeypair } from 'libp2r2p/key'
+
+const deletionKey = generateKeypair()
+await messenger.tell({
+  receiverPubkey,
+  payload: { text: 'remove this later' },
+  deletionPubkey: deletionKey.pubkey
+})
+```
+
+```js
+import { finalizeEvent } from 'nostr-tools'
+import { keypairFromSeckey } from 'libp2r2p/key'
+import { relayPool } from 'libp2r2p/relay'
+
+const sent = await messenger.tell({
+  receiverPubkey,
+  payload: { text: 'remove this later' }
+})
+
+if (sent.delivery.deletionSeckey) {
+  const deletionKey = keypairFromSeckey(sent.delivery.deletionSeckey)
+  // Persist this secret with the application's copy of the logical message.
+
+  const { result: outerEvents } = await relayPool.getEvents({
+    kinds: [3560],
+    authors: [channelPubkey],
+    '#s': [deletionKey.pubkey]
+  }, relays)
+  for (let offset = 0; offset < outerEvents.length; offset += 100) {
+    const deletion = finalizeEvent({
+      kind: 5,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [['k', '3560'], ...outerEvents.slice(offset, offset + 100).map(event => ['e', event.id])],
+      content: ''
+    }, deletionKey.secretKey)
+    await relayPool.sendEvent(deletion, relays)
+  }
+}
+```
+
+The `s` tag is public metadata and a deletion capability, not the channel key
+or sender identity. libp2r2p does not delete anything automatically.
+
+Relay support for this capability is not universal. A relay that implements it
+should accept only a kind `5` request signed by the matching `s` key with exactly
+one `['k', '3560']` tag, explicit matching `e` targets, and no `a` tags. A
+regular NIP-09 kind `5` request signed by the outer event's private-channel key
+must not delete a kind `3560` event, whether or not that event has an `s` tag.
+
 ### Temporary Send Storage
 
 While an outgoing private message is being assembled, the messenger keeps

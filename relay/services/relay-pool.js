@@ -842,10 +842,9 @@ export class RelayPool {
     const urls = normalizedRelayUrls(relays)
     if (!urls.length) {
       const promise = Promise.resolve(publishSummary([], urls, {
-        result: null,
         includeSucceededRelays: true
       }))
-      return { result: null, total: 0, success: false, promise }
+      return { total: 0, success: false, promise }
     }
 
     const eventToSend = event.meta ? { ...event } : event
@@ -862,11 +861,10 @@ export class RelayPool {
     })
 
     // Resolves after every relay settles (or reaches the operation timeout) as
-    // { result: null, success, total, fulfilled, succeededRelays, errors },
+    // { success, total, fulfilled, succeededRelays, errors },
     // where errors contains { relay, reason } entries for failed relays.
     const promise = settlement.promise
       .then(settlements => publishSummary(settlements, urls, {
-        result: null,
         includeSucceededRelays: true
       }))
 
@@ -895,7 +893,6 @@ export class RelayPool {
     if (!success) settlement.timeout()
 
     return {
-      result: null,
       total: urls.length,
       success,
       promise

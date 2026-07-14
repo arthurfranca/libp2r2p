@@ -76,35 +76,35 @@ function fakePrivateMessage () {
     },
     ask: async options => {
       sent.push({ method: 'ask', options })
-      return { question: { id: 'question-id', kind: ASK_KIND, pubkey: 'user' }, results: [] }
+      return { question: { id: 'question-id', kind: ASK_KIND, pubkey: 'user' }, delivery: { reports: [] } }
     },
     reply: async options => {
       sent.push({ method: 'reply', options })
-      return { reply: { id: 'reply-id', kind: REPLY_KIND }, results: [] }
+      return { reply: { id: 'reply-id', kind: REPLY_KIND }, delivery: { reports: [] } }
     },
     tell: async options => {
       sent.push({ method: 'tell', options })
-      return { tell: { id: 'tell-id', kind: TELL_KIND }, results: [] }
+      return { tell: { id: 'tell-id', kind: TELL_KIND }, delivery: { reports: [] } }
     },
     yell: async options => {
       sent.push({ method: 'yell', options })
-      return { yell: { id: 'yell-id', kind: TELL_KIND }, results: [] }
+      return { yell: { id: 'yell-id', kind: TELL_KIND }, delivery: { reports: [] } }
     },
     broadcastRumor: async options => {
       sent.push({ method: 'broadcastRumor', options })
-      return { rumor: { id: 'raw-id', kind: 9001 }, results: [] }
+      return { rumor: { id: 'raw-id', kind: 9001 }, delivery: { reports: [] } }
     },
     broadcastEvent: async options => {
       sent.push({ method: 'broadcastEvent', options })
-      return { event: options.event, results: [] }
+      return { event: options.event, delivery: { reports: [] } }
     },
     broadcastNymRumor: async options => {
       sent.push({ method: 'broadcastNymRumor', options })
-      return { rumor: { id: 'nym-raw-id', kind: 9003, pubkey: options.nymSigner.getPublicKey() }, results: [] }
+      return { rumor: { id: 'nym-raw-id', kind: 9003, pubkey: options.nymSigner.getPublicKey() }, delivery: { reports: [] } }
     },
     broadcastNymEvent: async options => {
       sent.push({ method: 'broadcastNymEvent', options })
-      return { event: options.event, results: [] }
+      return { event: options.event, delivery: { reports: [] } }
     },
     unwatch: channels => stopped.push(channels),
     clearChannelState: channel => cleared.push(channel)
@@ -516,14 +516,55 @@ test('private messenger delegates send helpers with scoped signers and relays', 
     assert.deepEqual(sent.options.relays, ['wss://relay.example'])
     assert.equal(sent.options.expirationSeconds, 7 * 24 * 60 * 60)
     assert.equal(sent.options.temporaryStorageArea, globalThis.localStorage)
+    assert.equal(sent.options.autoDeletionCapability, true)
   }
   assert.equal(pm.sent[5].options.event.id, 'signed-id')
   assert.equal(pm.sent[6].options.nymSigner.getPublicKey(), 'global-nym')
   assert.equal(pm.sent[6].options.privateChannelSigner.getPublicKey(), 'channel')
   assert.deepEqual(pm.sent[6].options.relays, ['wss://relay.example'])
   assert.equal(pm.sent[6].options.expirationSeconds, 7 * 24 * 60 * 60)
+  assert.equal(pm.sent[6].options.autoDeletionCapability, true)
   assert.equal(pm.sent[7].options.nymSigner.getPublicKey(), 'global-nym')
   assert.equal(pm.sent[7].options.event.pubkey, 'author')
+  assert.equal(pm.sent[7].options.autoDeletionCapability, true)
+})
+
+test('private messenger configures automatic deletion capabilities and forwards caller pubkeys', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm, autoDeletionCapability: true }).init({
+    userSigner: signer('user'),
+    channels: [
+      { pubkey: 'inherited', signer: signer('inherited'), relays: ['wss://relay.example'] },
+      { pubkey: 'disabled', signer: signer('disabled'), relays: ['wss://relay.example'], autoDeletionCapability: false }
+    ]
+  })
+
+  await messenger.tell({ channelPubkey: 'inherited', receiverPubkey: 'alice', payload: 'default' })
+  await messenger.tell({ channelPubkey: 'disabled', receiverPubkey: 'alice', payload: 'disabled' })
+  await messenger.tell({ channelPubkey: 'disabled', receiverPubkey: 'alice', payload: 'caller-managed', deletionPubkey: 'a'.repeat(64) })
+
+  assert.equal(pm.sent[0].options.autoDeletionCapability, true)
+  assert.equal(pm.sent[1].options.autoDeletionCapability, false)
+  assert.equal(pm.sent[2].options.autoDeletionCapability, false)
+  assert.equal(pm.sent[2].options.deletionPubkey, 'a'.repeat(64))
+
+  const enabledPm = fakePrivateMessage()
+  const enabledMessenger = await new PrivateMessenger({ _privateMessage: enabledPm, autoDeletionCapability: false }).init({
+    userSigner: signer('other-user'),
+    channels: [{ pubkey: 'enabled', signer: signer('enabled'), relays: ['wss://relay.example'], autoDeletionCapability: true }]
+  })
+  await enabledMessenger.tell({ receiverPubkey: 'alice', payload: 'enabled' })
+  assert.equal(enabledPm.sent[0].options.autoDeletionCapability, true)
+
+  await messenger.tell({
+    channelPubkey: 'inherited',
+    receiverPubkey: 'alice',
+    payload: 'ignored fields',
+    deletionSeckey: 'b'.repeat(64),
+    autoDeletionCapability: false
+  })
+  assert.equal(pm.sent[3].options.deletionPubkey, undefined)
+  assert.equal(pm.sent[3].options.autoDeletionCapability, true)
 })
 
 test('private messenger update accepts only same-user replacement signers', async () => {
@@ -1084,18 +1125,20 @@ test('seeder channels publish presence immediately and on interval', async () =>
     _clearInterval: timer => cleared.push(timer)
   }).init({
     userSigner: signer('user'),
-    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'], mode: 'seeder', seeders: ['alice'] }]
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'], mode: 'seeder', seeders: ['alice'], autoDeletionCapability: false }]
   })
 
   assert.equal(pm.sent[0].method, 'yell')
   assert.equal(pm.sent[0].options.code, SEEDER_PRESENCE_CODE)
   assert.deepEqual(pm.sent[0].options.receiverPubkeys, ['alice', 'user'])
+  assert.equal(pm.sent[0].options.autoDeletionCapability, false)
   assert.equal(intervals[0].ms, 10 * 60 * 1000)
 
   await intervals[0].fn()
 
   assert.equal(pm.sent[1].method, 'yell')
   assert.equal(pm.sent[1].options.code, SEEDER_PRESENCE_CODE)
+  assert.equal(pm.sent[1].options.autoDeletionCapability, false)
 
   messenger.close()
   assert.deepEqual(cleared, intervals)

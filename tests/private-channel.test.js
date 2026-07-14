@@ -439,9 +439,45 @@ test('wrapEvent creates private broadcast events under relay event size limit', 
   assert.equal(wrapped.length, 1)
   assert.equal(wrapped[0].kind, PRIVATE_BROADCAST_KIND)
   assert.equal(wrapped[0].pubkey, await alice.getPublicKey())
+  assert.equal(wrapped[0].tags.some(tag => tag[0] === 's'), false)
   assert.ok(Number(wrapped[0].tags[0][1]) >= before + EXPIRATION_SECONDS)
   assert.ok(new TextEncoder().encode(JSON.stringify(wrapped[0])).length <= MAX_EVENT_BYTES)
   assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+})
+
+test('private broadcast wrappers share and normalize one deletion pubkey per logical message', async () => {
+  const alice = signer()
+  const bob = signer()
+  const bobPubkey = await bob.getPublicKey()
+  const deletionPubkey = 'A'.repeat(64)
+  const [wrapped] = await wrapEvent({
+    senderSigner: alice,
+    receivers: [bobPubkey],
+    deletionPubkey,
+    event: eventFixture('deletable'),
+    _getIykcProofs: noContentKeys
+  })
+
+  assert.deepEqual(wrapped.tags.find(tag => tag[0] === 's'), ['s', deletionPubkey.toLowerCase()])
+  assert.ok(Number(wrapped.tags.find(tag => tag[0] === 'expiration')?.[1]) > 0)
+  assert.deepEqual(
+    await unwrapEvent({ receiverSigner: bob, privateChannelSigner: alice, event: wrapped, receiverPubkey: bobPubkey }),
+    unwrappedFixture(eventFixture('deletable'), await alice.getPublicKey())
+  )
+
+  for (const invalidDeletionPubkey of ['', 'not-a-pubkey']) {
+    await assert.rejects(
+      () => wrapEvent({
+        senderSigner: alice,
+        receivers: [bobPubkey],
+        deletionPubkey: invalidDeletionPubkey,
+        event: eventFixture('invalid'),
+        _getIykcProofs: noContentKeys
+      }),
+      /INVALID_DELETION_PUBKEY/
+    )
+  }
+
 })
 
 test('publish splits relay-targeted routers by receiver subset with separate router pubkeys', async () => {
@@ -465,7 +501,7 @@ test('publish splits relay-targeted routers by receiver subset with separate rou
     }
   }
 
-  await publish({
+  const reports = await publish({
     senderSigner: alice,
     receivers: [bobPubkey, carolPubkey, davePubkey],
     relayToReceivers: new Map([
@@ -474,6 +510,7 @@ test('publish splits relay-targeted routers by receiver subset with separate rou
       ['wss://three.example', [carolPubkey, davePubkey]]
     ]),
     recoveryRelays: ['wss://seed.example', 'wss://one.example'],
+    deletionPubkey: 'd'.repeat(64),
     event,
     temporaryStorageArea,
     _getIykcProofs: noContentKeys,
@@ -484,6 +521,11 @@ test('publish splits relay-targeted routers by receiver subset with separate rou
   })
 
   assert.equal(published.length, 2)
+  assert.deepEqual(published.map(({ outer }) => outer.tags.find(tag => tag[0] === 's')), [
+    ['s', 'd'.repeat(64)],
+    ['s', 'd'.repeat(64)]
+  ])
+  assert.deepEqual(reports, [{ success: true }, { success: true }])
   assert.deepEqual(published[0].relays, ['wss://one.example', 'wss://two.example', 'wss://seed.example'])
   assert.deepEqual(published[1].relays, ['wss://three.example', 'wss://seed.example', 'wss://one.example'])
 
@@ -586,12 +628,13 @@ test('publishNymEvent mirrors carrier chunks to recovery relays', async () => {
   const nym = signer()
   const published = []
 
-  await publishNymEvent({
+  const reports = await publishNymEvent({
     nymSigner: nym,
     privateChannelSigner: channel,
     event: eventFixture('nym mirror'),
     relays: ['wss://receiver.example'],
     recoveryRelays: ['wss://seed.example', 'wss://receiver.example'],
+    deletionPubkey: 'e'.repeat(64),
     _publish: async (outer, relays) => {
       published.push({ outer, relays })
       return { success: true }
@@ -600,6 +643,8 @@ test('publishNymEvent mirrors carrier chunks to recovery relays', async () => {
 
   assert.equal(published.length, 1)
   assert.deepEqual(published[0].relays, ['wss://receiver.example', 'wss://seed.example'])
+  assert.deepEqual(published[0].outer.tags.find(tag => tag[0] === 's'), ['s', 'e'.repeat(64)])
+  assert.deepEqual(reports, [{ success: true }])
   assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
 })
 
@@ -913,6 +958,7 @@ test('subscribe buffers out-of-order nym carrier chunks by nym pubkey and inner 
     const wrapped = await wrapNymEvent({
       nymSigner: nym,
       privateChannelSigner: channel,
+      deletionPubkey: 'e'.repeat(64),
       event: original
     })
     const routedEvents = []
@@ -921,6 +967,7 @@ test('subscribe buffers out-of-order nym carrier chunks by nym pubkey and inner 
 
     assert.ok(wrapped.length > 1)
     for (const event of wrapped) assert.ok(new TextEncoder().encode(JSON.stringify(event)).length <= MAX_EVENT_BYTES)
+    assert.deepEqual(new Set(wrapped.map(event => event.tags.find(tag => tag[0] === 's')?.[1])), new Set(['e'.repeat(64)]))
 
     subscribe({
       privateChannelSigner: channel,
@@ -1521,10 +1568,22 @@ test('wrapEvent chunks large jsonl without oversize events and unwraps reassembl
   const imkcPubkey = await imkc.getPublicKey()
   const original = eventFixture('x'.repeat(getJsonlChunkByteSize()))
   NsecSigner.setContentSigners(alice, [imkc])
-  const wrapped = await wrapEvent({ senderSigner: alice, imkcSigner: imkc, receivers: [bobPubkey], event: original, _getIykcProofs: noContentKeys })
+  const wrapped = await wrapEvent({
+    senderSigner: alice,
+    imkcSigner: imkc,
+    receivers: [bobPubkey],
+    deletionPubkey: 'd'.repeat(64),
+    event: original,
+    _getIykcProofs: noContentKeys
+  })
 
   assert.ok(wrapped.length > 1)
-  for (const event of wrapped) assert.ok(new TextEncoder().encode(JSON.stringify(event)).length <= MAX_EVENT_BYTES)
+  const deletionPubkeys = new Set()
+  for (const event of wrapped) {
+    assert.ok(new TextEncoder().encode(JSON.stringify(event)).length <= MAX_EVENT_BYTES)
+    deletionPubkeys.add(event.tags.find(tag => tag[0] === 's')?.[1])
+  }
+  assert.deepEqual(deletionPubkeys, new Set(['d'.repeat(64)]))
 
   const routers = []
   for (const event of wrapped) {
