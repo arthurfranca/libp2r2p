@@ -1,6 +1,6 @@
 {
   "name": "libp2r2p",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "description": "Peer-to-relay-to-peer",
   "keywords": [
     "p2r2p",
@@ -11,6 +11,27 @@
   "author": "arthurfranca",
   "type": "module",
   "sideEffects": false,
+  "files": [
+    "base16",
+    "base64",
+    "base93",
+    "content-key",
+    "double-dh",
+    "ecdh",
+    "idb",
+    "idb-queue",
+    "index.js",
+    "key",
+    "network",
+    "nip44-v3",
+    "nip46",
+    "private-channel",
+    "private-message",
+    "private-messenger",
+    "relay",
+    "temporary-storage",
+    "web-storage-queue"
+  ],
   "scripts": {
     "test": "node --test --experimental-test-module-mocks 'tests/**/*.test.js'",
     "test:only": "node --test --test-only --experimental-test-module-mocks 'tests/**/*.test.js'"
@@ -19,6 +40,7 @@
     ".": "./index.js",
     "./base16": "./base16/index.js",
     "./base64": "./base64/index.js",
+    "./base93": "./base93/index.js",
     "./content-key": "./content-key/index.js",
     "./content-key/event": "./content-key/event/index.js",
     "./double-dh": "./double-dh/index.js",
