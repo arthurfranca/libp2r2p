@@ -1,6 +1,6 @@
 {
   "name": "libp2r2p",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Peer-to-relay-to-peer",
   "keywords": [
     "p2r2p",
@@ -23,6 +23,7 @@
     "index.js",
     "key",
     "network",
+    "nip19",
     "nip44-v3",
     "nip46",
     "private-channel",
@@ -49,6 +50,7 @@
     "./idb-queue": "./idb-queue/index.js",
     "./key": "./key/index.js",
     "./network": "./network/index.js",
+    "./nip19": "./nip19/index.js",
     "./nip44-v3": "./nip44-v3/index.js",
     "./nip46": "./nip46/index.js",
     "./private-channel": "./private-channel/index.js",
@@ -63,6 +65,7 @@
     "@noble/ciphers": "2.2.0",
     "@noble/curves": "2.2.0",
     "@noble/hashes": "2.2.0",
+    "@scure/base": "2.0.0",
     "nostr-tools": "2.23.5"
   },
   "devDependencies": {
