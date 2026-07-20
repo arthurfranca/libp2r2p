@@ -88,8 +88,14 @@ describe('existing entities', () => {
   const hex = 'a0a810b0fa6499358355d353884e5633c1a237c81e58044c531639590817dfa5'
 
   it('round-trips app entities without changing their format', () => {
-    const value = { dTag: '', pubkey: hex, channel: 'main', relays: [] }
+    const value = {
+      dTag: 'my-app',
+      pubkey: hex,
+      channel: 'main',
+      relays: ['wss://one.example']
+    }
     const entity = appEncode(value)
+    assert.equal(entity, '+qYizSSBIIRhTSKm6lRDGAFOSrO1KgUm2l6TMXJvogyMTKagXypXriUE4v2Q2bqqHZRDsDv2hPHzNru1PO')
     assert.ok(NAPP_ENTITY_REGEX.test(entity))
     assert.deepEqual(appDecode(entity), { ...value, kind: 35128 })
   })

@@ -1,6 +1,6 @@
 {
   "name": "libp2r2p",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Peer-to-relay-to-peer",
   "keywords": [
     "p2r2p",
@@ -13,6 +13,8 @@
   "sideEffects": false,
   "files": [
     "base16",
+    "base36",
+    "base62",
     "base64",
     "base93",
     "content-key",
@@ -40,6 +42,8 @@
   "exports": {
     ".": "./index.js",
     "./base16": "./base16/index.js",
+    "./base36": "./base36/index.js",
+    "./base62": "./base62/index.js",
     "./base64": "./base64/index.js",
     "./base93": "./base93/index.js",
     "./content-key": "./content-key/index.js",

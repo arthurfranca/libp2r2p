@@ -17,3 +17,10 @@ test('base16 helpers encode bytes and expose hex aliases', () => {
   assert.equal(bytesToHex, bytesToBase16)
   assert.equal(hexToBytes, base16ToBytes)
 })
+
+test('base16 rejects non-canonical byte input', () => {
+  assert.deepEqual(base16ToBytes(''), new Uint8Array())
+  assert.throws(() => base16ToBytes('0'), /length/)
+  assert.throws(() => base16ToBytes('0g'), /character/)
+  assert.throws(() => base16ToBytes(null), /should be a string/)
+})

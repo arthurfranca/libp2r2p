@@ -3,6 +3,9 @@
 // base64 is useful for WebAuthn credential IDs and URL/query-string material.
 
 export function bytesToBase64 (bytes) {
+  if (typeof Buffer === 'function' && typeof Buffer.from === 'function') {
+    return Buffer.from(bytes).toString('base64')
+  }
   let s = ''
   for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i])
   return btoa(s)

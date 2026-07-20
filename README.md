@@ -174,3 +174,16 @@ clearing is asynchronous too: `await messenger.clearChannel(channelPubkey)`.
 Use explicit subpath imports for bundle size. The package root re-exports the
 main messenger API for convenience, but applications that only need one piece
 should import that subpath directly.
+
+## Binary encodings
+
+Base16, Base36, Base62, Base64/Base64URL, and Base93 helpers are available
+through their matching `libp2r2p/<encoding>` subpaths. Base36 exposes both a
+binary-safe variable-width codec and the canonical 32-byte/50-character
+NsiteBase36 representation from NIP-5A. Base62 uses the same case-sensitive
+alphabet as app NIP-19 entities; its default byte mode preserves leading zero
+bytes, while integer mode supports fixed-width identifiers.
+
+In NIP-5A, "no padding" means that no separate padding character such as `=`
+is used. Leading `0` digits are nevertheless required to make every Nsite
+Base36 value exactly 50 characters long.

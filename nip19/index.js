@@ -1,15 +1,9 @@
 import { bech32 } from '@scure/base'
+import { BASE62_ALPHABET, base62ToBytes, bytesToBase62 } from '../base62/index.js'
 
 const MAX_ENTITY_SIZE = 5000
 const MAX_TLV_VALUE_SIZE = 255
 const NOSTR_APP_D_TAG_MAX_LENGTH = 260
-const BASE62_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
-const BASE62_BASE = BigInt(BASE62_ALPHABET.length)
-const BASE62_LEADER = BASE62_ALPHABET[0]
-const BASE62_CHAR_MAP = new Map(
-  [...BASE62_ALPHABET].map((character, index) => [character, BigInt(index)])
-)
-
 export const NAPP_ENTITY_REGEX = new RegExp(
   `^\\+{1,3}[${BASE62_ALPHABET}]{48,${MAX_ENTITY_SIZE}}$`
 )
@@ -175,45 +169,6 @@ export function nfileDecode (entity) {
   if (authorBytes) result.author = bytesToHex(authorBytes)
   if (mimeBytes) result.mime = decodeText(mimeBytes, 'MIME')
   if (filenameBytes) result.filename = decodeText(filenameBytes, 'filename')
-  return result
-}
-
-function bytesToBase62 (bytes) {
-  if (bytes.length === 0) return ''
-  let number = 0n
-  for (const byte of bytes) number = (number << 8n) + BigInt(byte)
-
-  let result = ''
-  if (number === 0n) return BASE62_LEADER
-  while (number > 0n) {
-    result = BASE62_ALPHABET[Number(number % BASE62_BASE)] + result
-    number /= BASE62_BASE
-  }
-  for (const byte of bytes) {
-    if (byte !== 0) break
-    result = BASE62_LEADER + result
-  }
-  return result
-}
-
-function base62ToBytes (value) {
-  if (typeof value !== 'string') throw new TypeError('Base62 value should be a string')
-  let leadingZeros = 0
-  while (value[leadingZeros] === BASE62_LEADER) leadingZeros++
-
-  let number = 0n
-  for (const character of value) {
-    const digit = BASE62_CHAR_MAP.get(character)
-    if (digit === undefined) throw new Error(`Invalid Base62 character: ${character}`)
-    number = number * BASE62_BASE + digit
-  }
-  const suffix = []
-  while (number > 0n) {
-    suffix.unshift(Number(number & 0xffn))
-    number >>= 8n
-  }
-  const result = new Uint8Array(leadingZeros + suffix.length)
-  result.set(suffix, leadingZeros)
   return result
 }
 

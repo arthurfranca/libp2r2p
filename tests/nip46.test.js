@@ -605,6 +605,35 @@ test('public client and server roles support bidirectional custom RPC and relay 
   await server.close()
 })
 
+test('client and server reply with errors for unsupported methods', async () => {
+  const relayPool = new LoopbackRelayPool()
+  const serverSecretKey = generateSecretKey()
+  const clientSecretKey = generateSecretKey()
+  const server = new Nip46ServerSession(serverSecretKey, {
+    relays: RELAYS,
+    secret: 'one-use-secret',
+    relayPool
+  })
+  await server.start({ timeout: 100 })
+
+  const client = new Nip46Client(clientSecretKey, pointer(getPublicKey(serverSecretKey)), {
+    relayPool
+  })
+  await client.connect({ timeout: 100 })
+
+  await assert.rejects(
+    client.sendRequest('unknown_server_method', [], { timeout: 100 }),
+    /NIP46_METHOD_NOT_SUPPORTED/
+  )
+  await assert.rejects(
+    server.sendRequest('unknown_client_method', [], { timeout: 100 }),
+    /NIP46_METHOD_NOT_SUPPORTED/
+  )
+
+  await client.close()
+  await server.close()
+})
+
 test('server session keeps an invalid secret from consuming its single client slot', async () => {
   const relayPool = new LoopbackRelayPool()
   const serverSecretKey = generateSecretKey()

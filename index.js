@@ -1,6 +1,8 @@
 export * from './private-messenger/index.js'
 
 export * as base16 from './base16/index.js'
+export * as base36 from './base36/index.js'
+export * as base62 from './base62/index.js'
 export * as base64 from './base64/index.js'
 export * as contentKey from './content-key/index.js'
 export * as contentKeyEvent from './content-key/event/index.js'
