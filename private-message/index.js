@@ -301,7 +301,7 @@ function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, graceful
       modeByPubkey: modesForChannels(channelList),
       receivedChunkTtlMs: maxWatchNumber(channelList, 'receivedChunkTtlMs'),
       receivedChunkMaxBytes: maxWatchNumber(channelList, 'receivedChunkMaxBytes'),
-      receivedChunkStorageArea: firstWatchValue(channelList, 'receivedChunkStorageArea'),
+      receivedChunkIndexedDB: firstWatchValue(channelList, 'receivedChunkIndexedDB'),
       ignoredGroupTtlMs: maxWatchNumber(channelList, 'ignoredGroupTtlMs'),
       ignoredGroupMaxEntries: maxWatchNumber(channelList, 'ignoredGroupMaxEntries'),
       limit: 0,
@@ -348,7 +348,7 @@ export async function watch ({
   onError,
   receivedChunkTtlMs,
   receivedChunkMaxBytes,
-  receivedChunkStorageArea,
+  receivedChunkIndexedDB,
   ignoredGroupTtlMs,
   ignoredGroupMaxEntries,
   since = nowSeconds(),
@@ -372,7 +372,7 @@ export async function watch ({
       mode,
       receivedChunkTtlMs,
       receivedChunkMaxBytes,
-      receivedChunkStorageArea,
+      receivedChunkIndexedDB,
       ignoredGroupTtlMs,
       ignoredGroupMaxEntries,
       callbacks,
@@ -388,7 +388,7 @@ export async function watch ({
       current.mode === next.mode &&
       current.receivedChunkTtlMs === next.receivedChunkTtlMs &&
       current.receivedChunkMaxBytes === next.receivedChunkMaxBytes &&
-      current.receivedChunkStorageArea === next.receivedChunkStorageArea &&
+      current.receivedChunkIndexedDB === next.receivedChunkIndexedDB &&
       current.ignoredGroupTtlMs === next.ignoredGroupTtlMs &&
       current.ignoredGroupMaxEntries === next.ignoredGroupMaxEntries
     ) {

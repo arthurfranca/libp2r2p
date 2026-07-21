@@ -13,6 +13,7 @@ import {
   SEEDER_PRESENCE_CODE
 } from '../private-messenger/index.js'
 import { TEMPORARY_STORAGE_KEYS_KEY } from '../temporary-storage/index.js'
+import { createChannelStateStore } from '../private-messenger/services/channel-state.js'
 
 const data = new Map()
 const sessionData = new Map()
@@ -47,6 +48,14 @@ function signer (pubkey) {
     getPublicKey: () => pubkey,
     withSharedKey: () => ({})
   }
+}
+
+async function seedMessengerState (channels) {
+  const state = await createChannelStateStore({
+    prefix: 'libp2r2p:private-messenger:user',
+    indexedDB: globalThis.indexedDB
+  })
+  await state.replace(channels)
 }
 
 function jsonlContent (...rows) {
@@ -179,6 +188,30 @@ test('private messenger persists queued messages in IndexedDB across instances',
 
   assert.equal((await second.nextMessage()).event.id, 'durable-id')
   assert.equal(await second.nextMessage(), null)
+})
+
+test('private messenger persists per-channel recovery state in IndexedDB', async () => {
+  const indexedDB = new IDBFactory()
+  const first = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _indexedDB: indexedDB
+  }).init({
+    userSigner: signer('state-user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  first.updateChannelState('channel', { lastSeenAt: 123 })
+  await first.flushStateWrites()
+  first.close()
+
+  const second = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _indexedDB: indexedDB
+  }).init({
+    userSigner: signer('state-user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  assert.equal(second.readState().channels.channel.lastSeenAt, 123)
 })
 
 test('private messenger leaves legacy localStorage queue records untouched', async () => {
@@ -655,11 +688,9 @@ test('private messenger reload-gap fetch uses all local read relays when channel
     'wss://user.read-two.example',
     'wss://user.read-three.example'
   ]
-  globalThis.localStorage.setItem('libp2r2p:private-messenger:user:state', JSON.stringify({
-    channels: {
-      channel: { lastSeenAt: now - 10, lastWatchedAt: now - 10 }
-    }
-  }))
+  await seedMessengerState({
+    channel: { lastSeenAt: now - 10, lastWatchedAt: now - 10 }
+  })
 
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
@@ -1035,11 +1066,9 @@ test('watch schedules reload-gap recovery and fetches missing channel window', a
   const fetches = []
   let scheduled = null
   const now = Math.floor(Date.now() / 1000)
-  globalThis.localStorage.setItem('libp2r2p:private-messenger:user:state', JSON.stringify({
-    channels: {
-      channel: { lastSeenAt: now - 10, lastWatchedAt: now - 10 }
-    }
-  }))
+  await seedMessengerState({
+    channel: { lastSeenAt: now - 10, lastWatchedAt: now - 10 }
+  })
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
     _privateChannel: {
@@ -1077,11 +1106,9 @@ test('reader-only channels fetch reload gaps with the reader signer', async () =
   const fetches = []
   let scheduled = null
   const now = Math.floor(Date.now() / 1000)
-  globalThis.localStorage.setItem('libp2r2p:private-messenger:user:state', JSON.stringify({
-    channels: {
-      channel: { lastSeenAt: now - 10, lastWatchedAt: now - 10 }
-    }
-  }))
+  await seedMessengerState({
+    channel: { lastSeenAt: now - 10, lastWatchedAt: now - 10 }
+  })
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
     _privateChannel: {
@@ -1346,11 +1373,9 @@ test('recovery asks online seeders for the relay-uncovered left edge', async () 
   const fetches = []
   let scheduled = null
   const now = Math.floor(Date.now() / 1000)
-  globalThis.localStorage.setItem('libp2r2p:private-messenger:user:state', JSON.stringify({
-    channels: {
-      channel: { lastSeenAt: now - 20, lastWatchedAt: now - 20 }
-    }
-  }))
+  await seedMessengerState({
+    channel: { lastSeenAt: now - 20, lastWatchedAt: now - 20 }
+  })
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
     _privateChannel: {

@@ -1,5 +1,6 @@
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
+import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey } from 'nostr-tools'
 import NsecSigner, { deriveSharedKey } from './helpers/test-signer.js'
 import { deriveDoubleDhConversationKey } from '../double-dh/index.js'
@@ -122,12 +123,15 @@ if (!globalThis.sessionStorage) {
 if (!globalThis.crypto) globalThis.crypto = crypto
 if (!globalThis.btoa) globalThis.btoa = s => Buffer.from(s, 'binary').toString('base64')
 if (!globalThis.atob) globalThis.atob = s => Buffer.from(s, 'base64').toString('binary')
+globalThis.indexedDB = new IDBFactory()
+globalThis.IDBKeyRange = IDBKeyRange
 
 afterEach(() => {
   pool.subscribeMany = null
   NsecSigner.releaseAll()
   globalThis.localStorage.clear()
   globalThis.sessionStorage.clear()
+  globalThis.indexedDB = new IDBFactory()
 })
 
 function signer () {
@@ -648,9 +652,9 @@ test('publishNymEvent mirrors carrier chunks to recovery relays', async () => {
   assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
 })
 
-test('received chunk default cap is proportional to private-channel chunk size', () => {
+test('received chunk default cap is 16 MiB', () => {
   assert.equal(getJsonlChunkByteSize(), 30159)
-  assert.equal(DEFAULT_RECEIVED_CHUNK_MAX_BYTES, Math.min(getJsonlChunkByteSize() * 64, 3 * 1024 * 1024))
+  assert.equal(DEFAULT_RECEIVED_CHUNK_MAX_BYTES, 16 * 1024 * 1024)
 })
 
 test('wrapEvent supports overriding the outer expiration window', async () => {
@@ -778,6 +782,8 @@ test('live-only subscribe closes its RelayPool stream', async () => {
   })
   const received = []
   let aborted = false
+  let waitingForAbort
+  const reachedAbortWait = new Promise(resolve => { waitingForAbort = resolve })
 
   const subscription = subscribe({
     receiverSigner: bob,
@@ -789,6 +795,11 @@ test('live-only subscribe closes its RelayPool stream', async () => {
     onEvent: event => received.push(event),
     _liveEventsGenerator: (_filter, _relays, { signal }) => (async function * () {
       yield wrapped
+      waitingForAbort()
+      if (signal.aborted) {
+        aborted = true
+        return
+      }
       await new Promise(resolve => signal.addEventListener('abort', () => {
         aborted = true
         resolve()
@@ -796,11 +807,12 @@ test('live-only subscribe closes its RelayPool stream', async () => {
     })()
   })
 
-  for (let attempt = 0; attempt < 20 && received.length === 0; attempt++) {
+  for (let attempt = 0; attempt < 100 && received.length === 0; attempt++) {
     await new Promise(resolve => setImmediate(resolve))
   }
   assert.deepEqual(received, [unwrappedFixture(original, await sender.getPublicKey())])
 
+  await reachedAbortWait
   subscription.close()
   for (let attempt = 0; attempt < 20 && !aborted; attempt++) {
     await new Promise(resolve => setImmediate(resolve))
@@ -1818,72 +1830,176 @@ test('subscribe evicts old ignored groups when the tombstone cache is full', asy
   }
 })
 
-test('received chunk store purges stale incomplete groups', () => {
+test('received chunk store purges stale incomplete groups', async () => {
   const originalNow = Date.now
-  const storage = (() => {
-    const data = new Map()
-    return {
-      clear: () => data.clear(),
-      getItem: key => data.has(String(key)) ? data.get(String(key)) : null,
-      removeItem: key => { data.delete(String(key)) },
-      setItem: (key, value) => { data.set(String(key), String(value)) },
-      get length () { return data.size }
-    }
-  })()
+  const indexedDB = new IDBFactory()
   let now = 1000
   Date.now = () => now
 
   try {
     const store = createReceivedChunkStore({
       prefix: 'test:received-chunks',
-      storageArea: storage,
+      indexedDB,
       ttlMs: 5
     })
-    store.put({
+    const meta = await store.put({
       channelPubkey: 'channel',
       routerPubkey: 'router',
       index: 1,
       total: 2,
-      content: 'abc'
+      contentBytes: encoder.encode('abc')
     })
 
-    assert.ok(storage.length > 0)
+    assert.equal((await store.status(meta)).received, 1)
 
     now += 6
-    store.cleanupStale()
+    await store.cleanupStale()
 
-    assert.equal(storage.length, 0)
+    assert.deepEqual(await store.status('channel:router'), { received: 0, missing: [] })
   } finally {
     Date.now = originalNow
   }
 })
 
+test('received chunk store does not revive an expired partial group', async () => {
+  const originalNow = Date.now
+  const indexedDB = new IDBFactory()
+  let now = 1000
+  Date.now = () => now
+
+  try {
+    const store = createReceivedChunkStore({
+      prefix: 'test:received-chunks:expired-arrival',
+      indexedDB,
+      ttlMs: 5
+    })
+    await store.put({
+      channelPubkey: 'channel',
+      routerPubkey: 'router',
+      index: 0,
+      total: 2,
+      contentBytes: encoder.encode('old')
+    })
+
+    now += 6
+    const meta = await store.put({
+      channelPubkey: 'channel',
+      routerPubkey: 'router',
+      index: 1,
+      total: 2,
+      contentBytes: encoder.encode('new')
+    })
+
+    assert.deepEqual(await store.status(meta), { received: 1, missing: [0] })
+  } finally {
+    Date.now = originalNow
+  }
+})
+
+test('received chunk store evicts the least-recently-used group atomically', async () => {
+  const originalNow = Date.now
+  const indexedDB = new IDBFactory()
+  let now = 1000
+  Date.now = () => now
+
+  try {
+    const store = createReceivedChunkStore({
+      prefix: 'test:received-chunks:lru',
+      indexedDB,
+      maxBytes: 6
+    })
+    await store.put({
+      channelPubkey: 'channel',
+      routerPubkey: 'recent',
+      index: 0,
+      total: 1,
+      contentBytes: new Uint8Array([1, 2])
+    })
+    now++
+    await store.put({
+      channelPubkey: 'channel',
+      routerPubkey: 'old',
+      index: 0,
+      total: 2,
+      contentBytes: new Uint8Array([3])
+    })
+    await store.put({
+      channelPubkey: 'channel',
+      routerPubkey: 'old',
+      index: 1,
+      total: 2,
+      contentBytes: new Uint8Array([4])
+    })
+
+    // A duplicate does not consume bytes, but does make the group recent.
+    now++
+    await store.put({
+      channelPubkey: 'channel',
+      routerPubkey: 'recent',
+      index: 0,
+      total: 1,
+      contentBytes: new Uint8Array([1, 2])
+    })
+    now++
+    await store.put({
+      channelPubkey: 'channel',
+      routerPubkey: 'incoming',
+      index: 0,
+      total: 1,
+      contentBytes: new Uint8Array([5, 6, 7, 8])
+    })
+
+    assert.deepEqual(await store.status('channel:old'), { received: 0, missing: [] })
+    assert.equal((await store.status('channel:recent')).received, 1)
+    assert.equal((await store.status('channel:incoming')).received, 1)
+  } finally {
+    Date.now = originalNow
+  }
+})
+
+test('received chunk store rejects a group that cannot fit without evicting unrelated data', async () => {
+  const store = createReceivedChunkStore({
+    prefix: 'test:received-chunks:too-large',
+    indexedDB: new IDBFactory(),
+    maxBytes: 3
+  })
+  await store.put({
+    channelPubkey: 'channel',
+    routerPubkey: 'kept',
+    index: 0,
+    total: 1,
+    contentBytes: new Uint8Array([1, 2])
+  })
+
+  await assert.rejects(store.put({
+    channelPubkey: 'channel',
+    routerPubkey: 'too-large',
+    index: 0,
+    total: 1,
+    contentBytes: new Uint8Array([3, 4, 5, 6])
+  }), /RECEIVED_CHUNK_GROUP_TOO_LARGE/)
+
+  assert.equal((await store.status('channel:kept')).received, 1)
+  assert.deepEqual(await store.status('channel:too-large'), { received: 0, missing: [] })
+})
+
 test('received chunk store resumes incremental parsing after reload', async () => {
-  const storage = (() => {
-    const data = new Map()
-    return {
-      clear: () => data.clear(),
-      getItem: key => data.has(String(key)) ? data.get(String(key)) : null,
-      removeItem: key => { data.delete(String(key)) },
-      setItem: (key, value) => { data.set(String(key), String(value)) },
-      get length () { return data.size }
-    }
-  })()
+  const indexedDB = new IDBFactory()
   const line = `${JSON.stringify(['alice', 'ciphertext'])}\n`
   const first = line.slice(0, 12)
   const second = line.slice(12)
   const firstStore = createReceivedChunkStore({
     prefix: 'test:received-chunks:reload',
-    storageArea: storage
+    indexedDB
   })
   const lines = []
 
-  firstStore.put({
+  await firstStore.put({
     channelPubkey: 'channel',
     routerPubkey: 'router',
     index: 0,
     total: 2,
-    content: Buffer.from(first).toString('base64')
+    contentBytes: encoder.encode(first)
   })
 
   const firstDrain = await firstStore.drainAvailable('channel:router', { onLine: line => lines.push(line) })
@@ -1895,14 +2011,14 @@ test('received chunk store resumes incremental parsing after reload', async () =
 
   const secondStore = createReceivedChunkStore({
     prefix: 'test:received-chunks:reload',
-    storageArea: storage
+    indexedDB
   })
-  secondStore.put({
+  await secondStore.put({
     channelPubkey: 'channel',
     routerPubkey: 'router',
     index: 1,
     total: 2,
-    content: Buffer.from(second).toString('base64')
+    contentBytes: encoder.encode(second)
   })
 
   const secondDrain = await secondStore.drainAvailable('channel:router', { onLine: line => lines.push(line) })

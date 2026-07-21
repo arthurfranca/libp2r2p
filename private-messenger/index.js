@@ -26,7 +26,7 @@
 // await messenger.clearChannel(channelPubkey)
 //
 // Missed-message recovery:
-// - Each watched channel stores lastSeenAt/lastWatchedAt in localStorage.
+// - Each watched channel stores lastSeenAt/lastWatchedAt in IndexedDB.
 // - Re-watching after reload fetches the gap from lastSeenAt to now.
 // - Browser offline/online events add explicit offline ranges with a small skew.
 // - Ranges older than 7 days are ignored; channel state not watched for 45 days is pruned.
@@ -42,6 +42,7 @@ import { getRelaysByPubkey, pickRelaysForPubkeys, subscribeRelayListUpdates } fr
 import * as privateChannel from '../private-channel/index.js'
 import { cleanupTemporaryStorage as cleanupTemporaryChannelStorage } from '../temporary-storage/index.js'
 import { createQueue } from '../idb-queue/index.js'
+import { createChannelStateStore } from './services/channel-state.js'
 import { DEFAULT_STALE_CHANNEL_SECONDS } from './constants/index.js'
 import {
   compactSeedNymCarriers,
@@ -121,12 +122,12 @@ function isPlainObject (value) {
   return value && typeof value === 'object' && !Array.isArray(value)
 }
 
-function storesRecoverySeeds (mode) {
-  return mode === 'seeder' || mode === 'watchtower'
-}
-
 function parseJson (raw, fallback) {
   try { return JSON.parse(raw || '') } catch { return fallback }
+}
+
+function storesRecoverySeeds (mode) {
+  return mode === 'seeder' || mode === 'watchtower'
 }
 
 export class PrivateMessenger {
@@ -195,6 +196,9 @@ export class PrivateMessenger {
     this.prefix = ''
     this.queue = null
     this.seedQueue = null
+    this.stateStore = null
+    this.state = { channels: {} }
+    this.stateWriteTail = Promise.resolve()
     this.channels = new Map()
     this.stopByChannel = new Map()
     this.presenceTimers = new Map()
@@ -229,6 +233,11 @@ export class PrivateMessenger {
       evictionPolicy: 'fifo',
       indexedDB: this._indexedDB
     })
+    this.stateStore = await createChannelStateStore({
+      prefix: this.prefix,
+      indexedDB: this._indexedDB
+    })
+    this.state = { channels: await this.stateStore.load() }
     await this.cleanupStaleChannels()
     await this.update({ userSigner, contentKeySigner, nymSigner: this.nymSigner, channels, relays, mode })
     return this
@@ -372,18 +381,25 @@ export class PrivateMessenger {
     return { relayToReceivers: derived, recoveryRelays }
   }
 
-  stateKey () {
-    return `${this.prefix}:state`
-  }
-
   readState () {
-    const state = parseJson(localStorage.getItem(this.stateKey()), { channels: {} })
-    if (!isPlainObject(state.channels)) state.channels = {}
-    return state
+    return structuredClone(this.state)
   }
 
   writeState (state) {
-    localStorage.setItem(this.stateKey(), JSON.stringify(state))
+    const next = {
+      channels: isPlainObject(state?.channels) ? structuredClone(state.channels) : {}
+    }
+    this.state = next
+    const snapshot = structuredClone(next.channels)
+    const write = this.stateWriteTail.then(() => this.stateStore.replace(snapshot))
+    this.stateWriteTail = write.catch(err => {
+      try { this.onError?.(err) } catch {}
+    })
+    return write
+  }
+
+  async flushStateWrites () {
+    await this.stateWriteTail
   }
 
   updateChannelState (pubkey, patch) {
@@ -589,6 +605,7 @@ export class PrivateMessenger {
         onSeed: seed => this.queueIncoming(() => this.enqueueSeed(pubkey, seed)),
         onContentKeyUsage: usage => this.handleContentKeyUsage(pubkey, usage),
         receivedChunkTtlMs: this.offlineRecoverySeconds * 1000,
+        receivedChunkIndexedDB: this._indexedDB,
         onError: err => this.onError?.(err)
       })
       this.stopByChannel.set(pubkey, stop)
@@ -1272,6 +1289,7 @@ export class PrivateMessenger {
             mode: channel.mode,
             modeByPubkey: { [pubkey]: channel.mode },
             receivedChunkTtlMs: this.offlineRecoverySeconds * 1000,
+            receivedChunkIndexedDB: this._indexedDB,
             onEvent: (event, outer, meta) => this.queueIncoming(() => this.enqueueRumor(eventType(event), pubkey, { event, outer, meta, payload: parseEventContent(event) })),
             onNymEvent: (event, outer, meta) => this.queueIncoming(() => this.enqueueRumor('nym', pubkey, { event, outer, meta, payload: parseEventContent(event) })),
             onSeedEvent: seed => this.queueIncoming(() => this.enqueueSeed(pubkey, seed)),
@@ -1299,6 +1317,7 @@ export class PrivateMessenger {
       this._privateMessage.clearChannelState?.(pubkey)
       this.channels.delete(pubkey)
       this.removeChannelState(pubkey)
+      await this.flushStateWrites()
       await this.queue.removeBy('byChannel', pubkey)
       await this.seedQueue.removeBy('byChannel', pubkey)
       this.ensureRelayListWatcher()
@@ -1321,6 +1340,7 @@ export class PrivateMessenger {
         await this.seedQueue?.removeBy('byChannel', pubkey)
       }
       this.writeState(state)
+      await this.flushStateWrites()
     })
   }
 

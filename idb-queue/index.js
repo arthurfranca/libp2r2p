@@ -7,6 +7,29 @@ const STATE_KEY = 'queue'
 const DEFAULT_EVICTION_HEADROOM_RATIO = 0.1
 const MAX_EVICTION_HEADROOM_BYTES = 64 * 1024 // 64 KiB
 
+/*
+IndexedDB schema, scoped per queue prefix:
+
+database `${prefix}:idb-queue`, version managed additively
+
+items, keyPath "position"
+  position  integer ordering key between the queue head and tail
+  byteSize  logical serialized size used by the queue capacity limit
+  item      caller-provided queued value
+
+items indexes
+  Declared by each createQueue() caller. A requested keyPath such as "status"
+  is stored as "item.status"; compound paths receive the same "item." prefix.
+  The database version is incremented when declared indexes need to be added.
+
+state, keyPath "key"
+  key        state record name, currently "queue"
+  head/tail  half-open range containing allocated item positions
+  usedBytes  sum of the queued items' logical byte sizes
+
+The queue state record is absent while the queue is empty.
+*/
+
 function deferred () {
   let resolve
   let reject

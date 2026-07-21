@@ -670,14 +670,14 @@ function createProcessor ({
   onError,
   receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS,
   receivedChunkMaxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES,
-  receivedChunkStorageArea,
+  receivedChunkIndexedDB = globalThis.indexedDB,
   ignoredGroupTtlMs = DEFAULT_IGNORED_GROUP_TTL_MS,
   ignoredGroupMaxEntries = DEFAULT_IGNORED_GROUP_MAX_ENTRIES
 }) {
   const receivedChunks = createReceivedChunkStore({
     ttlMs: receivedChunkTtlMs,
     maxBytes: receivedChunkMaxBytes,
-    storageArea: receivedChunkStorageArea
+    indexedDB: receivedChunkIndexedDB
   })
   const ignoredGroups = createTtlSet({
     ttlMs: ignoredGroupTtlMs,
@@ -707,14 +707,14 @@ function createProcessor ({
         groupKey = receivedChunks.groupKeyFor(channelPubkey, nymCarrierGroupId(carrier))
         if (ignoredGroups.has(groupKey)) return
 
-        const meta = receivedChunks.put({
+        const meta = await receivedChunks.put({
           channelPubkey,
           routerPubkey: nymCarrierGroupId(carrier),
           index,
           total,
-          content: JSON.stringify(carrier)
+          contentBytes: encoder.encode(JSON.stringify(carrier))
         })
-        const status = receivedChunks.status(meta)
+        const status = await receivedChunks.status(meta)
         onChunk?.({
           outer,
           nymCarrier: carrier,
@@ -726,7 +726,7 @@ function createProcessor ({
         })
         if (status.received < total) return
 
-        const carriers = receivedChunks.readChunkContents(groupKey).map(raw => JSON.parse(raw))
+        const carriers = (await receivedChunks.readChunkContents(groupKey)).map(raw => JSON.parse(raw))
         const event = eventFromNymCarriers(carriers)
         const shouldSeed = storesRecoverySeeds(channelMode)
         if (shouldSeed) {
@@ -744,7 +744,7 @@ function createProcessor ({
           carriers,
           channelPubkey
         })
-        receivedChunks.removeGroup(groupKey)
+        await receivedChunks.removeGroup(groupKey)
         return
       }
       const router = decrypted
@@ -757,14 +757,14 @@ function createProcessor ({
 
       const imkcPubkey = readImkcTag(router)
       assertValidRouterImkcProof({ router, senderPubkey, imkcPubkey, imkcProof: readImkcProof(router) })
-      const meta = receivedChunks.put({
+      const meta = await receivedChunks.put({
         channelPubkey,
         routerPubkey: router.pubkey,
         index,
         total,
-        content: router.content
+        contentBytes: base64ToBytes(router.content)
       })
-      const status = receivedChunks.status(meta)
+      const status = await receivedChunks.status(meta)
       onChunk?.({
         outer,
         router,
@@ -826,15 +826,15 @@ function createProcessor ({
       if (event && !mustScanWholeBundle) {
         await onEvent?.(event, outer, { router: joinedRouter(router), channelPubkey })
         ignoredGroups.add(groupKey)
-        receivedChunks.removeGroup(groupKey)
+        await receivedChunks.removeGroup(groupKey)
         return
       }
 
       if (!drained.complete) return
 
       const receiverPubkeys = drained.meta?.receiverPubkeys || []
-      const content = shouldSeed ? receivedChunks.readEnvelopeBundleContent(groupKey) : ''
-      const jsonl = shouldSeed ? receivedChunks.readEnvelopeBundleText(groupKey) : ''
+      const content = shouldSeed ? await receivedChunks.readEnvelopeBundleContent(groupKey) : ''
+      const jsonl = shouldSeed ? await receivedChunks.readEnvelopeBundleText(groupKey) : ''
       const completeRouter = joinedRouter(router, content)
 
       emitSentContentKeyUsage({
@@ -848,11 +848,11 @@ function createProcessor ({
       if (shouldSeed) await onSeedEvent?.({ recordType: 'routerRow_v1', outer, router: completeRouter, channelPubkey, jsonl, innerEventIdsByRowIndex })
       if (event) await onEvent?.(event, outer, { router: completeRouter, channelPubkey, jsonl })
 
-      receivedChunks.removeGroup(groupKey)
+      await receivedChunks.removeGroup(groupKey)
     } catch (err) {
       if (shouldIgnoreGroupError(err) && groupKey) {
         ignoredGroups.add(groupKey)
-        receivedChunks.removeGroup(groupKey)
+        await receivedChunks.removeGroup(groupKey).catch(() => {})
       }
       onError?.(err)
     }
@@ -875,13 +875,14 @@ function shouldIgnoreGroupError (err) {
     'INVALID_RECIPIENT_ENVELOPE',
     'INVALID_SIGNED_INNER_EVENT',
     'MISSING_PAYLOAD_ENVELOPE',
+    'RECEIVED_CHUNK_GROUP_TOO_LARGE',
     'MISMATCHED_NYM_CARRIER_CHUNKS',
     'MISSING_NYM_CARRIER_CHUNK',
     'MISSING_NYM_CARRIER_ID'
   ].includes(err?.message)
 }
 
-export async function fetch ({ receiverSigner, iykcSigner, privateChannelSigner = receiverSigner, privateChannelSignersByPubkey, privateChannelReaderSigner = privateChannelSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, privateChannelPubkey, privateChannelPubkeys, receiverPubkey, relays, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, since, until, limit, mode = 'leecher', modeByPubkey, receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS, receivedChunkMaxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES, receivedChunkStorageArea, ignoredGroupTtlMs = DEFAULT_IGNORED_GROUP_TTL_MS, ignoredGroupMaxEntries = DEFAULT_IGNORED_GROUP_MAX_ENTRIES, _getEvents = getEvents }) {
+export async function fetch ({ receiverSigner, iykcSigner, privateChannelSigner = receiverSigner, privateChannelSignersByPubkey, privateChannelReaderSigner = privateChannelSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, privateChannelPubkey, privateChannelPubkeys, receiverPubkey, relays, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, since, until, limit, mode = 'leecher', modeByPubkey, receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS, receivedChunkMaxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES, receivedChunkIndexedDB = globalThis.indexedDB, ignoredGroupTtlMs = DEFAULT_IGNORED_GROUP_TTL_MS, ignoredGroupMaxEntries = DEFAULT_IGNORED_GROUP_MAX_ENTRIES, _getEvents = getEvents }) {
   if (!relays?.length) throw new Error('NO_RELAYS')
   const authors = privateChannelPubkeyList({ privateChannelPubkey, privateChannelPubkeys })
   const filter = { kinds: [PRIVATE_BROADCAST_KIND] }
@@ -895,12 +896,12 @@ export async function fetch ({ receiverSigner, iykcSigner, privateChannelSigner 
     timeoutAfterFirstEose: null
   })
   events.sort((a, b) => a.created_at - b.created_at)
-  const processOuterEvent = createProcessor({ receiverSigner, iykcSigner, privateChannelSigner, privateChannelSignersByPubkey, privateChannelReaderSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, receiverPubkey, mode, modeByPubkey, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, receivedChunkTtlMs, receivedChunkMaxBytes, receivedChunkStorageArea, ignoredGroupTtlMs, ignoredGroupMaxEntries })
+  const processOuterEvent = createProcessor({ receiverSigner, iykcSigner, privateChannelSigner, privateChannelSignersByPubkey, privateChannelReaderSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, receiverPubkey, mode, modeByPubkey, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, receivedChunkTtlMs, receivedChunkMaxBytes, receivedChunkIndexedDB, ignoredGroupTtlMs, ignoredGroupMaxEntries })
   for (const event of events) await processOuterEvent(event)
   return events
 }
 
-export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = receiverSigner, privateChannelSignersByPubkey, privateChannelReaderSigner = privateChannelSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, privateChannelPubkey, privateChannelPubkeys, receiverPubkey, relays, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, since = nowSeconds() - 5, limit, liveOnly = false, mode = 'leecher', modeByPubkey, receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS, receivedChunkMaxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES, receivedChunkStorageArea, ignoredGroupTtlMs = DEFAULT_IGNORED_GROUP_TTL_MS, ignoredGroupMaxEntries = DEFAULT_IGNORED_GROUP_MAX_ENTRIES, _liveEventsGenerator = getLiveEventsGenerator, _eventsFeedGenerator = getEventsFeedGenerator }) {
+export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = receiverSigner, privateChannelSignersByPubkey, privateChannelReaderSigner = privateChannelSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, privateChannelPubkey, privateChannelPubkeys, receiverPubkey, relays, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, since = nowSeconds() - 5, limit, liveOnly = false, mode = 'leecher', modeByPubkey, receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS, receivedChunkMaxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES, receivedChunkIndexedDB = globalThis.indexedDB, ignoredGroupTtlMs = DEFAULT_IGNORED_GROUP_TTL_MS, ignoredGroupMaxEntries = DEFAULT_IGNORED_GROUP_MAX_ENTRIES, _liveEventsGenerator = getLiveEventsGenerator, _eventsFeedGenerator = getEventsFeedGenerator }) {
   if (!relays?.length) throw new Error('NO_RELAYS')
   if (receiverSigner && !receiverSigner?.nip44DecryptDoubleDH && !receiverSigner?.nip44v3Decrypt) throw new Error('RECEIVER_SIGNER_NIP44V3_DECRYPT_UNSUPPORTED')
   if (!privateChannelReaderSigner && !privateChannelReaderSignersByPubkey && !privateChannelSigner && !privateChannelSignersByPubkey) throw new Error('PRIVATE_CHANNEL_READER_REQUIRED')
@@ -909,7 +910,7 @@ export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = 
   const filter = { kinds: [PRIVATE_BROADCAST_KIND], since }
   if (authors.length) filter.authors = authors
   if (limit != null) filter.limit = limit
-  const processOuterEvent = createProcessor({ receiverSigner, iykcSigner, privateChannelSigner, privateChannelSignersByPubkey, privateChannelReaderSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, receiverPubkey, mode, modeByPubkey, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, receivedChunkTtlMs, receivedChunkMaxBytes, receivedChunkStorageArea, ignoredGroupTtlMs, ignoredGroupMaxEntries })
+  const processOuterEvent = createProcessor({ receiverSigner, iykcSigner, privateChannelSigner, privateChannelSignersByPubkey, privateChannelReaderSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, receiverPubkey, mode, modeByPubkey, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, receivedChunkTtlMs, receivedChunkMaxBytes, receivedChunkIndexedDB, ignoredGroupTtlMs, ignoredGroupMaxEntries })
   const controller = new AbortController()
   const events = liveOnly
     ? _liveEventsGenerator(filter, relays, {

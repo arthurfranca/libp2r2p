@@ -148,6 +148,16 @@ does not clear persisted messages, recovery material, or channel state. Pass
 `temporaryStorageArea: localStorage` when constructing a messenger to opt into
 a different Storage area.
 
+Recovery metadata is separate from that temporary send staging. Per-channel
+`lastSeenAt`, offline ranges, and related state are stored in IndexedDB. Raw
+incomplete receive chunks are also stored in IndexedDB, expire after one hour,
+and share a 16 MiB logical budget. Capacity eviction removes whole
+least-recently-used message groups so a partial group is never mistaken for a
+complete one. `receivedChunkTtlMs`, `receivedChunkMaxBytes`, and
+`receivedChunkIndexedDB` may be supplied to the private-channel APIs when an
+embedding environment needs different limits or an injected IDB factory.
+Legacy Web Storage recovery records are neither read nor migrated.
+
 Signers are expected to expose the Nostr-style methods used by the messenger,
 including `getPublicKey()`, `signEvent(event)`, and the NIP-44 v3 methods
 needed by private channels. For double-DH content-key use, pass a
