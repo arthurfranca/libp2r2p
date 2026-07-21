@@ -83,14 +83,14 @@ export function base36ToBase16 (value) {
 // NIP-5A treats a raw 32-byte value as one unsigned integer and represents it
 // as exactly 50 lowercase Base36 digits. Its leading zeros are numeric width,
 // not zero-byte markers as they are in the binary-safe codec above.
-export function bytesToNsiteBase36 (bytes) {
+export function bytesToBase36Nsite (bytes) {
   if (bytes.length !== NSITE_BYTE_LENGTH) {
     throw new Error('Nsite Base36 input should be ' + NSITE_BYTE_LENGTH + ' bytes')
   }
   return integerToBase36(bytesToInteger(bytes)).padStart(NSITE_TEXT_LENGTH, LEADER)
 }
 
-export function nsiteBase36ToBytes (value) {
+export function base36NsiteToBytes (value) {
   if (typeof value !== 'string') throw new TypeError('Nsite Base36 value should be a string')
   if (value.length !== NSITE_TEXT_LENGTH) {
     throw new Error('Nsite Base36 value should be ' + NSITE_TEXT_LENGTH + ' characters')
@@ -105,10 +105,10 @@ export function nsiteBase36ToBytes (value) {
   return result
 }
 
-export function base16ToNsiteBase36 (value) {
-  return bytesToNsiteBase36(base16ToBytes(value))
+export function base16ToBase36Nsite (value) {
+  return bytesToBase36Nsite(base16ToBytes(value))
 }
 
-export function nsiteBase36ToBase16 (value) {
-  return bytesToBase16(nsiteBase36ToBytes(value))
+export function base36NsiteToBase16 (value) {
+  return bytesToBase16(base36NsiteToBytes(value))
 }

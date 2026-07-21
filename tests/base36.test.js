@@ -4,13 +4,13 @@ import assert from 'node:assert/strict'
 import {
   BASE36_ALPHABET,
   base16ToBase36,
-  base16ToNsiteBase36,
+  base16ToBase36Nsite,
+  base36NsiteToBase16,
+  base36NsiteToBytes,
   base36ToBase16,
   base36ToBytes,
   bytesToBase36,
-  bytesToNsiteBase36,
-  nsiteBase36ToBase16,
-  nsiteBase36ToBytes
+  bytesToBase36Nsite
 } from '../base36/index.js'
 import { bytesToBase16 } from '../base16/index.js'
 
@@ -54,29 +54,29 @@ test('nsite base36 matches the canonical NIP-5A representation', () => {
   const referenceHex = '0123456789abcdef'.repeat(4)
   const referenceBase36 = '010r2curot7aoi80l0gyf25bl7y111lpgrb8bzoi8f0c1uhmgf'
 
-  assert.equal(base16ToNsiteBase36(referenceHex), referenceBase36)
-  assert.equal(nsiteBase36ToBase16(referenceBase36), referenceHex)
-  assert.equal(base16ToNsiteBase36('0'.repeat(64)), '0'.repeat(50))
-  assert.equal(nsiteBase36ToBase16('0'.repeat(50)), '0'.repeat(64))
+  assert.equal(base16ToBase36Nsite(referenceHex), referenceBase36)
+  assert.equal(base36NsiteToBase16(referenceBase36), referenceHex)
+  assert.equal(base16ToBase36Nsite('0'.repeat(64)), '0'.repeat(50))
+  assert.equal(base36NsiteToBase16('0'.repeat(50)), '0'.repeat(64))
   assert.equal(
-    base16ToNsiteBase36('0'.repeat(62) + 'ff'),
+    base16ToBase36Nsite('0'.repeat(62) + 'ff'),
     '0'.repeat(48) + '73'
   )
   assert.equal(
-    base16ToNsiteBase36('f'.repeat(64)),
+    base16ToBase36Nsite('f'.repeat(64)),
     '6dp5qcb22im238nr3wvp0ic7q99w035jmy2iw7i6n43d37jtof'
   )
 })
 
 test('nsite base36 strictly validates width, alphabet, and 256-bit range', () => {
-  assert.throws(() => bytesToNsiteBase36(new Uint8Array(31)), /32 bytes/)
-  assert.throws(() => base16ToNsiteBase36('00'.repeat(31)), /32 bytes/)
-  assert.throws(() => nsiteBase36ToBytes('0'.repeat(49)), /50 characters/)
-  assert.throws(() => nsiteBase36ToBytes('0'.repeat(51)), /50 characters/)
-  assert.throws(() => nsiteBase36ToBytes('0'.repeat(49) + 'A'), /character/)
-  assert.throws(() => nsiteBase36ToBytes('0'.repeat(49) + '-'), /character/)
+  assert.throws(() => bytesToBase36Nsite(new Uint8Array(31)), /32 bytes/)
+  assert.throws(() => base16ToBase36Nsite('00'.repeat(31)), /32 bytes/)
+  assert.throws(() => base36NsiteToBytes('0'.repeat(49)), /50 characters/)
+  assert.throws(() => base36NsiteToBytes('0'.repeat(51)), /50 characters/)
+  assert.throws(() => base36NsiteToBytes('0'.repeat(49) + 'A'), /character/)
+  assert.throws(() => base36NsiteToBytes('0'.repeat(49) + '-'), /character/)
   assert.throws(
-    () => nsiteBase36ToBytes('6dp5qcb22im238nr3wvp0ic7q99w035jmy2iw7i6n43d37jtog'),
+    () => base36NsiteToBytes('6dp5qcb22im238nr3wvp0ic7q99w035jmy2iw7i6n43d37jtog'),
     /exceeds 32 bytes/
   )
 })
@@ -86,7 +86,7 @@ test('nsite base36 keeps the established 44billion 50-character output', () => {
     const bytes = Uint8Array.from({ length: 32 }, (_, index) => (seed * 131 + index * 73) & 0xff)
     const hex = bytesToBase16(bytes)
     const legacy = BigInt('0x' + hex).toString(36).padStart(50, '0')
-    assert.equal(bytesToNsiteBase36(bytes), legacy)
-    assert.deepEqual(nsiteBase36ToBytes(legacy), bytes)
+    assert.equal(bytesToBase36Nsite(bytes), legacy)
+    assert.deepEqual(base36NsiteToBytes(legacy), bytes)
   }
 })
