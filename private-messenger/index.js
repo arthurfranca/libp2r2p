@@ -3,6 +3,8 @@
 //   userSigner,
 //   contentKeySigner, // optional when userSigner handles content keys internally
 //   nymSigner: optionalDefaultNymSigner,
+//   staleChannelSeconds: optionalStaleChannelRetention,
+//   identityStorageRetentionSeconds: optionalIdentityStorageRetention,
 //   channels: [{ signer: privateChannelSigner, relays, mode: 'leecher', seeders: optionalSeederPubkeys, offlineRecoverySeconds: optionalChannelOverride }],
 //   onContentKeyChange: event => reviewContentKeyUse(event),
 //   onError: err => reportPrivateMessengerError(err)
@@ -30,7 +32,7 @@
 // - Re-watching after reload fetches the gap from lastSeenAt to now.
 // - Browser offline/online events add explicit offline ranges with a small skew.
 // - Recovery defaults to 7 days and can be overridden per channel; zero disables durable recovery.
-// - Channel state not watched for 45 days is pruned.
+// - Channel state not actively leased or watched within the configured stale window is pruned.
 // - Seeders announce presence every 10min and are used for the relay-uncovered left edge of a missed range.
 // - Configured seeders are all asked; auto-discovered seeders are capped to the 8 most recently active.
 // - Seeder/watchtower channels store reconstructed router events in a separate IndexedDB queue and auto-reply to recovery asks.
@@ -47,9 +49,11 @@ import { createChannelStateStore } from './services/channel-state.js'
 import { DEFAULT_STALE_CHANNEL_SECONDS } from './constants/index.js'
 import {
   activatePrivateMessengerStorage,
+  DEFAULT_IDENTITY_STORAGE_RETENTION_SECONDS,
   maintainPrivateMessengerStorage,
   PRIVATE_MESSENGER_STORAGE_HEARTBEAT_MS,
   PRIVATE_MESSENGER_STORAGE_MAINTENANCE_MS,
+  readPrivateMessengerStorage,
   releasePrivateMessengerStorage
 } from './services/storage-maintenance.js'
 import {
@@ -66,6 +70,7 @@ import {
 } from './recovery/index.js'
 
 export { DEFAULT_STALE_CHANNEL_SECONDS } from './constants/index.js'
+export { DEFAULT_IDENTITY_STORAGE_RETENTION_SECONDS } from './services/storage-maintenance.js'
 export {
   compactSeedNymCarriers,
   compactSeedRouterRows,
@@ -81,6 +86,7 @@ export {
 
 const DEFAULT_OFFLINE_RECOVERY_SECONDS = 7 * 24 * 60 * 60
 const MAX_OFFLINE_RECOVERY_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1000)
+const STORAGE_POLICY_BROADCAST_CHANNEL = 'libp2r2p:private-messenger:storage-policy'
 const DEFAULT_OFFLINE_SKEW_SECONDS = 30
 const DEFAULT_RELOAD_GAP_DELAY_MS = 500
 const DEFAULT_SEEDER_PRESENCE_INTERVAL_MS = 10 * 60 * 1000
@@ -125,6 +131,20 @@ function normalizeOfflineRecoverySeconds (value) {
   return value
 }
 
+function normalizeStaleChannelSeconds (value) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_OFFLINE_RECOVERY_SECONDS) {
+    throw new Error('INVALID_STALE_CHANNEL_SECONDS')
+  }
+  return value
+}
+
+function normalizeIdentityStorageRetentionSeconds (value) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_OFFLINE_RECOVERY_SECONDS) {
+    throw new Error('INVALID_IDENTITY_STORAGE_RETENTION_SECONDS')
+  }
+  return value
+}
+
 function uniq (values) {
   return [...new Set((values || []).filter(Boolean))]
 }
@@ -140,6 +160,10 @@ function isPlainObject (value) {
 
 function parseJson (raw, fallback) {
   try { return JSON.parse(raw || '') } catch { return fallback }
+}
+
+function sameStateValue (left, right) {
+  return JSON.stringify(left) === JSON.stringify(right)
 }
 
 function storesRecoverySeeds (mode) {
@@ -164,6 +188,7 @@ export class PrivateMessenger {
   constructor ({
     offlineRecoverySeconds = DEFAULT_OFFLINE_RECOVERY_SECONDS,
     staleChannelSeconds = DEFAULT_STALE_CHANNEL_SECONDS,
+    identityStorageRetentionSeconds = DEFAULT_IDENTITY_STORAGE_RETENTION_SECONDS,
     offlineSkewSeconds = DEFAULT_OFFLINE_SKEW_SECONDS,
     reloadGapDelayMs = DEFAULT_RELOAD_GAP_DELAY_MS,
     seederPresenceIntervalMs = DEFAULT_SEEDER_PRESENCE_INTERVAL_MS,
@@ -188,10 +213,12 @@ export class PrivateMessenger {
     _setInterval = globalThis.setInterval.bind(globalThis),
     _clearInterval = globalThis.clearInterval.bind(globalThis),
     _storageSetInterval = globalThis.setInterval.bind(globalThis),
-    _storageClearInterval = globalThis.clearInterval.bind(globalThis)
+    _storageClearInterval = globalThis.clearInterval.bind(globalThis),
+    _BroadcastChannel = _indexedDB === globalThis.indexedDB ? globalThis.BroadcastChannel : undefined
   } = {}) {
     this.offlineRecoverySeconds = normalizeOfflineRecoverySeconds(offlineRecoverySeconds)
-    this.staleChannelSeconds = staleChannelSeconds
+    this.staleChannelSeconds = normalizeStaleChannelSeconds(staleChannelSeconds)
+    this.identityStorageRetentionSeconds = normalizeIdentityStorageRetentionSeconds(identityStorageRetentionSeconds)
     this.offlineSkewSeconds = offlineSkewSeconds
     this.reloadGapDelayMs = reloadGapDelayMs
     this.seederPresenceIntervalMs = seederPresenceIntervalMs
@@ -217,6 +244,7 @@ export class PrivateMessenger {
     this._clearInterval = _clearInterval
     this._storageSetInterval = _storageSetInterval
     this._storageClearInterval = _storageClearInterval
+    this._BroadcastChannel = _BroadcastChannel
 
     this.userSigner = null
     this.contentKeySigner = null
@@ -245,6 +273,10 @@ export class PrivateMessenger {
     this.storageHeartbeatTimer = null
     this.storageMaintenanceTimer = null
     this.storageMaintenancePromise = null
+    this.storagePolicyRevision = 0
+    this.storagePolicyNeedsApply = false
+    this.storagePolicyBroadcast = null
+    this.storagePolicyRefreshTail = Promise.resolve()
     this.closePromise = null
     this.initSettledPromise = null
     this.initialized = false
@@ -264,13 +296,20 @@ export class PrivateMessenger {
       this.nymSigner = nymSigner || null
       this.userPubkey = await userSigner.getPublicKey()
       this.prefix = `libp2r2p:private-messenger:${this.userPubkey}`
-      await activatePrivateMessengerStorage({
+      const storageSnapshot = await activatePrivateMessengerStorage({
         userPubkey: this.userPubkey,
         leaseId: this.storageLeaseId,
+        activeChannelPubkeys: [],
+        storagePolicy: {
+          staleChannelSeconds: this.staleChannelSeconds,
+          identityStorageRetentionSeconds: this.identityStorageRetentionSeconds
+        },
         indexedDB: this._indexedDB
       })
+      this.applyStoragePolicySnapshot(storageSnapshot)
       this.storageActive = true
       this.lastStorageTouch = Date.now()
+      this.startStoragePolicyBroadcast()
       this.assertOpen()
       await PrivateMessenger.maintainStorage({
         indexedDB: this._indexedDB,
@@ -302,13 +341,15 @@ export class PrivateMessenger {
       this.assertOpen()
       this.startStorageMaintenance()
       this.state = { channels: await this.stateStore.load() }
-      await this.cleanupStaleChannels()
       await this.update({ userSigner, contentKeySigner, nymSigner: this.nymSigner, channels, relays, mode })
       await this.pruneStoredSeeds()
       this.initialized = true
+      await this.refreshAndApplyStoragePolicy()
+      this.broadcastStoragePolicyChange()
       return this
     } catch (err) {
       this.stopStorageMaintenance()
+      this.stopStoragePolicyBroadcast()
       try { await this.queueOperationTail } catch {}
       try { await this.stateWriteTail } catch {}
       await Promise.allSettled([
@@ -338,10 +379,102 @@ export class PrivateMessenger {
     if (this.closePromise) throw new Error('PRIVATE_MESSENGER_CLOSED')
   }
 
+  applyStoragePolicySnapshot (snapshot) {
+    if (!snapshot) return false
+    const staleChannelSeconds = normalizeStaleChannelSeconds(snapshot.staleChannelSeconds)
+    const identityStorageRetentionSeconds = normalizeIdentityStorageRetentionSeconds(
+      snapshot.identityStorageRetentionSeconds
+    )
+    const policyRevision = Math.max(0, Number(snapshot.policyRevision) || 0)
+    const changed = this.staleChannelSeconds !== staleChannelSeconds ||
+      this.identityStorageRetentionSeconds !== identityStorageRetentionSeconds
+    this.staleChannelSeconds = staleChannelSeconds
+    this.identityStorageRetentionSeconds = identityStorageRetentionSeconds
+    this.storagePolicyRevision = policyRevision
+    if (changed && this.initialized) this.storagePolicyNeedsApply = true
+    return changed
+  }
+
+  startStoragePolicyBroadcast () {
+    if (this.storagePolicyBroadcast || typeof this._BroadcastChannel !== 'function') return
+    try {
+      const channel = new this._BroadcastChannel(STORAGE_POLICY_BROADCAST_CHANNEL)
+      channel.unref?.()
+      channel.onmessage = event => {
+        const message = event?.data
+        if (message?.userPubkey !== this.userPubkey) return
+        if (!Number.isSafeInteger(message.policyRevision) || message.policyRevision <= (this.storagePolicyRevision || 0)) return
+        this.refreshAndApplyStoragePolicy().catch(err => {
+          try { this.onError?.(err) } catch {}
+        })
+      }
+      this.storagePolicyBroadcast = channel
+    } catch {}
+  }
+
+  stopStoragePolicyBroadcast () {
+    const channel = this.storagePolicyBroadcast
+    this.storagePolicyBroadcast = null
+    if (!channel) return
+    channel.onmessage = null
+    channel.close?.()
+  }
+
+  broadcastStoragePolicyChange () {
+    try {
+      this.storagePolicyBroadcast?.postMessage({
+        userPubkey: this.userPubkey,
+        policyRevision: this.storagePolicyRevision || 0
+      })
+    } catch (err) {
+      try { this.onError?.(err) } catch {}
+    }
+  }
+
+  async readStoragePolicySnapshot () {
+    if (!this.userPubkey) return null
+    const snapshot = await readPrivateMessengerStorage({
+      userPubkey: this.userPubkey,
+      indexedDB: this._indexedDB
+    })
+    this.applyStoragePolicySnapshot(snapshot)
+    return snapshot
+  }
+
+  async applyPendingStoragePolicy () {
+    if (!this.storagePolicyNeedsApply || !this.initialized || this.closePromise) return false
+    this.storagePolicyNeedsApply = false
+    try {
+      const channels = [...this.channels.values()]
+      await this.applyRecoveryPolicies(channels)
+      await this.cleanupStaleChannels()
+      const pubkeys = [...this.channels.keys()]
+      if (pubkeys.length) {
+        await this.unwatch(pubkeys)
+        await this.watch(pubkeys)
+      }
+      await this.reconcilePresencePublishers()
+      return true
+    } catch (err) {
+      this.storagePolicyNeedsApply = true
+      throw err
+    }
+  }
+
+  refreshAndApplyStoragePolicy () {
+    const previous = this.storagePolicyRefreshTail || Promise.resolve()
+    const refresh = previous.catch(() => {}).then(async () => {
+      await this.readStoragePolicySnapshot()
+      return this.applyPendingStoragePolicy()
+    })
+    this.storagePolicyRefreshTail = refresh
+    return refresh
+  }
+
   startStorageMaintenance () {
     if (this.storageHeartbeatTimer || this.storageMaintenanceTimer) return
     this.storageHeartbeatTimer = this._storageSetInterval(() => (
-      this.touchStorageActivity({ force: true }).catch(err => {
+      this.runStorageHeartbeat().catch(err => {
         try { this.onError?.(err) } catch {}
       })
     ), PRIVATE_MESSENGER_STORAGE_HEARTBEAT_MS)
@@ -362,19 +495,27 @@ export class PrivateMessenger {
 
   runStorageMaintenance () {
     if (this.storageMaintenancePromise) return this.storageMaintenancePromise
-    const maintenance = Promise.all([
-      PrivateMessenger.maintainStorage({
+    const maintenance = (async () => {
+      await PrivateMessenger.maintainStorage({
         indexedDB: this._indexedDB,
         temporaryStorageArea: this.temporaryStorageArea
-      }),
-      this.pruneStoredSeeds()
-    ]).catch(err => {
+      })
+      await this.refreshAndApplyStoragePolicy()
+      await this.cleanupStaleChannels()
+      await this.pruneStoredSeeds()
+    })().catch(err => {
       try { this.onError?.(err) } catch {}
     }).finally(() => {
       if (this.storageMaintenancePromise === maintenance) this.storageMaintenancePromise = null
     })
     this.storageMaintenancePromise = maintenance
     return maintenance
+  }
+
+  async runStorageHeartbeat () {
+    await this.stampActiveChannelActivity()
+    await this.touchStorageActivity({ force: true })
+    await this.applyPendingStoragePolicy()
   }
 
   async touchStorageActivity ({ force = false } = {}) {
@@ -387,9 +528,13 @@ export class PrivateMessenger {
     const touch = activatePrivateMessengerStorage({
       userPubkey: this.userPubkey,
       leaseId: this.storageLeaseId,
+      activeChannelPubkeys: [...this.channels.keys()],
       indexedDB: this._indexedDB,
       now
-    }).then(() => true, err => {
+    }).then(snapshot => {
+      this.applyStoragePolicySnapshot(snapshot)
+      return true
+    }, err => {
       this.lastStorageTouch = previousTouch
       throw err
     }).finally(() => {
@@ -435,8 +580,24 @@ export class PrivateMessenger {
     })
   }
 
-  async update ({ userSigner = this.userSigner, contentKeySigner = this.contentKeySigner, nymSigner = this.nymSigner, channels = [...this.channels.values()], relays = [], mode = 'leecher' } = {}) {
+  async update (options = {}) {
     this.assertOpen()
+    const {
+      userSigner = this.userSigner,
+      contentKeySigner = this.contentKeySigner,
+      nymSigner = this.nymSigner,
+      channels = [...this.channels.values()],
+      relays = [],
+      mode = 'leecher'
+    } = options
+    const updatesStalePolicy = Object.hasOwn(options, 'staleChannelSeconds')
+    const updatesIdentityPolicy = Object.hasOwn(options, 'identityStorageRetentionSeconds')
+    let nextStaleChannelSeconds = updatesStalePolicy
+      ? normalizeStaleChannelSeconds(options.staleChannelSeconds)
+      : this.staleChannelSeconds
+    let nextIdentityStorageRetentionSeconds = updatesIdentityPolicy
+      ? normalizeIdentityStorageRetentionSeconds(options.identityStorageRetentionSeconds)
+      : this.identityStorageRetentionSeconds
     if (userSigner) {
       const userPubkey = await userSigner.getPublicKey?.()
       if (!userPubkey) throw new Error('USER_SIGNER_REQUIRED')
@@ -449,19 +610,48 @@ export class PrivateMessenger {
     const nextChannels = await this.normalizeChannels(channels, { relays, mode })
     this.assertOpen()
     const nextPubkeys = new Set(nextChannels.map(channel => channel.pubkey))
+    const removedPubkeys = [...this.channels.keys()].filter(pubkey => !nextPubkeys.has(pubkey))
+    const updatesStoragePolicy = updatesStalePolicy || updatesIdentityPolicy
 
-    for (const pubkey of [...this.channels.keys()]) {
-      if (!nextPubkeys.has(pubkey)) {
-        await this.unwatch(pubkey)
-        this.channels.delete(pubkey)
+    if (updatesStoragePolicy) {
+      const currentPolicy = await this.readStoragePolicySnapshot()
+      if (!updatesStalePolicy) nextStaleChannelSeconds = currentPolicy?.staleChannelSeconds ?? this.staleChannelSeconds
+      if (!updatesIdentityPolicy) {
+        nextIdentityStorageRetentionSeconds = currentPolicy?.identityStorageRetentionSeconds ?? this.identityStorageRetentionSeconds
       }
     }
+
+    if (removedPubkeys.length) {
+      await this.stampChannelActivity(removedPubkeys)
+    }
+
+    const storageSnapshot = await activatePrivateMessengerStorage({
+      userPubkey: this.userPubkey,
+      leaseId: this.storageLeaseId,
+      activeChannelPubkeys: [...nextPubkeys],
+      storagePolicy: updatesStoragePolicy
+        ? {
+            staleChannelSeconds: nextStaleChannelSeconds,
+            identityStorageRetentionSeconds: nextIdentityStorageRetentionSeconds
+          }
+        : undefined,
+      indexedDB: this._indexedDB
+    })
+    this.applyStoragePolicySnapshot(storageSnapshot)
+    this.lastStorageTouch = Date.now()
+    if (updatesStoragePolicy) this.broadcastStoragePolicyChange()
+
+    await this.unwatch([...this.channels.keys()])
+    this.channels.clear()
     for (const channel of nextChannels) this.channels.set(channel.pubkey, channel)
 
-    await this.cleanupStaleChannels()
+    await this.cleanupStaleChannels({ storageSnapshot })
     await this.applyRecoveryPolicies(nextChannels)
     await this.watch()
     await this.reconcilePresencePublishers()
+    if (this.storagePolicyRevision === storageSnapshot.policyRevision) {
+      this.storagePolicyNeedsApply = false
+    }
     return this
   }
 
@@ -551,14 +741,19 @@ export class PrivateMessenger {
     return structuredClone(this.state)
   }
 
-  writeState (state) {
-    this.touchStorageActivity().catch(err => this.onError?.(err))
+  writeState (state, { touchStorage = true } = {}) {
+    if (touchStorage) this.touchStorageActivity().catch(err => this.onError?.(err))
+    const previous = this.state?.channels || {}
     const next = {
       channels: isPlainObject(state?.channels) ? structuredClone(state.channels) : {}
     }
+    const changed = Object.fromEntries(Object.entries(next.channels)
+      .filter(([pubkey, value]) => !sameStateValue(previous[pubkey], value)))
+    const removed = Object.keys(previous).filter(pubkey => !Object.hasOwn(next.channels, pubkey))
     this.state = next
-    const snapshot = structuredClone(next.channels)
-    const write = this.stateWriteTail.then(() => this.stateStore.replace(snapshot))
+    if (!Object.keys(changed).length && !removed.length) return this.stateWriteTail
+    const snapshot = structuredClone(changed)
+    const write = this.stateWriteTail.then(() => this.stateStore.update(snapshot, removed))
     this.stateWriteTail = write.catch(err => {
       try { this.onError?.(err) } catch {}
     })
@@ -567,6 +762,29 @@ export class PrivateMessenger {
 
   async flushStateWrites () {
     await this.stateWriteTail
+  }
+
+  async stampChannelActivity (pubkeys) {
+    if (!this.stateStore || !this.state) return false
+    pubkeys = [...new Set(pubkeys || [])].filter(pubkey => this.state.channels[pubkey])
+    if (!pubkeys.length) return false
+    const lastWatchedAt = nowSeconds()
+    for (const pubkey of pubkeys) {
+      this.state.channels[pubkey] = {
+        ...this.state.channels[pubkey],
+        lastWatchedAt
+      }
+    }
+    const write = this.stateWriteTail.then(() => this.stateStore.touch(pubkeys, lastWatchedAt))
+    this.stateWriteTail = write.catch(err => {
+      try { this.onError?.(err) } catch {}
+    })
+    await write
+    return true
+  }
+
+  stampActiveChannelActivity () {
+    return this.stampChannelActivity([...this.channels.keys()])
   }
 
   updateChannelState (pubkey, patch) {
@@ -578,9 +796,19 @@ export class PrivateMessenger {
   }
 
   removeChannelState (pubkey) {
-    const state = this.readState()
-    delete state.channels[pubkey]
-    this.writeState(state)
+    this.removeChannelStates([pubkey])
+  }
+
+  removeChannelStates (pubkeys) {
+    pubkeys = [...new Set(pubkeys || [])]
+    for (const pubkey of pubkeys) delete this.state.channels[pubkey]
+    if (!pubkeys.length) return this.stateWriteTail
+    this.touchStorageActivity().catch(err => this.onError?.(err))
+    const write = this.stateWriteTail.then(() => this.stateStore.update({}, pubkeys))
+    this.stateWriteTail = write.catch(err => {
+      try { this.onError?.(err) } catch {}
+    })
+    return write
   }
 
   markSeen (pubkey, createdAt = nowSeconds()) {
@@ -1270,7 +1498,7 @@ export class PrivateMessenger {
     return channel.autoDeletionCapability ?? this.autoDeletionCapability
   }
 
-  offlineRecoverySecondsFor (channelOrPubkey) {
+  requestedOfflineRecoverySecondsFor (channelOrPubkey) {
     const channel = typeof channelOrPubkey === 'string'
       ? this.channels.get(channelOrPubkey)
       : channelOrPubkey
@@ -1280,6 +1508,18 @@ export class PrivateMessenger {
     return persisted === undefined
       ? this.offlineRecoverySeconds
       : normalizeOfflineRecoverySeconds(persisted)
+  }
+
+  offlineRecoverySecondsFor (channelOrPubkey) {
+    return Math.min(
+      this.requestedOfflineRecoverySecondsFor(channelOrPubkey),
+      this.staleChannelSeconds,
+      this.identityStorageRetentionSeconds
+    )
+  }
+
+  staleChannelSecondsForCleanup () {
+    return Math.min(this.staleChannelSeconds, this.identityStorageRetentionSeconds)
   }
 
   eventExpirationSecondsFor (channel) {
@@ -1297,13 +1537,14 @@ export class PrivateMessenger {
       const now = nowSeconds()
       for (const channel of channels) {
         const current = state.channels[channel.pubkey] || {}
-        const seconds = channel.offlineRecoverySeconds
-        current.offlineRecoverySeconds = seconds
-        if (!seconds) {
+        const requestedSeconds = channel.offlineRecoverySeconds
+        const effectiveSeconds = this.offlineRecoverySecondsFor(channel)
+        current.offlineRecoverySeconds = requestedSeconds
+        if (!effectiveSeconds) {
           delete current.openOfflineStart
           current.offlineRanges = []
         } else {
-          const cutoff = now - seconds
+          const cutoff = now - effectiveSeconds
           current.offlineRanges = mergeRanges((current.offlineRanges || [])
             .filter(range => range.end >= cutoff)
             .map(range => ({ ...range, start: Math.max(range.start, cutoff) })))
@@ -1568,6 +1809,7 @@ export class PrivateMessenger {
       await this.flushStateWrites()
       await this.queue.removeBy('byChannel', pubkey)
       await this.seedQueue.removeBy('byChannel', pubkey)
+      await this.touchStorageActivity({ force: true })
       this.ensureRelayListWatcher()
     })
   }
@@ -1576,19 +1818,26 @@ export class PrivateMessenger {
     return this.runQueueOperation(() => this.queue.clear())
   }
 
-  async cleanupStaleChannels () {
+  async cleanupStaleChannels ({ storageSnapshot } = {}) {
     if (!this.prefix) return
+    storageSnapshot ||= await this.readStoragePolicySnapshot()
+    if (!storageSnapshot) return
+    const activeChannelPubkeys = new Set(storageSnapshot.activeChannelPubkeys || [])
     return this.runQueueOperation(async () => {
-      const state = this.readState()
-      const cutoff = nowSeconds() - this.staleChannelSeconds
+      await this.flushStateWrites()
+      const state = { channels: await this.stateStore.load() }
+      const cutoff = nowSeconds() - this.staleChannelSecondsForCleanup()
+      const stalePubkeys = []
       for (const [pubkey, channel] of Object.entries(state.channels)) {
+        if (activeChannelPubkeys.has(pubkey)) continue
         if ((channel.lastWatchedAt || 0) >= cutoff) continue
         delete state.channels[pubkey]
+        stalePubkeys.push(pubkey)
         await this.queue?.removeBy('byChannel', pubkey)
         await this.seedQueue?.removeBy('byChannel', pubkey)
       }
-      this.writeState(state)
-      await this.flushStateWrites()
+      this.state = state
+      if (stalePubkeys.length) await this.removeChannelStates(stalePubkeys)
     })
   }
 
@@ -1636,15 +1885,18 @@ export class PrivateMessenger {
     this.stopOffline = null
     this.stopOnline = null
     this.stopStorageMaintenance()
+    this.stopStoragePolicyBroadcast()
 
     this.closePromise = (async () => {
       let unwatchError
       try { await unwatchPromise } catch (err) { unwatchError = err }
       await initSettledPromise
+      await this.stampActiveChannelActivity()
       await this.queueOperationTail
       await this.stateWriteTail
       try { await this.storageTouchPromise } catch {}
       await this.storageMaintenancePromise
+      try { await this.storagePolicyRefreshTail } catch {}
       await Promise.all([
         this.queue?.close?.(),
         this.seedQueue?.close?.(),
@@ -1658,6 +1910,12 @@ export class PrivateMessenger {
         })
       }
       this.storageActive = false
+      if (this.identityStorageRetentionSeconds === 0) {
+        await PrivateMessenger.maintainStorage({
+          indexedDB: this._indexedDB,
+          temporaryStorageArea: this.temporaryStorageArea
+        })
+      }
       if (unwatchError) throw unwatchError
     })()
     return this.closePromise

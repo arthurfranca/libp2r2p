@@ -56,7 +56,7 @@ async function seedMessengerState (channels) {
     prefix: 'libp2r2p:private-messenger:user',
     indexedDB: globalThis.indexedDB
   })
-  await state.replace(channels)
+  await state.update(channels)
 }
 
 function jsonlContent (...rows) {
@@ -362,6 +362,106 @@ test('private messenger validates and applies offline recovery defaults and chan
     }),
     /INVALID_OFFLINE_RECOVERY_SECONDS/
   )
+  await messenger.close()
+})
+
+test('private messenger validates identity and stale-channel retention policies', async () => {
+  for (const invalid of [-1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER]) {
+    assert.throws(
+      () => new PrivateMessenger({ _privateMessage: fakePrivateMessage(), staleChannelSeconds: invalid }),
+      /INVALID_STALE_CHANNEL_SECONDS/
+    )
+    assert.throws(
+      () => new PrivateMessenger({ _privateMessage: fakePrivateMessage(), identityStorageRetentionSeconds: invalid }),
+      /INVALID_IDENTITY_STORAGE_RETENTION_SECONDS/
+    )
+  }
+
+  const messenger = await new PrivateMessenger({ _privateMessage: fakePrivateMessage() }).init({
+    userSigner: signer('retention-validation-user'),
+    channels: []
+  })
+  await assert.rejects(
+    messenger.update({ staleChannelSeconds: -1 }),
+    /INVALID_STALE_CHANNEL_SECONDS/
+  )
+  await assert.rejects(
+    messenger.update({ identityStorageRetentionSeconds: 0.5 }),
+    /INVALID_IDENTITY_STORAGE_RETENTION_SECONDS/
+  )
+  await messenger.close()
+})
+
+test('identity and stale-channel retention silently cap recovery without replacing its requested value', async () => {
+  const originalDateNow = Date.now
+  const now = 2_000_000_000
+  Date.now = () => now * 1000
+  const pm = fakePrivateMessage()
+  let messenger
+  try {
+    messenger = await new PrivateMessenger({
+      _privateMessage: pm,
+      offlineRecoverySeconds: 1000,
+      staleChannelSeconds: 100,
+      identityStorageRetentionSeconds: 60
+    }).init({
+      userSigner: signer('capped-recovery-user'),
+      channels: [{
+        pubkey: 'channel',
+        signer: signer('channel'),
+        relays: ['wss://relay.example'],
+        offlineRecoverySeconds: 500
+      }]
+    })
+
+    assert.equal(messenger.readState().channels.channel.offlineRecoverySeconds, 500)
+    assert.equal(messenger.offlineRecoverySecondsFor('channel'), 60)
+    assert.equal(pm.watchCalls.at(-1).receivedChunkTtlMs, 60 * 1000)
+    await messenger.tell({ channelPubkey: 'channel', receiverPubkey: 'alice', payload: 'capped' })
+    assert.equal(pm.sent.at(-1).options.expirationSeconds, 60)
+
+    await messenger.seedQueue.enqueue({
+      type: 'seed',
+      channelPubkey: 'channel',
+      receivedAt: now - 40,
+      __p2r2pSeedKey: 'capped-seed',
+      __p2r2pSeedTime: now - 40
+    })
+    messenger.updateChannelState('channel', {
+      offlineRanges: [{ start: now - 50, end: now - 10 }]
+    })
+    await messenger.flushStateWrites()
+
+    await messenger.update({ identityStorageRetentionSeconds: 30 })
+    assert.equal(messenger.readState().channels.channel.offlineRecoverySeconds, 500)
+    assert.equal(messenger.offlineRecoverySecondsFor('channel'), 30)
+    assert.equal(await messenger.seedQueue.someBy('bySeedKey', 'capped-seed'), false)
+    assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [{ start: now - 30, end: now - 10 }])
+    assert.equal(pm.watchCalls.at(-1).receivedChunkTtlMs, 30 * 1000)
+
+    await messenger.update({ identityStorageRetentionSeconds: 120 })
+    assert.equal(messenger.offlineRecoverySecondsFor('channel'), 100)
+    assert.equal(await messenger.seedQueue.someBy('bySeedKey', 'capped-seed'), false)
+  } finally {
+    await messenger?.close()
+    Date.now = originalDateNow
+  }
+})
+
+test('zero global retention disables durable recovery but preserves live technical deadlines', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    identityStorageRetentionSeconds: 0
+  }).init({
+    userSigner: signer('zero-global-recovery-user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  assert.equal(messenger.offlineRecoverySecondsFor('channel'), 0)
+  assert.equal(pm.watchCalls.at(-1).receivedChunkTtlMs, 60 * 60 * 1000)
+  await messenger.tell({ channelPubkey: 'channel', receiverPubkey: 'alice', payload: 'live' })
+  assert.equal(pm.sent.at(-1).options.expirationSeconds, EXPIRATION_SECONDS)
   await messenger.close()
 })
 

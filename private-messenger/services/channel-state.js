@@ -11,12 +11,14 @@ database `${prefix}:state:idb`, version 1
 channels, keyPath "pubkey"
   pubkey  watched channel public key
   value   evolving channel-recovery state, including last-seen/watched times,
-          mode, relays, seeders, effective offline-recovery retention, offline
+          mode, relays, seeders, requested offline-recovery retention, offline
           ranges, active offline-range start,
           per-seeder activity, and sent/received content-key usage
 
-The complete channels snapshot is replaced atomically on each persisted state
-change; value remains an extensible internal object rather than a public schema.
+Changed channel records are upserted individually and explicit removals are
+applied in the same transaction. This prevents one active instance from
+clearing state owned by another instance of the same principal identity.
+`value` remains an extensible internal object rather than a public schema.
 */
 
 function deferred () {
@@ -108,12 +110,30 @@ export async function createChannelStateStore ({ prefix, indexedDB = globalThis.
     })
   }
 
-  async function replace (channels) {
+  async function update (channels, removedPubkeys = []) {
     const snapshot = cloneChannels(channels)
+    const removals = [...new Set(removedPubkeys || [])]
     await runTransaction('readwrite', async tx => {
-      await run('clear', [], CHANNELS_STORE, null, { tx })
+      for (const pubkey of removals) await run('delete', [pubkey], CHANNELS_STORE, null, { tx })
       for (const [pubkey, value] of Object.entries(snapshot)) {
         await run('put', [{ pubkey, value }], CHANNELS_STORE, null, { tx })
+      }
+    })
+  }
+
+  async function touch (pubkeys, lastWatchedAt) {
+    const uniquePubkeys = [...new Set(pubkeys || [])]
+    if (!uniquePubkeys.length) return
+    await runTransaction('readwrite', async tx => {
+      for (const pubkey of uniquePubkeys) {
+        const current = (await run('get', [pubkey], CHANNELS_STORE, null, { tx })).result
+        await run('put', [{
+          pubkey,
+          value: {
+            ...(current?.value && typeof current.value === 'object' ? current.value : {}),
+            lastWatchedAt
+          }
+        }], CHANNELS_STORE, null, { tx })
       }
     })
   }
@@ -128,5 +148,5 @@ export async function createChannelStateStore ({ prefix, indexedDB = globalThis.
     return closePromise
   }
 
-  return { load, replace, close }
+  return { load, update, touch, close }
 }

@@ -2,12 +2,39 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { PrivateMessenger } from '../private-messenger/index.js'
+import { createChannelStateStore } from '../private-messenger/services/channel-state.js'
 import {
   PRIVATE_MESSENGER_STORAGE_HEARTBEAT_MS,
-  PRIVATE_MESSENGER_STORAGE_RETENTION_MS
+  PRIVATE_MESSENGER_IDENTITY_STORAGE_RETENTION_MS
 } from '../private-messenger/services/storage-maintenance.js'
 
 const REGISTRY_DATABASE = 'libp2r2p:private-messenger:registry:idb'
+
+class TestBroadcastChannel {
+  static channels = new Map()
+
+  constructor (name) {
+    this.name = name
+    const channels = TestBroadcastChannel.channels.get(name) || new Set()
+    channels.add(this)
+    TestBroadcastChannel.channels.set(name, channels)
+  }
+
+  postMessage (data) {
+    for (const channel of TestBroadcastChannel.channels.get(this.name) || []) {
+      if (channel === this) continue
+      queueMicrotask(() => channel.onmessage?.({ data }))
+    }
+  }
+
+  close () {
+    const channels = TestBroadcastChannel.channels.get(this.name)
+    channels?.delete(this)
+    if (!channels?.size) TestBroadcastChannel.channels.delete(this.name)
+  }
+
+  unref () {}
+}
 
 function signer (pubkey) {
   return { getPublicKey: () => pubkey, withSharedKey: () => ({}) }
@@ -37,8 +64,8 @@ function readRegistryRecord (indexedDB, userPubkey) {
     request.onerror = () => reject(request.error)
     request.onsuccess = () => {
       const db = request.result
-      const tx = db.transaction(['bundles'], 'readonly')
-      const get = tx.objectStore('bundles').get(userPubkey)
+      const tx = db.transaction(['storageSets'], 'readonly')
+      const get = tx.objectStore('storageSets').get(userPubkey)
       get.onerror = () => reject(get.error)
       get.onsuccess = () => resolve(get.result || null)
       tx.oncomplete = () => db.close()
@@ -91,7 +118,7 @@ test('private messenger keeps an inactive storage set for 59 days and removes it
     await messenger.queue.enqueue({ id: 'unconsumed' })
     await messenger.close()
 
-    now += PRIVATE_MESSENGER_STORAGE_RETENTION_MS - 24 * 60 * 60 * 1000
+    now += PRIVATE_MESSENGER_IDENTITY_STORAGE_RETENTION_MS - 24 * 60 * 60 * 1000
     assert.equal(await PrivateMessenger.maintainStorage({ indexedDB }), 0)
     let names = await databaseNames(indexedDB)
     assert.equal(names.has(`libp2r2p:private-messenger:${userPubkey}:idb-queue`), true)
@@ -154,7 +181,7 @@ test('closing one of two active instances preserves the other instance lease', a
     const afterFirstClose = await readRegistryRecord(indexedDB, userPubkey)
     assert.ok(afterFirstClose.leaseUntil > now)
 
-    now += PRIVATE_MESSENGER_STORAGE_RETENTION_MS
+    now += PRIVATE_MESSENGER_IDENTITY_STORAGE_RETENTION_MS
     await second.touchStorageActivity({ force: true })
     assert.equal(await PrivateMessenger.maintainStorage({ indexedDB }), 0)
     assert.equal((await databaseNames(indexedDB)).has(
@@ -191,7 +218,7 @@ test('a partial storage-set deletion remains pending and resumes idempotently', 
   try {
     const messenger = await createMessenger(indexedDB, userPubkey)
     await messenger.close()
-    now += PRIVATE_MESSENGER_STORAGE_RETENTION_MS
+    now += PRIVATE_MESSENGER_IDENTITY_STORAGE_RETENTION_MS
     failDelete = true
 
     assert.equal(await PrivateMessenger.maintainStorage({ indexedDB }), 1)
@@ -226,7 +253,7 @@ test('a blocked deletion keeps its durable operation live until the handle close
       indexedDB,
       `libp2r2p:private-messenger:${userPubkey}:state:idb`
     )
-    now += PRIVATE_MESSENGER_STORAGE_RETENTION_MS
+    now += PRIVATE_MESSENGER_IDENTITY_STORAGE_RETENTION_MS
     let settled = false
     const maintenance = PrivateMessenger.maintainStorage({ indexedDB })
       .then(value => { settled = true; return value })
@@ -264,7 +291,7 @@ test('reactivating an identity cancels a pending deletion before reopening its d
   try {
     const first = await createMessenger(indexedDB, userPubkey)
     await first.close()
-    now += PRIVATE_MESSENGER_STORAGE_RETENTION_MS
+    now += PRIVATE_MESSENGER_IDENTITY_STORAGE_RETENTION_MS
     failDelete = true
     await PrivateMessenger.maintainStorage({ indexedDB })
     assert.equal((await readRegistryRecord(inner, userPubkey)).status, 'delete_pending')
@@ -351,4 +378,237 @@ test('private messenger close waits for an initialization already in flight', as
   await closing
   assert.equal(closed, true)
   assert.equal((await readRegistryRecord(indexedDB, 'closing-init-user')).leaseUntil, 0)
+})
+
+test('storage retention is persisted per identity and the last configuring instance wins', async () => {
+  const indexedDB = new IDBFactory()
+  const userPubkey = 'policy-user'
+  const first = await createMessenger(indexedDB, userPubkey, {
+    staleChannelSeconds: 10,
+    identityStorageRetentionSeconds: 20
+  })
+  let record = await readRegistryRecord(indexedDB, userPubkey)
+  assert.equal(record.staleChannelSeconds, 10)
+  assert.equal(record.identityStorageRetentionSeconds, 20)
+  assert.equal(record.policyRevision, 1)
+
+  const second = await createMessenger(indexedDB, userPubkey, {
+    staleChannelSeconds: 30,
+    identityStorageRetentionSeconds: 40
+  })
+  record = await readRegistryRecord(indexedDB, userPubkey)
+  assert.equal(record.staleChannelSeconds, 30)
+  assert.equal(record.identityStorageRetentionSeconds, 40)
+  assert.equal(record.policyRevision, 2)
+
+  await first.touchStorageActivity({ force: true })
+  record = await readRegistryRecord(indexedDB, userPubkey)
+  assert.equal(record.staleChannelSeconds, 30)
+  assert.equal(record.identityStorageRetentionSeconds, 40)
+  assert.equal(record.policyRevision, 2)
+
+  await first.update({ staleChannelSeconds: 50 })
+  record = await readRegistryRecord(indexedDB, userPubkey)
+  assert.equal(record.staleChannelSeconds, 50)
+  assert.equal(record.identityStorageRetentionSeconds, 40)
+  assert.equal(record.policyRevision, 3)
+
+  await first.close()
+  await second.close()
+})
+
+test('storage policy changes propagate to another active instance', async () => {
+  const indexedDB = new IDBFactory()
+  const userPubkey = 'broadcast-policy-user'
+  const first = await createMessenger(indexedDB, userPubkey, {
+    _BroadcastChannel: TestBroadcastChannel,
+    staleChannelSeconds: 10,
+    identityStorageRetentionSeconds: 20
+  })
+  const second = await createMessenger(indexedDB, userPubkey, {
+    _BroadcastChannel: TestBroadcastChannel,
+    staleChannelSeconds: 30,
+    identityStorageRetentionSeconds: 40
+  })
+  await new Promise(resolve => setImmediate(resolve))
+  await first.storagePolicyRefreshTail
+  assert.equal(first.staleChannelSeconds, 30)
+  assert.equal(first.identityStorageRetentionSeconds, 40)
+
+  await first.update({ staleChannelSeconds: 50 })
+  await new Promise(resolve => setImmediate(resolve))
+  await second.storagePolicyRefreshTail
+  assert.equal(second.staleChannelSeconds, 50)
+  assert.equal(second.identityStorageRetentionSeconds, 40)
+
+  await first.close()
+  await second.close()
+})
+
+test('identity storage retention is independent per identity', async () => {
+  const originalNow = Date.now
+  const indexedDB = new IDBFactory()
+  let now = 1_000_000
+  Date.now = () => now
+  try {
+    const short = await createMessenger(indexedDB, 'short-retention', {
+      identityStorageRetentionSeconds: 10
+    })
+    const long = await createMessenger(indexedDB, 'long-retention', {
+      identityStorageRetentionSeconds: 20
+    })
+    await short.close()
+    await long.close()
+
+    now += 10_000
+    assert.equal(await PrivateMessenger.maintainStorage({ indexedDB }), 1)
+    assert.equal(await readRegistryRecord(indexedDB, 'short-retention'), null)
+    assert.ok(await readRegistryRecord(indexedDB, 'long-retention'))
+
+    now += 10_000
+    assert.equal(await PrivateMessenger.maintainStorage({ indexedDB }), 1)
+    assert.equal(await readRegistryRecord(indexedDB, 'long-retention'), null)
+  } finally {
+    Date.now = originalNow
+  }
+})
+
+test('zero identity storage retention removes the storage set after its final lease closes', async () => {
+  const indexedDB = new IDBFactory()
+  const userPubkey = 'zero-retention'
+  const messenger = await createMessenger(indexedDB, userPubkey, {
+    identityStorageRetentionSeconds: 0
+  })
+  assert.ok(await readRegistryRecord(indexedDB, userPubkey))
+  await messenger.close()
+  assert.equal(await readRegistryRecord(indexedDB, userPubkey), null)
+  const names = await databaseNames(indexedDB)
+  assert.equal(names.has(`libp2r2p:private-messenger:${userPubkey}:idb-queue`), false)
+  assert.equal(names.has(`libp2r2p:private-messenger:${userPubkey}:seeds:idb-queue`), false)
+  assert.equal(names.has(`libp2r2p:private-messenger:${userPubkey}:state:idb`), false)
+})
+
+test('an actively leased channel is not pruned after its stale-channel deadline', async () => {
+  const originalNow = Date.now
+  const indexedDB = new IDBFactory()
+  let now = 2_000_000_000_000
+  Date.now = () => now
+  try {
+    const messenger = await createMessenger(indexedDB, 'active-channel-user', {
+      staleChannelSeconds: 24 * 60 * 60
+    })
+    messenger.updateChannelState('active-channel-user-channel', {
+      lastWatchedAt: Math.floor(now / 1000) - 2 * 24 * 60 * 60
+    })
+    await messenger.flushStateWrites()
+
+    await messenger.cleanupStaleChannels()
+    assert.ok(messenger.readState().channels['active-channel-user-channel'])
+
+    now += PRIVATE_MESSENGER_STORAGE_HEARTBEAT_MS
+    await messenger.runStorageHeartbeat()
+    assert.equal(
+      messenger.readState().channels['active-channel-user-channel'].lastWatchedAt,
+      Math.floor(now / 1000)
+    )
+    await messenger.close()
+  } finally {
+    Date.now = originalNow
+  }
+})
+
+test('removing a configured channel starts its stale-channel retention window', async () => {
+  const originalNow = Date.now
+  const indexedDB = new IDBFactory()
+  let now = 2_050_000_000_000
+  Date.now = () => now
+  try {
+    const messenger = await createMessenger(indexedDB, 'removed-channel-user', {
+      staleChannelSeconds: 10
+    })
+    const pubkey = 'removed-channel-user-channel'
+    await messenger.update({ channels: [] })
+    assert.equal(messenger.readState().channels[pubkey].lastWatchedAt, Math.floor(now / 1000))
+
+    now += 10_000
+    await messenger.cleanupStaleChannels()
+    assert.ok(messenger.readState().channels[pubkey])
+
+    now += 1_000
+    await messenger.cleanupStaleChannels()
+    assert.equal(messenger.readState().channels[pubkey], undefined)
+    await messenger.close()
+  } finally {
+    Date.now = originalNow
+  }
+})
+
+test('another active lease protects its channel from stale cleanup', async () => {
+  const originalNow = Date.now
+  const indexedDB = new IDBFactory()
+  let now = 2_100_000_000_000
+  Date.now = () => now
+  const userPubkey = 'shared-channel-user'
+  try {
+    const first = await new PrivateMessenger({
+      _privateMessage: fakePrivateMessage(),
+      _indexedDB: indexedDB,
+      staleChannelSeconds: 1
+    }).init({
+      userSigner: signer(userPubkey),
+      channels: [{ signer: signer('first-channel'), relays: ['wss://relay.example'] }]
+    })
+    first.updateChannelState('first-channel', { lastWatchedAt: Math.floor(now / 1000) - 10 })
+    await first.flushStateWrites()
+    const second = await new PrivateMessenger({
+      _privateMessage: fakePrivateMessage(),
+      _indexedDB: indexedDB,
+      staleChannelSeconds: 1
+    }).init({
+      userSigner: signer(userPubkey),
+      channels: [{ signer: signer('second-channel'), relays: ['wss://relay.example'] }]
+    })
+
+    await second.cleanupStaleChannels()
+    assert.ok(second.readState().channels['first-channel'])
+
+    await first.close()
+    now += 2_000
+    await second.cleanupStaleChannels()
+    assert.equal(second.readState().channels['first-channel'], undefined)
+    await second.close()
+  } finally {
+    Date.now = originalNow
+  }
+})
+
+test('one instance heartbeat does not overwrite another instance channel state', async () => {
+  const indexedDB = new IDBFactory()
+  const userPubkey = 'incremental-channel-state-user'
+  const first = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _indexedDB: indexedDB
+  }).init({
+    userSigner: signer(userPubkey),
+    channels: [{ signer: signer('first-channel'), relays: ['wss://relay.example'] }]
+  })
+  const second = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _indexedDB: indexedDB
+  }).init({
+    userSigner: signer(userPubkey),
+    channels: [{ signer: signer('second-channel'), relays: ['wss://relay.example'] }]
+  })
+
+  await first.runStorageHeartbeat()
+  const stateStore = await createChannelStateStore({
+    prefix: `libp2r2p:private-messenger:${userPubkey}`,
+    indexedDB
+  })
+  const channels = await stateStore.load()
+  assert.ok(channels['first-channel'])
+  assert.ok(channels['second-channel'])
+  await stateStore.close()
+  await first.close()
+  await second.close()
 })

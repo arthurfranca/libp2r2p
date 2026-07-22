@@ -21,6 +21,8 @@ const messenger = await createPrivateMessenger({
   userSigner,
   contentKeySigner,
   offlineRecoverySeconds: 7 * 24 * 60 * 60,
+  staleChannelSeconds: 45 * 24 * 60 * 60,
+  identityStorageRetentionSeconds: 60 * 24 * 60 * 60,
   channels: [{
     signer: privateChannelSigner,
     relays: ['wss://relay.example'],
@@ -152,20 +154,41 @@ know database names or enumerate IndexedDB. Pass `temporaryStorageArea` only
 when the messenger was configured to use a Storage area other than the default
 `sessionStorage`.
 
-Each principal signer owns internal message, recovery-seed, and channel-state
-databases. The messenger updates their activity lease while it is open and
-closes all handles in `await messenger.close()`. The complete set is removed
-after 60 days without use, including messages that were never consumed.
+Each principal signer owns an internal storage set containing message,
+recovery-seed, and channel-state databases. The messenger updates its activity
+lease while it is open and closes all handles in `await messenger.close()`.
+The complete set is removed after `identityStorageRetentionSeconds` without
+use (60 days by default), including messages that were never consumed.
 Maintenance runs on every initialization and every six hours while a messenger
 is active; failed deletions remain journaled and retry automatically.
 
-Channel recovery state inside an otherwise active identity retains its separate
-45-day stale-channel cleanup policy. Offline recovery defaults to seven days.
+Channel recovery state inside an otherwise active identity uses the separate
+`staleChannelSeconds` cleanup policy (45 days by default). Active instances
+record the channels they administer, so a channel remains protected while any
+instance or tab still uses it. Offline recovery defaults to seven days.
 Set `offlineRecoverySeconds` on an individual channel to override the
 messenger default for its recovery seeds, offline ranges, new outer-event
 expiration, and new incomplete receive groups. Updating a channel applies a
 shorter window immediately to its stored seeds and ranges; increasing it does
 not recreate data already removed.
+
+The effective recovery duration is capped by both `staleChannelSeconds` and
+`identityStorageRetentionSeconds`. The requested per-channel value remains
+stored separately, so raising a cap affects new retention decisions without
+recreating data already removed. Both retention policies can be changed by an
+instance at runtime; omitted fields retain their current persisted values:
+
+```js
+await messenger.update({
+  staleChannelSeconds: 30 * 24 * 60 * 60,
+  identityStorageRetentionSeconds: 90 * 24 * 60 * 60
+})
+```
+
+The policies are persisted per principal identity. If multiple instances use
+the same identity, the last confirmed policy update wins and is propagated to
+the others. A zero policy disables durable recovery immediately. Identity
+storage itself remains protected until the final active lease closes.
 
 Set a channel's `offlineRecoverySeconds` to `0` to disable durable recovery for
 that channel. The messenger then stores no recovery seeds, tracks no offline
