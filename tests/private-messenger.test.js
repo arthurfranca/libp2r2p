@@ -120,12 +120,12 @@ function fakePrivateMessage () {
   }
 }
 
-test('private messenger cleanup uses session storage by default and configured storage on init', async () => {
+test('private messenger maintenance uses session storage by default and configured storage on init', async () => {
   globalThis.sessionStorage.setItem('tmp.session', 'encrypted')
   globalThis.sessionStorage.setItem(TEMPORARY_STORAGE_KEYS_KEY, JSON.stringify(['tmp.session']))
   globalThis.localStorage.setItem('permanent', 'keep')
 
-  PrivateMessenger.cleanupTemporaryStorage()
+  await PrivateMessenger.maintainStorage({ indexedDB: globalThis.indexedDB })
 
   assert.equal(globalThis.sessionStorage.getItem('tmp.session'), null)
   assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
@@ -133,14 +133,17 @@ test('private messenger cleanup uses session storage by default and configured s
 
   globalThis.localStorage.setItem('tmp.local', 'encrypted')
   globalThis.localStorage.setItem(TEMPORARY_STORAGE_KEYS_KEY, JSON.stringify(['tmp.local']))
-  PrivateMessenger.cleanupTemporaryStorage({ storageArea: globalThis.localStorage })
+  await PrivateMessenger.maintainStorage({
+    indexedDB: globalThis.indexedDB,
+    temporaryStorageArea: globalThis.localStorage
+  })
 
   assert.equal(globalThis.localStorage.getItem('tmp.local'), null)
   assert.equal(globalThis.localStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
 
   globalThis.localStorage.setItem('tmp.local', 'encrypted')
   globalThis.localStorage.setItem(TEMPORARY_STORAGE_KEYS_KEY, JSON.stringify(['tmp.local']))
-  await new PrivateMessenger({
+  const messenger = await new PrivateMessenger({
     _privateMessage: fakePrivateMessage(),
     temporaryStorageArea: globalThis.localStorage
   }).init({
@@ -150,6 +153,7 @@ test('private messenger cleanup uses session storage by default and configured s
 
   assert.equal(globalThis.localStorage.getItem('tmp.local'), null)
   assert.equal(globalThis.localStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+  await messenger.close()
 })
 
 test('private messenger defaults to larger bounded IndexedDB queues', () => {
@@ -176,7 +180,7 @@ test('private messenger persists queued messages in IndexedDB across instances',
     meta: { channelPubkey: 'channel' },
     payload: { payload: 'hi' }
   })
-  first.close()
+  await first.close()
 
   const second = await new PrivateMessenger({
     _privateMessage: fakePrivateMessage(),
@@ -201,7 +205,7 @@ test('private messenger persists per-channel recovery state in IndexedDB', async
   })
   first.updateChannelState('channel', { lastSeenAt: 123 })
   await first.flushStateWrites()
-  first.close()
+  await first.close()
 
   const second = await new PrivateMessenger({
     _privateMessage: fakePrivateMessage(),
@@ -385,7 +389,7 @@ test('private messenger pauses live watches offline, restarts them before durabl
     assert.equal((await messenger.nextMessage()).event.id, 'offline-duplicate')
     assert.equal(await messenger.nextMessage(), null)
   } finally {
-    messenger?.close()
+    await messenger?.close()
     Date.now = originalDateNow
     if (originalWindow === undefined) delete globalThis.window
     else globalThis.window = originalWindow
@@ -1167,7 +1171,7 @@ test('seeder channels publish presence immediately and on interval', async () =>
   assert.equal(pm.sent[1].options.code, SEEDER_PRESENCE_CODE)
   assert.equal(pm.sent[1].options.autoDeletionCapability, false)
 
-  messenger.close()
+  await messenger.close()
   assert.deepEqual(cleared, intervals)
 })
 

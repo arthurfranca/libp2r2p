@@ -79,9 +79,27 @@ function cloneChannels (channels) {
 export async function createChannelStateStore ({ prefix, indexedDB = globalThis.indexedDB } = {}) {
   if (!prefix) throw new Error('PRIVATE_MESSENGER_STATE_PREFIX_REQUIRED')
   const db = await openDatabase(indexedDB, `${prefix}:state:idb`)
+  let closed = false
+  let activeTransactions = 0
+  let closePromise = null
+  const closeWaiters = new Set()
+
+  async function runTransaction (mode, work) {
+    if (closed) throw new Error('PRIVATE_MESSENGER_STATE_CLOSED')
+    activeTransactions++
+    try {
+      return await transaction(db, mode, work)
+    } finally {
+      activeTransactions--
+      if (!activeTransactions) {
+        for (const resolve of closeWaiters) resolve()
+        closeWaiters.clear()
+      }
+    }
+  }
 
   async function load () {
-    return transaction(db, 'readonly', async tx => {
+    return runTransaction('readonly', async tx => {
       const records = (await run('getAll', [], CHANNELS_STORE, null, { tx })).result
       return Object.fromEntries(records
         .filter(record => typeof record?.pubkey === 'string' && record.pubkey)
@@ -91,7 +109,7 @@ export async function createChannelStateStore ({ prefix, indexedDB = globalThis.
 
   async function replace (channels) {
     const snapshot = cloneChannels(channels)
-    await transaction(db, 'readwrite', async tx => {
+    await runTransaction('readwrite', async tx => {
       await run('clear', [], CHANNELS_STORE, null, { tx })
       for (const [pubkey, value] of Object.entries(snapshot)) {
         await run('put', [{ pubkey, value }], CHANNELS_STORE, null, { tx })
@@ -99,5 +117,15 @@ export async function createChannelStateStore ({ prefix, indexedDB = globalThis.
     })
   }
 
-  return { load, replace }
+  function close () {
+    if (closePromise) return closePromise
+    closed = true
+    closePromise = (activeTransactions
+      ? new Promise(resolve => closeWaiters.add(resolve))
+      : Promise.resolve())
+      .then(() => { db.close() })
+    return closePromise
+  }
+
+  return { load, replace, close }
 }

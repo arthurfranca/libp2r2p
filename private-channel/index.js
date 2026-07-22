@@ -683,8 +683,11 @@ function createProcessor ({
     ttlMs: ignoredGroupTtlMs,
     maxEntries: ignoredGroupMaxEntries
   })
+  const storeReady = receivedChunks.ready()
+  storeReady.catch(() => {})
 
-  return async function processOuterEvent (outer) {
+  async function processOuterEvent (outer) {
+    await storeReady
     let groupKey = ''
     try {
       const channelPubkey = outer.pubkey || await privateChannelSigner?.getPublicKey?.()
@@ -857,6 +860,9 @@ function createProcessor ({
       onError?.(err)
     }
   }
+
+  processOuterEvent.close = () => receivedChunks.close()
+  return processOuterEvent
 }
 
 function shouldIgnoreGroupError (err) {
@@ -897,8 +903,12 @@ export async function fetch ({ receiverSigner, iykcSigner, privateChannelSigner 
   })
   events.sort((a, b) => a.created_at - b.created_at)
   const processOuterEvent = createProcessor({ receiverSigner, iykcSigner, privateChannelSigner, privateChannelSignersByPubkey, privateChannelReaderSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, receiverPubkey, mode, modeByPubkey, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, receivedChunkTtlMs, receivedChunkMaxBytes, receivedChunkIndexedDB, ignoredGroupTtlMs, ignoredGroupMaxEntries })
-  for (const event of events) await processOuterEvent(event)
-  return events
+  try {
+    for (const event of events) await processOuterEvent(event)
+    return events
+  } finally {
+    processOuterEvent.close()
+  }
 }
 
 export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = receiverSigner, privateChannelSignersByPubkey, privateChannelReaderSigner = privateChannelSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, privateChannelPubkey, privateChannelPubkeys, receiverPubkey, relays, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, since = nowSeconds() - 5, limit, liveOnly = false, mode = 'leecher', modeByPubkey, receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS, receivedChunkMaxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES, receivedChunkIndexedDB = globalThis.indexedDB, ignoredGroupTtlMs = DEFAULT_IGNORED_GROUP_TTL_MS, ignoredGroupMaxEntries = DEFAULT_IGNORED_GROUP_MAX_ENTRIES, _liveEventsGenerator = getLiveEventsGenerator, _eventsFeedGenerator = getEventsFeedGenerator }) {
@@ -914,13 +924,13 @@ export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = 
   const controller = new AbortController()
   const events = liveOnly
     ? _liveEventsGenerator(filter, relays, {
-        signal: controller.signal
-      })
+      signal: controller.signal
+    })
     : _eventsFeedGenerator(filter, relays, {
-        signal: controller.signal,
-        timeout: 5000,
-        timeoutAfterFirstEose: null
-      })
+      signal: controller.signal,
+      timeout: 5000,
+      timeoutAfterFirstEose: null
+    })
 
   async function consumeEvents () {
     try {
@@ -930,14 +940,17 @@ export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = 
       }
     } catch (error) {
       if (!controller.signal.aborted && error?.message !== 'Aborted') onError?.(error)
+    } finally {
+      processOuterEvent.close()
     }
   }
 
-  consumeEvents()
+  const consumePromise = consumeEvents()
 
   return {
     close () {
       controller.abort()
+      return consumePromise
     }
   }
 }

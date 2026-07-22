@@ -263,18 +263,27 @@ function firstWatchValue (channels, field) {
 }
 
 function closeSubscription (sub, gracefulClose) {
-  if (gracefulClose) setTimeout(() => sub.close(), RESUBSCRIBE_GRACE_MS)
-  else sub.close()
+  if (gracefulClose) {
+    setTimeout(() => Promise.resolve().then(() => sub.close()).catch(() => {}), RESUBSCRIBE_GRACE_MS)
+    return null
+  }
+  try {
+    return Promise.resolve(sub.close())
+  } catch (err) {
+    return Promise.reject(err)
+  }
 }
 
 function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, gracefulClose = true } = {}) {
   const desired = desiredRelayState()
+  const closing = []
 
   for (const [relay, current] of subsByRelay) {
     const nextChannels = desired.get(relay)
     if (nextChannels && setEquals(current.channels, nextChannels)) continue
     if (!nextChannels) {
-      closeSubscription(current.sub, gracefulClose)
+      const close = closeSubscription(current.sub, gracefulClose)
+      if (close) closing.push(close)
       subsByRelay.delete(relay)
     }
   }
@@ -322,8 +331,12 @@ function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, graceful
     })
 
     subsByRelay.set(relay, { channels: new Set(channels), sub })
-    if (current) closeSubscription(current.sub, gracefulClose)
+    if (current) {
+      const close = closeSubscription(current.sub, gracefulClose)
+      if (close) closing.push(close)
+    }
   }
+  return Promise.allSettled(closing)
 }
 
 export async function watch ({
@@ -399,18 +412,19 @@ export async function watch ({
     changed = true
   }
 
-  if (changed) rebuildSubscriptions({ _subscribe })
+  if (changed) await rebuildSubscriptions({ _subscribe })
   return () => unwatch(channelList)
 }
 
 export function unwatch (channels) {
   const channelList = channels ? uniq(Array.isArray(channels) ? channels : [channels]) : [...watchesByChannel.keys()]
   for (const channel of channelList) watchesByChannel.delete(channel)
-  rebuildSubscriptions({ gracefulClose: false })
+  return rebuildSubscriptions({ gracefulClose: false })
 }
 
 export function clearChannelState (channelPubkey) {
-  if (watchesByChannel.has(channelPubkey)) unwatch(channelPubkey)
+  if (watchesByChannel.has(channelPubkey)) return unwatch(channelPubkey)
+  return Promise.resolve([])
 }
 
 async function sendPrivateMessage ({

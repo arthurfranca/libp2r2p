@@ -151,3 +151,15 @@ test('idb queue rejects unavailable IndexedDB and clears atomically', async () =
   await queue.clear()
   assert.equal(await queue.shift(), null)
 })
+
+test('idb queue close is idempotent and lets an active transaction finish', async () => {
+  const queue = await queueFor(new IDBFactory(), 'close')
+  const write = queue.push({ value: 'committed-before-close' })
+  const firstClose = queue.close()
+  const secondClose = queue.close()
+
+  assert.equal(firstClose, secondClose)
+  await write
+  await firstClose
+  await assert.rejects(queue.push({ value: 'too-late' }), /QUEUE_CLOSED/)
+})

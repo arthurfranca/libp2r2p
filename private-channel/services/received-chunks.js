@@ -5,7 +5,7 @@ export const DEFAULT_RECEIVED_CHUNK_TTL_MS = 60 * 60 * 1000 // 1 hour
 export const DEFAULT_RECEIVED_CHUNK_MAX_BYTES = 16 * 1024 * 1024 // 16 MiB
 
 const DEFAULT_PREFIX = 'libp2r2p:private-channel:received'
-const DATABASE_VERSION = 1
+const DATABASE_VERSION = 2
 const GROUPS_STORE = 'groups'
 const CHUNKS_STORE = 'chunks'
 const STATE_STORE = 'state'
@@ -16,7 +16,7 @@ const decoder = new TextDecoder()
 /*
 IndexedDB schema, scoped per received-chunk prefix:
 
-database `${prefix}:idb`, version 1
+database `${prefix}:idb`, version 2
 
 groups, keyPath "groupKey"
   groupKey                  `${channelPubkey}:${routerPubkey}`
@@ -28,10 +28,12 @@ groups, keyPath "groupKey"
   receiverPubkeys           deduplicated intended receivers
   byteSize                  logical bytes charged to this group
   createdAt/updatedAt        lifecycle timestamps in milliseconds
+  ttlMs/expiresAt            group-specific retention and absolute expiry
   drainToken/drainUntil      optional drain lease owner and expiry
 
 groups indexes
   byUpdatedAt  updatedAt
+  byExpiresAt  expiresAt
 
 chunks, keyPath ["groupKey", "index"]
   groupKey  owning group coordinate
@@ -80,6 +82,7 @@ function openDatabase (indexedDB, name) {
         groups = tx.objectStore(GROUPS_STORE)
       }
       if (!groups.indexNames.contains('byUpdatedAt')) groups.createIndex('byUpdatedAt', 'updatedAt')
+      if (!groups.indexNames.contains('byExpiresAt')) groups.createIndex('byExpiresAt', 'expiresAt')
 
       let chunks
       if (!db.objectStoreNames.contains(CHUNKS_STORE)) {
@@ -119,12 +122,14 @@ function normalizeReceived (received) {
   )
 }
 
-function normalizeMeta (meta) {
+function normalizeMeta (meta, fallbackTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS) {
   if (!meta || typeof meta !== 'object') return null
   const total = Number(meta.total)
   const nextIndex = Number(meta.nextIndex)
   const rowIndex = Number(meta.rowIndex)
   if (!meta.groupKey || !Number.isSafeInteger(total) || total < 1) return null
+  const updatedAt = Number(meta.updatedAt) || Date.now()
+  const ttlMs = Number.isFinite(meta.ttlMs) && meta.ttlMs >= 0 ? meta.ttlMs : fallbackTtlMs
   return {
     groupKey: String(meta.groupKey),
     channelPubkey: String(meta.channelPubkey || ''),
@@ -139,7 +144,9 @@ function normalizeMeta (meta) {
     receiverPubkeys: uniq(meta.receiverPubkeys),
     byteSize: Math.max(0, Number(meta.byteSize) || 0),
     createdAt: Number(meta.createdAt) || Date.now(),
-    updatedAt: Number(meta.updatedAt) || Date.now(),
+    updatedAt,
+    ttlMs,
+    expiresAt: Number(meta.expiresAt) || updatedAt + ttlMs,
     drainToken: typeof meta.drainToken === 'string' ? meta.drainToken : '',
     drainUntil: Math.max(0, Number(meta.drainUntil) || 0)
   }
@@ -180,10 +187,18 @@ export function createReceivedChunkStore ({
   const configuredMaxBytes = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : Infinity
   let dbPromise
   let readyPromise
+  let closed = false
 
   function database () {
+    if (closed) return Promise.reject(new Error('RECEIVED_CHUNK_STORE_CLOSED'))
     dbPromise ||= openDatabase(indexedDB, `${prefix}:idb`)
-    return dbPromise
+    return dbPromise.then(db => {
+      if (closed) {
+        db.close()
+        throw new Error('RECEIVED_CHUNK_STORE_CLOSED')
+      }
+      return db
+    })
   }
 
   async function transaction (storeNames, mode, work) {
@@ -215,7 +230,7 @@ export function createReceivedChunkStore ({
   }
 
   async function deleteGroupInTransaction (tx, groupKey, usage, knownMeta) {
-    const meta = knownMeta || normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result)
+    const meta = knownMeta || normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result, configuredTtlMs)
     const keys = (await run('getAllKeys', [globalThis.IDBKeyRange?.only?.(groupKey) ?? groupKey], CHUNKS_STORE, 'byGroup', { tx })).result
     for (const key of keys) await run('delete', [key], CHUNKS_STORE, null, { tx })
     await run('delete', [groupKey], GROUPS_STORE, null, { tx })
@@ -226,19 +241,18 @@ export function createReceivedChunkStore ({
   async function oldestGroupsInTransaction (tx, except = '') {
     const values = (await run('getAll', [], GROUPS_STORE, null, { tx })).result
     return values
-      .map(normalizeMeta)
+      .map(value => normalizeMeta(value, configuredTtlMs))
       .filter(meta => meta && meta.groupKey !== except)
       .sort((left, right) => left.updatedAt - right.updatedAt || left.groupKey.localeCompare(right.groupKey))
   }
 
   async function cleanupStaleRaw (nowMs = Date.now()) {
-    const cutoff = nowMs - configuredTtlMs
     return transaction([GROUPS_STORE, CHUNKS_STORE, STATE_STORE], 'readwrite', async tx => {
       const usage = await readUsage(tx)
       const groups = await oldestGroupsInTransaction(tx)
       let removed = 0
       for (const meta of groups) {
-        if (meta.updatedAt > cutoff && (!Number.isFinite(configuredMaxBytes) || usage.usedBytes <= configuredMaxBytes)) continue
+        if (meta.expiresAt > nowMs && (!Number.isFinite(configuredMaxBytes) || usage.usedBytes <= configuredMaxBytes)) continue
         await deleteGroupInTransaction(tx, meta.groupKey, usage, meta)
         removed++
       }
@@ -247,13 +261,13 @@ export function createReceivedChunkStore ({
     })
   }
 
-  function ready () {
-    readyPromise ||= cleanupStaleRaw()
+  function ready (nowMs = Date.now()) {
+    readyPromise ||= cleanupStaleRaw(nowMs)
     return readyPromise
   }
 
   async function cleanupStale (nowMs = Date.now()) {
-    await ready()
+    await ready(nowMs)
     return cleanupStaleRaw(nowMs)
   }
 
@@ -264,9 +278,8 @@ export function createReceivedChunkStore ({
 
     return transaction([GROUPS_STORE, CHUNKS_STORE, STATE_STORE], 'readwrite', async tx => {
       const usage = await readUsage(tx)
-      let meta = normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result)
-      const staleCutoff = now - configuredTtlMs
-      if (meta && meta.updatedAt <= staleCutoff) {
+      let meta = normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result, configuredTtlMs)
+      if (meta && meta.expiresAt <= now) {
         await deleteGroupInTransaction(tx, groupKey, usage, meta)
         meta = null
       }
@@ -289,8 +302,10 @@ export function createReceivedChunkStore ({
           receiverPubkeys: [],
           byteSize: 0,
           createdAt: now,
-          updatedAt: now
-        })
+          updatedAt: now,
+          ttlMs: configuredTtlMs,
+          expiresAt: now + configuredTtlMs
+        }, configuredTtlMs)
       }
 
       const existing = (await run('get', [[groupKey, index]], CHUNKS_STORE, null, { tx })).result
@@ -304,11 +319,11 @@ export function createReceivedChunkStore ({
         const requiredBytes = bytes.byteLength
         const candidates = await oldestGroupsInTransaction(tx, groupKey)
         for (const candidate of candidates) {
-          if (candidate.updatedAt > staleCutoff) continue
+          if (candidate.expiresAt > now) continue
           await deleteGroupInTransaction(tx, candidate.groupKey, usage, candidate)
         }
         for (const candidate of candidates) {
-          if (candidate.updatedAt <= staleCutoff) continue
+          if (candidate.expiresAt <= now) continue
           if (!Number.isFinite(configuredMaxBytes) || usage.usedBytes + requiredBytes <= configuredMaxBytes) break
           await deleteGroupInTransaction(tx, candidate.groupKey, usage, candidate)
         }
@@ -327,6 +342,7 @@ export function createReceivedChunkStore ({
 
       meta.total = total
       meta.updatedAt = now
+      meta.expiresAt = now + meta.ttlMs
       await run('put', [meta], GROUPS_STORE, null, { tx })
       await writeUsage(tx, usage)
       return { tooLarge: false, meta }
@@ -365,12 +381,12 @@ export function createReceivedChunkStore ({
   async function readMeta (groupKey) {
     await ready()
     return transaction([GROUPS_STORE], 'readonly', async tx => {
-      return normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result)
+      return normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result, configuredTtlMs)
     })
   }
 
   async function status (metaOrGroupKey) {
-    const meta = typeof metaOrGroupKey === 'string' ? await readMeta(metaOrGroupKey) : normalizeMeta(metaOrGroupKey)
+    const meta = typeof metaOrGroupKey === 'string' ? await readMeta(metaOrGroupKey) : normalizeMeta(metaOrGroupKey, configuredTtlMs)
     if (!meta) return { received: 0, missing: [] }
     const missing = []
     let received = 0
@@ -393,13 +409,15 @@ export function createReceivedChunkStore ({
     while (true) {
       const now = Date.now()
       const result = await transaction([GROUPS_STORE], 'readwrite', async tx => {
-        const meta = normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result)
+        const meta = normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result, configuredTtlMs)
         if (!meta) return { meta: null, waitMs: 0 }
         if (meta.drainToken && meta.drainToken !== token && meta.drainUntil > now) {
           return { meta: null, waitMs: Math.min(DRAIN_LEASE_MS, meta.drainUntil - now) }
         }
         meta.drainToken = token
         meta.drainUntil = now + DRAIN_LEASE_MS
+        meta.updatedAt = now
+        meta.expiresAt = now + meta.ttlMs
         await run('put', [meta], GROUPS_STORE, null, { tx })
         return { meta, waitMs: 0 }
       })
@@ -410,7 +428,7 @@ export function createReceivedChunkStore ({
 
   async function readDrainChunk (groupKey, token) {
     return transaction([GROUPS_STORE, CHUNKS_STORE], 'readonly', async tx => {
-      const meta = normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result)
+      const meta = normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result, configuredTtlMs)
       if (!meta || meta.drainToken !== token) return { meta: null, bytes: null }
       if (meta.nextIndex >= meta.total) return { meta, bytes: null }
       const chunk = (await run('get', [[groupKey, meta.nextIndex]], CHUNKS_STORE, null, { tx })).result
@@ -420,7 +438,7 @@ export function createReceivedChunkStore ({
 
   async function commitDrainMeta (nextMeta, token) {
     return transaction([GROUPS_STORE], 'readwrite', async tx => {
-      const current = normalizeMeta((await run('get', [nextMeta.groupKey], GROUPS_STORE, null, { tx })).result)
+      const current = normalizeMeta((await run('get', [nextMeta.groupKey], GROUPS_STORE, null, { tx })).result, configuredTtlMs)
       if (!current || current.drainToken !== token) return null
       current.nextIndex = nextMeta.nextIndex
       current.rowIndex = nextMeta.rowIndex
@@ -428,6 +446,7 @@ export function createReceivedChunkStore ({
       current.payloadCiphertext = nextMeta.payloadCiphertext
       current.receiverPubkeys = uniq(nextMeta.receiverPubkeys)
       current.updatedAt = nextMeta.updatedAt
+      current.expiresAt = current.updatedAt + current.ttlMs
       current.drainUntil = Date.now() + DRAIN_LEASE_MS
       await run('put', [current], GROUPS_STORE, null, { tx })
       return current
@@ -436,7 +455,7 @@ export function createReceivedChunkStore ({
 
   async function releaseDrain (groupKey, token) {
     return transaction([GROUPS_STORE], 'readwrite', async tx => {
-      const meta = normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result)
+      const meta = normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result, configuredTtlMs)
       if (!meta || meta.drainToken !== token) return false
       meta.drainToken = ''
       meta.drainUntil = 0
@@ -504,7 +523,7 @@ export function createReceivedChunkStore ({
   async function readChunkBytes (groupKey) {
     await ready()
     return transaction([GROUPS_STORE, CHUNKS_STORE], 'readonly', async tx => {
-      const meta = normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result)
+      const meta = normalizeMeta((await run('get', [groupKey], GROUPS_STORE, null, { tx })).result, configuredTtlMs)
       if (!meta) return { meta: null, chunks: [] }
       const chunks = []
       for (let index = 0; index < meta.total; index++) {
@@ -551,6 +570,12 @@ export function createReceivedChunkStore ({
     })
   }
 
+  function close () {
+    if (closed) return
+    closed = true
+    dbPromise?.then(db => db.close()).catch(() => {})
+  }
+
   return {
     cleanupStale,
     drainAvailable,
@@ -559,7 +584,22 @@ export function createReceivedChunkStore ({
     readChunkContents,
     readEnvelopeBundleContent,
     readEnvelopeBundleText,
+    ready,
     removeGroup,
-    status
+    status,
+    close
+  }
+}
+
+export async function cleanupReceivedChunkStorage ({
+  indexedDB = globalThis.indexedDB,
+  prefix = DEFAULT_PREFIX,
+  now = Date.now()
+} = {}) {
+  const store = createReceivedChunkStore({ prefix, indexedDB })
+  try {
+    return await store.cleanupStale(now)
+  } finally {
+    store.close()
   }
 }

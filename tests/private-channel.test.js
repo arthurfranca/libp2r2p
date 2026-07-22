@@ -1896,6 +1896,45 @@ test('received chunk store does not revive an expired partial group', async () =
   }
 })
 
+test('received chunk groups retain the TTL chosen by their original caller', async () => {
+  const originalNow = Date.now
+  const indexedDB = new IDBFactory()
+  let now = 1000
+  Date.now = () => now
+
+  try {
+    const firstStore = createReceivedChunkStore({
+      prefix: 'test:received-chunks:caller-ttl',
+      indexedDB,
+      ttlMs: 100
+    })
+    await firstStore.put({
+      channelPubkey: 'channel',
+      routerPubkey: 'router',
+      index: 0,
+      total: 2,
+      contentBytes: encoder.encode('kept')
+    })
+    firstStore.close()
+
+    const secondStore = createReceivedChunkStore({
+      prefix: 'test:received-chunks:caller-ttl',
+      indexedDB,
+      ttlMs: 5
+    })
+    now += 6
+    await secondStore.cleanupStale(now)
+    assert.equal((await secondStore.status('channel:router')).received, 1)
+
+    now += 95
+    await secondStore.cleanupStale(now)
+    assert.deepEqual(await secondStore.status('channel:router'), { received: 0, missing: [] })
+    secondStore.close()
+  } finally {
+    Date.now = originalNow
+  }
+})
+
 test('received chunk store evicts the least-recently-used group atomically', async () => {
   const originalNow = Date.now
   const indexedDB = new IDBFactory()

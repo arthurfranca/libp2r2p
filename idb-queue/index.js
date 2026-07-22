@@ -274,6 +274,10 @@ export async function createQueue ({
   const waiters = new Set()
   let sessionMaxBytes = configuredMaxBytes
   let revision = 0
+  let closed = false
+  let activeTransactions = 0
+  let closePromise = null
+  const closeWaiters = new Set()
 
   function hasByteLimit () {
     return Number.isFinite(sessionMaxBytes)
@@ -317,17 +321,27 @@ export async function createQueue ({
   }
 
   async function transaction (mode, work) {
-    const tx = db.transaction([ITEMS_STORE, STATE_STORE], mode)
-    const done = transactionDone(tx)
+    if (closed) throw new Error('QUEUE_CLOSED')
+    activeTransactions++
     try {
-      // Keep work limited to IndexedDB requests so the transaction stays active.
-      const value = await work(tx)
-      await done
-      return value
-    } catch (err) {
-      try { tx.abort() } catch {}
-      try { await done } catch {}
-      throw err
+      const tx = db.transaction([ITEMS_STORE, STATE_STORE], mode)
+      const done = transactionDone(tx)
+      try {
+        // Keep work limited to IndexedDB requests so the transaction stays active.
+        const value = await work(tx)
+        await done
+        return value
+      } catch (err) {
+        try { tx.abort() } catch {}
+        try { await done } catch {}
+        throw err
+      }
+    } finally {
+      activeTransactions--
+      if (!activeTransactions) {
+        for (const resolve of closeWaiters) resolve()
+        closeWaiters.clear()
+      }
     }
   }
 
@@ -771,6 +785,17 @@ export async function createQueue ({
     for (const record of (await snapshotStoredItems()).reverse()) yield record.item
   }
 
+  function close () {
+    if (closePromise) return closePromise
+    closed = true
+    wake()
+    closePromise = (activeTransactions
+      ? new Promise(resolve => closeWaiters.add(resolve))
+      : Promise.resolve())
+      .then(() => { db.close() })
+    return closePromise
+  }
+
   async function * storedItemsBy (indexName, query, { direction = 'next' } = {}) {
     direction = validDirection(direction)
     const records = await snapshot(async tx => {
@@ -811,6 +836,7 @@ export async function createQueue ({
     getBy,
     someBy,
     removeBy,
-    storedItemsBy
+    storedItemsBy,
+    close
   }
 }

@@ -126,32 +126,48 @@ one `['k', '3560']` tag, explicit matching `e` targets, and no `a` tags. A
 regular NIP-09 kind `5` request signed by the outer event's private-channel key
 must not delete a kind `3560` event, whether or not that event has an `s` tag.
 
-### Temporary Send Storage
+### Storage Maintenance
 
 While an outgoing private message is being assembled, the messenger keeps
 encrypted envelope rows and router chunks in `sessionStorage`. They are
 removed when the send finishes, but an interrupted browser operation can leave
 them behind until cleanup runs.
 
-`PrivateMessenger.init()` performs cleanup automatically. Call
-`PrivateMessenger.cleanupTemporaryStorage()` once during app startup when
-messenger initialization may be delayed, such as while an account is locked:
+`PrivateMessenger.init()` awaits storage maintenance automatically. Call
+`PrivateMessenger.maintainStorage()` during app startup when messenger
+initialization may be delayed, such as while an account is locked:
 
 ```js
 import { PrivateMessenger } from 'libp2r2p/private-messenger'
 
-PrivateMessenger.cleanupTemporaryStorage()
+PrivateMessenger.maintainStorage().catch(console.warn)
 ```
 
-Call it before any private-message send using that storage area starts. It
-does not clear persisted messages, recovery material, or channel state. Pass
-`temporaryStorageArea: localStorage` when constructing a messenger to opt into
-a different Storage area.
+Maintenance removes interrupted-send staging, expired receive chunks, and
+storage belonging to inactive principal identities. It also
+resumes any interrupted database-set deletion. An application does not need to
+know database names or enumerate IndexedDB. Pass `temporaryStorageArea` only
+when the messenger was configured to use a Storage area other than the default
+`sessionStorage`.
+
+Each principal signer owns internal message, recovery-seed, and channel-state
+databases. The messenger updates their activity lease while it is open and
+closes all handles in `await messenger.close()`. The complete set is removed
+after 60 days without use, including messages that were never consumed.
+Maintenance runs on every initialization and every six hours while a messenger
+is active; failed deletions remain journaled and retry automatically.
+
+Channel recovery state inside an otherwise active identity retains its separate
+45-day stale-channel cleanup policy. Recovery seeds remain limited to seven
+days.
 
 Recovery metadata is separate from that temporary send staging. Per-channel
 `lastSeenAt`, offline ranges, and related state are stored in IndexedDB. Raw
-incomplete receive chunks are also stored in IndexedDB, expire after one hour,
-and share a 16 MiB logical budget. Capacity eviction removes whole
+incomplete receive chunks are also stored in IndexedDB and share a 16 MiB
+logical budget. Direct private-channel calls give each new group a one-hour
+TTL; PrivateMessenger groups use seven days. The TTL is persisted per group,
+so another caller opening the shared database cannot change it. Capacity
+eviction removes whole
 least-recently-used message groups so a partial group is never mistaken for a
 complete one. `receivedChunkTtlMs`, `receivedChunkMaxBytes`, and
 `receivedChunkIndexedDB` may be supplied to the private-channel APIs when an
@@ -164,7 +180,8 @@ needed by private channels. For double-DH content-key use, pass a
 `contentKeySigner` or a signer implementation that handles content keys
 internally.
 
-Messages are stored in a bounded, durable IndexedDB queue until consumed:
+Messages are stored in a bounded, durable IndexedDB queue until consumed or
+until the principal identity has been inactive for 60 days:
 
 ```js
 async function handleMessages () {
