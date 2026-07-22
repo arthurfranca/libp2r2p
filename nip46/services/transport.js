@@ -1,4 +1,4 @@
-import { getPublicKey } from 'nostr-tools'
+import { getPublicKey } from '../../key/index.js'
 import { relayPool as defaultRelayPool } from '../../relay/index.js'
 import { DEFAULT_TIMEOUT, DEFAULT_TIMEOUT_AFTER_FIRST_EOSE } from '../constants/index.js'
 import { createNip46Event, requestError } from '../helpers/frame.js'

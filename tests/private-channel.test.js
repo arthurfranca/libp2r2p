@@ -1,7 +1,8 @@
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
-import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey } from 'nostr-tools'
+import { finalizeEvent, getEventHash } from '../event/index.js'
+import { generateSecretKey, getPublicKey } from '../key/index.js'
 import NsecSigner, { deriveSharedKey } from './helpers/test-signer.js'
 import { deriveDoubleDhConversationKey } from '../double-dh/index.js'
 import {

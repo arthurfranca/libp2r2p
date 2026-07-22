@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { getPublicKey } from 'nostr-tools'
+import { getPublicKey } from '../key/index.js'
 import { sha256 } from '@noble/hashes/sha2.js'
 
 import * as nip44v3 from '../nip44-v3/index.js'

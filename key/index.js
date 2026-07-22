@@ -1,13 +1,21 @@
-import {
-  generateSecretKey,
-  getPublicKey,
-  finalizeEvent,
-  nip19
-} from 'nostr-tools'
+import { schnorr, secp256k1 } from '@noble/curves/secp256k1.js'
 
 import { bytesToHex, hexToBytes } from '../base16/index.js'
+import { finalizeEvent } from '../event/index.js'
+import { nsecDecode, nsecEncode, npubDecode, npubEncode } from '../nip19/index.js'
 
 const HEX_SECKEY_REGEX = /^[0-9a-f]{64}$/i
+
+export function generateSecretKey () {
+  return schnorr.utils.randomSecretKey()
+}
+
+export function getPublicKey (secretKey) {
+  if (!(secretKey instanceof Uint8Array) || secretKey.length !== 32 || !secp256k1.utils.isValidSecretKey(secretKey)) {
+    throw new Error('INVALID_SECRET_KEY')
+  }
+  return bytesToHex(schnorr.getPublicKey(secretKey))
+}
 
 export function generateKeypair () {
   const secretKey = generateSecretKey()
@@ -16,8 +24,8 @@ export function generateKeypair () {
     secretKey,
     seckey: bytesToHex(secretKey),
     pubkey,
-    nsec: nip19.nsecEncode(secretKey),
-    npub: nip19.npubEncode(pubkey)
+    nsec: nsecEncode(bytesToHex(secretKey)),
+    npub: npubEncode(pubkey)
   }
 }
 
@@ -29,17 +37,19 @@ export function keypairFromSeckey (raw) {
   if (HEX_SECKEY_REGEX.test(raw)) {
     secretKey = hexToBytes(raw.toLowerCase())
   } else {
-    const decoded = nip19.decode(raw)
-    if (decoded.type !== 'nsec') throw new Error('NOT_A_SECRET_KEY')
-    secretKey = decoded.data
+    try {
+      secretKey = hexToBytes(nsecDecode(raw))
+    } catch {
+      throw new Error('NOT_A_SECRET_KEY')
+    }
   }
   const pubkey = getPublicKey(secretKey)
   return {
     secretKey,
     seckey: bytesToHex(secretKey),
     pubkey,
-    nsec: nip19.nsecEncode(secretKey),
-    npub: nip19.npubEncode(pubkey)
+    nsec: nsecEncode(bytesToHex(secretKey)),
+    npub: npubEncode(pubkey)
   }
 }
 
@@ -47,17 +57,19 @@ export function keypairFromSeckey (raw) {
 // bech32 includes a checksum that protects against user-typo imports of a
 // pubkey they cannot sign for.
 export function pubkeyFromNpub (npub) {
-  const decoded = nip19.decode(npub)
-  if (decoded.type !== 'npub') throw new Error('NOT_AN_NPUB')
-  return decoded.data
+  try {
+    return npubDecode(npub)
+  } catch {
+    throw new Error('NOT_AN_NPUB')
+  }
 }
 
 export function nsecFromHex (hex) {
-  return nip19.nsecEncode(hexToBytes(hex))
+  return nsecEncode(hex)
 }
 
 export function npubFromPubkey (pubkey) {
-  return nip19.npubEncode(pubkey)
+  return npubEncode(pubkey)
 }
 
 function cleanProfileValue (value) {

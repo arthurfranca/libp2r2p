@@ -1,4 +1,4 @@
-import { verifyEvent } from 'nostr-tools'
+import { verifyEvent } from '../../event/index.js'
 import { validPubkey } from '../helpers/frame.js'
 import { Nip46Client } from './client.js'
 

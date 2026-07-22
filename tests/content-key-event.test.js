@@ -1,6 +1,7 @@
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { generateSecretKey, verifyEvent } from 'nostr-tools'
+import { verifyEvent } from '../event/index.js'
+import { generateSecretKey } from '../key/index.js'
 
 import TestSigner from './helpers/test-signer.js'
 import { bytesToHex } from '../base16/index.js'

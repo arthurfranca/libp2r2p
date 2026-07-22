@@ -1,4 +1,4 @@
-import { getPublicKey } from 'nostr-tools'
+import { getPublicKey } from '../../key/index.js'
 import { relayPool as defaultRelayPool } from '../../relay/index.js'
 import {
   DEFAULT_TIMEOUT,

@@ -1,4 +1,4 @@
-import { getEventHash } from 'nostr-tools'
+import { getEventHash } from '../../event/index.js'
 import { bytesToBase64, base64ToBytes } from '../../base64/index.js'
 import { ASK_KIND, parseRumorContent } from '../../private-message/index.js'
 

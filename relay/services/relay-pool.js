@@ -1,7 +1,7 @@
 import { decodeHll, encodeHll, estimateHllCount, mergeHll } from '../helpers/hll.js'
 import { createPublishSettlements, firstFulfillment, publishSummary } from '../helpers/publish.js'
 import { maybeUnref } from '../helpers/timer.js'
-import { normalizeURL } from 'nostr-tools/utils'
+import { normalizeUrl } from '../../url/index.js'
 import { RelayConnection } from './relay-connection.js'
 
 const CONNECTION_TIMEOUT_MS = 3000
@@ -82,7 +82,7 @@ function normalizedRelayUrls (relays) {
   const seen = new Set()
 
   for (const relay of relays || []) {
-    const normalizedUrl = normalizeURL(relay)
+    const normalizedUrl = normalizeUrl(relay)
     if (seen.has(normalizedUrl)) continue
     seen.add(normalizedUrl)
     // Keep the caller's first spelling in reports and metadata while using the
@@ -110,6 +110,11 @@ export class RelayPool {
   #relayTimeouts = new Map()
   #liveSubCounts = new Map() // url -> number of active live subscriptions
   #timeout = 30000 // 30 seconds
+  #createRelay
+
+  constructor ({ _createRelay = url => new RelayConnection(url) } = {}) {
+    this.#createRelay = _createRelay
+  }
 
   #scheduleIdleDisconnect (url) {
     clearTimeout(this.#relayTimeouts.get(url))
@@ -119,15 +124,14 @@ export class RelayPool {
   // Opens a normalized pooled connection. Failed connects are evicted so a later
   // retry creates a fresh RelayConnection instead of reusing broken socket state.
   async #getRelay (url) {
-    const normalizedUrl = normalizeURL(url)
+    const normalizedUrl = normalizeUrl(url)
     let relay = this.#relays.get(normalizedUrl)
     if (!relay) {
-      relay = new RelayConnection(normalizedUrl)
+      relay = this.#createRelay(normalizedUrl)
       this.#relays.set(normalizedUrl, relay)
     }
 
     try {
-      // nostr-tools cancels its socket attempt when this deadline elapses.
       await relay.connect({ timeout: CONNECTION_TIMEOUT_MS })
     } catch (error) {
       if (this.#relays.get(normalizedUrl) === relay) {
@@ -147,7 +151,7 @@ export class RelayPool {
   }
 
   #incrementLiveSub (url) {
-    const normalizedUrl = normalizeURL(url)
+    const normalizedUrl = normalizeUrl(url)
     this.#liveSubCounts.set(normalizedUrl, (this.#liveSubCounts.get(normalizedUrl) ?? 0) + 1)
     // Cancel any pending idle timeout — this relay must stay open
     clearTimeout(this.#relayTimeouts.get(normalizedUrl))
@@ -155,7 +159,7 @@ export class RelayPool {
   }
 
   #decrementLiveSub (url) {
-    const normalizedUrl = normalizeURL(url)
+    const normalizedUrl = normalizeUrl(url)
     const next = (this.#liveSubCounts.get(normalizedUrl) ?? 1) - 1
     if (next <= 0) {
       this.#liveSubCounts.delete(normalizedUrl)
@@ -414,8 +418,6 @@ export class RelayPool {
           // Actual EOSE and filter satisfaction share the same graceful close path.
           const handleEose = () => {
             if (isResolved || !pending.has(url)) return
-            // nostr-tools reports "closed by caller" through onclose(). This is a
-            // successful local completion, not a relay failure.
             normalCloseUrls.add(url)
             sub.close()
             if (hasEvents && timeoutAfterFirstEose !== null && !eoseTimer && !isResolved) {

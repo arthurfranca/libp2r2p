@@ -1,4 +1,4 @@
-import { describe, it, beforeEach, mock, test } from 'node:test'
+import { describe, it, beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 
 // ─── Fake Relay infrastructure ────────────────────────────────────────────────
@@ -26,6 +26,10 @@ class FakeRelay {
     this.subscriptions = []
     this.ws = { readyState: 1 }
     this.publishTimeout = 100
+    this.pendingCounts = new Map()
+    this.pendingAuths = new Map()
+    this.serial = 0
+    this.challenge = null
     relayRegistry.set(url, this)
     // RelayPool canonicalizes URLs; retain the test's terse lookup spelling.
     if (url.endsWith('/')) relayRegistry.set(url.slice(0, -1), this)
@@ -68,7 +72,52 @@ class FakeRelay {
     if (fn) await fn(message, this)
   }
 
-  _onmessage (_message) {}
+  countWithHll (filters, { signal } = {}) {
+    const id = `p2r2p-count:${++this.serial}`
+    const pending = Promise.withResolvers()
+    const onAbort = () => {
+      this.pendingCounts.delete(id)
+      pending.reject(new Error('COUNT_ABORTED'))
+    }
+    this.pendingCounts.set(id, { ...pending, signal, onAbort })
+    signal?.addEventListener('abort', onAbort, { once: true })
+    this.send(JSON.stringify(['COUNT', id, ...filters]))
+    return pending.promise
+  }
+
+  async authenticate (getAuthEvent) {
+    if (!this.challenge) throw new Error('AUTH_CHALLENGE_MISSING')
+    const event = await getAuthEvent({ relay: this.url, challenge: this.challenge })
+    const pending = Promise.withResolvers()
+    this.pendingAuths.set(event.id, pending)
+    await this.send(JSON.stringify(['AUTH', event]))
+    return pending.promise
+  }
+
+  _onmessage (message) {
+    const data = JSON.parse(message.data)
+    if (data[0] === 'AUTH') this.challenge = data[1]
+    if (data[0] === 'COUNT') {
+      const pending = this.pendingCounts.get(data[1])
+      if (!pending) return
+      this.pendingCounts.delete(data[1])
+      pending.signal?.removeEventListener('abort', pending.onAbort)
+      pending.resolve(data[2])
+    }
+    if (data[0] === 'CLOSED') {
+      const pending = this.pendingCounts.get(data[1])
+      if (!pending) return
+      this.pendingCounts.delete(data[1])
+      pending.reject(new Error(data[2]))
+    }
+    if (data[0] === 'OK') {
+      const pending = this.pendingAuths.get(data[1])
+      if (!pending) return
+      this.pendingAuths.delete(data[1])
+      if (data[2]) pending.resolve(data[3])
+      else pending.reject(new Error(data[3]))
+    }
+  }
 
   async close () {
     this.ws.readyState = 3
@@ -76,14 +125,11 @@ class FakeRelay {
   }
 }
 
-mock.module('nostr-tools/relay', {
-  namedExports: {
-    Relay: FakeRelay
-  }
-})
-
-// Dynamic import AFTER mock.module so the module picks up FakeRelay
 const { RelayPool, relayPool } = await import('../relay/index.js')
+
+function createRelayPool () {
+  return new RelayPool({ _createRelay: url => new FakeRelay(url) })
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -155,7 +201,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     relayRegistry.clear()
     connectOverrides.clear()
     autoEoseForLiveSubscriptions = true
-    nostr = new RelayPool()
+    nostr = createRelayPool()
   })
 
   it('yields live events and runs until aborted', async () => {
@@ -723,7 +769,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
     _nextId = 1
     relayRegistry.clear()
     connectOverrides.clear()
-    nostr = new RelayPool()
+    nostr = createRelayPool()
   })
 
   // ── live:true ────────────────────────────────────────────────────────────────
@@ -1012,7 +1058,7 @@ describe('RelayPool.getEvents', () => {
     _nextId = 1
     relayRegistry.clear()
     connectOverrides.clear()
-    nostr = new RelayPool()
+    nostr = createRelayPool()
   })
 
   it('collects events and resolves on EOSE', async () => {
@@ -1221,7 +1267,7 @@ describe('RelayPool.getEvents EOSE grace', () => {
     _nextId = 1
     relayRegistry.clear()
     connectOverrides.clear()
-    nostr = new RelayPool()
+    nostr = createRelayPool()
   })
 
   it('collects events and resolves when all relay subs close', async () => {
@@ -1379,7 +1425,7 @@ describe('RelayPool.countEvents', () => {
     relayRegistry.clear()
     connectOverrides.clear()
     sendOverrides.clear()
-    nostr = new RelayPool()
+    nostr = createRelayPool()
   })
 
   it('sends one NIP-45 filter and returns a single relay count immediately', async () => {
@@ -1589,7 +1635,7 @@ describe('RelayPool.getEventsGenerator', () => {
     _nextId = 1
     relayRegistry.clear()
     connectOverrides.clear()
-    nostr = new RelayPool()
+    nostr = createRelayPool()
   })
 
   it('yields event items', async () => {
@@ -1647,7 +1693,7 @@ describe('RelayPool.sendEvent', () => {
     connectOverrides.clear()
     publishOverrides.clear()
     sendOverrides.clear()
-    nostr = new RelayPool()
+    nostr = createRelayPool()
   })
 
   it('returns after the first accepted relay and keeps a full settlement promise', async () => {

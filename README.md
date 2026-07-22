@@ -91,7 +91,7 @@ await messenger.tell({
 ```
 
 ```js
-import { finalizeEvent } from 'nostr-tools'
+import { finalizeEvent } from 'libp2r2p/event'
 import { keypairFromSeckey } from 'libp2r2p/key'
 import { relayPool } from 'libp2r2p/relay'
 
@@ -149,7 +149,7 @@ PrivateMessenger.maintainStorage().catch(console.warn)
 
 Maintenance removes interrupted-send staging, expired receive chunks, and
 storage belonging to inactive principal identities. It also
-resumes any interrupted database-set deletion. An application does not need to
+resumes any interrupted storage-set deletion. An application does not need to
 know database names or enumerate IndexedDB. Pass `temporaryStorageArea` only
 when the messenger was configured to use a Storage area other than the default
 `sessionStorage`.
@@ -244,6 +244,26 @@ clearing is asynchronous too: `await messenger.clearChannel(channelPubkey)`.
 Use explicit subpath imports for bundle size. The package root re-exports the
 main messenger API for convenience, but applications that only need one piece
 should import that subpath directly.
+
+## Nostr primitives
+
+The modern stack can use the package without `nostr-tools`. Its intentionally
+small public surface includes strict, non-caching NIP-01 helpers, NIP-04 for
+legacy interoperability, NIP-44 v2, key helpers, and relay URL normalization:
+
+```js
+import { finalizeEvent, verifyEvent } from 'libp2r2p/event'
+import { generateSecretKey, getPublicKey } from 'libp2r2p/key'
+import * as nip44 from 'libp2r2p/nip44'
+import { normalizeUrl } from 'libp2r2p/url'
+```
+
+`verifyEvent()` recalculates and verifies every event on every call; it never
+adds a cache marker to the event. NIP-04 remains available at
+`libp2r2p/nip04` only for compatibility with older Nostr applications.
+Low-level relay sockets, subscriptions, message parsing, and serialization are
+internal implementation details; use `RelayPool` or the `relayPool` singleton
+from `libp2r2p/relay`.
 
 ## Internationalization
 

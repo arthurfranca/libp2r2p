@@ -1,5 +1,5 @@
-import { finalizeEvent, verifyEvent } from 'nostr-tools'
-import { decrypt, encrypt, getConversationKey } from 'nostr-tools/nip44'
+import { finalizeEvent, verifyEvent } from '../../event/index.js'
+import { decrypt, encrypt, getConversationKey } from '../../nip44/index.js'
 import { NIP46_KIND } from '../constants/index.js'
 
 const PUBKEY = /^[0-9a-f]{64}$/

@@ -1,6 +1,7 @@
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { finalizeEvent, generateSecretKey, getEventHash } from 'nostr-tools'
+import { finalizeEvent, getEventHash } from '../event/index.js'
+import { generateSecretKey } from '../key/index.js'
 import {
   ASK_KIND,
   REPLY_KIND,
@@ -279,7 +280,7 @@ test('ask publishes an ask rumor and watch dispatches the reply with its questio
   assert.equal(result.question.id, getEventHash({ ...published.event, pubkey: senderPubkey }))
   assert.deepEqual(result.delivery.reports, [{ success: true }])
   assert.equal(keypairFromSeckey(result.delivery.deletionSeckey).pubkey, published.deletionPubkey)
-  assert.throws(() => getEventHash(published.event), /wrong or missing properties/)
+  assert.throws(() => getEventHash(published.event), /INVALID_EVENT/)
 
   calls[0].onEvent({
     kind: REPLY_KIND,

@@ -1,4 +1,4 @@
-import { getEventHash, verifyEvent } from 'nostr-tools'
+import { getEventHash, verifyEvent } from '../../event/index.js'
 
 export const CONTENT_KEY_KIND = 18716
 
@@ -34,7 +34,7 @@ export function parseContentKeyEvent (event) {
   if (!event || event.kind !== CONTENT_KEY_KIND || event.content !== '') return null
   if (!HEX_PUBKEY.test(event.pubkey) || !Number.isSafeInteger(event.created_at)) return null
   if (!Array.isArray(event.tags) || event.tags.length !== 1) return null
-  if (event.id !== getEventHash(event) || !verifyEvent(event)) return null
+  if (!verifyEvent(event)) return null
 
   const [name, contentPubkey, ...rest] = event.tags[0] || []
   if (name !== 'cp' || rest.length || !HEX_PUBKEY.test(contentPubkey || '')) return null

@@ -1,7 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools'
-import { decrypt, encrypt, getConversationKey } from 'nostr-tools/nip44'
+import { finalizeEvent } from '../event/index.js'
+import { generateSecretKey, getPublicKey } from '../key/index.js'
+import { decrypt, encrypt, getConversationKey } from '../nip44/index.js'
 import {
   BunkerSigner,
   createNostrConnectURI,

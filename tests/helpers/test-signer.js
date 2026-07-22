@@ -1,4 +1,7 @@
-import { finalizeEvent, getPublicKey, nip04, nip44 } from 'nostr-tools'
+import { finalizeEvent } from '../../event/index.js'
+import { getPublicKey } from '../../key/index.js'
+import * as nip04 from '../../nip04/index.js'
+import * as nip44 from '../../nip44/index.js'
 import { extract as hkdfExtract, expand as hkdfExpand } from '@noble/hashes/hkdf.js'
 import { sha256 } from '@noble/hashes/sha2.js'
 

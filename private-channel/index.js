@@ -1,4 +1,5 @@
-import { generateSecretKey, getPublicKey, finalizeEvent, getEventHash, validateEvent, verifyEvent } from 'nostr-tools'
+import { finalizeEvent, getEventHash, validateEvent, verifyEvent } from '../event/index.js'
+import { generateSecretKey, getPublicKey } from '../key/index.js'
 import { bytesToBase64, base64ToBytes } from '../base64/index.js'
 import { hexToBytes } from '../base16/index.js'
 import { makeContentKeyEventForPubkey, parseContentKeyEvent, verifyContentKeyProof, verifyIykcProof } from '../content-key/event/index.js'
@@ -260,7 +261,7 @@ function isSignedEvent (event) {
 }
 
 function assertValidSignedInnerEvent (event) {
-  if (!validateEvent(event) || event.id !== getEventHash(event) || !verifyEvent(event)) {
+  if (!verifyEvent(event)) {
     throw new Error('INVALID_SIGNED_INNER_EVENT')
   }
   return event
@@ -282,7 +283,7 @@ function wireNymRumor (event = {}) {
 }
 
 function assertValidNymCarrierEvent (carrier) {
-  if (!validateEvent(carrier) || carrier.id !== getEventHash(carrier) || !verifyEvent(carrier)) {
+  if (!verifyEvent(carrier)) {
     throw new Error('INVALID_NYM_CARRIER')
   }
   if (carrier.kind !== NYM_CARRIER_KIND) throw new Error('INVALID_NYM_CARRIER_KIND')

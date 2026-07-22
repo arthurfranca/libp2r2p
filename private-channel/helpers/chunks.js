@@ -1,4 +1,4 @@
-import { generateSecretKey, getPublicKey } from 'nostr-tools'
+import { generateSecretKey, getPublicKey } from '../../key/index.js'
 import { bytesToBase64, base64ToBytes } from '../../base64/index.js'
 import { bytesToHex } from '../../base16/index.js'
 import { verifyIykcProof } from '../../content-key/event/index.js'

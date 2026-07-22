@@ -1,4 +1,4 @@
-import { getEventHash, validateEvent, verifyEvent } from 'nostr-tools'
+import { getEventHash, validateEvent, verifyEvent } from '../event/index.js'
 import { generateKeypair } from '../key/index.js'
 import * as privateChannel from '../private-channel/index.js'
 
@@ -139,7 +139,7 @@ function normalizeRumor (event, pubkey) {
 }
 
 function assertValidSignedEvent (event) {
-  if (!validateEvent(event) || event.id !== getEventHash(event) || !verifyEvent(event)) {
+  if (!verifyEvent(event)) {
     throw new Error('INVALID_SIGNED_EVENT')
   }
   return event
