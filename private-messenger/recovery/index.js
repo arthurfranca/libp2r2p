@@ -295,7 +295,8 @@ export function createMissingMessageReplyPacker ({
   receiverPubkey = question?.pubkey,
   since,
   until,
-  eventsPerChunk = DEFAULT_EVENTS_PER_CHUNK
+  eventsPerChunk = DEFAULT_EVENTS_PER_CHUNK,
+  sendEmptyReply = false
 }) {
   if (!messenger?.reply) throw new Error('MESSENGER_REQUIRED')
   if (!question?.id) throw new Error('QUESTION_REQUIRED')
@@ -311,6 +312,7 @@ export function createMissingMessageReplyPacker ({
     code: MISSING_MESSAGES_REPLY_CODE,
     payload: { since: range.since, until: range.until },
     eventsPerChunk,
+    sendEmptyReply,
     recordsFromInput: seed => compactRecordsFromSeed(seed, { receiverPubkey, since: range.since, until: range.until })
   })
 }

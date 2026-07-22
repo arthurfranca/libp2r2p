@@ -2,6 +2,7 @@ import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { ASK_KIND, REPLY_KIND, TELL_KIND } from '../private-message/index.js'
+import { EXPIRATION_SECONDS } from '../private-channel/index.js'
 import {
   createEventReplyPacker,
   createMissingMessageReplyPacker,
@@ -323,6 +324,224 @@ test('private messenger watches channels and queues received leecher rumors', as
   assert.equal(raw.type, 'message')
   assert.equal(raw.event.id, 'raw-id')
   assert.deepEqual(raw.payload, ['raw-payload', 'not-a-private-message-code'])
+})
+
+test('private messenger validates and applies offline recovery defaults and channel overrides', async () => {
+  for (const invalid of [-1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER]) {
+    assert.throws(
+      () => new PrivateMessenger({ _privateMessage: fakePrivateMessage(), offlineRecoverySeconds: invalid }),
+      /INVALID_OFFLINE_RECOVERY_SECONDS/
+    )
+  }
+
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    offlineRecoverySeconds: 2 * 60 * 60
+  }).init({
+    userSigner: signer('user'),
+    channels: [
+      { pubkey: 'inherited', signer: signer('inherited'), relays: ['wss://relay.example'] },
+      { pubkey: 'custom', signer: signer('custom'), relays: ['wss://relay.example'], offlineRecoverySeconds: 30 * 60 }
+    ]
+  })
+
+  assert.equal(pm.watchCalls[0].receivedChunkTtlMs, 2 * 60 * 60 * 1000)
+  assert.equal(pm.watchCalls[1].receivedChunkTtlMs, 30 * 60 * 1000)
+  assert.equal(messenger.readState().channels.inherited.offlineRecoverySeconds, 2 * 60 * 60)
+  assert.equal(messenger.readState().channels.custom.offlineRecoverySeconds, 30 * 60)
+
+  await messenger.tell({ channelPubkey: 'inherited', receiverPubkey: 'alice', payload: 'default' })
+  await messenger.tell({ channelPubkey: 'custom', receiverPubkey: 'alice', payload: 'custom' })
+  assert.equal(pm.sent[0].options.expirationSeconds, 2 * 60 * 60)
+  assert.equal(pm.sent[1].options.expirationSeconds, 30 * 60)
+
+  await assert.rejects(
+    () => messenger.update({
+      channels: [{ pubkey: 'custom', signer: signer('custom'), relays: ['wss://relay.example'], offlineRecoverySeconds: -1 }]
+    }),
+    /INVALID_OFFLINE_RECOVERY_SECONDS/
+  )
+  await messenger.close()
+})
+
+test('private messenger applies reduced channel recovery policies immediately without affecting other channels', async () => {
+  const originalDateNow = Date.now
+  const now = 2_000_000_000
+  Date.now = () => now * 1000
+  const pm = fakePrivateMessage()
+  let messenger
+  try {
+    messenger = await new PrivateMessenger({
+      _privateMessage: pm,
+      offlineRecoverySeconds: 1000,
+      _setTimeout: () => null
+    }).init({
+      userSigner: signer('user'),
+      channels: [
+        { pubkey: 'short', signer: signer('short'), relays: ['wss://relay.example'] },
+        { pubkey: 'long', signer: signer('long'), relays: ['wss://relay.example'] }
+      ]
+    })
+
+    await messenger.seedQueue.enqueue({
+      type: 'seed',
+      channelPubkey: 'short',
+      receivedAt: now - 100,
+      __p2r2pSeedKey: 'short-seed',
+      __p2r2pSeedTime: now - 100
+    })
+    await messenger.seedQueue.enqueue({
+      type: 'seed',
+      channelPubkey: 'long',
+      receivedAt: now - 100,
+      __p2r2pSeedKey: 'long-seed',
+      __p2r2pSeedTime: now - 100
+    })
+    messenger.updateChannelState('short', {
+      openOfflineStart: now - 500,
+      offlineRanges: [
+        { start: now - 500, end: now - 400 },
+        { start: now - 100, end: now - 10 }
+      ]
+    })
+    await messenger.flushStateWrites()
+
+    await messenger.update({
+      channels: [
+        { pubkey: 'short', signer: signer('short'), relays: ['wss://relay.example'], offlineRecoverySeconds: 60 },
+        { pubkey: 'long', signer: signer('long'), relays: ['wss://relay.example'], offlineRecoverySeconds: 200 }
+      ]
+    })
+
+    assert.equal(await messenger.seedQueue.someBy('bySeedKey', 'short-seed'), false)
+    assert.equal(await messenger.seedQueue.someBy('bySeedKey', 'long-seed'), true)
+    assert.deepEqual(messenger.readState().channels.short.offlineRanges, [{ start: now - 60, end: now - 10 }])
+    assert.equal(messenger.readState().channels.short.openOfflineStart, now - 60)
+
+    await messenger.update({
+      channels: [
+        { pubkey: 'short', signer: signer('short'), relays: ['wss://relay.example'], offlineRecoverySeconds: 500 },
+        { pubkey: 'long', signer: signer('long'), relays: ['wss://relay.example'], offlineRecoverySeconds: 200 }
+      ]
+    })
+    assert.equal(await messenger.seedQueue.someBy('bySeedKey', 'short-seed'), false)
+  } finally {
+    await messenger?.close()
+    Date.now = originalDateNow
+  }
+})
+
+test('private messenger applies the current channel policy before startup pruning', async () => {
+  const originalDateNow = Date.now
+  const indexedDB = new IDBFactory()
+  const now = 2_000_000_000
+  Date.now = () => now * 1000
+  let first
+  let second
+  try {
+    first = await new PrivateMessenger({
+      _privateMessage: fakePrivateMessage(),
+      _indexedDB: indexedDB,
+      offlineRecoverySeconds: 1000
+    }).init({
+      userSigner: signer('restart-user'),
+      channels: [{
+        pubkey: 'channel',
+        signer: signer('channel'),
+        relays: ['wss://relay.example'],
+        offlineRecoverySeconds: 60
+      }]
+    })
+    await first.seedQueue.enqueue({
+      type: 'seed',
+      channelPubkey: 'channel',
+      receivedAt: now - 100,
+      __p2r2pSeedKey: 'policy-increase-seed',
+      __p2r2pSeedTime: now - 100
+    })
+    await first.close()
+    first = null
+
+    second = await new PrivateMessenger({
+      _privateMessage: fakePrivateMessage(),
+      _indexedDB: indexedDB,
+      offlineRecoverySeconds: 1000
+    }).init({
+      userSigner: signer('restart-user'),
+      channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'] }]
+    })
+
+    assert.equal(second.readState().channels.channel.offlineRecoverySeconds, 1000)
+    assert.equal(await second.seedQueue.someBy('bySeedKey', 'policy-increase-seed'), true)
+  } finally {
+    await first?.close()
+    await second?.close()
+    Date.now = originalDateNow
+  }
+})
+
+test('offline recovery zero disables durable recovery while preserving live technical deadlines', async () => {
+  const pm = fakePrivateMessage()
+  const intervals = []
+  const scheduled = []
+  const contentKeyChanges = []
+  const fetches = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    _privateChannel: { fetch: async options => { fetches.push(options); return [] } },
+    _setInterval: (fn, ms) => { const timer = { fn, ms }; intervals.push(timer); return timer },
+    _setTimeout: fn => { scheduled.push(fn); return fn },
+    onContentKeyChange: event => contentKeyChanges.push(event)
+  }).init({
+    userSigner: signer('user'),
+    channels: [
+      { pubkey: 'leecher', signer: signer('leecher'), relays: ['wss://relay.example'], seeders: ['remote'], offlineRecoverySeconds: 0 },
+      { pubkey: 'seeder', signer: signer('seeder'), relays: ['wss://relay.example'], mode: 'seeder', offlineRecoverySeconds: 0 },
+      { pubkey: 'watchtower', signer: signer('watchtower'), relays: ['wss://relay.example'], mode: 'watchtower', offlineRecoverySeconds: 0 }
+    ]
+  })
+
+  assert.deepEqual(pm.watchCalls.map(call => call.receivedChunkTtlMs), [60 * 60 * 1000, 60 * 60 * 1000, 60 * 60 * 1000])
+  assert.equal(intervals.length, 0)
+  assert.equal(scheduled.length, 0)
+  assert.deepEqual(messenger.readState().channels.leecher.offlineRanges, [])
+
+  messenger.addOfflineRange('leecher', 1, 2)
+  await messenger.recoverOfflineRanges(['leecher'])
+  assert.deepEqual(messenger.readState().channels.leecher.offlineRanges, [])
+  assert.equal(fetches.length, 0)
+
+  await messenger.enqueueSeed('seeder', { channelPubkey: 'seeder' })
+  assert.equal(await messenger.seedQueue.some(() => true), false)
+  assert.deepEqual(await messenger.askSeedersForMissingRange('leecher', 1, 2), [])
+  assert.equal(await messenger.publishSeederPresence('seeder'), null)
+
+  await messenger.tell({ channelPubkey: 'leecher', receiverPubkey: 'alice', payload: 'live' })
+  assert.equal(pm.sent[0].options.expirationSeconds, EXPIRATION_SECONDS)
+  assert.deepEqual(pm.sent[0].options.recoveryRelays, [])
+
+  const now = Math.floor(Date.now() / 1000)
+  await pm.watchCalls[1].onAsk({
+    event: { id: 'question-id', kind: ASK_KIND, pubkey: 'alice', created_at: now, tags: [], content: '' },
+    outer: { id: 'outer-id', created_at: now },
+    meta: { channelPubkey: 'seeder' },
+    payload: { code: MISSING_MESSAGES_ASK_CODE, payload: { since: now - 10, until: now } }
+  })
+  const emptyReply = pm.sent.find(sent => sent.method === 'reply' && sent.options.code === MISSING_MESSAGES_REPLY_CODE)
+  assert.equal(emptyReply.options.payload.jsonl, '')
+  assert.equal(emptyReply.options.payload.isLast, true)
+  assert.equal(emptyReply.options.expirationSeconds, EXPIRATION_SECONDS)
+
+  pm.watchCalls[2].onContentKeyUsage({
+    direction: 'received',
+    senderPubkey: 'alice',
+    receiverPubkey: 'user',
+    contentKeyPubkey: 'content-key'
+  })
+  assert.equal(contentKeyChanges.length, 1)
+  assert.equal(contentKeyChanges[0].channelPubkey, 'watchtower')
+  await messenger.close()
 })
 
 test('private messenger pauses live watches offline, restarts them before durable recovery, and keeps presence running', async () => {

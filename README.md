@@ -20,10 +20,12 @@ import { createPrivateMessenger } from 'libp2r2p/private-messenger'
 const messenger = await createPrivateMessenger({
   userSigner,
   contentKeySigner,
+  offlineRecoverySeconds: 7 * 24 * 60 * 60,
   channels: [{
     signer: privateChannelSigner,
     relays: ['wss://relay.example'],
-    mode: 'leecher'
+    mode: 'leecher',
+    offlineRecoverySeconds: 30 * 24 * 60 * 60
   }],
   onError: err => console.warn('private messenger failed', err)
 })
@@ -158,21 +160,39 @@ Maintenance runs on every initialization and every six hours while a messenger
 is active; failed deletions remain journaled and retry automatically.
 
 Channel recovery state inside an otherwise active identity retains its separate
-45-day stale-channel cleanup policy. Recovery seeds remain limited to seven
-days.
+45-day stale-channel cleanup policy. Offline recovery defaults to seven days.
+Set `offlineRecoverySeconds` on an individual channel to override the
+messenger default for its recovery seeds, offline ranges, new outer-event
+expiration, and new incomplete receive groups. Updating a channel applies a
+shorter window immediately to its stored seeds and ranges; increasing it does
+not recreate data already removed.
+
+Set a channel's `offlineRecoverySeconds` to `0` to disable durable recovery for
+that channel. The messenger then stores no recovery seeds, tracks no offline
+ranges, contacts no seeders, publishes no seeder presence, and uses no recovery
+mirror relays. Live delivery remains usable: new outer events retain the
+private-channel two-day technical expiration and incomplete receive groups use
+the one-hour technical TTL. Existing signed events and receive groups retain
+the deadlines chosen when they were created.
 
 Recovery metadata is separate from that temporary send staging. Per-channel
 `lastSeenAt`, offline ranges, and related state are stored in IndexedDB. Raw
 incomplete receive chunks are also stored in IndexedDB and share a 16 MiB
 logical budget. Direct private-channel calls give each new group a one-hour
-TTL; PrivateMessenger groups use seven days. The TTL is persisted per group,
-so another caller opening the shared database cannot change it. Capacity
+TTL; PrivateMessenger groups use the effective recovery window of their
+channel, or one hour when durable recovery is disabled. The TTL is persisted
+per group, so another caller opening the shared database or a later channel
+configuration update cannot change it. Capacity
 eviction removes whole
 least-recently-used message groups so a partial group is never mistaken for a
 complete one. `receivedChunkTtlMs`, `receivedChunkMaxBytes`, and
 `receivedChunkIndexedDB` may be supplied to the private-channel APIs when an
 embedding environment needs different limits or an injected IDB factory.
 Legacy Web Storage recovery records are neither read nor migrated.
+
+The recovery-seed queue has a shared 64 MiB logical budget by default and uses
+FIFO eviction. A channel recovery duration is therefore a maximum retention
+window, not a guarantee that every seed remains available until its deadline.
 
 Signers are expected to expose the Nostr-style methods used by the messenger,
 including `getPublicKey()`, `signEvent(event)`, and the NIP-44 v3 methods

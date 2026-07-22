@@ -1926,10 +1926,61 @@ test('received chunk groups retain the TTL chosen by their original caller', asy
     await secondStore.cleanupStale(now)
     assert.equal((await secondStore.status('channel:router')).received, 1)
 
-    now += 95
+    now += 100
     await secondStore.cleanupStale(now)
     assert.deepEqual(await secondStore.status('channel:router'), { received: 0, missing: [] })
     secondStore.close()
+  } finally {
+    Date.now = originalNow
+  }
+})
+
+test('received chunk groups use per-group TTL overrides without changing existing groups', async () => {
+  const originalNow = Date.now
+  const indexedDB = new IDBFactory()
+  let now = 1000
+  Date.now = () => now
+
+  try {
+    const store = createReceivedChunkStore({
+      prefix: 'test:received-chunks:per-group-ttl',
+      indexedDB,
+      ttlMs: 1000
+    })
+    await store.put({
+      channelPubkey: 'short',
+      routerPubkey: 'router',
+      index: 0,
+      total: 2,
+      contentBytes: encoder.encode('short'),
+      ttlMs: 5
+    })
+    await store.put({
+      channelPubkey: 'long',
+      routerPubkey: 'router',
+      index: 0,
+      total: 3,
+      contentBytes: encoder.encode('long'),
+      ttlMs: 100
+    })
+
+    now += 6
+    await store.put({
+      channelPubkey: 'long',
+      routerPubkey: 'router',
+      index: 1,
+      total: 3,
+      contentBytes: encoder.encode('still long'),
+      ttlMs: 5
+    })
+    await store.cleanupStale(now)
+    assert.deepEqual(await store.status('short:router'), { received: 0, missing: [] })
+    assert.equal((await store.status('long:router')).received, 2)
+
+    now += 100
+    await store.cleanupStale(now)
+    assert.deepEqual(await store.status('long:router'), { received: 0, missing: [] })
+    store.close()
   } finally {
     Date.now = originalNow
   }

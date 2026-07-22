@@ -271,10 +271,11 @@ export function createReceivedChunkStore ({
     return cleanupStaleRaw(nowMs)
   }
 
-  async function putOnce ({ channelPubkey, routerPubkey, index, total, contentBytes }) {
+  async function putOnce ({ channelPubkey, routerPubkey, index, total, contentBytes, ttlMs }) {
     const groupKey = groupKeyFor(channelPubkey, routerPubkey)
     const bytes = normalizeBytes(contentBytes)
     const now = Date.now()
+    const groupTtlMs = Number.isFinite(ttlMs) && ttlMs >= 0 ? ttlMs : configuredTtlMs
 
     return transaction([GROUPS_STORE, CHUNKS_STORE, STATE_STORE], 'readwrite', async tx => {
       const usage = await readUsage(tx)
@@ -303,8 +304,8 @@ export function createReceivedChunkStore ({
           byteSize: 0,
           createdAt: now,
           updatedAt: now,
-          ttlMs: configuredTtlMs,
-          expiresAt: now + configuredTtlMs
+          ttlMs: groupTtlMs,
+          expiresAt: now + groupTtlMs
         }, configuredTtlMs)
       }
 
@@ -360,7 +361,7 @@ export function createReceivedChunkStore ({
     })
   }
 
-  async function put ({ channelPubkey, routerPubkey, index, total, contentBytes }) {
+  async function put ({ channelPubkey, routerPubkey, index, total, contentBytes, ttlMs }) {
     if (!channelPubkey || !routerPubkey) throw new Error('RECEIVED_CHUNK_GROUP_REQUIRED')
     if (!Number.isSafeInteger(index) || !Number.isSafeInteger(total) || index < 0 || total < 1 || index >= total) {
       throw new Error('INVALID_RECEIVED_CHUNK_INDEX')
@@ -369,7 +370,7 @@ export function createReceivedChunkStore ({
     await ready()
     while (true) {
       try {
-        const result = await putOnce({ channelPubkey, routerPubkey, index, total, contentBytes: bytes })
+        const result = await putOnce({ channelPubkey, routerPubkey, index, total, contentBytes: bytes, ttlMs })
         if (result.tooLarge) throw new Error('RECEIVED_CHUNK_GROUP_TOO_LARGE')
         return result.meta
       } catch (err) {

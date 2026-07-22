@@ -11,7 +11,8 @@ database `${prefix}:state:idb`, version 1
 channels, keyPath "pubkey"
   pubkey  watched channel public key
   value   evolving channel-recovery state, including last-seen/watched times,
-          mode, relays, seeders, offline ranges, active offline-range start,
+          mode, relays, seeders, effective offline-recovery retention, offline
+          ranges, active offline-range start,
           per-seeder activity, and sent/received content-key usage
 
 The complete channels snapshot is replaced atomically on each persisted state

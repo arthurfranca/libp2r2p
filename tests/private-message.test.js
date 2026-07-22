@@ -59,10 +59,11 @@ test('watch merges overlapping relay subscriptions by channel author', async () 
   const { calls, closed, fakeSubscribe } = fakeSubscribeFactory()
   const channel1 = signer('channel1')
   const reader1 = signer('reader1')
+  const receiver = signer('receiver')
   await watch({
     channels: ['channel1'],
     relays: ['wss://a.example'],
-    receiverSigner: signer('receiver'),
+    receiverSigner: receiver,
     privateChannelSigner: channel1,
     privateChannelReaderSigner: reader1,
     privateChannelReaderPubkey: 'reader1',
@@ -71,7 +72,7 @@ test('watch merges overlapping relay subscriptions by channel author', async () 
   await watch({
     channels: ['channel1'],
     relays: ['wss://a.example'],
-    receiverSigner: signer('receiver'),
+    receiverSigner: receiver,
     privateChannelSigner: channel1,
     privateChannelReaderSigner: reader1,
     privateChannelReaderPubkey: 'reader1',
@@ -80,7 +81,7 @@ test('watch merges overlapping relay subscriptions by channel author', async () 
   await watch({
     channels: ['channel2'],
     relays: ['wss://a.example', 'wss://b.example'],
-    receiverSigner: signer('receiver'),
+    receiverSigner: receiver,
     privateChannelSigner: signer('channel2'),
     privateChannelReaderSigner: signer('reader2'),
     privateChannelReaderPubkey: 'reader2',
@@ -112,20 +113,60 @@ test('watch merges overlapping relay subscriptions by channel author', async () 
   assert.deepEqual(closed[0].privateChannelPubkeys, ['channel1'])
 })
 
+test('watch preserves per-channel receive TTLs inside a shared relay subscription', async () => {
+  const { calls, fakeSubscribe } = fakeSubscribeFactory()
+  const receiverSigner = signer('receiver')
+  const channel1 = signer('channel1')
+  await watch({
+    channels: ['channel1'],
+    relays: ['wss://relay.example'],
+    receiverSigner,
+    privateChannelSigner: channel1,
+    receivedChunkTtlMs: 100,
+    _subscribe: fakeSubscribe
+  })
+  await watch({
+    channels: ['channel2'],
+    relays: ['wss://relay.example'],
+    receiverSigner,
+    privateChannelSigner: signer('channel2'),
+    receivedChunkTtlMs: 200,
+    _subscribe: fakeSubscribe
+  })
+
+  assert.equal(calls[1].receivedChunkTtlMs, 200)
+  assert.deepEqual(calls[1].receivedChunkTtlMsByPubkey, { channel1: 100, channel2: 200 })
+
+  await watch({
+    channels: ['channel1'],
+    relays: ['wss://relay.example'],
+    receiverSigner,
+    privateChannelSigner: channel1,
+    receivedChunkTtlMs: 300,
+    _subscribe: fakeSubscribe
+  })
+
+  assert.equal(calls.length, 3)
+  assert.equal(calls[2].receivedChunkTtlMs, 300)
+  assert.deepEqual(calls[2].receivedChunkTtlMsByPubkey, { channel1: 300, channel2: 200 })
+})
+
 test('watch refresh keeps shared relay subscriptions and gracefully closes removed relays', async () => {
   const { calls, closed, fakeSubscribe } = fakeSubscribeFactory()
+  const channel1 = signer('channel1')
+  const receiver = signer('receiver')
   await watch({
     channels: ['channel1'],
     relays: ['wss://a.example', 'wss://b.example'],
-    receiverSigner: signer('receiver'),
-    privateChannelSigner: signer('channel1'),
+    receiverSigner: receiver,
+    privateChannelSigner: channel1,
     _subscribe: fakeSubscribe
   })
   await watch({
     channels: ['channel1'],
     relays: ['wss://b.example', 'wss://c.example'],
-    receiverSigner: signer('receiver'),
-    privateChannelSigner: signer('channel1'),
+    receiverSigner: receiver,
+    privateChannelSigner: channel1,
     _subscribe: fakeSubscribe
   })
 

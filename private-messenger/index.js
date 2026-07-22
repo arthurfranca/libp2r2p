@@ -3,7 +3,7 @@
 //   userSigner,
 //   contentKeySigner, // optional when userSigner handles content keys internally
 //   nymSigner: optionalDefaultNymSigner,
-//   channels: [{ signer: privateChannelSigner, relays, mode: 'leecher', seeders: optionalSeederPubkeys }],
+//   channels: [{ signer: privateChannelSigner, relays, mode: 'leecher', seeders: optionalSeederPubkeys, offlineRecoverySeconds: optionalChannelOverride }],
 //   onContentKeyChange: event => reviewContentKeyUse(event),
 //   onError: err => reportPrivateMessengerError(err)
 // })
@@ -29,7 +29,8 @@
 // - Each watched channel stores lastSeenAt/lastWatchedAt in IndexedDB.
 // - Re-watching after reload fetches the gap from lastSeenAt to now.
 // - Browser offline/online events add explicit offline ranges with a small skew.
-// - Ranges older than 7 days are ignored; channel state not watched for 45 days is pruned.
+// - Recovery defaults to 7 days and can be overridden per channel; zero disables durable recovery.
+// - Channel state not watched for 45 days is pruned.
 // - Seeders announce presence every 10min and are used for the relay-uncovered left edge of a missed range.
 // - Configured seeders are all asked; auto-discovered seeders are capped to the 8 most recently active.
 // - Seeder/watchtower channels store reconstructed router events in a separate IndexedDB queue and auto-reply to recovery asks.
@@ -40,6 +41,7 @@ import * as privateMessage from '../private-message/index.js'
 import { bytesToBase64 } from '../base64/index.js'
 import { getRelaysByPubkey, pickRelaysForPubkeys, subscribeRelayListUpdates } from '../relay/index.js'
 import * as privateChannel from '../private-channel/index.js'
+import { DEFAULT_RECEIVED_CHUNK_TTL_MS } from '../private-channel/services/received-chunks.js'
 import { createQueue } from '../idb-queue/index.js'
 import { createChannelStateStore } from './services/channel-state.js'
 import { DEFAULT_STALE_CHANNEL_SECONDS } from './constants/index.js'
@@ -78,6 +80,7 @@ export {
 } from './recovery/index.js'
 
 const DEFAULT_OFFLINE_RECOVERY_SECONDS = 7 * 24 * 60 * 60
+const MAX_OFFLINE_RECOVERY_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1000)
 const DEFAULT_OFFLINE_SKEW_SECONDS = 30
 const DEFAULT_RELOAD_GAP_DELAY_MS = 500
 const DEFAULT_SEEDER_PRESENCE_INTERVAL_MS = 10 * 60 * 1000
@@ -113,6 +116,13 @@ function defaultOnError (err) {
 
 function nowSeconds () {
   return Math.floor(Date.now() / 1000)
+}
+
+function normalizeOfflineRecoverySeconds (value) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_OFFLINE_RECOVERY_SECONDS) {
+    throw new Error('INVALID_OFFLINE_RECOVERY_SECONDS')
+  }
+  return value
 }
 
 function uniq (values) {
@@ -180,7 +190,7 @@ export class PrivateMessenger {
     _storageSetInterval = globalThis.setInterval.bind(globalThis),
     _storageClearInterval = globalThis.clearInterval.bind(globalThis)
   } = {}) {
-    this.offlineRecoverySeconds = offlineRecoverySeconds
+    this.offlineRecoverySeconds = normalizeOfflineRecoverySeconds(offlineRecoverySeconds)
     this.staleChannelSeconds = staleChannelSeconds
     this.offlineSkewSeconds = offlineSkewSeconds
     this.reloadGapDelayMs = reloadGapDelayMs
@@ -293,8 +303,8 @@ export class PrivateMessenger {
       this.startStorageMaintenance()
       this.state = { channels: await this.stateStore.load() }
       await this.cleanupStaleChannels()
-      await this.pruneStoredSeeds()
       await this.update({ userSigner, contentKeySigner, nymSigner: this.nymSigner, channels, relays, mode })
+      await this.pruneStoredSeeds()
       this.initialized = true
       return this
     } catch (err) {
@@ -449,6 +459,7 @@ export class PrivateMessenger {
     for (const channel of nextChannels) this.channels.set(channel.pubkey, channel)
 
     await this.cleanupStaleChannels()
+    await this.applyRecoveryPolicies(nextChannels)
     await this.watch()
     await this.reconcilePresencePublishers()
     return this
@@ -473,6 +484,9 @@ export class PrivateMessenger {
       const autoDeletionCapability = channel.autoDeletionCapability === undefined
         ? undefined
         : normalizeAutoDeletionCapability(channel.autoDeletionCapability)
+      const offlineRecoverySeconds = normalizeOfflineRecoverySeconds(
+        channel.offlineRecoverySeconds ?? this.offlineRecoverySeconds
+      )
       out.push({
         pubkey,
         signer,
@@ -484,6 +498,7 @@ export class PrivateMessenger {
         usesNip65WatchRelays: !hasChannelRelays && !hasDefaultRelays,
         mode,
         seeders: uniq(channel.seeders),
+        offlineRecoverySeconds,
         autoDeletionCapability
       })
     }
@@ -505,6 +520,7 @@ export class PrivateMessenger {
   }
 
   async recoveryMirrorRelays (channelPubkey) {
+    if (!this.offlineRecoverySecondsFor(channelPubkey)) return []
     const seeders = this.recoverySeeders(channelPubkey)
     if (!seeders.length) return []
     try {
@@ -583,6 +599,7 @@ export class PrivateMessenger {
   }
 
   recoverySeeders (pubkey) {
+    if (!this.offlineRecoverySecondsFor(pubkey)) return []
     const channel = this.channels.get(pubkey)
     const configuredSeeders = channel?.seeders || []
     if (configuredSeeders.length) return configuredSeeders.filter(seeder => seeder !== this.userPubkey)
@@ -597,6 +614,7 @@ export class PrivateMessenger {
   }
 
   markSeederActive (channelPubkey, seederPubkey, { announced = false, at = nowSeconds() } = {}) {
+    if (!this.offlineRecoverySecondsFor(channelPubkey)) return false
     const state = this.readState()
     const current = state.channels[channelPubkey] || {}
     const activity = current.seederActivity || {}
@@ -610,6 +628,7 @@ export class PrivateMessenger {
     current.seederActivity = activity
     state.channels[channelPubkey] = current
     this.writeState(state)
+    return true
   }
 
   trackSeederActivity (channelPubkey, message) {
@@ -695,8 +714,10 @@ export class PrivateMessenger {
   }
 
   addOfflineRange (pubkey, start, end) {
+    const recoverySeconds = this.offlineRecoverySecondsFor(pubkey)
+    if (!recoverySeconds) return
     const now = nowSeconds()
-    const minStart = now - this.offlineRecoverySeconds
+    const minStart = now - recoverySeconds
     const normalized = {
       start: Math.max(0, Math.floor(start)),
       end: Math.floor(end)
@@ -718,10 +739,17 @@ export class PrivateMessenger {
   closeOpenOfflineRanges () {
     const state = this.readState()
     const end = nowSeconds()
-    const minStart = end - this.offlineRecoverySeconds
     for (const pubkey of Object.keys(state.channels)) {
       const current = state.channels[pubkey]
       if (!current.openOfflineStart) continue
+      const recoverySeconds = this.offlineRecoverySecondsFor(pubkey)
+      if (!recoverySeconds) {
+        delete current.openOfflineStart
+        current.offlineRanges = []
+        state.channels[pubkey] = current
+        continue
+      }
+      const minStart = end - recoverySeconds
       const start = Math.max(minStart, Math.max(0, current.openOfflineStart))
       if (end > start) {
         current.offlineRanges = mergeRanges((current.offlineRanges || []).concat([{ start, end }]))
@@ -757,7 +785,7 @@ export class PrivateMessenger {
         onMessage: message => this.queueIncoming(() => this.handleMessage(pubkey, message)),
         onSeed: seed => this.queueIncoming(() => this.enqueueSeed(pubkey, seed)),
         onContentKeyUsage: usage => this.handleContentKeyUsage(pubkey, usage),
-        receivedChunkTtlMs: this.offlineRecoverySeconds * 1000,
+        receivedChunkTtlMs: this.receivedChunkTtlMsFor(channel),
         receivedChunkIndexedDB: this._indexedDB,
         onError: err => this.onError?.(err)
       })
@@ -770,7 +798,8 @@ export class PrivateMessenger {
         lastWatchedAt: nowSeconds(),
         mode: channel.mode,
         relays: watchRelays,
-        seeders: channel.seeders
+        seeders: channel.seeders,
+        offlineRecoverySeconds: channel.offlineRecoverySeconds
       })
       this.debug('watch', {
         channelPubkey: pubkey,
@@ -922,6 +951,7 @@ export class PrivateMessenger {
   }
 
   async enqueueSeed (channelPubkey, seed) {
+    if (!this.offlineRecoverySecondsFor(channelPubkey)) return
     const receivedAt = nowSeconds()
     if (seed.recordType === NYM_CARRIER_SEED_RECORD_TYPE || seed.carriers?.length) {
       const carriers = compactSeedNymCarriers(seed.carriers)
@@ -994,7 +1024,7 @@ export class PrivateMessenger {
       privateChannelReaderPubkey: channel.readerPubkey,
       receiverPubkey,
       ...routing,
-      expirationSeconds: this.offlineRecoverySeconds,
+      expirationSeconds: this.eventExpirationSecondsFor(channel),
       temporaryStorageArea: this.temporaryStorageArea,
       deletionPubkey,
       autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
@@ -1020,7 +1050,7 @@ export class PrivateMessenger {
       question,
       receiverPubkey,
       ...routing,
-      expirationSeconds: this.offlineRecoverySeconds,
+      expirationSeconds: this.eventExpirationSecondsFor(channel),
       temporaryStorageArea: this.temporaryStorageArea,
       deletionPubkey,
       autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
@@ -1044,7 +1074,7 @@ export class PrivateMessenger {
       privateChannelReaderPubkey: channel.readerPubkey,
       receiverPubkey,
       ...routing,
-      expirationSeconds: this.offlineRecoverySeconds,
+      expirationSeconds: this.eventExpirationSecondsFor(channel),
       temporaryStorageArea: this.temporaryStorageArea,
       deletionPubkey,
       autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
@@ -1068,7 +1098,7 @@ export class PrivateMessenger {
       privateChannelReaderPubkey: channel.readerPubkey,
       receiverPubkeys,
       ...routing,
-      expirationSeconds: this.offlineRecoverySeconds,
+      expirationSeconds: this.eventExpirationSecondsFor(channel),
       temporaryStorageArea: this.temporaryStorageArea,
       deletionPubkey,
       autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
@@ -1092,7 +1122,7 @@ export class PrivateMessenger {
       privateChannelReaderPubkey: channel.readerPubkey,
       receiverPubkeys,
       ...routing,
-      expirationSeconds: this.offlineRecoverySeconds,
+      expirationSeconds: this.eventExpirationSecondsFor(channel),
       temporaryStorageArea: this.temporaryStorageArea,
       deletionPubkey,
       autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
@@ -1112,7 +1142,7 @@ export class PrivateMessenger {
       privateChannelReaderPubkey: channel.readerPubkey,
       receiverPubkeys,
       ...routing,
-      expirationSeconds: this.offlineRecoverySeconds,
+      expirationSeconds: this.eventExpirationSecondsFor(channel),
       temporaryStorageArea: this.temporaryStorageArea,
       deletionPubkey,
       autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
@@ -1131,7 +1161,7 @@ export class PrivateMessenger {
       privateChannelSigner: channel.signer,
       privateChannelReaderPubkey: channel.readerPubkey,
       ...routing,
-      expirationSeconds: this.offlineRecoverySeconds,
+      expirationSeconds: this.eventExpirationSecondsFor(channel),
       deletionPubkey,
       autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       rumor
@@ -1148,7 +1178,7 @@ export class PrivateMessenger {
       privateChannelSigner: channel.signer,
       privateChannelReaderPubkey: channel.readerPubkey,
       ...routing,
-      expirationSeconds: this.offlineRecoverySeconds,
+      expirationSeconds: this.eventExpirationSecondsFor(channel),
       deletionPubkey,
       autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       event
@@ -1157,6 +1187,7 @@ export class PrivateMessenger {
 
   async publishSeederPresence (channelPubkey = this.defaultChannelPubkey()) {
     const channel = this.requireWritableChannel(channelPubkey)
+    if (!this.offlineRecoverySecondsFor(channel)) return null
     const receiverPubkeys = uniq([...this.knownSeeders(channelPubkey), this.userPubkey])
     const routing = await this.resolveSendRouting({ channel, receiverPubkeys })
     this.debugSend('yell', channelPubkey, { code: SEEDER_PRESENCE_CODE, receiverPubkeys })
@@ -1167,7 +1198,7 @@ export class PrivateMessenger {
       privateChannelReaderPubkey: channel.readerPubkey,
       receiverPubkeys,
       ...routing,
-      expirationSeconds: this.offlineRecoverySeconds,
+      expirationSeconds: this.eventExpirationSecondsFor(channel),
       temporaryStorageArea: this.temporaryStorageArea,
       autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       code: SEEDER_PRESENCE_CODE,
@@ -1177,6 +1208,7 @@ export class PrivateMessenger {
   }
 
   async startPresencePublisher (channelPubkey) {
+    if (!this.offlineRecoverySecondsFor(channelPubkey)) return
     if (this.presenceTimers.has(channelPubkey)) return
     try {
       await this.publishSeederPresence(channelPubkey)
@@ -1201,10 +1233,10 @@ export class PrivateMessenger {
   async reconcilePresencePublishers () {
     const starts = []
     for (const pubkey of [...this.presenceTimers.keys()]) {
-      if (!storesRecoverySeeds(this.channels.get(pubkey)?.mode)) this.stopPresencePublisher(pubkey)
+      if (!storesRecoverySeeds(this.channels.get(pubkey)?.mode) || !this.offlineRecoverySecondsFor(pubkey)) this.stopPresencePublisher(pubkey)
     }
     for (const [pubkey, channel] of this.channels) {
-      if (storesRecoverySeeds(channel.mode)) starts.push(this.startPresencePublisher(pubkey))
+      if (storesRecoverySeeds(channel.mode) && this.offlineRecoverySecondsFor(channel)) starts.push(this.startPresencePublisher(pubkey))
       else this.stopPresencePublisher(pubkey)
     }
     await Promise.all(starts)
@@ -1238,6 +1270,53 @@ export class PrivateMessenger {
     return channel.autoDeletionCapability ?? this.autoDeletionCapability
   }
 
+  offlineRecoverySecondsFor (channelOrPubkey) {
+    const channel = typeof channelOrPubkey === 'string'
+      ? this.channels.get(channelOrPubkey)
+      : channelOrPubkey
+    if (channel?.offlineRecoverySeconds !== undefined) return channel.offlineRecoverySeconds
+    const pubkey = typeof channelOrPubkey === 'string' ? channelOrPubkey : channelOrPubkey?.pubkey
+    const persisted = pubkey ? this.state.channels[pubkey]?.offlineRecoverySeconds : undefined
+    return persisted === undefined
+      ? this.offlineRecoverySeconds
+      : normalizeOfflineRecoverySeconds(persisted)
+  }
+
+  eventExpirationSecondsFor (channel) {
+    return this.offlineRecoverySecondsFor(channel) || privateChannel.EXPIRATION_SECONDS
+  }
+
+  receivedChunkTtlMsFor (channel) {
+    const seconds = this.offlineRecoverySecondsFor(channel)
+    return seconds ? seconds * 1000 : DEFAULT_RECEIVED_CHUNK_TTL_MS
+  }
+
+  async applyRecoveryPolicies (channels) {
+    return this.runQueueOperation(async () => {
+      const state = this.readState()
+      const now = nowSeconds()
+      for (const channel of channels) {
+        const current = state.channels[channel.pubkey] || {}
+        const seconds = channel.offlineRecoverySeconds
+        current.offlineRecoverySeconds = seconds
+        if (!seconds) {
+          delete current.openOfflineStart
+          current.offlineRanges = []
+        } else {
+          const cutoff = now - seconds
+          current.offlineRanges = mergeRanges((current.offlineRanges || [])
+            .filter(range => range.end >= cutoff)
+            .map(range => ({ ...range, start: Math.max(range.start, cutoff) })))
+          if (current.openOfflineStart) current.openOfflineStart = Math.max(current.openOfflineStart, cutoff)
+        }
+        state.channels[channel.pubkey] = current
+      }
+      this.writeState(state)
+      await this.flushStateWrites()
+      for (const channel of channels) await this.pruneStoredSeeds(channel.pubkey)
+    })
+  }
+
   requireNymSigner (channel, override) {
     const signer = override || channel?.nymSigner || this.nymSigner
     if (!signer?.getPublicKey) throw new Error('NYM_SIGNER_REQUIRED')
@@ -1249,6 +1328,7 @@ export class PrivateMessenger {
   }
 
   scheduleReloadGap (pubkey) {
+    if (!this.offlineRecoverySecondsFor(pubkey)) return
     const current = this.readState().channels[pubkey]
     const start = current?.openOfflineStart || current?.lastSeenAt
     if (!start) return
@@ -1278,6 +1358,7 @@ export class PrivateMessenger {
         const state = this.readState()
         const start = Math.max(0, nowSeconds() - this.offlineSkewSeconds)
         for (const pubkey of this.channels.keys()) {
+          if (!this.offlineRecoverySecondsFor(pubkey)) continue
           const current = state.channels[pubkey] || {}
           current.openOfflineStart ||= start
           state.channels[pubkey] = current
@@ -1300,6 +1381,7 @@ export class PrivateMessenger {
   }
 
   async askSeedersForMissingRange (channelPubkey, since, until) {
+    if (!this.offlineRecoverySecondsFor(channelPubkey)) return []
     if (!this.channels.get(channelPubkey)?.signer) return []
     const seeders = this.recoverySeeders(channelPubkey)
     if (!seeders.length || until < since) return []
@@ -1336,11 +1418,14 @@ export class PrivateMessenger {
       question: message.event,
       receiverPubkey: message.event?.pubkey,
       since,
-      until
+      until,
+      sendEmptyReply: !this.offlineRecoverySecondsFor(channelPubkey)
     })
 
-    for await (const seed of this.seedQueue.storedItemsBy('byChannel', channelPubkey)) {
-      await packer.update(seed)
+    if (this.offlineRecoverySecondsFor(channelPubkey)) {
+      for await (const seed of this.seedQueue.storedItemsBy('byChannel', channelPubkey)) {
+        await packer.update(seed)
+      }
     }
     await packer.finalize()
   }
@@ -1424,12 +1509,14 @@ export class PrivateMessenger {
   async recoverOfflineRanges (channels = [...this.stopByChannel.keys()]) {
     const state = this.readState()
     const now = nowSeconds()
-    const minStart = now - this.offlineRecoverySeconds
 
     for (const pubkey of uniq(channels)) {
       const channel = this.channels.get(pubkey)
       const current = state.channels[pubkey]
       if (!channel || !current?.offlineRanges?.length) continue
+      const recoverySeconds = this.offlineRecoverySecondsFor(channel)
+      if (!recoverySeconds) continue
+      const minStart = now - recoverySeconds
 
       const remaining = []
       for (const range of current.offlineRanges) {
@@ -1449,7 +1536,7 @@ export class PrivateMessenger {
             until: range.end,
             mode: channel.mode,
             modeByPubkey: { [pubkey]: channel.mode },
-            receivedChunkTtlMs: this.offlineRecoverySeconds * 1000,
+            receivedChunkTtlMs: this.receivedChunkTtlMsFor(channel),
             receivedChunkIndexedDB: this._indexedDB,
             onEvent: (event, outer, meta) => this.queueIncoming(() => this.enqueueRumor(eventType(event), pubkey, { event, outer, meta, payload: parseEventContent(event) })),
             onNymEvent: (event, outer, meta) => this.queueIncoming(() => this.enqueueRumor('nym', pubkey, { event, outer, meta, payload: parseEventContent(event) })),
@@ -1507,18 +1594,26 @@ export class PrivateMessenger {
 
   async pruneStoredSeeds (channelPubkey) {
     if (!this.seedQueue) return
-    const cutoff = nowSeconds() - this.offlineRecoverySeconds
     const keyRange = globalThis.IDBKeyRange
-    if (channelPubkey && keyRange?.bound) {
+    if (!channelPubkey) {
+      const pubkeys = new Set([...Object.keys(this.state.channels), ...this.channels.keys()])
+      for (const pubkey of pubkeys) await this.pruneStoredSeeds(pubkey)
+      await this.seedQueue.removeWhere(item => !pubkeys.has(item.channelPubkey))
+      return
+    }
+    const recoverySeconds = this.offlineRecoverySecondsFor(channelPubkey)
+    if (!recoverySeconds) {
+      await this.seedQueue.removeBy('byChannel', channelPubkey)
+      return
+    }
+    const cutoff = nowSeconds() - recoverySeconds
+    if (cutoff <= 0) return
+    if (keyRange?.bound) {
       await this.seedQueue.removeBy('byChannelTime', keyRange.bound([channelPubkey, 0], [channelPubkey, cutoff], false, true))
       return
     }
-    if (!channelPubkey && keyRange?.upperBound) {
-      await this.seedQueue.removeBy('byTime', keyRange.upperBound(cutoff, true))
-      return
-    }
     await this.seedQueue.removeWhere(item => {
-      if (channelPubkey && item.channelPubkey !== channelPubkey) return false
+      if (item.channelPubkey !== channelPubkey) return false
       return (seedRecordTime(item) || item.receivedAt || 0) < cutoff
     })
   }

@@ -12,6 +12,7 @@ const HEX_PUBKEY = /^[0-9a-f]{64}$/i
 
 const watchesByChannel = new Map()
 const subsByRelay = new Map()
+let nextWatchRevision = 1
 
 function nowSeconds () {
   return Math.floor(Date.now() / 1000)
@@ -254,6 +255,27 @@ function maxWatchNumber (channels, field) {
   return values.length ? Math.max(...values) : undefined
 }
 
+function watchNumbersForChannels (channels, field) {
+  const out = {}
+  for (const channel of channels) {
+    const value = watchesByChannel.get(channel)?.[field]
+    if (Number.isFinite(value)) out[channel] = value
+  }
+  return out
+}
+
+function watchRevisionsForChannels (channels) {
+  return Object.fromEntries(channels.map(channel => [channel, watchesByChannel.get(channel)?.revision || 0]))
+}
+
+function subscriptionMatches (current, channels) {
+  if (!current || !setEquals(current.channels, channels)) return false
+  for (const channel of channels) {
+    if (current.revisions?.[channel] !== watchesByChannel.get(channel)?.revision) return false
+  }
+  return true
+}
+
 function firstWatchValue (channels, field) {
   for (const channel of channels) {
     const value = watchesByChannel.get(channel)?.[field]
@@ -280,7 +302,7 @@ function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, graceful
 
   for (const [relay, current] of subsByRelay) {
     const nextChannels = desired.get(relay)
-    if (nextChannels && setEquals(current.channels, nextChannels)) continue
+    if (nextChannels && subscriptionMatches(current, nextChannels)) continue
     if (!nextChannels) {
       const close = closeSubscription(current.sub, gracefulClose)
       if (close) closing.push(close)
@@ -290,7 +312,7 @@ function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, graceful
 
   for (const [relay, channels] of desired) {
     const current = subsByRelay.get(relay)
-    if (current && setEquals(current.channels, channels)) continue
+    if (subscriptionMatches(current, channels)) continue
 
     const channelList = [...channels]
     const firstWatch = watchesByChannel.get(channelList[0])
@@ -309,6 +331,7 @@ function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, graceful
       mode: firstWatch.mode,
       modeByPubkey: modesForChannels(channelList),
       receivedChunkTtlMs: maxWatchNumber(channelList, 'receivedChunkTtlMs'),
+      receivedChunkTtlMsByPubkey: watchNumbersForChannels(channelList, 'receivedChunkTtlMs'),
       receivedChunkMaxBytes: maxWatchNumber(channelList, 'receivedChunkMaxBytes'),
       receivedChunkIndexedDB: firstWatchValue(channelList, 'receivedChunkIndexedDB'),
       ignoredGroupTtlMs: maxWatchNumber(channelList, 'ignoredGroupTtlMs'),
@@ -330,7 +353,11 @@ function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, graceful
       onError: err => firstWatch.callbacks.onError?.(err)
     })
 
-    subsByRelay.set(relay, { channels: new Set(channels), sub })
+    subsByRelay.set(relay, {
+      channels: new Set(channels),
+      revisions: watchRevisionsForChannels(channelList),
+      sub
+    })
     if (current) {
       const close = closeSubscription(current.sub, gracefulClose)
       if (close) closing.push(close)
@@ -392,19 +419,23 @@ export async function watch ({
       since
     }
     const current = watchesByChannel.get(channel)
-    if (
+    const sameSettings = Boolean(
       current &&
-      setEquals(new Set(current.relays), new Set(next.relays)) &&
+      current.receiverSigner === next.receiverSigner &&
+      current.iykcSigner === next.iykcSigner &&
       current.privateChannelSigner === next.privateChannelSigner &&
       current.privateChannelReaderSigner === next.privateChannelReaderSigner &&
       current.privateChannelReaderPubkey === next.privateChannelReaderPubkey &&
+      current.receiverPubkey === next.receiverPubkey &&
       current.mode === next.mode &&
       current.receivedChunkTtlMs === next.receivedChunkTtlMs &&
       current.receivedChunkMaxBytes === next.receivedChunkMaxBytes &&
       current.receivedChunkIndexedDB === next.receivedChunkIndexedDB &&
       current.ignoredGroupTtlMs === next.ignoredGroupTtlMs &&
       current.ignoredGroupMaxEntries === next.ignoredGroupMaxEntries
-    ) {
+    )
+    next.revision = sameSettings ? current.revision : nextWatchRevision++
+    if (sameSettings && setEquals(new Set(current.relays), new Set(next.relays))) {
       current.callbacks = callbacks
       continue
     }
