@@ -1804,7 +1804,7 @@ describe('RelayPool.sendEvent', () => {
     const full = await early.promise
 
     assert.equal(publishCount, 2)
-    assert.deepEqual(authRequests, [{ relay: 'wss://r1/', challenge: 'challenge-one' }])
+    assert.deepEqual(authRequests, [{ relay: 'wss://r1', challenge: 'challenge-one' }])
     assert.deepEqual(full.succeededRelays, ['wss://r1'])
   })
 

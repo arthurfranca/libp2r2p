@@ -5,10 +5,20 @@ import {
   NAPP_ENTITY_REGEX,
   appDecode,
   appEncode,
+  naddrDecode,
+  naddrEncode,
+  neventDecode,
+  neventEncode,
   nfileDecode,
   nfileEncode,
+  noteDecode,
+  noteEncode,
+  nprofileDecode,
+  nprofileEncode,
   npubDecode,
   npubEncode,
+  nrelayDecode,
+  nrelayEncode,
   nsecDecode,
   nsecEncode
 } from '../nip19/index.js'
@@ -103,5 +113,42 @@ describe('existing entities', () => {
   it('round-trips npub and nsec entities', () => {
     assert.equal(npubDecode(npubEncode(hex)), hex)
     assert.equal(nsecDecode(nsecEncode(hex)), hex)
+  })
+})
+
+describe('standard pointer entities', () => {
+  it('decodes the NostrHub naddr vector and re-encodes it exactly', () => {
+    const entity = 'naddr1qvzqqqrcvypzplrsshpc8wn3w3tsf0wpcmhu7latqxt4q809nrz7d3fh4s9n9fxtqqd8gct894jx2enfdejkgtt9wejkuapdvfjksctkd9hhyapjete'
+    const value = {
+      identifier: 'tag-defined-event-behavior',
+      pubkey: 'fc7085c383ba71745704bdc1c6efcf7fab0197501de598c5e6c537ac0b32a4cb',
+      kind: 30817,
+      relays: []
+    }
+    assert.deepEqual(naddrDecode(entity), value)
+    assert.equal(naddrEncode(value), entity)
+  })
+
+  it('round-trips note, profile, event, relay and empty-address identifiers', () => {
+    const id = '12'.repeat(32)
+    const author = '34'.repeat(32)
+    const relays = ['wss://one.example', 'wss://two.example']
+    assert.equal(noteDecode(noteEncode(id)), id)
+    assert.deepEqual(nprofileDecode(nprofileEncode({ pubkey: author, relays })), { pubkey: author, relays })
+    assert.deepEqual(neventDecode(neventEncode({ id, relays, author, kind: 65535 })), { id, relays, author, kind: 65535 })
+    assert.equal(nrelayDecode(nrelayEncode(relays[0])), relays[0])
+    assert.deepEqual(naddrDecode(naddrEncode({ identifier: '', pubkey: author, kind: 30000 })), {
+      identifier: '', pubkey: author, kind: 30000, relays: []
+    })
+  })
+
+  it('rejects non-canonical and duplicate unique fields while ignoring unknown TLVs', () => {
+    const id = [...Buffer.from('12'.repeat(32), 'hex')]
+    const duplicate = bech32.encode('nevent', bech32.toWords(Uint8Array.from([0, 32, ...id, 0, 32, ...id])), 5000)
+    assert.throws(() => neventDecode(duplicate), /Duplicate event ID/)
+    assert.throws(() => noteDecode(noteEncode('12'.repeat(32)).toUpperCase()), /canonical lowercase/)
+    assert.throws(() => neventEncode({ id: '12'.repeat(32), kind: 0x100000000 }), /Invalid kind/)
+    const unknown = bech32.encode('nprofile', bech32.toWords(Uint8Array.from([0, 32, ...id, 99, 1, 1])), 5000)
+    assert.deepEqual(nprofileDecode(unknown), { pubkey: '12'.repeat(32), relays: [] })
   })
 })

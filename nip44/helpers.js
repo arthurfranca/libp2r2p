@@ -86,6 +86,9 @@ export function decodePayload (conversationKey, payload) {
   return unpad(chacha20(messageKeys.key, messageKeys.nonce, ciphertext))
 }
 
-export function extractConversationKey (sharedSecret) {
-  return extract(sha256, sharedSecret, encoder.encode('nip44-v2'))
+export function extractConversationKey (sharedSecret, salt = 'nip44-v2') {
+  if (typeof salt !== 'string') throw new TypeError('SALT_SHOULD_BE_A_STRING')
+  const saltBytes = encoder.encode(salt)
+  if (saltBytes.length === 0 || saltBytes.length > 32) throw new Error('INVALID_SALT')
+  return extract(sha256, sharedSecret, saltBytes)
 }

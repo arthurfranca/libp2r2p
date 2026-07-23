@@ -3,19 +3,39 @@ import assert from 'node:assert/strict'
 
 test('new public Nostr subpaths expose only the used surface', async () => {
   const expected = {
-    event: ['finalizeEvent', 'getEventHash', 'validateEvent', 'verifyEvent'],
+    event: [
+      'classifyEvent', 'finalizeEvent', 'getEventHash', 'isAddressableEvent',
+      'isEphemeralEvent', 'isRegularEvent', 'isReplaceableEvent', 'validateEvent', 'verifyEvent'
+    ],
     key: [
       'generateKeypair', 'generateSecretKey', 'getPublicKey', 'keypairFromSeckey',
       'npubFromPubkey', 'nsecFromHex', 'parseProfileEvent', 'profileEventTemplate',
       'pubkeyFromNpub', 'signProfileEvent', 'signRelayListEvent'
     ],
+    kind: [],
     nip04: ['decrypt', 'encrypt'],
+    nip05: ['queryProfile'],
     nip44: ['decrypt', 'encrypt', 'getConversationKey'],
-    url: ['normalizeUrl']
+    nip96: [
+      'calculateFileHash', 'checkFileProcessingStatus', 'deleteFile', 'generateDownloadUrl',
+      'generateFSPEventTemplate', 'readServerConfig', 'uploadFile',
+      'validateDelayedProcessingResponse', 'validateFileUploadResponse', 'validateServerConfiguration'
+    ],
+    nip98: ['getToken'],
+    nwt: ['createToken', 'decodeToken', 'encodeToken', 'validateToken'],
+    url: ['isValidPublicRelayUrl', 'normalizeRelayUrl']
   }
 
   for (const [subpath, names] of Object.entries(expected)) {
-    assert.deepEqual(Object.keys(await import(`libp2r2p/${subpath}`)).sort(), names.sort())
+    const actual = Object.keys(await import(`libp2r2p/${subpath}`)).sort()
+    if (subpath === 'kind') {
+      assert.ok(actual.includes('eventKinds'))
+      assert.ok(actual.includes('classifyKind'))
+      assert.ok(actual.includes('isRegularKind'))
+      assert.ok(actual.includes('PERSONAL_COPY'))
+      continue
+    }
+    assert.deepEqual(actual, names.sort())
   }
 })
 

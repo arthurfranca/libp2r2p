@@ -1,7 +1,7 @@
 import { decodeHll, encodeHll, estimateHllCount, mergeHll } from '../helpers/hll.js'
 import { createPublishSettlements, firstFulfillment, publishSummary } from '../helpers/publish.js'
 import { maybeUnref } from '../helpers/timer.js'
-import { normalizeUrl } from '../../url/index.js'
+import { normalizeRelayUrl } from '../../url/index.js'
 import { RelayConnection } from './relay-connection.js'
 
 const CONNECTION_TIMEOUT_MS = 3000
@@ -82,7 +82,7 @@ function normalizedRelayUrls (relays) {
   const seen = new Set()
 
   for (const relay of relays || []) {
-    const normalizedUrl = normalizeUrl(relay)
+    const normalizedUrl = normalizeRelayUrl(relay)
     if (seen.has(normalizedUrl)) continue
     seen.add(normalizedUrl)
     // Keep the caller's first spelling in reports and metadata while using the
@@ -124,7 +124,7 @@ export class RelayPool {
   // Opens a normalized pooled connection. Failed connects are evicted so a later
   // retry creates a fresh RelayConnection instead of reusing broken socket state.
   async #getRelay (url) {
-    const normalizedUrl = normalizeUrl(url)
+    const normalizedUrl = normalizeRelayUrl(url)
     let relay = this.#relays.get(normalizedUrl)
     if (!relay) {
       relay = this.#createRelay(normalizedUrl)
@@ -151,7 +151,7 @@ export class RelayPool {
   }
 
   #incrementLiveSub (url) {
-    const normalizedUrl = normalizeUrl(url)
+    const normalizedUrl = normalizeRelayUrl(url)
     this.#liveSubCounts.set(normalizedUrl, (this.#liveSubCounts.get(normalizedUrl) ?? 0) + 1)
     // Cancel any pending idle timeout — this relay must stay open
     clearTimeout(this.#relayTimeouts.get(normalizedUrl))
@@ -159,7 +159,7 @@ export class RelayPool {
   }
 
   #decrementLiveSub (url) {
-    const normalizedUrl = normalizeUrl(url)
+    const normalizedUrl = normalizeRelayUrl(url)
     const next = (this.#liveSubCounts.get(normalizedUrl) ?? 1) - 1
     if (next <= 0) {
       this.#liveSubCounts.delete(normalizedUrl)

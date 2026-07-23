@@ -44,3 +44,17 @@ test('NIP-44 v2 rejects malformed, non-canonical and modified payloads early', (
   assert.throws(() => decrypt(`${payload}=`, key), /INVALID/)
   assert.throws(() => encrypt('', key), /INVALID_PLAINTEXT_SIZE/)
 })
+
+test('NIP-44 v2 accepts explicit salts without changing the interoperable default', () => {
+  const alice = base16ToBytes('0'.repeat(63) + '1')
+  const bob = base16ToBytes('0'.repeat(63) + '2')
+  const alicePubkey = getPublicKey(alice)
+  const bobPubkey = getPublicKey(bob)
+  const defaultKey = getConversationKey(alice, bobPubkey)
+  assert.deepEqual(getConversationKey(alice, bobPubkey, {}), defaultKey)
+  const custom = getConversationKey(alice, bobPubkey, { salt: 'private-app' })
+  assert.notDeepEqual(custom, defaultKey)
+  assert.deepEqual(custom, getConversationKey(bob, alicePubkey, { salt: 'private-app' }))
+  assert.throws(() => getConversationKey(alice, bobPubkey, { salt: '' }), /INVALID_SALT/)
+  assert.throws(() => getConversationKey(alice, bobPubkey, { salt: 'x'.repeat(33) }), /INVALID_SALT/)
+})

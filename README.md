@@ -249,14 +249,58 @@ should import that subpath directly.
 
 The modern stack can use the package without `nostr-tools`. Its intentionally
 small public surface includes strict, non-caching NIP-01 helpers, NIP-04 for
-legacy interoperability, NIP-44 v2, key helpers, and relay URL normalization:
+legacy interoperability, NIP-44 v2, key helpers, event-kind classification,
+NIP-05 lookup, NIP-96 compatibility, NIP-98 authorization, Nostr Web Tokens,
+and relay URL normalization:
 
 ```js
 import { finalizeEvent, verifyEvent } from 'libp2r2p/event'
 import { generateSecretKey, getPublicKey } from 'libp2r2p/key'
+import { eventKinds, classifyKind } from 'libp2r2p/kind'
 import * as nip44 from 'libp2r2p/nip44'
-import { normalizeUrl } from 'libp2r2p/url'
+import { normalizeRelayUrl } from 'libp2r2p/url'
 ```
+
+`classifyEvent()` from `libp2r2p/event` combines the exact NIP-01 kind
+ranges with tag-defined behavior. The first `d` tag may add `replaceable` or
+`addressable`, while an `expiration` tag equal to `created_at` adds
+`ephemeral`. An event is also regular when it is neither replaceable nor
+addressable. Classifications are additive and callers can disable the legacy
+kind ranges with `{ includeLegacyKindRanges: false }`.
+
+NIP-44 v2 uses the interoperable `nip44-v2` salt by default. A custom UTF-8
+salt of at most 32 bytes may be passed to `getConversationKey()`, but messages
+derived with it are not interoperable with standard NIP-44 implementations.
+
+Nostr Web Tokens are available from `libp2r2p/nwt`. Creation returns a signed
+kind `27519` event, while transport encoding is kept separate:
+
+```js
+import { createToken, encodeToken, validateToken } from 'libp2r2p/nwt'
+
+const event = await createToken({
+  signEvent,
+  audience: ['api.example.com'],
+  expiration: Math.floor(Date.now() / 1000) + 300,
+  claims: [['action', 'upload']],
+  content: 'Authorize an upload'
+})
+const authorization = encodeToken(event, { includeAuthorizationScheme: true })
+const claims = validateToken(authorization, { audience: 'api.example.com' })
+```
+
+Transport decoding requires canonical unpadded Base64URL. Validation verifies
+the Nostr signature on every call, enforces registered-claim cardinality and
+time bounds, and requires the verifier to provide its identity whenever an
+`aud` claim is present. Tokens without `aud` or `exp` retain the draft
+specification's public/unbounded defaults; servers can reject those forms with
+`requireAudience` and `requireExpiration`.
+
+The NIP-96 module is provided only for interoperability with older file
+servers. New applications should prefer NIP-B7. Its upload API accepts an
+`AbortSignal` and a ProgressEvent-compatible callback; browsers use XHR for
+real upload progress when available, while the fetch fallback reports only
+estimated start and successful completion.
 
 `verifyEvent()` recalculates and verifies every event on every call; it never
 adds a cache marker to the event. NIP-04 remains available at

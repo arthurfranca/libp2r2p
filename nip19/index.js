@@ -63,9 +63,9 @@ function concatBytes (arrays) {
   return result
 }
 
-function encodeText (value, fieldName) {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new Error(`${fieldName} should be a non-empty string`)
+function encodeText (value, fieldName, { allowEmpty = false } = {}) {
+  if (typeof value !== 'string' || (!allowEmpty && value.length === 0)) {
+    throw new Error(`${fieldName} should be ${allowEmpty ? 'a string' : 'a non-empty string'}`)
   }
   const bytes = textEncoder.encode(value)
   if (bytes.length > MAX_TLV_VALUE_SIZE) throw new Error(`${fieldName} is too big`)
@@ -75,8 +75,8 @@ function encodeText (value, fieldName) {
   return bytes
 }
 
-function decodeText (bytes, fieldName) {
-  if (bytes.length === 0 || bytes.length > MAX_TLV_VALUE_SIZE) {
+function decodeText (bytes, fieldName, { allowEmpty = false } = {}) {
+  if ((!allowEmpty && bytes.length === 0) || bytes.length > MAX_TLV_VALUE_SIZE) {
     throw new Error(`Invalid ${fieldName} length`)
   }
   try {
@@ -117,6 +117,59 @@ function decodeTlvEntries (bytes) {
 function onlyValue (values, fieldName) {
   if (values.length > 1) throw new Error(`Duplicate ${fieldName}`)
   return values[0]
+}
+
+function encodeBech32Tlv (prefix, entries) {
+  return bech32.encode(prefix, bech32.toWords(encodeTlvEntries(entries)), MAX_ENTITY_SIZE)
+}
+
+function encodeStandardPointer (prefix, entries) {
+  return encodeBech32Tlv(prefix, entries.slice().sort(([left], [right]) => right - left))
+}
+
+function decodeBech32Bytes (entity, prefix) {
+  if (typeof entity !== 'string' || entity !== entity.toLowerCase() || !entity.startsWith(`${prefix}1`)) {
+    throw new Error(`${prefix} should use canonical lowercase Bech32`)
+  }
+  let decoded
+  try {
+    decoded = bech32.decode(entity, MAX_ENTITY_SIZE)
+  } catch (error) {
+    throw new Error(`Invalid ${prefix}: ${error.message}`)
+  }
+  if (decoded.prefix !== prefix) throw new Error(`Invalid ${prefix} prefix`)
+  try {
+    return new Uint8Array(bech32.fromWords(decoded.words))
+  } catch (error) {
+    throw new Error(`Invalid ${prefix} data: ${error.message}`)
+  }
+}
+
+function decodeKnownTlv (entity, prefix, types) {
+  const known = new Map(types.map(type => [type, []]))
+  for (const [type, value] of decodeTlvEntries(decodeBech32Bytes(entity, prefix))) known.get(type)?.push(value)
+  return known
+}
+
+function encodeUint32 (value, fieldName = 'kind') {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) throw new Error(`Invalid ${fieldName}`)
+  const bytes = new Uint8Array(4)
+  new DataView(bytes.buffer).setUint32(0, value, false)
+  return bytes
+}
+
+function decodeUint32 (bytes, fieldName = 'kind') {
+  if (!bytes || bytes.length !== 4) throw new Error(`${fieldName} should be 4 bytes`)
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0, false)
+}
+
+function relayEntries (relays) {
+  if (!Array.isArray(relays)) throw new TypeError('relays should be an array')
+  return relays.map(relay => [1, encodeText(relay, 'relay hint')])
+}
+
+function decodeRelayHints (values) {
+  return values.map(value => decodeText(value, 'relay hint'))
 }
 
 export function nfileEncode ({ root, relays = [], author, mime, filename }) {
@@ -170,6 +223,85 @@ export function nfileDecode (entity) {
   if (mimeBytes) result.mime = decodeText(mimeBytes, 'MIME')
   if (filenameBytes) result.filename = decodeText(filenameBytes, 'filename')
   return result
+}
+
+export function noteEncode (eventId) {
+  return bech32.encode('note', bech32.toWords(fixedHexToBytes(eventId, 32, 'event ID')), MAX_ENTITY_SIZE)
+}
+
+export function noteDecode (entity) {
+  const bytes = decodeBech32Bytes(entity, 'note')
+  if (bytes.length !== 32) throw new Error('event ID should be 32 bytes')
+  return bytesToHex(bytes)
+}
+
+export function nprofileEncode ({ pubkey, relays = [] }) {
+  return encodeStandardPointer('nprofile', [
+    [0, fixedHexToBytes(pubkey, 32, 'profile pubkey')],
+    ...relayEntries(relays)
+  ])
+}
+
+export function nprofileDecode (entity) {
+  const known = decodeKnownTlv(entity, 'nprofile', [0, 1])
+  const pubkey = onlyValue(known.get(0), 'profile pubkey')
+  if (!pubkey || pubkey.length !== 32) throw new Error('profile pubkey should be 32 bytes')
+  return { pubkey: bytesToHex(pubkey), relays: decodeRelayHints(known.get(1)) }
+}
+
+export function neventEncode ({ id, relays = [], author, kind }) {
+  const entries = [[0, fixedHexToBytes(id, 32, 'event ID')], ...relayEntries(relays)]
+  if (author !== undefined) entries.push([2, fixedHexToBytes(author, 32, 'event author')])
+  if (kind !== undefined) entries.push([3, encodeUint32(kind)])
+  return encodeStandardPointer('nevent', entries)
+}
+
+export function neventDecode (entity) {
+  const known = decodeKnownTlv(entity, 'nevent', [0, 1, 2, 3])
+  const id = onlyValue(known.get(0), 'event ID')
+  const author = onlyValue(known.get(2), 'event author')
+  const kind = onlyValue(known.get(3), 'event kind')
+  if (!id || id.length !== 32) throw new Error('event ID should be 32 bytes')
+  if (author && author.length !== 32) throw new Error('event author should be 32 bytes')
+  const result = { id: bytesToHex(id), relays: decodeRelayHints(known.get(1)) }
+  if (author) result.author = bytesToHex(author)
+  if (kind) result.kind = decodeUint32(kind, 'event kind')
+  return result
+}
+
+export function naddrEncode ({ identifier, pubkey, kind, relays = [] }) {
+  return encodeStandardPointer('naddr', [
+    [0, encodeText(identifier, 'identifier', { allowEmpty: true })],
+    ...relayEntries(relays),
+    [2, fixedHexToBytes(pubkey, 32, 'address author')],
+    [3, encodeUint32(kind)]
+  ])
+}
+
+export function naddrDecode (entity) {
+  const known = decodeKnownTlv(entity, 'naddr', [0, 1, 2, 3])
+  const identifier = onlyValue(known.get(0), 'identifier')
+  const pubkey = onlyValue(known.get(2), 'address author')
+  const kind = onlyValue(known.get(3), 'address kind')
+  if (!identifier) throw new Error('Missing identifier')
+  if (!pubkey || pubkey.length !== 32) throw new Error('address author should be 32 bytes')
+  return {
+    identifier: decodeText(identifier, 'identifier', { allowEmpty: true }),
+    pubkey: bytesToHex(pubkey),
+    kind: decodeUint32(kind, 'address kind'),
+    relays: decodeRelayHints(known.get(1))
+  }
+}
+
+export function nrelayEncode (relay) {
+  return encodeStandardPointer('nrelay', [[0, encodeText(relay, 'relay URL')]])
+}
+
+export function nrelayDecode (entity) {
+  const known = decodeKnownTlv(entity, 'nrelay', [0])
+  const relay = onlyValue(known.get(0), 'relay URL')
+  if (!relay) throw new Error('Missing relay URL')
+  return decodeText(relay, 'relay URL')
 }
 
 function isNostrAppDTagSafe (value) {
@@ -245,13 +377,8 @@ export function nsecDecode (entity) {
 }
 
 function decodeSimpleEntity (entity, prefix, fieldName) {
-  if (typeof entity !== 'string' || !entity.startsWith(`${prefix}1`)) {
-    throw new Error(`Invalid ${prefix} format`)
-  }
   try {
-    const decoded = bech32.decode(entity)
-    if (decoded.prefix !== prefix) throw new Error(`Invalid ${prefix} prefix`)
-    const bytes = new Uint8Array(bech32.fromWords(decoded.words))
+    const bytes = decodeBech32Bytes(entity, prefix)
     if (bytes.length !== 32) throw new Error(`Invalid ${fieldName} length`)
     return bytesToHex(bytes)
   } catch (error) {
