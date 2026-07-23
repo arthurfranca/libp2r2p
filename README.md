@@ -254,11 +254,17 @@ NIP-05 lookup, NIP-96 compatibility, NIP-98 authorization, Nostr Web Tokens,
 and relay URL normalization:
 
 ```js
-import { finalizeEvent, verifyEvent } from 'libp2r2p/event'
+import {
+  assertSerializableEvent,
+  assertValidEvent,
+  finalizeEvent,
+  isSerializableEvent,
+  isValidEvent
+} from 'libp2r2p/event'
 import { generateSecretKey, getPublicKey } from 'libp2r2p/key'
 import { eventKinds, classifyKind } from 'libp2r2p/kind'
 import * as nip44 from 'libp2r2p/nip44'
-import { normalizeRelayUrl } from 'libp2r2p/url'
+import { assertValidPublicRelayUrl, normalizeRelayUrl } from 'libp2r2p/url'
 ```
 
 `classifyEvent()` from `libp2r2p/event` combines the exact NIP-01 kind
@@ -302,8 +308,19 @@ servers. New applications should prefer NIP-B7. Its upload API accepts an
 real upload progress when available, while the fetch fallback reports only
 estimated start and successful completion.
 
-`verifyEvent()` recalculates and verifies every event on every call; it never
-adds a cache marker to the event. NIP-04 remains available at
+`isSerializableEvent()` checks only the NIP-01 fields used during
+serialization. `isValidEvent()` additionally recalculates the ID and verifies
+the Schnorr signature on every call; it never adds a cache marker to the
+event. Their `assert…` counterparts return the original event or throw a
+`ValidationError` with a stable code.
+
+Public validity checks consistently use a non-throwing `is…` predicate plus an
+`assert…` counterpart when callers need the exact reason. Strict codecs,
+decoders, token validation, and malformed public arguments also throw
+`ValidationError` from `libp2r2p/error`. Network, timeout, abort, quota, and
+closed-state failures remain ordinary operational errors.
+
+NIP-04 remains available at
 `libp2r2p/nip04` only for compatibility with older Nostr applications.
 Low-level relay sockets, subscriptions, message parsing, and serialization are
 internal implementation details; use `RelayPool` or the `relayPool` singleton

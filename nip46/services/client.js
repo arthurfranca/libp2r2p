@@ -1,3 +1,4 @@
+import { ValidationError } from '../../error/index.js'
 import { getPublicKey } from '../../key/index.js'
 import { relayPool as defaultRelayPool } from '../../relay/index.js'
 import {
@@ -10,10 +11,10 @@ import {
   decodeNip46Frame,
   isNip46EventFor,
   requestError,
-  validRequestFrame
+  isValidRequestFrame
 } from '../helpers/frame.js'
 import { normalizeBunkerPointer, parseNostrConnectURI } from '../helpers/url.js'
-import { Nip46Transport, sameRelays, waitForNip46 } from './transport.js'
+import { areRelaySetsEqual, Nip46Transport, waitForNip46 } from './transport.js'
 
 function cleanClientMetadata (value) {
   if (!value || typeof value !== 'object') return null
@@ -41,7 +42,7 @@ export class Nip46Client {
     timeoutAfterFirstEose = DEFAULT_TIMEOUT_AFTER_FIRST_EOSE
   } = {}) {
     const normalized = normalizeBunkerPointer(pointer)
-    if (!normalized) throw new Error('INVALID_BUNKER_POINTER')
+    if (!normalized) throw new ValidationError('INVALID_BUNKER_POINTER')
     this.#secretKey = clientSecretKey
     this.#pointer = normalized
     this.#onAuthUrl = onAuthUrl
@@ -64,7 +65,7 @@ export class Nip46Client {
   static async fromURI (clientSecretKey, uri, options = {}) {
     const parsed = parseNostrConnectURI(uri)
     const clientPubkey = getPublicKey(clientSecretKey)
-    if (!parsed || clientPubkey !== parsed.clientPubkey) throw new Error('INVALID_NOSTRCONNECT_URI')
+    if (!parsed || clientPubkey !== parsed.clientPubkey) throw new ValidationError('INVALID_NOSTRCONNECT_URI')
 
     const relayPool = options.relayPool || defaultRelayPool
     const controller = new AbortController()
@@ -169,7 +170,7 @@ export class Nip46Client {
     if (relays === null) return false
 
     const nextPointer = normalizeBunkerPointer({ ...this.#pointer, relays })
-    if (!nextPointer || sameRelays(nextPointer.relays, this.#pointer.relays)) return false
+    if (!nextPointer || areRelaySetsEqual(nextPointer.relays, this.#pointer.relays)) return false
 
     const nextContext = this.#openResponseContext(nextPointer)
     try {
@@ -229,7 +230,7 @@ export class Nip46Client {
   }
 
   async #handleRequest (peerPubkey, request, context) {
-    if (!validRequestFrame(request)) {
+    if (!isValidRequestFrame(request)) {
       if (typeof request?.id === 'string') {
         await this.#transport.reply(peerPubkey, request.id, null, 'NIP46_INVALID_REQUEST', { context })
       }

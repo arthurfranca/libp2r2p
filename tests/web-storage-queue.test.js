@@ -1,5 +1,6 @@
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
+import { ValidationError } from '../error/index.js'
 import { createQueue } from '../web-storage-queue/index.js'
 
 const data = new Map()
@@ -436,7 +437,9 @@ test('insertAt evicts to fit before inserting the new item', () => {
 test('queue rejects items larger than maxBytes', () => {
   const queue = createQueue({ prefix: 'test', maxBytes: 80 })
 
-  assert.throws(() => queue.push({ value: 'too-large'.repeat(20) }), /QUEUE_ITEM_TOO_LARGE/)
+  assert.throws(() => queue.push({ value: 'too-large'.repeat(20) }), error => (
+    !(error instanceof ValidationError) && error.message === 'QUEUE_ITEM_TOO_LARGE'
+  ))
   assert.equal(queue.shift(), null)
 })
 

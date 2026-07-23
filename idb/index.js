@@ -1,3 +1,5 @@
+import { ValidationError } from '../error/index.js'
+
 const READ_METHODS = new Set([
   'count',
   'get',
@@ -29,15 +31,15 @@ export async function run (method, args = [], storeName, indexName, {
   storeOrIndex
 } = {}) {
   if (!tx) {
-    if (!db) throw new Error('IDB_DATABASE_REQUIRED')
-    if (!storeName) throw new Error('IDB_STORE_REQUIRED')
+    if (!db) throw new ValidationError('IDB_DATABASE_REQUIRED')
+    if (!storeName) throw new ValidationError('IDB_STORE_REQUIRED')
     // Caller may pre-select it if it wants to use many different methods in a row
     txMode ??= READ_METHODS.has(method) ? 'readonly' : 'readwrite'
     tx = db.transaction([storeName], txMode)
   }
 
   if (!storeOrIndex) {
-    if (!storeName) throw new Error('IDB_STORE_REQUIRED')
+    if (!storeName) throw new ValidationError('IDB_STORE_REQUIRED')
     const store = tx.objectStore(storeName)
     storeOrIndex = indexName ? store.index(indexName) : store
   }

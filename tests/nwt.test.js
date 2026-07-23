@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { bytesToBase64Url } from '../base64/index.js'
+import { ValidationError } from '../error/index.js'
 import { finalizeEvent } from '../event/index.js'
 import { NWT } from '../kind/index.js'
 import { createToken, decodeToken, encodeToken, validateToken } from '../nwt/index.js'
@@ -103,7 +104,9 @@ test('NWT enforces exact audience and optional identity constraints', async () =
   })
 
   assert.throws(() => validateToken(event, { now: NOW }), /NWT_AUDIENCE_REQUIRED/)
-  assert.throws(() => validateToken(event, { now: NOW, audience: 'other.example' }), /NWT_AUDIENCE_MISMATCH/)
+  assert.throws(() => validateToken(event, { now: NOW, audience: 'other.example' }), error => (
+    error instanceof ValidationError && error.code === 'NWT_AUDIENCE_MISMATCH'
+  ))
   assert.throws(() => validateToken(event, { now: NOW, audience: 'api.example.com', signer: 'other' }), /NWT_SIGNER_MISMATCH/)
   assert.throws(() => validateToken(event, { now: NOW, audience: 'api.example.com', issuer: 'other' }), /NWT_ISSUER_MISMATCH/)
   assert.throws(() => validateToken(event, { now: NOW, audience: 'api.example.com', subject: 'other' }), /NWT_SUBJECT_MISMATCH/)

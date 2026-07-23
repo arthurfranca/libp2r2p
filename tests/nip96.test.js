@@ -1,16 +1,20 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
+import { ValidationError } from '../error/index.js'
 import {
+  assertValidDelayedProcessingResponse,
+  assertValidFileUploadResponse,
+  assertValidServerConfiguration,
   calculateFileHash,
   checkFileProcessingStatus,
   generateDownloadUrl,
   generateFSPEventTemplate,
   readServerConfig,
-  uploadFile,
-  validateDelayedProcessingResponse,
-  validateFileUploadResponse,
-  validateServerConfiguration
+  isValidDelayedProcessingResponse,
+  isValidFileUploadResponse,
+  isValidServerConfiguration,
+  uploadFile
 } from '../nip96/index.js'
 
 const success = {
@@ -26,9 +30,15 @@ const success = {
 }
 
 test('NIP-96 validates direct and delegated configuration with one hop', async () => {
-  assert.equal(validateServerConfiguration({ api_url: 'https://files.example/api' }), true)
-  assert.equal(validateServerConfiguration({ delegated_to_url: 'https://delegate.example/config.json' }), true)
-  assert.equal(validateServerConfiguration({ api_url: 'https://a', delegated_to_url: 'https://b' }), false)
+  const direct = { api_url: 'https://files.example/api' }
+  assert.equal(isValidServerConfiguration(direct), true)
+  assert.equal(assertValidServerConfiguration(direct), direct)
+  assert.equal(isValidServerConfiguration({ delegated_to_url: 'https://delegate.example/config.json' }), true)
+  const conflict = { api_url: 'https://a', delegated_to_url: 'https://b' }
+  assert.equal(isValidServerConfiguration(conflict), false)
+  assert.throws(() => assertValidServerConfiguration(conflict), error => (
+    error instanceof ValidationError && error.code === 'NIP96_SERVER_CONFIGURATION_SOURCE_CONFLICT'
+  ))
   const calls = []
   const config = await readServerConfig({
     serverUrl: 'https://relay.example/path',
@@ -45,6 +55,14 @@ test('NIP-96 validates direct and delegated configuration with one hop', async (
     'https://delegate.example/config.json'
   ])
   assert.deepEqual(config, { api_url: 'https://files.example/api' })
+})
+
+test('NIP-96 keeps network failures outside ValidationError', async () => {
+  const networkError = new Error('network unavailable')
+  await assert.rejects(readServerConfig({
+    serverUrl: 'https://relay.example',
+    fetch: async () => { throw networkError }
+  }), error => error === networkError && !(error instanceof ValidationError))
 })
 
 test('NIP-96 fetch upload preserves falsy fields and reports estimated progress', async () => {
@@ -96,10 +114,21 @@ test('NIP-96 uses XHR upload progress when available', async () => {
 })
 
 test('NIP-96 validates responses, status and file hashes', async () => {
-  assert.equal(validateFileUploadResponse(success), true)
-  assert.equal(validateFileUploadResponse({ ...success, nip94_event: { tags: [] } }), false)
-  assert.equal(validateDelayedProcessingResponse({ status: 'processing', message: '', percentage: 0 }), true)
-  assert.equal(validateDelayedProcessingResponse({ status: 'processing', message: '', percentage: 101 }), false)
+  assert.equal(isValidFileUploadResponse(success), true)
+  assert.equal(assertValidFileUploadResponse(success), success)
+  const invalidUpload = { ...success, nip94_event: { tags: [] } }
+  assert.equal(isValidFileUploadResponse(invalidUpload), false)
+  assert.throws(() => assertValidFileUploadResponse(invalidUpload), error => (
+    error instanceof ValidationError && error.code === 'NIP94_URL_TAG_REQUIRED'
+  ))
+  const processing = { status: 'processing', message: '', percentage: 0 }
+  assert.equal(isValidDelayedProcessingResponse(processing), true)
+  assert.equal(assertValidDelayedProcessingResponse(processing), processing)
+  const invalidProcessing = { ...processing, percentage: 101 }
+  assert.equal(isValidDelayedProcessingResponse(invalidProcessing), false)
+  assert.throws(() => assertValidDelayedProcessingResponse(invalidProcessing), error => (
+    error instanceof ValidationError && error.code === 'INVALID_NIP96_DELAYED_PERCENTAGE'
+  ))
   assert.deepEqual(await checkFileProcessingStatus({
     processingUrl: 'https://files.example/status',
     fetch: async () => new Response(JSON.stringify({ status: 'processing', message: '', percentage: 0 }), { status: 200 })

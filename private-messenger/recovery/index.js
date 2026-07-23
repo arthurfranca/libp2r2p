@@ -1,5 +1,6 @@
 import { getEventHash } from '../../event/index.js'
 import { bytesToBase64, base64ToBytes } from '../../base64/index.js'
+import { ValidationError } from '../../error/index.js'
 import { ASK_KIND, parseRumorContent } from '../../private-message/index.js'
 
 export const SEEDER_PRESENCE_CODE = 'seederPresence_8mj8'
@@ -37,7 +38,7 @@ function encodeJsonlRows (...rows) {
   return bytesToBase64(encoder.encode(rows.map(row => String(row).endsWith('\n') ? row : `${row}\n`).join('')))
 }
 
-function eventInRange (event, since, until) {
+function isEventInRange (event, since, until) {
   if (!Number.isFinite(event?.created_at)) return true
   if (since != null && event.created_at < since) return false
   if (until != null && event.created_at > until) return false
@@ -159,17 +160,17 @@ function routerWithSingleRow (router, payloadRow, row) {
   }
 }
 
-function seedRowInRange (seed, since, until) {
+function isSeedRowInRange (seed, since, until) {
   const firstSeenAt = seed.firstSeenAt ?? seed.router?.created_at
   const lastSeenAt = seed.lastSeenAt ?? seed.router?.created_at
-  if (!Number.isFinite(firstSeenAt) || !Number.isFinite(lastSeenAt)) return eventInRange(seed.router, since, until)
+  if (!Number.isFinite(firstSeenAt) || !Number.isFinite(lastSeenAt)) return isEventInRange(seed.router, since, until)
   if (since != null && lastSeenAt < since) return false
   if (until != null && firstSeenAt > until) return false
   return true
 }
 
 function compactRoutersFromSeed (seed, { receiverPubkey, since, until }) {
-  if (!seed?.payloadRow || !seed?.row || !seed?.router || !seedRowInRange(seed, since, until)) return []
+  if (!seed?.payloadRow || !seed?.row || !seed?.router || !isSeedRowInRange(seed, since, until)) return []
   if (receiverPubkey && seed.receiverPubkey !== receiverPubkey) return []
   return [{
     recordType: ROUTER_SEED_RECORD_TYPE,
@@ -185,7 +186,7 @@ function compactNymCarriersFromSeed (seed, { since, until }) {
   // eslint-disable-next-line camelcase
   const created_at = nymCarrierRecordTime(seed)
   // eslint-disable-next-line camelcase
-  if (!seed?.carriers?.length || !eventInRange({ created_at }, since, until)) return []
+  if (!seed?.carriers?.length || !isEventInRange({ created_at }, since, until)) return []
   return [{
     recordType: NYM_CARRIER_SEED_RECORD_TYPE,
     carriers: compactSeedNymCarriers(seed.carriers)
@@ -226,10 +227,10 @@ export function createEventReplyPacker ({
   recordsFromInput = eventRecordFromInput,
   sendEmptyReply = false
 }) {
-  if (!messenger?.reply) throw new Error('MESSENGER_REQUIRED')
-  if (!question?.id) throw new Error('QUESTION_REQUIRED')
-  if (!receiverPubkey) throw new Error('RECEIVER_PUBKEY_REQUIRED')
-  if (!Number.isSafeInteger(eventsPerChunk) || eventsPerChunk < 1) throw new Error('INVALID_EVENTS_PER_CHUNK')
+  if (!messenger?.reply) throw new ValidationError('MESSENGER_REQUIRED')
+  if (!question?.id) throw new ValidationError('QUESTION_REQUIRED')
+  if (!receiverPubkey) throw new ValidationError('RECEIVER_PUBKEY_REQUIRED')
+  if (!Number.isSafeInteger(eventsPerChunk) || eventsPerChunk < 1) throw new ValidationError('INVALID_EVENTS_PER_CHUNK')
 
   let chunk = ''
   let chunkEvents = 0
@@ -298,10 +299,10 @@ export function createMissingMessageReplyPacker ({
   eventsPerChunk = DEFAULT_EVENTS_PER_CHUNK,
   sendEmptyReply = false
 }) {
-  if (!messenger?.reply) throw new Error('MESSENGER_REQUIRED')
-  if (!question?.id) throw new Error('QUESTION_REQUIRED')
-  if (!receiverPubkey) throw new Error('RECEIVER_PUBKEY_REQUIRED')
-  if (!Number.isSafeInteger(eventsPerChunk) || eventsPerChunk < 1) throw new Error('INVALID_EVENTS_PER_CHUNK')
+  if (!messenger?.reply) throw new ValidationError('MESSENGER_REQUIRED')
+  if (!question?.id) throw new ValidationError('QUESTION_REQUIRED')
+  if (!receiverPubkey) throw new ValidationError('RECEIVER_PUBKEY_REQUIRED')
+  if (!Number.isSafeInteger(eventsPerChunk) || eventsPerChunk < 1) throw new ValidationError('INVALID_EVENTS_PER_CHUNK')
 
   const range = backfillRequestRange(question, since, until)
   return createEventReplyPacker({

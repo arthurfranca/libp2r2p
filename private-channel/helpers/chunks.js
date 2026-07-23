@@ -1,7 +1,8 @@
 import { generateSecretKey, getPublicKey } from '../../key/index.js'
 import { bytesToBase64, base64ToBytes } from '../../base64/index.js'
 import { bytesToHex } from '../../base16/index.js'
-import { verifyIykcProof } from '../../content-key/event/index.js'
+import { isValidIykcProof } from '../../content-key/event/index.js'
+import { ValidationError } from '../../error/index.js'
 import * as nip44v3 from '../../nip44-v3/index.js'
 import { JSONL_CHUNK_BYTES } from './chunk-size.js'
 import { ROUTER_KIND } from '../constants/index.js'
@@ -28,7 +29,7 @@ function rowTempKey (id, index) {
 
 function normalizeContentKey ({ receiverPubkey, iykcPubkey = '', iykcProof = '' } = {}) {
   if (!iykcPubkey) return { iykcPubkey: '', iykcProof: '' }
-  if (!verifyIykcProof({ receiverPubkey, iykcPubkey, iykcProof })) throw new Error('INVALID_IYKC_PROOF')
+  if (!isValidIykcProof({ receiverPubkey, iykcPubkey, iykcProof })) throw new ValidationError('INVALID_IYKC_PROOF')
   return { iykcPubkey, iykcProof }
 }
 
@@ -157,7 +158,7 @@ function setPreparedRow (id, index, row, temporaryStorage) {
 
 function readPreparedRow (preparedRows, index) {
   const row = storageFor(preparedRows.temporaryStorage).getItem(rowTempKey(preparedRows.id, index))
-  if (typeof row !== 'string') throw new Error('MISSING_PREPARED_ROW')
+  if (typeof row !== 'string') throw new ValidationError('MISSING_PREPARED_ROW')
   return row
 }
 
@@ -187,7 +188,7 @@ async function prepareEnvelopeRowsOnce ({ id, senderSigner, receivers, receiverC
       ciphertext = encrypted[0]
       const nextContentPubkey = encrypted[1] || ''
       if (foundOwnContentPubkey && nextContentPubkey !== usedOwnContentPubkey) {
-        throw new Error('INCONSISTENT_IMKC_PUBKEY')
+        throw new ValidationError('INCONSISTENT_IMKC_PUBKEY')
       }
       foundOwnContentPubkey = true
       if (nextContentPubkey) usedOwnContentPubkey = nextContentPubkey
@@ -240,7 +241,7 @@ export function preparedRowIndexesForReceivers (preparedRows, receivers) {
   for (const receiver of receivers || []) {
     const pubkey = receiverRecord(receiver, {}).receiverPubkey
     const index = preparedRows?.receiverRowIndexesByPubkey?.[pubkey]
-    if (!pubkey || index === undefined) throw new Error('MISSING_PREPARED_RECEIVER')
+    if (!pubkey || index === undefined) throw new ValidationError('MISSING_PREPARED_RECEIVER')
     if (seen.has(index)) continue
     seen.add(index)
     indexes.push(index)

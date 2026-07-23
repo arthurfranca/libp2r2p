@@ -1,16 +1,19 @@
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { verifyEvent } from '../event/index.js'
+import { isValidEvent } from '../event/index.js'
+import { ValidationError } from '../error/index.js'
 import { generateSecretKey } from '../key/index.js'
 
 import TestSigner from './helpers/test-signer.js'
 import { bytesToHex } from '../base16/index.js'
 import {
   CONTENT_KEY_KIND,
+  assertValidContentKeyProof,
+  assertValidIykcProof,
+  isValidContentKeyProof,
+  isValidIykcProof,
   makeContentKeyEvent,
-  parseContentKeyEvent,
-  verifyContentKeyProof,
-  verifyIykcProof
+  parseContentKeyEvent
 } from '../content-key/event/index.js'
 
 afterEach(() => {
@@ -34,9 +37,24 @@ test('makeContentKeyEvent publishes a signed content pubkey proof', async () => 
   assert.deepEqual(event.tags, [['cp', contentPubkey]])
   assert.equal(parsed.iykcPubkey, contentPubkey)
   assert.equal(parsed.iykcProof, `${event.created_at}:${event.sig}`)
-  assert.equal(verifyIykcProof({ receiverPubkey: userPubkey, iykcPubkey: contentPubkey, iykcProof: parsed.iykcProof }), true)
-  assert.equal(verifyContentKeyProof({ ownerPubkey: userPubkey, contentPubkey, proof: parsed.iykcProof }), true)
-  assert.equal(verifyEvent(event), true)
+  const iykc = { receiverPubkey: userPubkey, iykcPubkey: contentPubkey, iykcProof: parsed.iykcProof }
+  const proofInput = { ownerPubkey: userPubkey, contentPubkey, proof: parsed.iykcProof }
+  assert.equal(isValidIykcProof(iykc), true)
+  assert.equal(assertValidIykcProof(iykc), iykc)
+  assert.equal(isValidContentKeyProof(proofInput), true)
+  assert.equal(assertValidContentKeyProof(proofInput), proofInput)
+  assert.equal(isValidEvent(event), true)
+
+  const invalid = { ...proofInput, proof: `${event.created_at}:${'0'.repeat(128)}` }
+  assert.equal(isValidContentKeyProof(invalid), false)
+  assert.throws(() => assertValidContentKeyProof(invalid), error => (
+    error instanceof ValidationError && error.code === 'INVALID_CONTENT_KEY_PROOF_SIGNATURE'
+  ))
+  const invalidIykc = { ...iykc, receiverPubkey: 'not-a-pubkey' }
+  assert.equal(isValidIykcProof(invalidIykc), false)
+  assert.throws(() => assertValidIykcProof(invalidIykc), error => (
+    error instanceof ValidationError && error.code === 'INVALID_IYKC_RECEIVER_PUBKEY'
+  ))
 })
 
 test('parseContentKeyEvent rejects malformed content-key events', async () => {

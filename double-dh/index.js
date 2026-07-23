@@ -1,7 +1,9 @@
+import { secp256k1 } from '@noble/curves/secp256k1.js'
 import { extract, expand } from '@noble/hashes/hkdf.js'
 import { sha256 } from '@noble/hashes/sha2.js'
 import { concatBytes } from '@noble/hashes/utils.js'
 import { sharedXOnlySecret } from '../ecdh/index.js'
+import { ValidationError } from '../error/index.js'
 
 const textEncoder = new TextEncoder()
 
@@ -57,7 +59,7 @@ function u32be (n) {
 
 function normalizeKind (kind) {
   const n = typeof kind === 'string' && kind.trim() !== '' ? Number(kind) : kind
-  if (!Number.isInteger(n) || n < 0 || n > 0xffffffff) throw new Error('INVALID_KIND')
+  if (!Number.isInteger(n) || n < 0 || n > 0xffffffff) throw new ValidationError('INVALID_KIND')
   return n
 }
 
@@ -119,8 +121,21 @@ export function deriveDoubleDhConversationKey ({
   kind,
   scope = ''
 }) {
-  if (role !== 'sender' && role !== 'receiver') throw new Error('INVALID_DOUBLE_DH_ROLE')
-  if (!identitySecretKey || !identityPubkey || !peerIdentityPubkey) throw new Error('DOUBLE_DH_IDENTITY_REQUIRED')
+  if (role !== 'sender' && role !== 'receiver') throw new ValidationError('INVALID_DOUBLE_DH_ROLE')
+  if (!identitySecretKey || !identityPubkey || !peerIdentityPubkey) throw new ValidationError('DOUBLE_DH_IDENTITY_REQUIRED')
+  if (!(identitySecretKey instanceof Uint8Array) || !secp256k1.utils.isValidSecretKey(identitySecretKey)) {
+    throw new ValidationError('INVALID_SECRET_KEY')
+  }
+  for (const pubkey of [identityPubkey, peerIdentityPubkey, contentPubkey, peerContentPubkey]) {
+    if (pubkey && (typeof pubkey !== 'string' || !/^[0-9a-f]{64}$/.test(pubkey))) {
+      throw new ValidationError('INVALID_PUBLIC_KEY')
+    }
+  }
+  if (contentSecretKey != null &&
+      (!(contentSecretKey instanceof Uint8Array) || !secp256k1.utils.isValidSecretKey(contentSecretKey))) {
+    throw new ValidationError('INVALID_CONTENT_SECRET_KEY')
+  }
+  if (typeof scope !== 'string') throw new ValidationError('INVALID_SCOPE')
 
   const isSender = role === 'sender'
   const senderContentPubkey = isSender ? contentPubkey : peerContentPubkey
@@ -128,8 +143,8 @@ export function deriveDoubleDhConversationKey ({
   const mode = modeFor({ senderContentPubkey, receiverContentPubkey })
 
   if (mode === 'identity') return { mode, conversationKey: null }
-  if (isSender && senderContentPubkey && !contentSecretKey) throw new Error('SENDER_CONTENT_KEY_REQUIRED')
-  if (!isSender && receiverContentPubkey && !contentSecretKey) throw new Error('RECEIVER_CONTENT_KEY_REQUIRED')
+  if (isSender && senderContentPubkey && !contentSecretKey) throw new ValidationError('SENDER_CONTENT_KEY_REQUIRED')
+  if (!isSender && receiverContentPubkey && !contentSecretKey) throw new ValidationError('RECEIVER_CONTENT_KEY_REQUIRED')
 
   const [a, b] = orderedPair({ identityPubkey, contentPubkey, peerIdentityPubkey, peerContentPubkey })
   const steps = []
@@ -137,7 +152,7 @@ export function deriveDoubleDhConversationKey ({
   if (identityPubkey === peerIdentityPubkey) {
     const ownContentPubkey = contentPubkey || peerContentPubkey
     if (ownContentPubkey && !contentSecretKey) {
-      throw new Error(isSender ? 'SENDER_CONTENT_KEY_REQUIRED' : 'RECEIVER_CONTENT_KEY_REQUIRED')
+      throw new ValidationError(isSender ? 'SENDER_CONTENT_KEY_REQUIRED' : 'RECEIVER_CONTENT_KEY_REQUIRED')
     }
     // In self-encryption, DH(identitySecret, contentPubkey) could be computed
     // with either single secret plus the other public key. The two self-DH

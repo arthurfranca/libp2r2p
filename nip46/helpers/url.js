@@ -1,3 +1,5 @@
+import { ValidationError } from '../../error/index.js'
+
 const PUBKEY = /^[0-9a-f]{64}$/
 
 function uniqueStrings (values) {
@@ -5,7 +7,7 @@ function uniqueStrings (values) {
   return [...new Set(values.filter(value => typeof value === 'string' && value))]
 }
 
-function validPubkey (value) {
+function isValidPubkey (value) {
   return typeof value === 'string' && PUBKEY.test(value)
 }
 
@@ -13,7 +15,7 @@ export function normalizeBunkerPointer (pointer) {
   if (!pointer || typeof pointer !== 'object') return null
   const remoteSignerPubkey = String(pointer.remoteSignerPubkey || '').toLowerCase()
   const relays = uniqueStrings(pointer.relays)
-  if (!validPubkey(remoteSignerPubkey) || !relays.length) return null
+  if (!isValidPubkey(remoteSignerPubkey) || !relays.length) return null
   return {
     remoteSignerPubkey,
     relays,
@@ -39,7 +41,7 @@ export function parseBunkerUrl (input) {
 // Serializes a direct NIP-46 bunker pointer without any network lookup.
 export function toBunkerUrl (pointer) {
   const normalized = normalizeBunkerPointer(pointer)
-  if (!normalized) throw new Error('INVALID_BUNKER_POINTER')
+  if (!normalized) throw new ValidationError('INVALID_BUNKER_POINTER')
   const url = new URL(`bunker://${normalized.remoteSignerPubkey}`)
   for (const relay of normalized.relays) url.searchParams.append('relay', relay)
   if (normalized.secret) url.searchParams.set('secret', normalized.secret)
@@ -58,8 +60,8 @@ export function createNostrConnectURI ({
 } = {}) {
   const normalizedPubkey = String(clientPubkey || '').toLowerCase()
   const normalizedRelays = uniqueStrings(relays)
-  if (!validPubkey(normalizedPubkey) || !normalizedRelays.length || typeof secret !== 'string' || !secret) {
-    throw new Error('INVALID_NOSTRCONNECT_URI')
+  if (!isValidPubkey(normalizedPubkey) || !normalizedRelays.length || typeof secret !== 'string' || !secret) {
+    throw new ValidationError('INVALID_NOSTRCONNECT_URI')
   }
 
   const uri = new URL(`nostrconnect://${normalizedPubkey}`)
@@ -78,7 +80,7 @@ export function parseNostrConnectURI (input) {
     const clientPubkey = url.hostname.toLowerCase()
     const relays = uniqueStrings(url.searchParams.getAll('relay'))
     const secret = url.searchParams.get('secret') || ''
-    if (url.protocol !== 'nostrconnect:' || !validPubkey(clientPubkey) || !relays.length || !secret) return null
+    if (url.protocol !== 'nostrconnect:' || !isValidPubkey(clientPubkey) || !relays.length || !secret) return null
     return {
       clientPubkey,
       relays,

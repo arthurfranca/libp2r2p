@@ -1,6 +1,7 @@
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
+import { ValidationError } from '../error/index.js'
 import { ASK_KIND, REPLY_KIND, TELL_KIND } from '../private-message/index.js'
 import { EXPIRATION_SECONDS } from '../private-channel/index.js'
 import {
@@ -330,7 +331,7 @@ test('private messenger validates and applies offline recovery defaults and chan
   for (const invalid of [-1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER]) {
     assert.throws(
       () => new PrivateMessenger({ _privateMessage: fakePrivateMessage(), offlineRecoverySeconds: invalid }),
-      /INVALID_OFFLINE_RECOVERY_SECONDS/
+      error => error instanceof ValidationError && error.code === 'INVALID_OFFLINE_RECOVERY_SECONDS'
     )
   }
 

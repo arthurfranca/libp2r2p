@@ -1,4 +1,5 @@
 import { NYM_CARRIER_KIND, ROUTER_KIND } from '../constants/index.js'
+import { ValidationError } from '../../error/index.js'
 
 const encoder = new TextEncoder()
 
@@ -16,7 +17,7 @@ export function readReceiverTag (event) {
 
 export function readSenderTag (event) {
   const senderPubkey = event.tags?.find(t => t[0] === 'f')?.[1]
-  if (!senderPubkey) throw new Error('MISSING_SENDER_TAG')
+  if (!senderPubkey) throw new ValidationError('MISSING_SENDER_TAG')
   return senderPubkey
 }
 
@@ -41,7 +42,7 @@ export function readChunkTag (event) {
   const index = Number(tag?.[1])
   const total = Number(tag?.[2])
   if (!Number.isInteger(index) || !Number.isInteger(total) || index < 0 || total < 1) {
-    throw new Error('INVALID_CHUNK_TAG')
+    throw new ValidationError('INVALID_CHUNK_TAG')
   }
   return { index, total }
 }
@@ -49,7 +50,7 @@ export function readChunkTag (event) {
 export function makeRouterEvent ({ pubkey, senderPubkey, imkcPubkey, imkcProof, receiverPubkey, chunkIndex, chunkTotal, content }) {
   const tags = [['f', senderPubkey]]
   if (imkcPubkey) {
-    if (!imkcProof) throw new Error('INVALID_IMKC_PROOF')
+    if (!imkcProof) throw new ValidationError('INVALID_IMKC_PROOF')
     tags.push(['imkc', imkcPubkey, imkcProof])
   }
   tags.push(['c', String(chunkIndex), String(chunkTotal)])
@@ -58,7 +59,7 @@ export function makeRouterEvent ({ pubkey, senderPubkey, imkcPubkey, imkcProof, 
 }
 
 export function makeNymCarrierEvent ({ innerId, chunkIndex, chunkTotal, content, createdAt = nowSeconds() }) {
-  if (!innerId) throw new Error('INNER_EVENT_ID_REQUIRED')
+  if (!innerId) throw new ValidationError('INNER_EVENT_ID_REQUIRED')
   return {
     kind: NYM_CARRIER_KIND,
     created_at: createdAt,

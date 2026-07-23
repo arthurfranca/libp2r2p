@@ -2,6 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  assertSerializableEvent,
+  assertValidEvent,
   classifyEvent,
   finalizeEvent,
   getEventHash,
@@ -9,9 +11,10 @@ import {
   isEphemeralEvent,
   isRegularEvent,
   isReplaceableEvent,
-  validateEvent,
-  verifyEvent
+  isSerializableEvent,
+  isValidEvent
 } from '../event/index.js'
+import { ValidationError } from '../error/index.js'
 import { serializeEvent } from '../event/helpers/serialize.js'
 import { generateSecretKey, getPublicKey } from '../key/index.js'
 
@@ -25,7 +28,7 @@ test('NIP-01 serialization, hashing and signing are deterministic', () => {
   const event = finalizeEvent(template(), secretKey)
   assert.equal(event.pubkey, getPublicKey(secretKey))
   assert.equal(event.id, getEventHash(event))
-  assert.equal(verifyEvent(event), true)
+  assert.equal(isValidEvent(event), true)
   assert.equal(serializeEvent(event), JSON.stringify([0, event.pubkey, 1, 1, event.tags, 'hello']))
 })
 
@@ -39,24 +42,52 @@ test('finalizeEvent is pure and copies tags', () => {
   assert.equal(event.extension, true)
 })
 
-test('verifyEvent never caches or mutates and detects later mutations', () => {
+test('finalizeEvent reports malformed secret keys as validation errors', () => {
+  assert.throws(() => finalizeEvent(template(), new Uint8Array(32)), error => (
+    error instanceof ValidationError && error.code === 'INVALID_SECRET_KEY'
+  ))
+})
+
+test('isValidEvent never caches or mutates and detects later mutations', () => {
   const event = finalizeEvent(template(), secretKey)
   const ownKeys = Reflect.ownKeys(event)
-  assert.equal(verifyEvent(event), true)
+  assert.equal(isValidEvent(event), true)
   assert.deepEqual(Reflect.ownKeys(event), ownKeys)
   event.content = 'changed'
-  assert.equal(verifyEvent(event), false)
+  assert.equal(isValidEvent(event), false)
   assert.deepEqual(Reflect.ownKeys(event), ownKeys)
 })
 
-test('validateEvent applies strict canonical NIP-01 bounds', () => {
+test('serializable event predicate and assert share strict canonical NIP-01 bounds', () => {
   const valid = { ...template(), pubkey: 'a'.repeat(64) }
-  assert.equal(validateEvent(valid), true)
+  assert.equal(isSerializableEvent(valid), true)
+  assert.equal(assertSerializableEvent(valid), valid)
   for (const changed of [
     { kind: -1 }, { kind: 65536 }, { kind: 1.1 }, { created_at: -1 },
     { created_at: Number.MAX_SAFE_INTEGER + 1 }, { pubkey: 'A'.repeat(64) },
     { tags: [[]] }, { tags: [['p', 1]] }, { content: null }
-  ]) assert.equal(validateEvent({ ...valid, ...changed }), false)
+  ]) {
+    const invalid = { ...valid, ...changed }
+    assert.equal(isSerializableEvent(invalid), false)
+    assert.throws(() => assertSerializableEvent(invalid), ValidationError)
+  }
+})
+
+test('valid event predicate and assert distinguish ID from signature failures', () => {
+  const event = finalizeEvent(template(), secretKey)
+  assert.equal(assertValidEvent(event), event)
+
+  const wrongId = { ...event, id: '0'.repeat(64) }
+  assert.equal(isValidEvent(wrongId), false)
+  assert.throws(() => assertValidEvent(wrongId), error => (
+    error instanceof ValidationError && error.code === 'EVENT_ID_MISMATCH'
+  ))
+
+  const wrongSignature = { ...event, sig: '0'.repeat(128) }
+  assert.equal(isValidEvent(wrongSignature), false)
+  assert.throws(() => assertValidEvent(wrongSignature), error => (
+    error instanceof ValidationError && error.code === 'INVALID_EVENT_SIGNATURE'
+  ))
 })
 
 test('event classification adds tag-defined behavior from any tag position', () => {

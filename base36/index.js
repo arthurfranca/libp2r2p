@@ -1,4 +1,5 @@
 import { base16ToBytes, bytesToBase16 } from '../base16/index.js'
+import { ValidationError } from '../error/index.js'
 
 export const BASE36_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyz'
 
@@ -30,7 +31,7 @@ function parseBase36Integer (value) {
   let number = 0n
   for (const character of value) {
     const digit = CHAR_MAP.get(character)
-    if (digit === undefined) throw new Error('Invalid Base36 character: ' + character)
+    if (digit === undefined) throw new ValidationError('INVALID_BASE36_CHARACTER', { message: 'Invalid Base36 character: ' + character })
     number = number * BASE + digit
   }
   return number
@@ -49,6 +50,9 @@ function integerToMinimalBytes (number) {
 // A binary-safe Base36 codec. Every leading zero byte is represented by a
 // leading zero character, making arbitrary byte arrays round-trip exactly.
 export function bytesToBase36 (bytes) {
+  if (!bytes || !Number.isSafeInteger(bytes.length) || typeof bytes[Symbol.iterator] !== 'function') {
+    throw new ValidationError('INVALID_BYTE_ARRAY')
+  }
   if (bytes.length === 0) return ''
 
   const number = bytesToInteger(bytes)
@@ -60,7 +64,7 @@ export function bytesToBase36 (bytes) {
 }
 
 export function base36ToBytes (value) {
-  if (typeof value !== 'string') throw new TypeError('Base36 value should be a string')
+  if (typeof value !== 'string') throw new ValidationError('INVALID_BASE36_TYPE', { message: 'Base36 value should be a string' })
   if (value.length === 0) return new Uint8Array()
 
   let leadingZeros = 0
@@ -84,21 +88,21 @@ export function base36ToBase16 (value) {
 // as exactly 50 lowercase Base36 digits. Its leading zeros are numeric width,
 // not zero-byte markers as they are in the binary-safe codec above.
 export function bytesToBase36Nsite (bytes) {
-  if (bytes.length !== NSITE_BYTE_LENGTH) {
-    throw new Error('Nsite Base36 input should be ' + NSITE_BYTE_LENGTH + ' bytes')
+  if (!bytes || bytes.length !== NSITE_BYTE_LENGTH || typeof bytes[Symbol.iterator] !== 'function') {
+    throw new ValidationError('INVALID_NSITE_BASE36_BYTE_LENGTH', { message: 'Nsite Base36 input should be ' + NSITE_BYTE_LENGTH + ' bytes' })
   }
   return integerToBase36(bytesToInteger(bytes)).padStart(NSITE_TEXT_LENGTH, LEADER)
 }
 
 export function base36NsiteToBytes (value) {
-  if (typeof value !== 'string') throw new TypeError('Nsite Base36 value should be a string')
+  if (typeof value !== 'string') throw new ValidationError('INVALID_NSITE_BASE36_TYPE', { message: 'Nsite Base36 value should be a string' })
   if (value.length !== NSITE_TEXT_LENGTH) {
-    throw new Error('Nsite Base36 value should be ' + NSITE_TEXT_LENGTH + ' characters')
+    throw new ValidationError('INVALID_NSITE_BASE36_LENGTH', { message: 'Nsite Base36 value should be ' + NSITE_TEXT_LENGTH + ' characters' })
   }
-  if (!/^[0-9a-z]+$/.test(value)) throw new Error('Invalid Nsite Base36 character')
+  if (!/^[0-9a-z]+$/.test(value)) throw new ValidationError('INVALID_NSITE_BASE36_CHARACTER', { message: 'Invalid Nsite Base36 character' })
 
   const number = parseBase36Integer(value)
-  if (number > MAX_NSITE_VALUE) throw new Error('Nsite Base36 value exceeds 32 bytes')
+  if (number > MAX_NSITE_VALUE) throw new ValidationError('NSITE_BASE36_OVERFLOW', { message: 'Nsite Base36 value exceeds 32 bytes' })
   const bytes = integerToMinimalBytes(number)
   const result = new Uint8Array(NSITE_BYTE_LENGTH)
   if (number !== 0n) result.set(bytes, NSITE_BYTE_LENGTH - bytes.length)

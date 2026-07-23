@@ -18,3 +18,17 @@ internal files directly through `package.json`; add or adjust an export-folder
 
 Keep the `exports` object in `package.json` sorted, with `.` first.
 Do not keep backwards-compatible alias exports unless explicitly requested.
+
+## Validation APIs
+
+Boolean predicates must use an interrogative prefix such as `is`, `has`,
+`does`, or `are`, and return `false` rather than throwing for a simply invalid
+candidate. Public validity predicates should have an `assert…` counterpart
+when callers benefit from a detailed reason; both must share one checker so
+their accepted inputs cannot drift.
+
+Strict public decoders, codecs, validators, and malformed public arguments
+throw `ValidationError` from `libp2r2p/error` with a stable uppercase
+snake-case code. Preserve ordinary operational errors for network, timeout,
+abort, quota, unavailable storage, and closed-state failures. Permissive
+parsers that use `null` for an expected mismatch keep that contract.

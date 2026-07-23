@@ -52,7 +52,7 @@ function relayListCreatedAt (event) {
   return Number.isFinite(event?.created_at) ? event.created_at : 0
 }
 
-function relaySetsEqual (a, b) {
+function areRelaySetsEqual (a, b) {
   const left = new Set(a || [])
   const right = new Set(b || [])
   if (left.size !== right.size) return false
@@ -61,8 +61,8 @@ function relaySetsEqual (a, b) {
 }
 
 function relaySetChanges (previous, next) {
-  const read = !relaySetsEqual(previous?.read, next?.read)
-  const write = !relaySetsEqual(previous?.write, next?.write)
+  const read = !areRelaySetsEqual(previous?.read, next?.read)
+  const write = !areRelaySetsEqual(previous?.write, next?.write)
   return {
     read,
     write,

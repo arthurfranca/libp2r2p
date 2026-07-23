@@ -1,5 +1,6 @@
 import { bech32 } from '@scure/base'
 import { BASE62_ALPHABET, base62ToBytes, bytesToBase62 } from '../base62/index.js'
+import { ValidationError } from '../error/index.js'
 
 const MAX_ENTITY_SIZE = 5000
 const MAX_TLV_VALUE_SIZE = 255
@@ -29,6 +30,10 @@ const channelByPrefix = Object.fromEntries(
   Object.entries(prefixByChannel).map(([channel, prefix]) => [prefix, channel])
 )
 
+function invalid (code, message, cause) {
+  return new ValidationError(code, { message, cause })
+}
+
 function bytesToHex (bytes) {
   let result = ''
   for (const byte of bytes) result += byte.toString(16).padStart(2, '0')
@@ -37,7 +42,7 @@ function bytesToHex (bytes) {
 
 function hexToBytes (hex, fieldName = 'hex value') {
   if (typeof hex !== 'string' || !/^[0-9a-f]+$/i.test(hex) || hex.length % 2 !== 0) {
-    throw new Error(`Invalid ${fieldName}`)
+    throw invalid('INVALID_NIP19_HEX', `Invalid ${fieldName}`)
   }
   const result = new Uint8Array(hex.length / 2)
   for (let index = 0; index < result.length; index++) {
@@ -48,7 +53,7 @@ function hexToBytes (hex, fieldName = 'hex value') {
 
 function fixedHexToBytes (hex, byteLength, fieldName) {
   const bytes = hexToBytes(hex, fieldName)
-  if (bytes.length !== byteLength) throw new Error(`${fieldName} should be ${byteLength} bytes`)
+  if (bytes.length !== byteLength) throw invalid('INVALID_NIP19_FIELD_LENGTH', `${fieldName} should be ${byteLength} bytes`)
   return bytes
 }
 
@@ -65,32 +70,32 @@ function concatBytes (arrays) {
 
 function encodeText (value, fieldName, { allowEmpty = false } = {}) {
   if (typeof value !== 'string' || (!allowEmpty && value.length === 0)) {
-    throw new Error(`${fieldName} should be ${allowEmpty ? 'a string' : 'a non-empty string'}`)
+    throw invalid('INVALID_NIP19_TEXT_FIELD', `${fieldName} should be ${allowEmpty ? 'a string' : 'a non-empty string'}`)
   }
   const bytes = textEncoder.encode(value)
-  if (bytes.length > MAX_TLV_VALUE_SIZE) throw new Error(`${fieldName} is too big`)
+  if (bytes.length > MAX_TLV_VALUE_SIZE) throw invalid('NIP19_FIELD_TOO_LARGE', `${fieldName} is too big`)
   // TextEncoder replaces lone surrogates. Reject them instead of silently changing
   // the signed/canonical entity value.
-  if (fatalTextDecoder.decode(bytes) !== value) throw new Error(`Invalid ${fieldName} UTF-8`)
+  if (fatalTextDecoder.decode(bytes) !== value) throw invalid('INVALID_NIP19_UTF8', `Invalid ${fieldName} UTF-8`)
   return bytes
 }
 
 function decodeText (bytes, fieldName, { allowEmpty = false } = {}) {
   if ((!allowEmpty && bytes.length === 0) || bytes.length > MAX_TLV_VALUE_SIZE) {
-    throw new Error(`Invalid ${fieldName} length`)
+    throw invalid('INVALID_NIP19_FIELD_LENGTH', `Invalid ${fieldName} length`)
   }
   try {
     return fatalTextDecoder.decode(bytes)
-  } catch {
-    throw new Error(`Invalid ${fieldName} UTF-8`)
+  } catch (cause) {
+    throw invalid('INVALID_NIP19_UTF8', `Invalid ${fieldName} UTF-8`, cause)
   }
 }
 
 function encodeTlvEntries (entries) {
   return concatBytes(entries.map(([type, value]) => {
-    if (!Number.isInteger(type) || type < 0 || type > 255) throw new Error('Invalid TLV type')
-    if (!(value instanceof Uint8Array)) throw new TypeError('TLV value should be a Uint8Array')
-    if (value.length > MAX_TLV_VALUE_SIZE) throw new Error('TLV value is too big')
+    if (!Number.isInteger(type) || type < 0 || type > 255) throw invalid('INVALID_TLV_TYPE', 'Invalid TLV type')
+    if (!(value instanceof Uint8Array)) throw invalid('INVALID_TLV_VALUE', 'TLV value should be a Uint8Array')
+    if (value.length > MAX_TLV_VALUE_SIZE) throw invalid('TLV_VALUE_TOO_LARGE', 'TLV value is too big')
     const entry = new Uint8Array(value.length + 2)
     entry[0] = type
     entry[1] = value.length
@@ -103,11 +108,11 @@ function decodeTlvEntries (bytes) {
   const entries = []
   let offset = 0
   while (offset < bytes.length) {
-    if (bytes.length - offset < 2) throw new Error('Truncated TLV header')
+    if (bytes.length - offset < 2) throw invalid('TRUNCATED_TLV_HEADER', 'Truncated TLV header')
     const type = bytes[offset]
     const length = bytes[offset + 1]
     offset += 2
-    if (bytes.length - offset < length) throw new Error(`Truncated TLV value for type ${type}`)
+    if (bytes.length - offset < length) throw invalid('TRUNCATED_TLV_VALUE', `Truncated TLV value for type ${type}`)
     entries.push([type, bytes.slice(offset, offset + length)])
     offset += length
   }
@@ -115,7 +120,7 @@ function decodeTlvEntries (bytes) {
 }
 
 function onlyValue (values, fieldName) {
-  if (values.length > 1) throw new Error(`Duplicate ${fieldName}`)
+  if (values.length > 1) throw invalid('DUPLICATE_NIP19_FIELD', `Duplicate ${fieldName}`)
   return values[0]
 }
 
@@ -129,19 +134,19 @@ function encodeStandardPointer (prefix, entries) {
 
 function decodeBech32Bytes (entity, prefix) {
   if (typeof entity !== 'string' || entity !== entity.toLowerCase() || !entity.startsWith(`${prefix}1`)) {
-    throw new Error(`${prefix} should use canonical lowercase Bech32`)
+    throw invalid('NON_CANONICAL_NIP19_ENTITY', `${prefix} should use canonical lowercase Bech32`)
   }
   let decoded
   try {
     decoded = bech32.decode(entity, MAX_ENTITY_SIZE)
   } catch (error) {
-    throw new Error(`Invalid ${prefix}: ${error.message}`)
+    throw invalid('INVALID_NIP19_ENTITY', `Invalid ${prefix}: ${error.message}`, error)
   }
-  if (decoded.prefix !== prefix) throw new Error(`Invalid ${prefix} prefix`)
+  if (decoded.prefix !== prefix) throw invalid('INVALID_NIP19_PREFIX', `Invalid ${prefix} prefix`)
   try {
     return new Uint8Array(bech32.fromWords(decoded.words))
   } catch (error) {
-    throw new Error(`Invalid ${prefix} data: ${error.message}`)
+    throw invalid('INVALID_NIP19_DATA', `Invalid ${prefix} data: ${error.message}`, error)
   }
 }
 
@@ -152,19 +157,19 @@ function decodeKnownTlv (entity, prefix, types) {
 }
 
 function encodeUint32 (value, fieldName = 'kind') {
-  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) throw new Error(`Invalid ${fieldName}`)
+  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) throw invalid('INVALID_NIP19_UINT32', `Invalid ${fieldName}`)
   const bytes = new Uint8Array(4)
   new DataView(bytes.buffer).setUint32(0, value, false)
   return bytes
 }
 
 function decodeUint32 (bytes, fieldName = 'kind') {
-  if (!bytes || bytes.length !== 4) throw new Error(`${fieldName} should be 4 bytes`)
+  if (!bytes || bytes.length !== 4) throw invalid('INVALID_NIP19_UINT32', `${fieldName} should be 4 bytes`)
   return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0, false)
 }
 
 function relayEntries (relays) {
-  if (!Array.isArray(relays)) throw new TypeError('relays should be an array')
+  if (!Array.isArray(relays)) throw invalid('INVALID_RELAY_HINTS', 'relays should be an array')
   return relays.map(relay => [1, encodeText(relay, 'relay hint')])
 }
 
@@ -173,7 +178,7 @@ function decodeRelayHints (values) {
 }
 
 export function nfileEncode ({ root, relays = [], author, mime, filename }) {
-  if (!Array.isArray(relays)) throw new TypeError('relays should be an array')
+  if (!Array.isArray(relays)) throw invalid('INVALID_RELAY_HINTS', 'relays should be an array')
   const entries = [[0, fixedHexToBytes(root, 32, 'MMR root')]]
   for (const relay of relays) entries.push([1, encodeText(relay, 'relay hint')])
   if (author !== undefined) entries.push([2, fixedHexToBytes(author, 32, 'author hint')])
@@ -186,32 +191,32 @@ export function nfileEncode ({ root, relays = [], author, mime, filename }) {
 
 export function nfileDecode (entity) {
   if (typeof entity !== 'string' || entity !== entity.toLowerCase()) {
-    throw new Error('nfile should use canonical lowercase Bech32')
+    throw invalid('NON_CANONICAL_NFILE', 'nfile should use canonical lowercase Bech32')
   }
   let decoded
   try {
     decoded = bech32.decode(entity, MAX_ENTITY_SIZE)
   } catch (error) {
-    throw new Error(`Invalid nfile: ${error.message}`)
+    throw invalid('INVALID_NFILE', `Invalid nfile: ${error.message}`, error)
   }
-  if (decoded.prefix !== 'nfile') throw new Error('Invalid nfile prefix')
+  if (decoded.prefix !== 'nfile') throw invalid('INVALID_NFILE_PREFIX', 'Invalid nfile prefix')
 
   let bytes
   try {
     bytes = new Uint8Array(bech32.fromWords(decoded.words))
   } catch (error) {
-    throw new Error(`Invalid nfile data: ${error.message}`)
+    throw invalid('INVALID_NFILE_DATA', `Invalid nfile data: ${error.message}`, error)
   }
 
   const known = new Map([[0, []], [1, []], [2, []], [3, []], [4, []]])
   for (const [type, value] of decodeTlvEntries(bytes)) known.get(type)?.push(value)
 
   const rootBytes = onlyValue(known.get(0), 'MMR root')
-  if (!rootBytes) throw new Error('Missing MMR root')
-  if (rootBytes.length !== 32) throw new Error('MMR root should be 32 bytes')
+  if (!rootBytes) throw invalid('MISSING_NFILE_ROOT', 'Missing MMR root')
+  if (rootBytes.length !== 32) throw invalid('INVALID_NFILE_ROOT', 'MMR root should be 32 bytes')
 
   const authorBytes = onlyValue(known.get(2), 'author hint')
-  if (authorBytes && authorBytes.length !== 32) throw new Error('Author hint should be 32 bytes')
+  if (authorBytes && authorBytes.length !== 32) throw invalid('INVALID_NFILE_AUTHOR', 'Author hint should be 32 bytes')
   const mimeBytes = onlyValue(known.get(3), 'MIME')
   const filenameBytes = onlyValue(known.get(4), 'filename')
 
@@ -231,7 +236,7 @@ export function noteEncode (eventId) {
 
 export function noteDecode (entity) {
   const bytes = decodeBech32Bytes(entity, 'note')
-  if (bytes.length !== 32) throw new Error('event ID should be 32 bytes')
+  if (bytes.length !== 32) throw invalid('INVALID_NOTE_EVENT_ID', 'event ID should be 32 bytes')
   return bytesToHex(bytes)
 }
 
@@ -245,7 +250,7 @@ export function nprofileEncode ({ pubkey, relays = [] }) {
 export function nprofileDecode (entity) {
   const known = decodeKnownTlv(entity, 'nprofile', [0, 1])
   const pubkey = onlyValue(known.get(0), 'profile pubkey')
-  if (!pubkey || pubkey.length !== 32) throw new Error('profile pubkey should be 32 bytes')
+  if (!pubkey || pubkey.length !== 32) throw invalid('INVALID_NPROFILE_PUBKEY', 'profile pubkey should be 32 bytes')
   return { pubkey: bytesToHex(pubkey), relays: decodeRelayHints(known.get(1)) }
 }
 
@@ -261,8 +266,8 @@ export function neventDecode (entity) {
   const id = onlyValue(known.get(0), 'event ID')
   const author = onlyValue(known.get(2), 'event author')
   const kind = onlyValue(known.get(3), 'event kind')
-  if (!id || id.length !== 32) throw new Error('event ID should be 32 bytes')
-  if (author && author.length !== 32) throw new Error('event author should be 32 bytes')
+  if (!id || id.length !== 32) throw invalid('INVALID_NEVENT_ID', 'event ID should be 32 bytes')
+  if (author && author.length !== 32) throw invalid('INVALID_NEVENT_AUTHOR', 'event author should be 32 bytes')
   const result = { id: bytesToHex(id), relays: decodeRelayHints(known.get(1)) }
   if (author) result.author = bytesToHex(author)
   if (kind) result.kind = decodeUint32(kind, 'event kind')
@@ -283,8 +288,8 @@ export function naddrDecode (entity) {
   const identifier = onlyValue(known.get(0), 'identifier')
   const pubkey = onlyValue(known.get(2), 'address author')
   const kind = onlyValue(known.get(3), 'address kind')
-  if (!identifier) throw new Error('Missing identifier')
-  if (!pubkey || pubkey.length !== 32) throw new Error('address author should be 32 bytes')
+  if (!identifier) throw invalid('MISSING_NADDR_IDENTIFIER', 'Missing identifier')
+  if (!pubkey || pubkey.length !== 32) throw invalid('INVALID_NADDR_AUTHOR', 'address author should be 32 bytes')
   return {
     identifier: decodeText(identifier, 'identifier', { allowEmpty: true }),
     pubkey: bytesToHex(pubkey),
@@ -300,7 +305,7 @@ export function nrelayEncode (relay) {
 export function nrelayDecode (entity) {
   const known = decodeKnownTlv(entity, 'nrelay', [0])
   const relay = onlyValue(known.get(0), 'relay URL')
-  if (!relay) throw new Error('Missing relay URL')
+  if (!relay) throw invalid('MISSING_NRELAY_URL', 'Missing relay URL')
   return decodeText(relay, 'relay URL')
 }
 
@@ -309,9 +314,9 @@ function isNostrAppDTagSafe (value) {
 }
 
 export function appEncode (ref) {
-  if (!isNostrAppDTagSafe(ref.dTag)) throw new Error('Invalid deduplication tag')
+  if (!isNostrAppDTagSafe(ref?.dTag)) throw invalid('INVALID_APP_D_TAG', 'Invalid deduplication tag')
   const channel = ref.channel ? (prefixByChannel[ref.channel] && ref.channel) : channelByKind[ref.kind]
-  if (!channel) throw new Error('Wrong channel')
+  if (!channel) throw invalid('INVALID_APP_CHANNEL', 'Wrong channel')
 
   // Keep the established app-entity byte ordering exactly for compatibility.
   const groups = [
@@ -327,15 +332,15 @@ export function appEncode (ref) {
       for (const value of values) entries.push([type, value])
     })
   const entity = `${prefixByChannel[channel]}${bytesToBase62(encodeTlvEntries(entries))}`
-  if (entity.length > MAX_ENTITY_SIZE) throw new Error('App entity is too big')
+  if (entity.length > MAX_ENTITY_SIZE) throw invalid('APP_ENTITY_TOO_LARGE', 'App entity is too big')
   return entity
 }
 
 export function appDecode (entity) {
-  if (typeof entity !== 'string' || entity.length > MAX_ENTITY_SIZE) throw new Error('Invalid app entity')
+  if (typeof entity !== 'string' || entity.length > MAX_ENTITY_SIZE) throw invalid('INVALID_APP_ENTITY', 'Invalid app entity')
   const prefix = entity.match(/^\+*/)?.[0]
   const channel = channelByPrefix[prefix]
-  if (!channel) throw new Error('Invalid channel')
+  if (!channel) throw invalid('INVALID_APP_CHANNEL', 'Invalid channel')
 
   const values = new Map()
   for (const [type, value] of decodeTlvEntries(base62ToBytes(entity.slice(prefix.length)))) {
@@ -345,11 +350,11 @@ export function appDecode (entity) {
   }
   const dTagBytes = values.get(0)?.[0]
   const pubkeyBytes = values.get(2)?.[0]
-  if (!dTagBytes) throw new Error('Missing deduplication tag')
-  if (!pubkeyBytes) throw new Error('Missing author pubkey')
-  if (pubkeyBytes.length !== 32) throw new Error('Author pubkey should be 32 bytes')
+  if (!dTagBytes) throw invalid('MISSING_APP_D_TAG', 'Missing deduplication tag')
+  if (!pubkeyBytes) throw invalid('MISSING_APP_AUTHOR', 'Missing author pubkey')
+  if (pubkeyBytes.length !== 32) throw invalid('INVALID_APP_AUTHOR', 'Author pubkey should be 32 bytes')
   const dTag = textDecoder.decode(dTagBytes)
-  if (!isNostrAppDTagSafe(dTag)) throw new Error('Invalid deduplication tag')
+  if (!isNostrAppDTagSafe(dTag)) throw invalid('INVALID_APP_D_TAG', 'Invalid deduplication tag')
 
   return {
     dTag,
@@ -379,9 +384,10 @@ export function nsecDecode (entity) {
 function decodeSimpleEntity (entity, prefix, fieldName) {
   try {
     const bytes = decodeBech32Bytes(entity, prefix)
-    if (bytes.length !== 32) throw new Error(`Invalid ${fieldName} length`)
+    if (bytes.length !== 32) throw invalid('INVALID_NIP19_FIELD_LENGTH', `Invalid ${fieldName} length`)
     return bytesToHex(bytes)
   } catch (error) {
-    throw new Error(`Failed to decode ${prefix}: ${error.message}`)
+    if (error instanceof ValidationError && error.code === 'INVALID_NIP19_FIELD_LENGTH') throw error
+    throw invalid('INVALID_NIP19_ENTITY', `Failed to decode ${prefix}: ${error.message}`, error)
   }
 }

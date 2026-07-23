@@ -41,6 +41,7 @@
 
 import * as privateMessage from '../private-message/index.js'
 import { bytesToBase64 } from '../base64/index.js'
+import { ValidationError } from '../error/index.js'
 import { getRelaysByPubkey, pickRelaysForPubkeys, subscribeRelayListUpdates } from '../relay/index.js'
 import * as privateChannel from '../private-channel/index.js'
 import { DEFAULT_RECEIVED_CHUNK_TTL_MS } from '../private-channel/services/received-chunks.js'
@@ -126,21 +127,21 @@ function nowSeconds () {
 
 function normalizeOfflineRecoverySeconds (value) {
   if (!Number.isSafeInteger(value) || value < 0 || value > MAX_OFFLINE_RECOVERY_SECONDS) {
-    throw new Error('INVALID_OFFLINE_RECOVERY_SECONDS')
+    throw new ValidationError('INVALID_OFFLINE_RECOVERY_SECONDS')
   }
   return value
 }
 
 function normalizeStaleChannelSeconds (value) {
   if (!Number.isSafeInteger(value) || value < 0 || value > MAX_OFFLINE_RECOVERY_SECONDS) {
-    throw new Error('INVALID_STALE_CHANNEL_SECONDS')
+    throw new ValidationError('INVALID_STALE_CHANNEL_SECONDS')
   }
   return value
 }
 
 function normalizeIdentityStorageRetentionSeconds (value) {
   if (!Number.isSafeInteger(value) || value < 0 || value > MAX_OFFLINE_RECOVERY_SECONDS) {
-    throw new Error('INVALID_IDENTITY_STORAGE_RETENTION_SECONDS')
+    throw new ValidationError('INVALID_IDENTITY_STORAGE_RETENTION_SECONDS')
   }
   return value
 }
@@ -150,7 +151,7 @@ function uniq (values) {
 }
 
 function normalizeAutoDeletionCapability (value) {
-  if (typeof value !== 'boolean') throw new Error('AUTO_DELETION_CAPABILITY_BOOLEAN_REQUIRED')
+  if (typeof value !== 'boolean') throw new ValidationError('AUTO_DELETION_CAPABILITY_BOOLEAN_REQUIRED')
   return value
 }
 
@@ -162,11 +163,11 @@ function parseJson (raw, fallback) {
   try { return JSON.parse(raw || '') } catch { return fallback }
 }
 
-function sameStateValue (left, right) {
+function areStateValuesEqual (left, right) {
   return JSON.stringify(left) === JSON.stringify(right)
 }
 
-function storesRecoverySeeds (mode) {
+function doesModeStoreRecoverySeeds (mode) {
   return mode === 'seeder' || mode === 'watchtower'
 }
 
@@ -283,7 +284,7 @@ export class PrivateMessenger {
   }
 
   async init ({ userSigner, contentKeySigner, nymSigner, channels = [], relays = [], mode = 'leecher' }) {
-    if (!userSigner?.getPublicKey) throw new Error('USER_SIGNER_REQUIRED')
+    if (!userSigner?.getPublicKey) throw new ValidationError('USER_SIGNER_REQUIRED')
     this.assertOpen()
     if (this.initSettledPromise) throw new Error('PRIVATE_MESSENGER_INIT_IN_PROGRESS')
     if (this.initialized) throw new Error('PRIVATE_MESSENGER_ALREADY_INITIALIZED')
@@ -600,8 +601,8 @@ export class PrivateMessenger {
       : this.identityStorageRetentionSeconds
     if (userSigner) {
       const userPubkey = await userSigner.getPublicKey?.()
-      if (!userPubkey) throw new Error('USER_SIGNER_REQUIRED')
-      if (this.userPubkey && userPubkey !== this.userPubkey) throw new Error('USER_SIGNER_MISMATCH')
+      if (!userPubkey) throw new ValidationError('USER_SIGNER_REQUIRED')
+      if (this.userPubkey && userPubkey !== this.userPubkey) throw new ValidationError('USER_SIGNER_MISMATCH')
       this.userSigner = userSigner
     }
     this.contentKeySigner = contentKeySigner || null
@@ -666,10 +667,10 @@ export class PrivateMessenger {
       const hasChannelSendRelays = Boolean(channel.sendRelays?.length)
       const hasDefaultRelays = Boolean(defaults.relays?.length)
       const pubkey = channel.pubkey || await signer?.getPublicKey?.()
-      if (!pubkey) throw new Error('CHANNEL_PUBKEY_REQUIRED')
-      if (!signer && !readerSigner) throw new Error('CHANNEL_SIGNER_REQUIRED')
+      if (!pubkey) throw new ValidationError('CHANNEL_PUBKEY_REQUIRED')
+      if (!signer && !readerSigner) throw new ValidationError('CHANNEL_SIGNER_REQUIRED')
       const mode = channel.mode || defaults.mode || 'leecher'
-      if (!signer && storesRecoverySeeds(mode)) throw new Error('PRIVATE_CHANNEL_WRITER_REQUIRED')
+      if (!signer && doesModeStoreRecoverySeeds(mode)) throw new ValidationError('PRIVATE_CHANNEL_WRITER_REQUIRED')
       const readerPubkey = channel.readerPubkey || channel.privateChannelReaderPubkey || await readerSigner?.getPublicKey?.() || pubkey
       const autoDeletionCapability = channel.autoDeletionCapability === undefined
         ? undefined
@@ -733,7 +734,7 @@ export class PrivateMessenger {
     if (channel.sendRelays.length) return { relays: channel.sendRelays, recoveryRelays }
     if (channel.relays.length) return { relays: channel.relays, recoveryRelays }
     const derived = await this.readRelayToReceivers(receiverPubkeys)
-    if (!relayMapRelays(derived).length) throw new Error('NO_RELAYS')
+    if (!relayMapRelays(derived).length) throw new ValidationError('NO_RELAYS')
     return { relayToReceivers: derived, recoveryRelays }
   }
 
@@ -748,7 +749,7 @@ export class PrivateMessenger {
       channels: isPlainObject(state?.channels) ? structuredClone(state.channels) : {}
     }
     const changed = Object.fromEntries(Object.entries(next.channels)
-      .filter(([pubkey, value]) => !sameStateValue(previous[pubkey], value)))
+      .filter(([pubkey, value]) => !areStateValuesEqual(previous[pubkey], value)))
     const removed = Object.keys(previous).filter(pubkey => !Object.hasOwn(next.channels, pubkey))
     this.state = next
     if (!Object.keys(changed).length && !removed.length) return this.stateWriteTail
@@ -993,7 +994,7 @@ export class PrivateMessenger {
     const channelPubkeys = uniq(channels)
     for (const pubkey of channelPubkeys) {
       const channel = this.channels.get(pubkey)
-      if (!channel) throw new Error('UNKNOWN_CHANNEL')
+      if (!channel) throw new ValidationError('UNKNOWN_CHANNEL')
       const watchRelays = await this.resolveWatchRelays(channel)
       this.assertOpen()
       const stop = await this._privateMessage.watch({
@@ -1107,7 +1108,7 @@ export class PrivateMessenger {
 
   async handleAsk (channelPubkey, message) {
     this.trackSeederActivity(channelPubkey, message)
-    if (storesRecoverySeeds(this.channels.get(channelPubkey)?.mode) && messageCode(message) === MISSING_MESSAGES_ASK_CODE) {
+    if (doesModeStoreRecoverySeeds(this.channels.get(channelPubkey)?.mode) && messageCode(message) === MISSING_MESSAGES_ASK_CODE) {
       await this.replyWithStoredSeeds(channelPubkey, message)
       return
     }
@@ -1461,10 +1462,10 @@ export class PrivateMessenger {
   async reconcilePresencePublishers () {
     const starts = []
     for (const pubkey of [...this.presenceTimers.keys()]) {
-      if (!storesRecoverySeeds(this.channels.get(pubkey)?.mode) || !this.offlineRecoverySecondsFor(pubkey)) this.stopPresencePublisher(pubkey)
+      if (!doesModeStoreRecoverySeeds(this.channels.get(pubkey)?.mode) || !this.offlineRecoverySecondsFor(pubkey)) this.stopPresencePublisher(pubkey)
     }
     for (const [pubkey, channel] of this.channels) {
-      if (storesRecoverySeeds(channel.mode) && this.offlineRecoverySecondsFor(channel)) starts.push(this.startPresencePublisher(pubkey))
+      if (doesModeStoreRecoverySeeds(channel.mode) && this.offlineRecoverySecondsFor(channel)) starts.push(this.startPresencePublisher(pubkey))
       else this.stopPresencePublisher(pubkey)
     }
     await Promise.all(starts)
@@ -1484,13 +1485,13 @@ export class PrivateMessenger {
 
   requireChannel (pubkey) {
     const channel = this.channels.get(pubkey)
-    if (!channel) throw new Error('UNKNOWN_CHANNEL')
+    if (!channel) throw new ValidationError('UNKNOWN_CHANNEL')
     return channel
   }
 
   requireWritableChannel (pubkey) {
     const channel = this.requireChannel(pubkey)
-    if (!channel.signer) throw new Error('PRIVATE_CHANNEL_WRITER_REQUIRED')
+    if (!channel.signer) throw new ValidationError('PRIVATE_CHANNEL_WRITER_REQUIRED')
     return channel
   }
 
@@ -1560,7 +1561,7 @@ export class PrivateMessenger {
 
   requireNymSigner (channel, override) {
     const signer = override || channel?.nymSigner || this.nymSigner
-    if (!signer?.getPublicKey) throw new Error('NYM_SIGNER_REQUIRED')
+    if (!signer?.getPublicKey) throw new ValidationError('NYM_SIGNER_REQUIRED')
     return signer
   }
 
@@ -1704,7 +1705,7 @@ export class PrivateMessenger {
 
     const routerRecord = record?.recordType === ROUTER_SEED_RECORD_TYPE ? record.router : null
     if (!isPrivateChannelRouter(routerRecord)) return null
-    if (!this._privateChannel.unwrapEvent) throw new Error('PRIVATE_CHANNEL_UNWRAP_UNSUPPORTED')
+    if (!this._privateChannel.unwrapEvent) throw new ValidationError('PRIVATE_CHANNEL_UNWRAP_UNSUPPORTED')
 
     const channel = this.requireChannel(channelPubkey)
     const router = {

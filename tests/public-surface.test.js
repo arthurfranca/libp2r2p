@@ -3,10 +3,18 @@ import assert from 'node:assert/strict'
 
 test('new public Nostr subpaths expose only the used surface', async () => {
   const expected = {
-    event: [
-      'classifyEvent', 'finalizeEvent', 'getEventHash', 'isAddressableEvent',
-      'isEphemeralEvent', 'isRegularEvent', 'isReplaceableEvent', 'validateEvent', 'verifyEvent'
+    'content-key/event': [
+      'CONTENT_KEY_KIND', 'assertValidContentKeyProof', 'assertValidIykcProof',
+      'isValidContentKeyProof', 'isValidIykcProof', 'makeContentKeyEvent',
+      'makeContentKeyEventForPubkey', 'makeContentKeyProof', 'makeIykcProof',
+      'parseContentKeyEvent'
     ],
+    event: [
+      'assertSerializableEvent', 'assertValidEvent', 'classifyEvent', 'finalizeEvent',
+      'getEventHash', 'isAddressableEvent', 'isEphemeralEvent', 'isRegularEvent',
+      'isReplaceableEvent', 'isSerializableEvent', 'isValidEvent'
+    ],
+    error: ['ValidationError'],
     key: [
       'generateKeypair', 'generateSecretKey', 'getPublicKey', 'keypairFromSeckey',
       'npubFromPubkey', 'nsecFromHex', 'parseProfileEvent', 'profileEventTemplate',
@@ -17,13 +25,15 @@ test('new public Nostr subpaths expose only the used surface', async () => {
     nip05: ['queryProfile'],
     nip44: ['decrypt', 'encrypt', 'getConversationKey'],
     nip96: [
+      'assertValidDelayedProcessingResponse', 'assertValidFileUploadResponse',
+      'assertValidServerConfiguration',
       'calculateFileHash', 'checkFileProcessingStatus', 'deleteFile', 'generateDownloadUrl',
       'generateFSPEventTemplate', 'readServerConfig', 'uploadFile',
-      'validateDelayedProcessingResponse', 'validateFileUploadResponse', 'validateServerConfiguration'
+      'isValidDelayedProcessingResponse', 'isValidFileUploadResponse', 'isValidServerConfiguration'
     ],
     nip98: ['getToken'],
     nwt: ['createToken', 'decodeToken', 'encodeToken', 'validateToken'],
-    url: ['isValidPublicRelayUrl', 'normalizeRelayUrl']
+    url: ['assertValidPublicRelayUrl', 'isValidPublicRelayUrl', 'normalizeRelayUrl']
   }
 
   for (const [subpath, names] of Object.entries(expected)) {
@@ -37,6 +47,9 @@ test('new public Nostr subpaths expose only the used surface', async () => {
     }
     assert.deepEqual(actual, names.sort())
   }
+
+  const root = await import('libp2r2p')
+  assert.equal(root.error.ValidationError, (await import('libp2r2p/error')).ValidationError)
 })
 
 test('serialization and RelayConnection remain package-internal', async () => {

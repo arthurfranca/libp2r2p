@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { bech32 } from '@scure/base'
+import { ValidationError } from '../error/index.js'
 import {
   NAPP_ENTITY_REGEX,
   appDecode,
@@ -108,6 +109,18 @@ describe('existing entities', () => {
     assert.equal(entity, '+qYizSSBIIRhTSKm6lRDGAFOSrO1KgUm2l6TMXJvogyMTKagXypXriUE4v2Q2bqqHZRDsDv2hPHzNru1PO')
     assert.ok(NAPP_ENTITY_REGEX.test(entity))
     assert.deepEqual(appDecode(entity), { ...value, kind: 35128 })
+  })
+
+  it('appDecode reports stable validation codes', () => {
+    for (const [entity, code] of [
+      ['', 'INVALID_APP_CHANNEL'],
+      ['+0', 'TRUNCATED_TLV_HEADER'],
+      ['+', 'MISSING_APP_D_TAG']
+    ]) {
+      assert.throws(() => appDecode(entity), error => (
+        error instanceof ValidationError && error.code === code
+      ))
+    }
   })
 
   it('round-trips npub and nsec entities', () => {

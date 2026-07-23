@@ -1,4 +1,5 @@
-import { getEventHash, validateEvent, verifyEvent } from '../event/index.js'
+import { getEventHash, isSerializableEvent, isValidEvent } from '../event/index.js'
+import { ValidationError } from '../error/index.js'
 import { generateKeypair } from '../key/index.js'
 import * as privateChannel from '../private-channel/index.js'
 
@@ -25,14 +26,14 @@ function uniq (values) {
 function normalizeDeletionPubkey (deletionPubkey) {
   if (deletionPubkey === undefined) return undefined
   if (typeof deletionPubkey !== 'string' || !HEX_PUBKEY.test(deletionPubkey)) {
-    throw new Error('INVALID_DELETION_PUBKEY')
+    throw new ValidationError('INVALID_DELETION_PUBKEY')
   }
   return deletionPubkey.toLowerCase()
 }
 
 function resolveDeletionCapability ({ deletionPubkey, deletionSeckey, autoDeletionCapability = true }) {
-  if (deletionSeckey !== undefined) throw new Error('DELETION_SECKEY_NOT_ACCEPTED')
-  if (typeof autoDeletionCapability !== 'boolean') throw new Error('AUTO_DELETION_CAPABILITY_BOOLEAN_REQUIRED')
+  if (deletionSeckey !== undefined) throw new ValidationError('DELETION_SECKEY_NOT_ACCEPTED')
+  if (typeof autoDeletionCapability !== 'boolean') throw new ValidationError('AUTO_DELETION_CAPABILITY_BOOLEAN_REQUIRED')
 
   const normalizedDeletionPubkey = normalizeDeletionPubkey(deletionPubkey)
   if (normalizedDeletionPubkey) return { deletionPubkey: normalizedDeletionPubkey }
@@ -51,7 +52,7 @@ function withDelivery (result, reports, deletionSeckey) {
   }
 }
 
-function setEquals (a, b) {
+function areSetsEqual (a, b) {
   if (a.size !== b.size) return false
   for (const value of a) if (!b.has(value)) return false
   return true
@@ -117,7 +118,7 @@ function cloneTags (tags) {
 }
 
 async function makeOutgoingRumor ({ senderSigner, rumor }) {
-  if (!senderSigner?.getPublicKey) throw new Error('SENDER_SIGNER_REQUIRED')
+  if (!senderSigner?.getPublicKey) throw new ValidationError('SENDER_SIGNER_REQUIRED')
   const senderPubkey = await senderSigner.getPublicKey()
   // This is what gets sent. Id and pubkey are added later by recipient.
   const wireEvent = {
@@ -134,13 +135,13 @@ async function makeOutgoingRumor ({ senderSigner, rumor }) {
 
 function normalizeRumor (event, pubkey) {
   const normalized = { ...event, pubkey }
-  if (!validateEvent(normalized)) throw new Error('INVALID_RUMOR')
+  if (!isSerializableEvent(normalized)) throw new ValidationError('INVALID_RUMOR')
   return { ...normalized, id: getEventHash(normalized) }
 }
 
 function assertValidSignedEvent (event) {
-  if (!verifyEvent(event)) {
-    throw new Error('INVALID_SIGNED_EVENT')
+  if (!isValidEvent(event)) {
+    throw new ValidationError('INVALID_SIGNED_EVENT')
   }
   return event
 }
@@ -150,7 +151,7 @@ function readTag (event, name) {
 }
 
 async function ownPrivateChannelPubkey (signer) {
-  if (!signer?.getPublicKey) throw new Error('PRIVATE_CHANNEL_SIGNER_REQUIRED')
+  if (!signer?.getPublicKey) throw new ValidationError('PRIVATE_CHANNEL_SIGNER_REQUIRED')
   return signer.getPublicKey()
 }
 
@@ -268,8 +269,8 @@ function watchRevisionsForChannels (channels) {
   return Object.fromEntries(channels.map(channel => [channel, watchesByChannel.get(channel)?.revision || 0]))
 }
 
-function subscriptionMatches (current, channels) {
-  if (!current || !setEquals(current.channels, channels)) return false
+function doesSubscriptionMatch (current, channels) {
+  if (!current || !areSetsEqual(current.channels, channels)) return false
   for (const channel of channels) {
     if (current.revisions?.[channel] !== watchesByChannel.get(channel)?.revision) return false
   }
@@ -302,7 +303,7 @@ function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, graceful
 
   for (const [relay, current] of subsByRelay) {
     const nextChannels = desired.get(relay)
-    if (nextChannels && subscriptionMatches(current, nextChannels)) continue
+    if (nextChannels && doesSubscriptionMatch(current, nextChannels)) continue
     if (!nextChannels) {
       const close = closeSubscription(current.sub, gracefulClose)
       if (close) closing.push(close)
@@ -312,7 +313,7 @@ function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, graceful
 
   for (const [relay, channels] of desired) {
     const current = subsByRelay.get(relay)
-    if (subscriptionMatches(current, channels)) continue
+    if (doesSubscriptionMatch(current, channels)) continue
 
     const channelList = [...channels]
     const firstWatch = watchesByChannel.get(channelList[0])
@@ -394,7 +395,7 @@ export async function watch ({
   since = nowSeconds(),
   _subscribe = privateChannel.subscribe
 }) {
-  if (!relays?.length) throw new Error('NO_RELAYS')
+  if (!relays?.length) throw new ValidationError('NO_RELAYS')
   const channelList = uniq(channels?.length ? channels : [await ownPrivateChannelPubkey(privateChannelSigner)])
   const ownPubkey = receiverPubkey || await receiverSigner?.getPublicKey?.()
   const callbacks = { onAsk, onReply, onTell, onYell, onNym, onMessage, onSeed, onChunk, onContentKeyUsage, onError }
@@ -419,7 +420,7 @@ export async function watch ({
       since
     }
     const current = watchesByChannel.get(channel)
-    const sameSettings = Boolean(
+    const areSettingsEqual = Boolean(
       current &&
       current.receiverSigner === next.receiverSigner &&
       current.iykcSigner === next.iykcSigner &&
@@ -434,8 +435,8 @@ export async function watch ({
       current.ignoredGroupTtlMs === next.ignoredGroupTtlMs &&
       current.ignoredGroupMaxEntries === next.ignoredGroupMaxEntries
     )
-    next.revision = sameSettings ? current.revision : nextWatchRevision++
-    if (sameSettings && setEquals(new Set(current.relays), new Set(next.relays))) {
+    next.revision = areSettingsEqual ? current.revision : nextWatchRevision++
+    if (areSettingsEqual && areSetsEqual(new Set(current.relays), new Set(next.relays))) {
       current.callbacks = callbacks
       continue
     }
@@ -475,7 +476,7 @@ async function sendPrivateMessage ({
   _getIykcProofs,
   _publish = privateChannel.publish
 }) {
-  if (!privateChannelSigner?.getPublicKey) throw new Error('PRIVATE_CHANNEL_WRITER_REQUIRED')
+  if (!privateChannelSigner?.getPublicKey) throw new ValidationError('PRIVATE_CHANNEL_WRITER_REQUIRED')
   return _publish({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, _getIykcProofs })
 }
 
@@ -491,8 +492,8 @@ async function sendNymMessage ({
   deletionPubkey,
   _publish = privateChannel.publishNymEvent
 }) {
-  if (!nymSigner?.getPublicKey) throw new Error('NYM_SIGNER_REQUIRED')
-  if (!privateChannelSigner?.getPublicKey) throw new Error('PRIVATE_CHANNEL_WRITER_REQUIRED')
+  if (!nymSigner?.getPublicKey) throw new ValidationError('NYM_SIGNER_REQUIRED')
+  if (!privateChannelSigner?.getPublicKey) throw new ValidationError('PRIVATE_CHANNEL_WRITER_REQUIRED')
   return _publish({ nymSigner, privateChannelSigner, privateChannelReaderPubkey, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds })
 }
 
@@ -518,8 +519,8 @@ export async function ask ({
   autoDeletionCapability = true,
   _publish = privateChannel.publish
 }) {
-  if (!receiverPubkey) throw new Error('RECEIVER_PUBKEY_REQUIRED')
-  if (!privateChannelSigner?.getPublicKey) throw new Error('PRIVATE_CHANNEL_WRITER_REQUIRED')
+  if (!receiverPubkey) throw new ValidationError('RECEIVER_PUBKEY_REQUIRED')
+  if (!privateChannelSigner?.getPublicKey) throw new ValidationError('PRIVATE_CHANNEL_WRITER_REQUIRED')
   const privateChannelPubkey = await ownPrivateChannelPubkey(privateChannelSigner)
   assertWatching(privateChannelPubkey)
 
@@ -560,8 +561,8 @@ export async function reply ({
   autoDeletionCapability = true,
   _publish = privateChannel.publish
 }) {
-  if (!question?.id) throw new Error('QUESTION_REQUIRED')
-  if (!receiverPubkey) throw new Error('RECEIVER_PUBKEY_REQUIRED')
+  if (!question?.id) throw new ValidationError('QUESTION_REQUIRED')
+  if (!receiverPubkey) throw new ValidationError('RECEIVER_PUBKEY_REQUIRED')
   const { event, wireEvent } = await makeOutgoingRumor({
     senderSigner,
     rumor: makeMessageRumor({
@@ -597,7 +598,7 @@ export async function tell ({
   autoDeletionCapability = true,
   _publish = privateChannel.publish
 }) {
-  if (!receiverPubkey) throw new Error('RECEIVER_PUBKEY_REQUIRED')
+  if (!receiverPubkey) throw new ValidationError('RECEIVER_PUBKEY_REQUIRED')
   const { event, wireEvent } = await makeOutgoingRumor({
     senderSigner,
     rumor: makeMessageRumor({
@@ -634,7 +635,7 @@ export async function yell ({
   _publish = privateChannel.publish
 }) {
   const receivers = uniq(receiverPubkeys)
-  if (!receivers.length) throw new Error('NO_RECEIVERS')
+  if (!receivers.length) throw new ValidationError('NO_RECEIVERS')
   const { event, wireEvent } = await makeOutgoingRumor({
     senderSigner,
     rumor: makeMessageRumor({
@@ -667,7 +668,7 @@ export async function broadcastRumor ({
   _publish = privateChannel.publish
 }) {
   const receivers = uniq(receiverPubkeys)
-  if (!receivers.length) throw new Error('NO_RECEIVERS')
+  if (!receivers.length) throw new ValidationError('NO_RECEIVERS')
   const { event, wireEvent } = await makeOutgoingRumor({ senderSigner, rumor })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
   const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, _getIykcProofs, _publish })
@@ -693,7 +694,7 @@ export async function broadcastEvent ({
   _publish = privateChannel.publish
 }) {
   const receivers = uniq(receiverPubkeys)
-  if (!receivers.length) throw new Error('NO_RECEIVERS')
+  if (!receivers.length) throw new ValidationError('NO_RECEIVERS')
   const wireEvent = assertValidSignedEvent({ ...event, tags: cloneTags(event?.tags) })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
   const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, _getIykcProofs, _publish })
@@ -714,7 +715,7 @@ export async function broadcastNymRumor ({
   autoDeletionCapability = true,
   _publish = privateChannel.publishNymEvent
 }) {
-  if (!nymSigner?.getPublicKey) throw new Error('NYM_SIGNER_REQUIRED')
+  if (!nymSigner?.getPublicKey) throw new ValidationError('NYM_SIGNER_REQUIRED')
   const { event, wireEvent } = await makeOutgoingRumor({ senderSigner: nymSigner, rumor })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
   const reports = await sendNymMessage({ nymSigner, privateChannelSigner, privateChannelReaderPubkey, deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, _publish })
@@ -735,7 +736,7 @@ export async function broadcastNymEvent ({
   autoDeletionCapability = true,
   _publish = privateChannel.publishNymEvent
 }) {
-  if (!nymSigner?.getPublicKey) throw new Error('NYM_SIGNER_REQUIRED')
+  if (!nymSigner?.getPublicKey) throw new ValidationError('NYM_SIGNER_REQUIRED')
   const wireEvent = assertValidSignedEvent({ ...event, tags: cloneTags(event?.tags) })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
   const reports = await sendNymMessage({ nymSigner, privateChannelSigner, privateChannelReaderPubkey, deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, _publish })

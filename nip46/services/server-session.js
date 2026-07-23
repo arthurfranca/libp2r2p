@@ -1,11 +1,12 @@
+import { ValidationError } from '../../error/index.js'
 import { relayPool as defaultRelayPool } from '../../relay/index.js'
 import { DEFAULT_TIMEOUT, DEFAULT_TIMEOUT_AFTER_FIRST_EOSE, NIP46_KIND } from '../constants/index.js'
 import {
   decodeNip46Frame,
   isNip46EventFor,
-  validRequestFrame
+  isValidRequestFrame
 } from '../helpers/frame.js'
-import { Nip46Transport, sameRelays } from './transport.js'
+import { areRelaySetsEqual, Nip46Transport } from './transport.js'
 
 function cleanRelays (relays) {
   return [...new Set((Array.isArray(relays) ? relays : [])
@@ -48,8 +49,8 @@ export class Nip46ServerSession {
     timeoutAfterFirstEose = DEFAULT_TIMEOUT_AFTER_FIRST_EOSE
   } = {}) {
     this.#relays = cleanRelays(relays)
-    if (!this.#relays.length) throw new Error('NIP46_RELAYS_REQUIRED')
-    if (typeof secret !== 'string') throw new Error('NIP46_SECRET_REQUIRED')
+    if (!this.#relays.length) throw new ValidationError('NIP46_RELAYS_REQUIRED')
+    if (typeof secret !== 'string') throw new ValidationError('NIP46_SECRET_REQUIRED')
     this.#secretKey = serverSecretKey
     this.#secret = secret
     this.#onConnect = onConnect
@@ -85,8 +86,8 @@ export class Nip46ServerSession {
   // Opens replacements now and switches only after the client requests them.
   async updateRelays (relays) {
     const nextRelays = cleanRelays(relays)
-    if (!nextRelays.length) throw new Error('NIP46_RELAYS_REQUIRED')
-    if (sameRelays(nextRelays, this.#relays)) return false
+    if (!nextRelays.length) throw new ValidationError('NIP46_RELAYS_REQUIRED')
+    if (areRelaySetsEqual(nextRelays, this.#relays)) return false
     if (!this.#transport.activeContext) {
       this.#relays = nextRelays
       return true
@@ -137,7 +138,7 @@ export class Nip46ServerSession {
   }
 
   async #handleRequest (peerPubkey, request, context) {
-    if (!validRequestFrame(request)) {
+    if (!isValidRequestFrame(request)) {
       if (typeof request?.id === 'string') {
         await this.#transport.reply(peerPubkey, request.id, null, 'NIP46_INVALID_REQUEST', { context })
       }

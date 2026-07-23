@@ -24,7 +24,7 @@ import {
   wrapNymEvent
 } from '../private-channel/index.js'
 import { createReceivedChunkStore, DEFAULT_RECEIVED_CHUNK_MAX_BYTES } from '../private-channel/services/received-chunks.js'
-import { makeContentKeyEvent, parseContentKeyEvent, verifyContentKeyProof } from '../content-key/event/index.js'
+import { isValidContentKeyProof, makeContentKeyEvent, parseContentKeyEvent } from '../content-key/event/index.js'
 import { TEMPORARY_STORAGE_KEYS_KEY } from '../temporary-storage/index.js'
 import { bytesToBase64, base64ToBytes } from '../base64/index.js'
 import { bytesToHex, hexToBytes } from '../base16/index.js'
@@ -1078,7 +1078,7 @@ test('unwrapEvent uses imkc tag as the row encryption pubkey', async () => {
 
   assert.equal(router.tags.find(t => t[0] === 'f')?.[1], alicePubkey)
   assert.equal(imkcTag?.[1], imkcPubkey)
-  assert.equal(verifyContentKeyProof({ ownerPubkey: alicePubkey, contentPubkey: imkcPubkey, proof: imkcTag?.[2] }), true)
+  assert.equal(isValidContentKeyProof({ ownerPubkey: alicePubkey, contentPubkey: imkcPubkey, proof: imkcTag?.[2] }), true)
   assert.deepEqual(
     await unwrapEvent({
       receiverSigner: bob,
@@ -1110,7 +1110,7 @@ test('wrapEvent can add imkc from senderSigner Double-DH without direct content 
   const imkcTag = router.tags.find(t => t[0] === 'imkc')
 
   assert.equal(imkcTag?.[1], contentPubkey)
-  assert.equal(verifyContentKeyProof({ ownerPubkey: alicePubkey, contentPubkey, proof: imkcTag?.[2] }), true)
+  assert.equal(isValidContentKeyProof({ ownerPubkey: alicePubkey, contentPubkey, proof: imkcTag?.[2] }), true)
   assert.deepEqual(
     await unwrapEvent({
       receiverSigner: bob,
@@ -1152,7 +1152,7 @@ test('wrapEvent uses Double-DH returned own content pubkey for imkc tag', async 
   const imkcTag = router.tags.find(t => t[0] === 'imkc')
 
   assert.equal(imkcTag?.[1], actualContentPubkey)
-  assert.equal(verifyContentKeyProof({ ownerPubkey: alicePubkey, contentPubkey: actualContentPubkey, proof: imkcTag?.[2] }), true)
+  assert.equal(isValidContentKeyProof({ ownerPubkey: alicePubkey, contentPubkey: actualContentPubkey, proof: imkcTag?.[2] }), true)
 })
 
 test('wrapEvent retries once when sender content key rotates while writing chunks', async () => {

@@ -1,4 +1,5 @@
 import { run } from '../idb/index.js'
+import { ValidationError } from '../error/index.js'
 
 const encoder = new TextEncoder()
 const ITEMS_STORE = 'items'
@@ -56,7 +57,7 @@ function normalizeEvictionPolicy (policy) {
   if (policy === 'opposite-end' || policy === undefined || policy === null) return 'opposite-end'
   if (policy === 'fifo' || policy === 'head') return 'head'
   if (policy === 'lifo' || policy === 'tail') return 'tail'
-  throw new Error('QUEUE_INVALID_EVICTION_POLICY')
+  throw new ValidationError('QUEUE_INVALID_EVICTION_POLICY')
 }
 
 function normalizeState (value) {
@@ -67,17 +68,17 @@ function normalizeState (value) {
 }
 
 function normalizeIndexes (indexes = {}) {
-  if (!indexes || typeof indexes !== 'object' || Array.isArray(indexes)) throw new Error('QUEUE_INDEXES_INVALID')
+  if (!indexes || typeof indexes !== 'object' || Array.isArray(indexes)) throw new ValidationError('QUEUE_INDEXES_INVALID')
 
   return Object.entries(indexes).map(([name, definition]) => {
     const options = typeof definition === 'string' || Array.isArray(definition)
       ? { keyPath: definition }
       : definition
     const keyPath = options?.keyPath
-    if (!name || (!Array.isArray(keyPath) && typeof keyPath !== 'string')) throw new Error('QUEUE_INDEX_INVALID')
-    if (Array.isArray(keyPath) && keyPath.some(path => typeof path !== 'string' || !path)) throw new Error('QUEUE_INDEX_INVALID')
-    if (typeof keyPath === 'string' && !keyPath) throw new Error('QUEUE_INDEX_INVALID')
-    if (options.multiEntry && Array.isArray(keyPath)) throw new Error('QUEUE_INDEX_MULTI_ENTRY_COMPOUND')
+    if (!name || (!Array.isArray(keyPath) && typeof keyPath !== 'string')) throw new ValidationError('QUEUE_INDEX_INVALID')
+    if (Array.isArray(keyPath) && keyPath.some(path => typeof path !== 'string' || !path)) throw new ValidationError('QUEUE_INDEX_INVALID')
+    if (typeof keyPath === 'string' && !keyPath) throw new ValidationError('QUEUE_INDEX_INVALID')
+    if (options.multiEntry && Array.isArray(keyPath)) throw new ValidationError('QUEUE_INDEX_MULTI_ENTRY_COMPOUND')
     return {
       name,
       keyPath,
@@ -90,7 +91,7 @@ function normalizeIndexes (indexes = {}) {
   })
 }
 
-function keyPathEqual (a, b) {
+function areKeyPathsEqual (a, b) {
   return JSON.stringify(a) === JSON.stringify(b)
 }
 
@@ -129,12 +130,12 @@ function ensureSchema (db, tx, indexDefinitions) {
     items = db.createObjectStore(ITEMS_STORE, { keyPath: 'position' })
   } else {
     items = tx.objectStore(ITEMS_STORE)
-    if (!keyPathEqual(items.keyPath, 'position')) throw new Error('QUEUE_SCHEMA_MISMATCH')
+    if (!areKeyPathsEqual(items.keyPath, 'position')) throw new Error('QUEUE_SCHEMA_MISMATCH')
   }
 
   if (!db.objectStoreNames.contains(STATE_STORE)) {
     db.createObjectStore(STATE_STORE, { keyPath: 'key' })
-  } else if (!keyPathEqual(tx.objectStore(STATE_STORE).keyPath, 'key')) {
+  } else if (!areKeyPathsEqual(tx.objectStore(STATE_STORE).keyPath, 'key')) {
     throw new Error('QUEUE_SCHEMA_MISMATCH')
   }
 
@@ -148,7 +149,7 @@ function ensureSchema (db, tx, indexDefinitions) {
     }
     const existing = items.index(definition.name)
     if (
-      !keyPathEqual(existing.keyPath, definition.storedKeyPath) ||
+      !areKeyPathsEqual(existing.keyPath, definition.storedKeyPath) ||
       existing.unique !== definition.unique ||
       existing.multiEntry !== definition.multiEntry
     ) {
@@ -165,7 +166,7 @@ async function inspectSchema (db, indexDefinitions) {
   const done = transactionDone(tx)
   const items = tx.objectStore(ITEMS_STORE)
   const state = tx.objectStore(STATE_STORE)
-  if (!keyPathEqual(items.keyPath, 'position') || !keyPathEqual(state.keyPath, 'key')) {
+  if (!areKeyPathsEqual(items.keyPath, 'position') || !areKeyPathsEqual(state.keyPath, 'key')) {
     await done
     return { missing: false, incompatible: true }
   }
@@ -178,7 +179,7 @@ async function inspectSchema (db, indexDefinitions) {
     }
     const existing = items.index(definition.name)
     if (
-      !keyPathEqual(existing.keyPath, definition.storedKeyPath) ||
+      !areKeyPathsEqual(existing.keyPath, definition.storedKeyPath) ||
       existing.unique !== definition.unique ||
       existing.multiEntry !== definition.multiEntry
     ) {
@@ -241,13 +242,13 @@ function itemForStorage (position, item) {
 
 function assertIndex (index, length, { allowEnd = false } = {}) {
   const max = allowEnd ? length : length - 1
-  if (!Number.isSafeInteger(index) || index < 0 || index > max) throw new Error('QUEUE_INDEX_OUT_OF_RANGE')
+  if (!Number.isSafeInteger(index) || index < 0 || index > max) throw new ValidationError('QUEUE_INDEX_OUT_OF_RANGE')
 }
 
-function validDirection (direction) {
+function normalizeDirection (direction) {
   if (direction === undefined || direction === 'next') return 'next'
   if (direction === 'prev') return 'prev'
-  throw new Error('QUEUE_INVALID_DIRECTION')
+  throw new ValidationError('QUEUE_INVALID_DIRECTION')
 }
 
 function isQuotaExceeded (err) {
@@ -265,7 +266,7 @@ export async function createQueue ({
   evictionPolicy = 'opposite-end',
   indexedDB = globalThis.indexedDB
 } = {}) {
-  if (!prefix) throw new Error('QUEUE_PREFIX_REQUIRED')
+  if (!prefix) throw new ValidationError('QUEUE_PREFIX_REQUIRED')
 
   const indexDefinitions = normalizeIndexes(indexes)
   const db = await openQueueDatabase(indexedDB, prefix, indexDefinitions)
@@ -663,7 +664,7 @@ export async function createQueue ({
   }
 
   async function insertWhere (predicate, item, { appendIfMissing = false } = {}) {
-    if (typeof predicate !== 'function') throw new Error('QUEUE_PREDICATE_REQUIRED')
+    if (typeof predicate !== 'function') throw new ValidationError('QUEUE_PREDICATE_REQUIRED')
     const requiredBytes = itemForStorage(0, item).byteSize
     return mutate(async (tx, state) => {
       const records = await recordsForState(tx, state)
@@ -683,7 +684,7 @@ export async function createQueue ({
   }
 
   async function removeWhere (predicate) {
-    if (typeof predicate !== 'function') throw new Error('QUEUE_PREDICATE_REQUIRED')
+    if (typeof predicate !== 'function') throw new ValidationError('QUEUE_PREDICATE_REQUIRED')
     return mutate(async (tx, state) => {
       const records = await recordsForState(tx, state)
       const removed = new Set()
@@ -699,7 +700,7 @@ export async function createQueue ({
   }
 
   async function some (predicate) {
-    if (typeof predicate !== 'function') throw new Error('QUEUE_PREDICATE_REQUIRED')
+    if (typeof predicate !== 'function') throw new ValidationError('QUEUE_PREDICATE_REQUIRED')
     return snapshot(async tx => {
       const state = await readState(tx)
       const records = await recordsForState(tx, state)
@@ -797,7 +798,7 @@ export async function createQueue ({
   }
 
   async function * storedItemsBy (indexName, query, { direction = 'next' } = {}) {
-    direction = validDirection(direction)
+    direction = normalizeDirection(direction)
     const records = await snapshot(async tx => {
       const { result } = await run('getAll', [query], ITEMS_STORE, indexName, { tx })
       return result

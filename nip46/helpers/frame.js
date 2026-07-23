@@ -1,10 +1,10 @@
-import { finalizeEvent, verifyEvent } from '../../event/index.js'
+import { finalizeEvent, isValidEvent } from '../../event/index.js'
 import { decrypt, encrypt, getConversationKey } from '../../nip44/index.js'
 import { NIP46_KIND } from '../constants/index.js'
 
 const PUBKEY = /^[0-9a-f]{64}$/
 
-export function validPubkey (value) {
+export function isValidPubkey (value) {
   return typeof value === 'string' && PUBKEY.test(value)
 }
 
@@ -14,9 +14,9 @@ export function hasPTag (event, pubkey) {
 
 export function isNip46EventFor (event, pubkey) {
   return event?.kind === NIP46_KIND &&
-    validPubkey(event.pubkey) &&
+    isValidPubkey(event.pubkey) &&
     hasPTag(event, pubkey) &&
-    verifyEvent(event)
+    isValidEvent(event)
 }
 
 export function decodeNip46Frame (event, secretKey) {
@@ -38,7 +38,7 @@ export function createNip46Event ({ secretKey, recipientPubkey, payload }) {
   }, secretKey)
 }
 
-export function validRequestFrame (frame) {
+export function isValidRequestFrame (frame) {
   return typeof frame?.id === 'string' && frame.id &&
     typeof frame.method === 'string' && frame.method &&
     Array.isArray(frame.params) && frame.params.every(param => typeof param === 'string')

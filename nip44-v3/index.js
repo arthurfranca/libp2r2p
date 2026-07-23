@@ -5,6 +5,7 @@ import { concatBytes, utf8ToBytes } from '@noble/hashes/utils.js'
 import { chacha20 } from '@noble/ciphers/chacha.js'
 import { bytesToBase64, base64ToBytes } from '../base64/index.js'
 import { sharedXOnlySecret } from '../ecdh/index.js'
+import { ValidationError } from '../error/index.js'
 
 // NIP-44 v3 — local implementation (spec.nostr.land/nip44v3)
 // Copied from the bunker testbench and verified against the vendored
@@ -34,7 +35,7 @@ function readU32be (b, off) {
   return new DataView(b.buffer, b.byteOffset, b.byteLength).getUint32(off, false)
 }
 
-function equalBytes (a, b) {
+function areBytesEqual (a, b) {
   if (a.length !== b.length) return false
   let diff = 0
   for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i]
@@ -47,7 +48,15 @@ function randomBytes32 () {
   return bytes
 }
 
+function assertBytes (value, code, length) {
+  if (!(value instanceof Uint8Array) || (length !== undefined && value.length !== length)) {
+    throw new ValidationError(code)
+  }
+  return value
+}
+
 export function deriveKeys (seckey, pubkey, nonce) {
+  assertBytes(nonce, 'INVALID_NONCE', 32)
   const shared = sharedXOnlySecret(seckey, pubkey)
   const salt = concatBytes(utf8ToBytes('nip44-v3\x00'), nonce)
   const prk = hkdfExtract(sha256, shared, salt)
@@ -71,6 +80,8 @@ export function payloadByteLength (plaintextByteLength, scopeByteLength = 0) {
 }
 
 export function deriveKeysFromConversationKey (conversationKey, nonce) {
+  assertBytes(conversationKey, 'INVALID_CONVERSATION_KEY', 32)
+  assertBytes(nonce, 'INVALID_NONCE', 32)
   const salt = concatBytes(utf8ToBytes('nip44-v3\x00'), nonce)
   const prk = hkdfExtract(sha256, conversationKey, salt)
   return {
@@ -87,6 +98,11 @@ export function encryptBytes (seckey, pubkey, kind, scope, plaintext, nonce) {
 
 export function encryptWithConversationKeyBytes (conversationKey, kind, scope, plaintext, nonce) {
   nonce ??= randomBytes32()
+  assertBytes(conversationKey, 'INVALID_CONVERSATION_KEY', 32)
+  kind = normalizeKind(kind)
+  assertBytes(scope, 'INVALID_SCOPE')
+  assertBytes(plaintext, 'INVALID_PLAINTEXT')
+  assertBytes(nonce, 'INVALID_NONCE', 32)
   const { encryption_key: encryptionKey, mac_key: macKey } = deriveKeysFromConversationKey(conversationKey, nonce)
   const prefixed = concatBytes(u32be(plaintext.length), plaintext)
   const padded = new Uint8Array(targetSize(prefixed.length))
@@ -102,34 +118,37 @@ export function decryptBytes (seckey, pubkey, expectedKind, expectedScope, ciphe
 }
 
 export function decryptWithConversationKeyBytes (conversationKey, expectedKind, expectedScope, ciphertext) {
-  if (!ciphertext || ciphertext.length === 0) throw new Error('empty ciphertext')
-  if (ciphertext[0] === '#') throw new Error('unsupported future version')
+  assertBytes(conversationKey, 'INVALID_CONVERSATION_KEY', 32)
+  expectedKind = normalizeKind(expectedKind)
+  assertBytes(expectedScope, 'INVALID_SCOPE')
+  if (typeof ciphertext !== 'string' || ciphertext.length === 0) throw new ValidationError('EMPTY_CIPHERTEXT', { message: 'empty ciphertext' })
+  if (ciphertext[0] === '#') throw new ValidationError('UNSUPPORTED_NIP44_VERSION', { message: 'unsupported future version' })
   let decoded
-  try { decoded = base64ToBytes(ciphertext) } catch { throw new Error('invalid base64') }
-  if (decoded.length < 77) throw new Error('ciphertext too short')
-  if (decoded[0] !== VERSION) throw new Error(`unsupported version ${decoded[0]}`)
+  try { decoded = base64ToBytes(ciphertext) } catch (cause) { throw new ValidationError('INVALID_BASE64', { message: 'invalid base64', cause }) }
+  if (decoded.length < 77) throw new ValidationError('NIP44_CIPHERTEXT_TOO_SHORT', { message: 'ciphertext too short' })
+  if (decoded[0] !== VERSION) throw new ValidationError('UNSUPPORTED_NIP44_VERSION', { message: `unsupported version ${decoded[0]}` })
   const nonce = decoded.subarray(1, 33)
   const mac = decoded.subarray(33, 65)
   const kind = readU32be(decoded, 65)
   const scopeLength = readU32be(decoded, 69)
-  if (scopeLength > decoded.length - 73) throw new Error('invalid scope length')
+  if (scopeLength > decoded.length - 73) throw new ValidationError('INVALID_NIP44_SCOPE_LENGTH', { message: 'invalid scope length' })
   const scope = decoded.subarray(73, 73 + scopeLength)
-  try { fatalTextDecoder.decode(scope) } catch { throw new Error('scope is not valid UTF-8') }
+  try { fatalTextDecoder.decode(scope) } catch (cause) { throw new ValidationError('INVALID_NIP44_SCOPE_UTF8', { message: 'scope is not valid UTF-8', cause }) }
   const ct = decoded.subarray(73 + scopeLength)
-  if (ct.length < 4) throw new Error('ciphertext too short')
-  if (kind !== expectedKind) throw new Error(`kind mismatch: got ${kind}, expected ${expectedKind}`)
-  if (!equalBytes(scope, expectedScope)) throw new Error('scope mismatch')
+  if (ct.length < 4) throw new ValidationError('NIP44_CIPHERTEXT_TOO_SHORT', { message: 'ciphertext too short' })
+  if (kind !== expectedKind) throw new ValidationError('NIP44_KIND_MISMATCH', { message: `kind mismatch: got ${kind}, expected ${expectedKind}` })
+  if (!areBytesEqual(scope, expectedScope)) throw new ValidationError('NIP44_SCOPE_MISMATCH', { message: 'scope mismatch' })
   const { encryption_key: encryptionKey, mac_key: macKey } = deriveKeysFromConversationKey(conversationKey, nonce)
   const authData = concatBytes(nonce, u32be(kind), u32be(scope.length), scope, ct)
-  if (!equalBytes(mac, hmac(sha256, macKey, authData))) throw new Error('invalid MAC')
+  if (!areBytesEqual(mac, hmac(sha256, macKey, authData))) throw new ValidationError('INVALID_MAC', { message: 'invalid MAC' })
   const padded = chacha(encryptionKey, ct)
   const plaintextLength = readU32be(padded, 0)
-  if (plaintextLength + 4 > padded.length) throw new Error('invalid plaintext length')
-  if (plaintextLength > 2 ** 31 - 1) throw new Error('plaintext too long')
+  if (plaintextLength + 4 > padded.length) throw new ValidationError('INVALID_PLAINTEXT_LENGTH', { message: 'invalid plaintext length' })
+  if (plaintextLength > 2 ** 31 - 1) throw new ValidationError('PLAINTEXT_TOO_LONG', { message: 'plaintext too long' })
   // Only verify the padding is all-zeroes. Per spec, implementations MUST NOT do any
   // other check on the padding length — non-standard zero-padding must decrypt.
   const padding = padded.subarray(4 + plaintextLength)
-  if (!equalBytes(padding, new Uint8Array(padding.length))) throw new Error('invalid padding')
+  if (!areBytesEqual(padding, new Uint8Array(padding.length))) throw new ValidationError('INVALID_PADDING', { message: 'invalid padding' })
   return padded.subarray(4, 4 + plaintextLength)
 }
 
@@ -139,7 +158,7 @@ function deriveSharedConversationKey (seckey, pubkey) {
 
 export function normalizeKind (kind) {
   const n = typeof kind === 'string' && kind.trim() !== '' ? Number(kind) : kind
-  if (!Number.isInteger(n) || n < 0 || n > 0xffffffff) throw new Error('INVALID_KIND')
+  if (!Number.isInteger(n) || n < 0 || n > 0xffffffff) throw new ValidationError('INVALID_KIND')
   return n
 }
 

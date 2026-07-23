@@ -1,9 +1,10 @@
-import { finalizeEvent, getEventHash, validateEvent, verifyEvent } from '../event/index.js'
+import { finalizeEvent, getEventHash, isSerializableEvent, isValidEvent } from '../event/index.js'
 import { generateSecretKey, getPublicKey } from '../key/index.js'
 import { bytesToBase64, base64ToBytes } from '../base64/index.js'
 import { hexToBytes } from '../base16/index.js'
-import { makeContentKeyEventForPubkey, parseContentKeyEvent, verifyContentKeyProof, verifyIykcProof } from '../content-key/event/index.js'
+import { isValidContentKeyProof, isValidIykcProof, makeContentKeyEventForPubkey, parseContentKeyEvent } from '../content-key/event/index.js'
 import { getIykcProofs } from '../content-key/index.js'
+import { ValidationError } from '../error/index.js'
 import * as nip44v3 from '../nip44-v3/index.js'
 import { relayPool } from '../relay/index.js'
 import { JSONL_CHUNK_BYTES, NYM_CARRIER_CHUNK_CHARS } from './helpers/chunk-size.js'
@@ -44,7 +45,7 @@ function uniq (values) {
 function normalizeDeletionPubkey (deletionPubkey) {
   if (deletionPubkey === undefined) return undefined
   if (typeof deletionPubkey !== 'string' || !HEX_PUBKEY.test(deletionPubkey)) {
-    throw new Error('INVALID_DELETION_PUBKEY')
+    throw new ValidationError('INVALID_DELETION_PUBKEY')
   }
   return deletionPubkey.toLowerCase()
 }
@@ -80,7 +81,7 @@ async function nip44v3DecryptText (signer, peerPubkey, kind, ciphertext) {
   return base64ToText(await signer.nip44v3Decrypt(peerPubkey, kind, NIP44_V3_SCOPE, ciphertext))
 }
 
-function storesRecoverySeeds (mode) {
+function doesModeStoreRecoverySeeds (mode) {
   return mode === 'seeder' || mode === 'watchtower'
 }
 
@@ -90,16 +91,16 @@ async function makeImkcProof ({ senderSigner, senderPubkey, imkcPubkey }) {
   if (
     event.pubkey !== senderPubkey ||
     parsed?.iykcPubkey !== imkcPubkey ||
-    !verifyContentKeyProof({ ownerPubkey: senderPubkey, contentPubkey: imkcPubkey, proof: parsed?.iykcProof })
-  ) throw new Error('INVALID_IMKC_PROOF')
+    !isValidContentKeyProof({ ownerPubkey: senderPubkey, contentPubkey: imkcPubkey, proof: parsed?.iykcProof })
+  ) throw new ValidationError('INVALID_IMKC_PROOF')
   return parsed.iykcProof
 }
 
 async function prepareRoutedMessage ({ senderSigner, imkcSigner, privateChannelSigner = senderSigner, privateChannelReaderPubkey, receivers, event, temporaryStorageArea, _getIykcProofs = getIykcProofs }) {
-  if (!senderSigner?.getPublicKey) throw new Error('SENDER_SIGNER_REQUIRED')
-  if (!senderSigner?.nip44EncryptDoubleDH && !senderSigner?.nip44v3Encrypt) throw new Error('SIGNER_NIP44V3_ENCRYPT_UNSUPPORTED')
-  if (!privateChannelSigner?.getPublicKey || !privateChannelSigner?.nip44v3Encrypt || !privateChannelSigner?.signEvent) throw new Error('PRIVATE_CHANNEL_SIGNER_REQUIRED')
-  if (!Array.isArray(receivers) || !receivers.length) throw new Error('NO_RECEIVERS')
+  if (!senderSigner?.getPublicKey) throw new ValidationError('SENDER_SIGNER_REQUIRED')
+  if (!senderSigner?.nip44EncryptDoubleDH && !senderSigner?.nip44v3Encrypt) throw new ValidationError('SIGNER_NIP44V3_ENCRYPT_UNSUPPORTED')
+  if (!privateChannelSigner?.getPublicKey || !privateChannelSigner?.nip44v3Encrypt || !privateChannelSigner?.signEvent) throw new ValidationError('PRIVATE_CHANNEL_SIGNER_REQUIRED')
+  if (!Array.isArray(receivers) || !receivers.length) throw new ValidationError('NO_RECEIVERS')
 
   const senderPubkey = await senderSigner.getPublicKey()
   const useDoubleDh = typeof senderSigner.nip44EncryptDoubleDH === 'function'
@@ -159,7 +160,7 @@ async function * wrapPreparedEvents ({ privateChannelSigner, receivers, receiver
         tags: privateBroadcastTags({ deletionPubkey, createdAt, expirationSeconds }),
         content: await nip44v3EncryptText(privateChannelSigner, context.channelReaderPubkey, PRIVATE_BROADCAST_KIND, JSON.stringify(router))
       })
-      if (eventByteLength(outer) > MAX_EVENT_BYTES) throw new Error('EVENT_TOO_LARGE')
+      if (eventByteLength(outer) > MAX_EVENT_BYTES) throw new ValidationError('EVENT_TOO_LARGE')
       yield outer
     }
   } finally {
@@ -194,17 +195,17 @@ export async function wrapEvent (options) {
 }
 
 export async function * wrapNymEvents ({ nymSigner, privateChannelSigner, privateChannelReaderPubkey, deletionPubkey, event, expirationSeconds = EXPIRATION_SECONDS }) {
-  if (!nymSigner?.getPublicKey || !nymSigner?.signEvent) throw new Error('NYM_SIGNER_REQUIRED')
-  if (!privateChannelSigner?.getPublicKey || !privateChannelSigner?.nip44v3Encrypt || !privateChannelSigner?.signEvent) throw new Error('PRIVATE_CHANNEL_SIGNER_REQUIRED')
+  if (!nymSigner?.getPublicKey || !nymSigner?.signEvent) throw new ValidationError('NYM_SIGNER_REQUIRED')
+  if (!privateChannelSigner?.getPublicKey || !privateChannelSigner?.nip44v3Encrypt || !privateChannelSigner?.signEvent) throw new ValidationError('PRIVATE_CHANNEL_SIGNER_REQUIRED')
   const normalizedDeletionPubkey = normalizeDeletionPubkey(deletionPubkey)
 
   const nymPubkey = await nymSigner.getPublicKey()
   const channelPubkey = await privateChannelSigner.getPublicKey()
   const channelReaderPubkey = privateChannelReaderPubkey || channelPubkey
-  const wireEvent = isSignedEvent(event)
+  const wireEvent = hasEventSignature(event)
     ? assertValidSignedInnerEvent(event)
     : wireNymRumor({ ...event, created_at: event?.created_at !== undefined ? event.created_at : nowSeconds() })
-  const innerEvent = isSignedEvent(wireEvent) ? wireEvent : normalizeNymRumor(wireEvent, nymPubkey)
+  const innerEvent = hasEventSignature(wireEvent) ? wireEvent : normalizeNymRumor(wireEvent, nymPubkey)
   const encoded = bytesToBase64(encoder.encode(JSON.stringify(wireEvent)))
   const total = Math.max(1, Math.ceil(encoded.length / NYM_CARRIER_CHUNK_CHARS))
   const carrierCreatedAt = nowSeconds()
@@ -224,7 +225,7 @@ export async function * wrapNymEvents ({ nymSigner, privateChannelSigner, privat
       tags: privateBroadcastTags({ deletionPubkey: normalizedDeletionPubkey, createdAt, expirationSeconds }),
       content: await nip44v3EncryptText(privateChannelSigner, channelReaderPubkey, PRIVATE_BROADCAST_KIND, JSON.stringify(carrier))
     })
-    if (eventByteLength(outer) > MAX_EVENT_BYTES) throw new Error('EVENT_TOO_LARGE')
+    if (eventByteLength(outer) > MAX_EVENT_BYTES) throw new ValidationError('EVENT_TOO_LARGE')
     yield outer
   }
 }
@@ -245,31 +246,31 @@ function joinedRouter (router, content = '') {
 
 function parsePayloadEnvelope (line, index = 0) {
   const record = JSON.parse(line)
-  if (!Array.isArray(record) || record.length !== 1 || typeof record[0] !== 'string') throw new Error('INVALID_PAYLOAD_ENVELOPE')
+  if (!Array.isArray(record) || record.length !== 1 || typeof record[0] !== 'string') throw new ValidationError('INVALID_PAYLOAD_ENVELOPE')
   return { index, type: 'payload', ciphertext: record[0] }
 }
 
 function parseRecipientEnvelope (line, index = 0) {
   const record = JSON.parse(line)
-  if (!Array.isArray(record) || (record.length !== 2 && record.length !== 4)) throw new Error('INVALID_RECIPIENT_ENVELOPE')
+  if (!Array.isArray(record) || (record.length !== 2 && record.length !== 4)) throw new ValidationError('INVALID_RECIPIENT_ENVELOPE')
   const [receiverPubkey, ciphertext, iykcPubkey = '', iykcProof = ''] = record
   return { index, receiverPubkey, ciphertext, iykcPubkey, iykcProof }
 }
 
-function isSignedEvent (event) {
+function hasEventSignature (event) {
   return Object.prototype.hasOwnProperty.call(event || {}, 'sig')
 }
 
 function assertValidSignedInnerEvent (event) {
-  if (!verifyEvent(event)) {
-    throw new Error('INVALID_SIGNED_INNER_EVENT')
+  if (!isValidEvent(event)) {
+    throw new ValidationError('INVALID_SIGNED_INNER_EVENT')
   }
   return event
 }
 
 function normalizeNymRumor (event, pubkey) {
   const normalized = { ...event, pubkey }
-  if (!validateEvent(normalized)) throw new Error('INVALID_NYM_RUMOR')
+  if (!isSerializableEvent(normalized)) throw new ValidationError('INVALID_NYM_RUMOR')
   return { ...normalized, id: getEventHash(normalized) }
 }
 
@@ -283,11 +284,11 @@ function wireNymRumor (event = {}) {
 }
 
 function assertValidNymCarrierEvent (carrier) {
-  if (!verifyEvent(carrier)) {
-    throw new Error('INVALID_NYM_CARRIER')
+  if (!isValidEvent(carrier)) {
+    throw new ValidationError('INVALID_NYM_CARRIER')
   }
-  if (carrier.kind !== NYM_CARRIER_KIND) throw new Error('INVALID_NYM_CARRIER_KIND')
-  if (!readIdTag(carrier)) throw new Error('MISSING_NYM_CARRIER_ID')
+  if (carrier.kind !== NYM_CARRIER_KIND) throw new ValidationError('INVALID_NYM_CARRIER_KIND')
+  if (!readIdTag(carrier)) throw new ValidationError('MISSING_NYM_CARRIER_ID')
   readChunkTag(carrier)
   return carrier
 }
@@ -297,7 +298,7 @@ function nymCarrierGroupId (carrier) {
 }
 
 function validateNymCarriers (carriers) {
-  if (!Array.isArray(carriers) || !carriers.length) throw new Error('NYM_CARRIERS_REQUIRED')
+  if (!Array.isArray(carriers) || !carriers.length) throw new ValidationError('NYM_CARRIERS_REQUIRED')
   const chunks = []
   let nymPubkey = ''
   let innerId = ''
@@ -313,15 +314,15 @@ function validateNymCarriers (carriers) {
       total = nextTotal
     }
     if (carrier.pubkey !== nymPubkey || nextInnerId !== innerId || nextTotal !== total) {
-      throw new Error('MISMATCHED_NYM_CARRIER_CHUNKS')
+      throw new ValidationError('MISMATCHED_NYM_CARRIER_CHUNKS')
     }
-    if (chunks[index] !== undefined) throw new Error('DUPLICATE_NYM_CARRIER_CHUNK')
+    if (chunks[index] !== undefined) throw new ValidationError('DUPLICATE_NYM_CARRIER_CHUNK')
     chunks[index] = carrier.content
   }
 
-  if (chunks.length !== total) throw new Error('MISSING_NYM_CARRIER_CHUNK')
+  if (chunks.length !== total) throw new ValidationError('MISSING_NYM_CARRIER_CHUNK')
   for (let index = 0; index < total; index++) {
-    if (chunks[index] == null) throw new Error('MISSING_NYM_CARRIER_CHUNK')
+    if (chunks[index] == null) throw new ValidationError('MISSING_NYM_CARRIER_CHUNK')
   }
   return { nymPubkey, innerId, content: chunks.join('') }
 }
@@ -332,44 +333,44 @@ export function eventFromNymCarriers (carriers) {
   try {
     parsed = JSON.parse(decoder.decode(base64ToBytes(content)))
   } catch {
-    throw new Error('INVALID_NYM_CARRIER_PAYLOAD')
+    throw new ValidationError('INVALID_NYM_CARRIER_PAYLOAD')
   }
 
-  if (isSignedEvent(parsed)) {
+  if (hasEventSignature(parsed)) {
     const event = assertValidSignedInnerEvent(parsed)
-    if (event.id !== innerId) throw new Error('INVALID_NYM_CARRIER_INNER_ID')
+    if (event.id !== innerId) throw new ValidationError('INVALID_NYM_CARRIER_INNER_ID')
     return event
   }
 
   const event = normalizeNymRumor(parsed, nymPubkey)
-  if (event.id !== innerId) throw new Error('INVALID_NYM_CARRIER_INNER_ID')
+  if (event.id !== innerId) throw new ValidationError('INVALID_NYM_CARRIER_INNER_ID')
   return event
 }
 
 function assertValidEnvelopeIykcProof (envelope) {
   if (!envelope.iykcPubkey) return
-  if (!verifyIykcProof({
+  if (!isValidIykcProof({
     receiverPubkey: envelope.receiverPubkey,
     iykcPubkey: envelope.iykcPubkey,
     iykcProof: envelope.iykcProof
-  })) throw new Error('INVALID_IYKC_PROOF')
+  })) throw new ValidationError('INVALID_IYKC_PROOF')
 }
 
 function assertValidRouterImkcProof ({ router, senderPubkey, imkcPubkey, imkcProof }) {
   if (!hasImkcTag(router)) return
-  if (!verifyContentKeyProof({
+  if (!isValidContentKeyProof({
     ownerPubkey: senderPubkey,
     contentPubkey: imkcPubkey,
     proof: imkcProof
-  })) throw new Error('INVALID_IMKC_PROOF')
+  })) throw new ValidationError('INVALID_IMKC_PROOF')
 }
 
 function eventFromPayload ({ payloadCiphertext, messageSeckey, senderPubkey }) {
-  if (!HEX_SECKEY.test(messageSeckey || '')) throw new Error('INVALID_MESSAGE_SECKEY')
+  if (!HEX_SECKEY.test(messageSeckey || '')) throw new ValidationError('INVALID_MESSAGE_SECKEY')
   const messageSecretKey = hexToBytes(messageSeckey)
   const messagePubkey = getPublicKey(messageSecretKey)
   const decrypted = JSON.parse(nip44v3.decrypt(messageSecretKey, messagePubkey, ROUTER_KIND, NIP44_V3_SCOPE, payloadCiphertext))
-  if (isSignedEvent(decrypted)) return assertValidSignedInnerEvent(decrypted)
+  if (hasEventSignature(decrypted)) return assertValidSignedInnerEvent(decrypted)
   const normalized = { ...decrypted, pubkey: senderPubkey }
   return { ...normalized, id: getEventHash(normalized) }
 }
@@ -378,7 +379,7 @@ async function unwrapRecipientEnvelope ({ payloadCiphertext, envelope, receiverS
   if (receiverPubkey && envelope.receiverPubkey !== receiverPubkey) return null
   let messageSeckey
   if (envelope.iykcPubkey || imkcPubkey) {
-    if (!receiverSigner?.nip44DecryptDoubleDH) throw new Error('RECEIVER_DOUBLE_DH_UNSUPPORTED')
+    if (!receiverSigner?.nip44DecryptDoubleDH) throw new ValidationError('RECEIVER_DOUBLE_DH_UNSUPPORTED')
     if (envelope.iykcPubkey) {
       assertValidEnvelopeIykcProof(envelope)
     }
@@ -391,7 +392,7 @@ async function unwrapRecipientEnvelope ({ payloadCiphertext, envelope, receiverS
       envelope.iykcPubkey || ''
     ))
   } else {
-    if (!receiverSigner?.nip44v3Decrypt) throw new Error('RECEIVER_SIGNER_NIP44V3_DECRYPT_UNSUPPORTED')
+    if (!receiverSigner?.nip44v3Decrypt) throw new ValidationError('RECEIVER_SIGNER_NIP44V3_DECRYPT_UNSUPPORTED')
     messageSeckey = base64ToText(await receiverSigner.nip44v3Decrypt(senderPubkey, ROUTER_KIND, rowScope, envelope.ciphertext))
   }
   return eventFromPayload({ payloadCiphertext, messageSeckey, senderPubkey })
@@ -399,12 +400,12 @@ async function unwrapRecipientEnvelope ({ payloadCiphertext, envelope, receiverS
 
 export async function unwrapEvent ({ receiverSigner, privateChannelSigner = receiverSigner, privateChannelReaderSigner = privateChannelSigner, privateChannelReaderPubkey, event, receiverPubkey }) {
   if (!event || event.kind !== PRIVATE_BROADCAST_KIND) return null
-  if (!receiverSigner?.nip44DecryptDoubleDH && !receiverSigner?.nip44v3Decrypt) throw new Error('RECEIVER_SIGNER_NIP44V3_DECRYPT_UNSUPPORTED')
+  if (!receiverSigner?.nip44DecryptDoubleDH && !receiverSigner?.nip44v3Decrypt) throw new ValidationError('RECEIVER_SIGNER_NIP44V3_DECRYPT_UNSUPPORTED')
   const channelReaderSigner = privateChannelReaderSigner || privateChannelSigner
-  if (!channelReaderSigner?.nip44v3Decrypt) throw new Error('PRIVATE_CHANNEL_READER_REQUIRED')
+  if (!channelReaderSigner?.nip44v3Decrypt) throw new ValidationError('PRIVATE_CHANNEL_READER_REQUIRED')
 
   const channelPubkey = event.pubkey || await privateChannelSigner?.getPublicKey?.()
-  if (!channelPubkey) throw new Error('PRIVATE_CHANNEL_PUBKEY_REQUIRED')
+  if (!channelPubkey) throw new ValidationError('PRIVATE_CHANNEL_PUBKEY_REQUIRED')
   const router = await decryptRouter({
     content: event.content,
     channelPubkey,
@@ -412,14 +413,14 @@ export async function unwrapEvent ({ receiverSigner, privateChannelSigner = rece
     channelReaderSigner,
     channelReaderPubkey: privateChannelReaderPubkey
   })
-  if (router.kind !== ROUTER_KIND) throw new Error('INVALID_ROUTER_KIND')
+  if (router.kind !== ROUTER_KIND) throw new ValidationError('INVALID_ROUTER_KIND')
   if (receiverPubkey && readReceiverTag(router) && readReceiverTag(router) !== receiverPubkey) return null
 
   const senderPubkey = readSenderTag(router)
   const imkcPubkey = readImkcTag(router)
   assertValidRouterImkcProof({ router, senderPubkey, imkcPubkey, imkcProof: readImkcProof(router) })
   const lines = decodeChunkLines(router.content)
-  if (!lines.length) throw new Error('MISSING_PAYLOAD_ENVELOPE')
+  if (!lines.length) throw new ValidationError('MISSING_PAYLOAD_ENVELOPE')
   const payload = parsePayloadEnvelope(lines[0], 0)
   for (let index = 1; index < lines.length; index++) {
     const event = await unwrapRecipientEnvelope({
@@ -444,7 +445,7 @@ function relayReceiverEntries (relayToReceivers) {
   if (!relayToReceivers) return []
   if (relayToReceivers instanceof Map) return [...relayToReceivers.entries()]
   if (typeof relayToReceivers === 'object') return Object.entries(relayToReceivers)
-  throw new Error('INVALID_RELAY_RECEIVERS')
+  throw new ValidationError('INVALID_RELAY_RECEIVERS')
 }
 
 function groupedRelayReceivers ({ relayToReceivers, receivers }) {
@@ -468,7 +469,7 @@ function groupedRelayReceivers ({ relayToReceivers, receivers }) {
     const pubkeys = uniq(Array.isArray(value) ? value : [value])
     if (!pubkeys.length) continue
     for (const pubkey of pubkeys) {
-      if (!wanted.has(pubkey)) throw new Error('RELAY_RECEIVER_NOT_REQUESTED')
+      if (!wanted.has(pubkey)) throw new ValidationError('RELAY_RECEIVER_NOT_REQUESTED')
       covered.add(pubkey)
     }
     const key = [...pubkeys].sort().join(',')
@@ -482,9 +483,9 @@ function groupedRelayReceivers ({ relayToReceivers, receivers }) {
     groupsByKey.get(key).relays.push(relay)
   }
 
-  if (!groupsByKey.size) throw new Error('NO_RELAYS')
+  if (!groupsByKey.size) throw new ValidationError('NO_RELAYS')
   for (const pubkey of orderedPubkeys) {
-    if (!covered.has(pubkey)) throw new Error('RELAY_RECEIVER_MISSING')
+    if (!covered.has(pubkey)) throw new ValidationError('RELAY_RECEIVER_MISSING')
   }
 
   return [...groupsByKey.values()].map(group => ({
@@ -555,7 +556,7 @@ function readSignerFromMap (signersByPubkey, pubkey) {
 
 async function decryptRouter ({ content, channelPubkey, channelSigner, channelReaderSigner, channelReaderPubkey }) {
   const signer = channelReaderSigner || channelSigner
-  if (!signer?.nip44v3Decrypt) throw new Error('PRIVATE_CHANNEL_READER_REQUIRED')
+  if (!signer?.nip44v3Decrypt) throw new ValidationError('PRIVATE_CHANNEL_READER_REQUIRED')
 
   const readerPubkey = channelReaderPubkey || channelPubkey
   const signerPubkey = await signer.getPublicKey?.()
@@ -698,7 +699,7 @@ function createProcessor ({
       const channelReaderPubkey = readValueFromMap(privateChannelReaderPubkeysByPubkey, channelPubkey) || privateChannelReaderPubkey || channelPubkey
       const channelMode = readValueFromMap(modeByPubkey, channelPubkey) || mode
       const channelReceivedChunkTtlMs = readValueFromMap(receivedChunkTtlMsByPubkey, channelPubkey) ?? receivedChunkTtlMs
-      if (!channelPubkey) throw new Error('PRIVATE_CHANNEL_PUBKEY_REQUIRED')
+      if (!channelPubkey) throw new ValidationError('PRIVATE_CHANNEL_PUBKEY_REQUIRED')
 
       const decrypted = await decryptRouter({
         content: outer.content,
@@ -735,7 +736,7 @@ function createProcessor ({
 
         const carriers = (await receivedChunks.readChunkContents(groupKey)).map(raw => JSON.parse(raw))
         const event = eventFromNymCarriers(carriers)
-        const shouldSeed = storesRecoverySeeds(channelMode)
+        const shouldSeed = doesModeStoreRecoverySeeds(channelMode)
         if (shouldSeed) {
           await onSeedEvent?.({
             recordType: 'nymCarrier_v1',
@@ -783,7 +784,7 @@ function createProcessor ({
         missing: status.missing
       })
 
-      const shouldSeed = storesRecoverySeeds(channelMode)
+      const shouldSeed = doesModeStoreRecoverySeeds(channelMode)
       const sentByReceiver = receiverPubkey && senderPubkey === receiverPubkey
       // Recovery seeders and own-sent messages need the full recipient list;
       // regular leechers can stop as soon as their envelope is decrypted.
@@ -797,7 +798,7 @@ function createProcessor ({
             helpers.rememberPayloadCiphertext(groupMeta, parsePayloadEnvelope(line, rowIndex).ciphertext)
             return
           }
-          if (!groupMeta.payloadCiphertext) throw new Error('MISSING_PAYLOAD_ENVELOPE')
+          if (!groupMeta.payloadCiphertext) throw new ValidationError('MISSING_PAYLOAD_ENVELOPE')
           const envelope = parseRecipientEnvelope(line, rowIndex)
           helpers.rememberReceiverPubkey(groupMeta, envelope.receiverPubkey)
 
@@ -894,7 +895,7 @@ function shouldIgnoreGroupError (err) {
 }
 
 export async function fetch ({ receiverSigner, iykcSigner, privateChannelSigner = receiverSigner, privateChannelSignersByPubkey, privateChannelReaderSigner = privateChannelSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, privateChannelPubkey, privateChannelPubkeys, receiverPubkey, relays, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, since, until, limit, mode = 'leecher', modeByPubkey, receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS, receivedChunkTtlMsByPubkey, receivedChunkMaxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES, receivedChunkIndexedDB = globalThis.indexedDB, ignoredGroupTtlMs = DEFAULT_IGNORED_GROUP_TTL_MS, ignoredGroupMaxEntries = DEFAULT_IGNORED_GROUP_MAX_ENTRIES, _getEvents = getEvents }) {
-  if (!relays?.length) throw new Error('NO_RELAYS')
+  if (!relays?.length) throw new ValidationError('NO_RELAYS')
   const authors = privateChannelPubkeyList({ privateChannelPubkey, privateChannelPubkeys })
   const filter = { kinds: [PRIVATE_BROADCAST_KIND] }
   if (authors.length) filter.authors = authors
@@ -917,9 +918,9 @@ export async function fetch ({ receiverSigner, iykcSigner, privateChannelSigner 
 }
 
 export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = receiverSigner, privateChannelSignersByPubkey, privateChannelReaderSigner = privateChannelSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, privateChannelPubkey, privateChannelPubkeys, receiverPubkey, relays, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, since = nowSeconds() - 5, limit, liveOnly = false, mode = 'leecher', modeByPubkey, receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS, receivedChunkTtlMsByPubkey, receivedChunkMaxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES, receivedChunkIndexedDB = globalThis.indexedDB, ignoredGroupTtlMs = DEFAULT_IGNORED_GROUP_TTL_MS, ignoredGroupMaxEntries = DEFAULT_IGNORED_GROUP_MAX_ENTRIES, _liveEventsGenerator = getLiveEventsGenerator, _eventsFeedGenerator = getEventsFeedGenerator }) {
-  if (!relays?.length) throw new Error('NO_RELAYS')
-  if (receiverSigner && !receiverSigner?.nip44DecryptDoubleDH && !receiverSigner?.nip44v3Decrypt) throw new Error('RECEIVER_SIGNER_NIP44V3_DECRYPT_UNSUPPORTED')
-  if (!privateChannelReaderSigner && !privateChannelReaderSignersByPubkey && !privateChannelSigner && !privateChannelSignersByPubkey) throw new Error('PRIVATE_CHANNEL_READER_REQUIRED')
+  if (!relays?.length) throw new ValidationError('NO_RELAYS')
+  if (receiverSigner && !receiverSigner?.nip44DecryptDoubleDH && !receiverSigner?.nip44v3Decrypt) throw new ValidationError('RECEIVER_SIGNER_NIP44V3_DECRYPT_UNSUPPORTED')
+  if (!privateChannelReaderSigner && !privateChannelReaderSignersByPubkey && !privateChannelSigner && !privateChannelSignersByPubkey) throw new ValidationError('PRIVATE_CHANNEL_READER_REQUIRED')
 
   const authors = privateChannelPubkeyList({ privateChannelPubkey, privateChannelPubkeys })
   const filter = { kinds: [PRIVATE_BROADCAST_KIND], since }

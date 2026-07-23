@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { base64ToBytes } from '../base64/index.js'
-import { finalizeEvent, verifyEvent } from '../event/index.js'
+import { finalizeEvent, isValidEvent } from '../event/index.js'
 import { getToken } from '../nip98/index.js'
 
 const decoder = new TextDecoder()
@@ -18,7 +18,7 @@ test('NIP-98 signs exact payload bytes and optionally includes the scheme', asyn
   })
   assert.match(token, /^Nostr /)
   const event = JSON.parse(decoder.decode(base64ToBytes(token.slice(6))))
-  assert.equal(verifyEvent(event), true)
+  assert.equal(isValidEvent(event), true)
   assert.equal(event.kind, 27235)
   assert.deepEqual(event.tags.slice(0, 2), [
     ['u', 'https://example.com/upload'],

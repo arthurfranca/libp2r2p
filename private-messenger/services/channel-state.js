@@ -1,4 +1,5 @@
 import { run } from '../../idb/index.js'
+import { ValidationError } from '../../error/index.js'
 
 const DATABASE_VERSION = 1
 const CHANNELS_STORE = 'channels'
@@ -80,7 +81,7 @@ function cloneChannels (channels) {
 }
 
 export async function createChannelStateStore ({ prefix, indexedDB = globalThis.indexedDB } = {}) {
-  if (!prefix) throw new Error('PRIVATE_MESSENGER_STATE_PREFIX_REQUIRED')
+  if (!prefix) throw new ValidationError('PRIVATE_MESSENGER_STATE_PREFIX_REQUIRED')
   const db = await openDatabase(indexedDB, `${prefix}:state:idb`)
   let closed = false
   let activeTransactions = 0

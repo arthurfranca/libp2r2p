@@ -1,4 +1,5 @@
 import { bytesToBase64 } from '../../base64/index.js'
+import { ValidationError } from '../../error/index.js'
 import { run } from '../../idb/index.js'
 
 export const DEFAULT_RECEIVED_CHUNK_TTL_MS = 60 * 60 * 1000 // 1 hour
@@ -106,7 +107,7 @@ function normalizeBytes (value) {
   if (value instanceof Uint8Array) return new Uint8Array(value)
   if (value instanceof ArrayBuffer) return new Uint8Array(value)
   if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
-  throw new Error('RECEIVED_CHUNK_BYTES_REQUIRED')
+  throw new ValidationError('RECEIVED_CHUNK_BYTES_REQUIRED')
 }
 
 function uniq (values) {
@@ -362,9 +363,9 @@ export function createReceivedChunkStore ({
   }
 
   async function put ({ channelPubkey, routerPubkey, index, total, contentBytes, ttlMs }) {
-    if (!channelPubkey || !routerPubkey) throw new Error('RECEIVED_CHUNK_GROUP_REQUIRED')
+    if (!channelPubkey || !routerPubkey) throw new ValidationError('RECEIVED_CHUNK_GROUP_REQUIRED')
     if (!Number.isSafeInteger(index) || !Number.isSafeInteger(total) || index < 0 || total < 1 || index >= total) {
-      throw new Error('INVALID_RECEIVED_CHUNK_INDEX')
+      throw new ValidationError('INVALID_RECEIVED_CHUNK_INDEX')
     }
     const bytes = normalizeBytes(contentBytes)
     await ready()

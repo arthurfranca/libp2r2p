@@ -1,9 +1,11 @@
+import { ValidationError } from '../error/index.js'
+
 const DEFAULT_LOCALE = 'en'
 const INTERPOLATION_RE = /{{\s*([A-Za-z0-9_.-]+)\s*}}/g
 
 function assertLocales (locales) {
   if (!locales || typeof locales !== 'object' || Array.isArray(locales)) {
-    throw new TypeError('locales should be an object')
+    throw new ValidationError('INVALID_LOCALES', { message: 'locales should be an object' })
   }
 }
 
@@ -17,21 +19,21 @@ function placeholderSignature (value) {
 function validateTranslationValue (key, locale, value, expectedPlaceholders) {
   if (typeof value === 'string') {
     if (placeholderSignature(value) !== expectedPlaceholders) {
-      throw new Error(`placeholder mismatch for "${key}" (${locale})`)
+      throw new ValidationError('I18N_PLACEHOLDER_MISMATCH', { message: `placeholder mismatch for "${key}" (${locale})` })
     }
     return
   }
 
   if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.other !== 'string') {
-    throw new TypeError(`translation for "${key}" (${locale}) should be a string or plural object with an other form`)
+    throw new ValidationError('INVALID_TRANSLATION', { message: `translation for "${key}" (${locale}) should be a string or plural object with an other form` })
   }
 
   for (const form of Object.values(value)) {
     if (typeof form !== 'string') {
-      throw new TypeError(`plural forms for "${key}" (${locale}) should be strings`)
+      throw new ValidationError('INVALID_PLURAL_TRANSLATION', { message: `plural forms for "${key}" (${locale}) should be strings` })
     }
     if (placeholderSignature(form) !== expectedPlaceholders) {
-      throw new Error(`placeholder mismatch for "${key}" (${locale})`)
+      throw new ValidationError('I18N_PLACEHOLDER_MISMATCH', { message: `placeholder mismatch for "${key}" (${locale})` })
     }
   }
 }
@@ -39,7 +41,7 @@ function validateTranslationValue (key, locale, value, expectedPlaceholders) {
 export function validateLocales (locales, options = {}) {
   assertLocales(locales)
   if (!options || typeof options !== 'object' || Array.isArray(options)) {
-    throw new TypeError('validation options should be an object')
+    throw new ValidationError('INVALID_I18N_VALIDATION_OPTIONS', { message: 'validation options should be an object' })
   }
   const {
     requiredLocales = [],
@@ -47,20 +49,20 @@ export function validateLocales (locales, options = {}) {
     requireReferenceKey = false
   } = options
   if (!Array.isArray(requiredLocales) || requiredLocales.some(locale => typeof locale !== 'string' || !locale)) {
-    throw new TypeError('requiredLocales should be an array of non-empty strings')
+    throw new ValidationError('INVALID_REQUIRED_LOCALES', { message: 'requiredLocales should be an array of non-empty strings' })
   }
   if (typeof referenceLocale !== 'string' || !referenceLocale) {
-    throw new TypeError('referenceLocale should be a non-empty string')
+    throw new ValidationError('INVALID_REFERENCE_LOCALE', { message: 'referenceLocale should be a non-empty string' })
   }
 
   for (const [key, translations] of Object.entries(locales)) {
     if (!translations || typeof translations !== 'object' || Array.isArray(translations)) {
-      throw new TypeError(`translations for "${key}" should be an object`)
+      throw new ValidationError('INVALID_TRANSLATIONS', { message: `translations for "${key}" should be an object` })
     }
 
     for (const locale of requiredLocales) {
       if (!Object.prototype.hasOwnProperty.call(translations, locale)) {
-        throw new Error(`missing translation for "${key}" (${locale})`)
+        throw new ValidationError('MISSING_TRANSLATION', { message: `missing translation for "${key}" (${locale})` })
       }
     }
 
@@ -71,12 +73,12 @@ export function validateLocales (locales, options = {}) {
 
     if (requireReferenceKey) {
       if (!Object.prototype.hasOwnProperty.call(translations, referenceLocale)) {
-        throw new Error(`missing reference translation for "${key}" (${referenceLocale})`)
+        throw new ValidationError('MISSING_REFERENCE_TRANSLATION', { message: `missing reference translation for "${key}" (${referenceLocale})` })
       }
       const reference = translations[referenceLocale]
       const referenceValue = typeof reference === 'string' ? reference : reference.other
       if (referenceValue !== key) {
-        throw new Error(`reference translation should match key "${key}" (${referenceLocale})`)
+        throw new ValidationError('REFERENCE_TRANSLATION_MISMATCH', { message: `reference translation should match key "${key}" (${referenceLocale})` })
       }
     }
   }
@@ -227,7 +229,7 @@ export function getT (locales, {
   const canonicalFallback = canonicalizeLocale(fallbackLocale) ?? DEFAULT_LOCALE
 
   return function t (key, values) {
-    if (typeof key !== 'string') throw new TypeError('translation key should be a string')
+    if (typeof key !== 'string') throw new ValidationError('INVALID_TRANSLATION_KEY', { message: 'translation key should be a string' })
     const translations = Object.prototype.hasOwnProperty.call(locales, key) ? locales[key] : null
     const template = selectTemplate(translations, requestedLocale, canonicalFallback, values) ?? key
     return interpolate(template, values)

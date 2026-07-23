@@ -1,8 +1,9 @@
-import { getEventHash, verifyEvent } from '../../event/index.js'
+import { ValidationError } from '../../error/index.js'
+import { getEventHash, isValidEvent } from '../../event/index.js'
 
 export const CONTENT_KEY_KIND = 18716
 
-const HEX_PUBKEY = /^[0-9a-f]{64}$/i
+const HEX_PUBKEY = /^[0-9a-f]{64}$/
 const HEX_SIG = /^[0-9a-f]{128}$/i
 
 function nowSeconds () {
@@ -10,8 +11,8 @@ function nowSeconds () {
 }
 
 export async function makeContentKeyEventForPubkey ({ userSigner, contentPubkey, createdAt = nowSeconds() }) {
-  if (!userSigner?.getPublicKey || !userSigner?.signEvent) throw new Error('USER_SIGNER_REQUIRED')
-  if (!HEX_PUBKEY.test(contentPubkey || '')) throw new Error('CONTENT_PUBKEY_REQUIRED')
+  if (!userSigner?.getPublicKey || !userSigner?.signEvent) throw new ValidationError('USER_SIGNER_REQUIRED')
+  if (!HEX_PUBKEY.test(contentPubkey || '')) throw new ValidationError('CONTENT_PUBKEY_REQUIRED')
 
   return userSigner.signEvent({
     kind: CONTENT_KEY_KIND,
@@ -22,7 +23,7 @@ export async function makeContentKeyEventForPubkey ({ userSigner, contentPubkey,
 }
 
 export async function makeContentKeyEvent ({ userSigner, contentKeySigner, createdAt = nowSeconds() }) {
-  if (!contentKeySigner?.getPublicKey) throw new Error('CONTENT_KEY_SIGNER_REQUIRED')
+  if (!contentKeySigner?.getPublicKey) throw new ValidationError('CONTENT_KEY_SIGNER_REQUIRED')
   return makeContentKeyEventForPubkey({
     userSigner,
     contentPubkey: await contentKeySigner.getPublicKey(),
@@ -34,7 +35,7 @@ export function parseContentKeyEvent (event) {
   if (!event || event.kind !== CONTENT_KEY_KIND || event.content !== '') return null
   if (!HEX_PUBKEY.test(event.pubkey) || !Number.isSafeInteger(event.created_at)) return null
   if (!Array.isArray(event.tags) || event.tags.length !== 1) return null
-  if (!verifyEvent(event)) return null
+  if (!isValidEvent(event)) return null
 
   const [name, contentPubkey, ...rest] = event.tags[0] || []
   if (name !== 'cp' || rest.length || !HEX_PUBKEY.test(contentPubkey || '')) return null
@@ -59,10 +60,11 @@ function parseContentKeyProof (proof) {
   return { created_at, sig }
 }
 
-export function verifyContentKeyProof ({ ownerPubkey, contentPubkey, proof }) {
-  if (!HEX_PUBKEY.test(ownerPubkey || '') || !HEX_PUBKEY.test(contentPubkey || '')) return false
+function contentKeyProofError ({ ownerPubkey, contentPubkey, proof }) {
+  if (!HEX_PUBKEY.test(ownerPubkey || '')) return 'INVALID_CONTENT_KEY_OWNER_PUBKEY'
+  if (!HEX_PUBKEY.test(contentPubkey || '')) return 'INVALID_CONTENT_KEY_PUBKEY'
   const parsed = parseContentKeyProof(proof)
-  if (!parsed) return false
+  if (!parsed) return 'INVALID_CONTENT_KEY_PROOF'
 
   const event = {
     kind: CONTENT_KEY_KIND,
@@ -73,13 +75,39 @@ export function verifyContentKeyProof ({ ownerPubkey, contentPubkey, proof }) {
     sig: parsed.sig
   }
   event.id = getEventHash(event)
-  return verifyEvent(event)
+  return isValidEvent(event) ? null : 'INVALID_CONTENT_KEY_PROOF_SIGNATURE'
 }
 
-export function verifyIykcProof ({ receiverPubkey, iykcPubkey, iykcProof }) {
-  return verifyContentKeyProof({
+function iykcProofError ({ receiverPubkey, iykcPubkey, iykcProof }) {
+  const error = contentKeyProofError({
     ownerPubkey: receiverPubkey,
     contentPubkey: iykcPubkey,
     proof: iykcProof
   })
+  return {
+    INVALID_CONTENT_KEY_OWNER_PUBKEY: 'INVALID_IYKC_RECEIVER_PUBKEY',
+    INVALID_CONTENT_KEY_PUBKEY: 'INVALID_IYKC_PUBKEY',
+    INVALID_CONTENT_KEY_PROOF: 'INVALID_IYKC_PROOF',
+    INVALID_CONTENT_KEY_PROOF_SIGNATURE: 'INVALID_IYKC_PROOF_SIGNATURE'
+  }[error] ?? null
+}
+
+export function isValidContentKeyProof (value) {
+  return contentKeyProofError(value ?? {}) === null
+}
+
+export function assertValidContentKeyProof (value) {
+  const code = contentKeyProofError(value ?? {})
+  if (code) throw new ValidationError(code)
+  return value
+}
+
+export function isValidIykcProof (value) {
+  return iykcProofError(value ?? {}) === null
+}
+
+export function assertValidIykcProof (value) {
+  const code = iykcProofError(value ?? {})
+  if (code) throw new ValidationError(code)
+  return value
 }

@@ -5,6 +5,7 @@ import { hmac } from '@noble/hashes/hmac.js'
 import { sha256 } from '@noble/hashes/sha2.js'
 
 import { base64ToBytes, bytesToBase64 } from '../base64/index.js'
+import { ValidationError } from '../error/index.js'
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: true })
@@ -24,14 +25,14 @@ function concatBytes (...arrays) {
 }
 
 export function getMessageKeys (conversationKey, nonce) {
-  if (!(conversationKey instanceof Uint8Array) || conversationKey.length !== 32) throw new Error('INVALID_CONVERSATION_KEY')
-  if (!(nonce instanceof Uint8Array) || nonce.length !== 32) throw new Error('INVALID_NONCE')
+  if (!(conversationKey instanceof Uint8Array) || conversationKey.length !== 32) throw new ValidationError('INVALID_CONVERSATION_KEY')
+  if (!(nonce instanceof Uint8Array) || nonce.length !== 32) throw new ValidationError('INVALID_NONCE')
   const keys = expand(sha256, conversationKey, nonce, 76)
   return { key: keys.subarray(0, 32), nonce: keys.subarray(32, 44), hmacKey: keys.subarray(44) }
 }
 
 export function calcPaddedLen (length) {
-  if (!Number.isSafeInteger(length) || length < minPlaintextSize || length > maxPlaintextSize) throw new Error('INVALID_PLAINTEXT_SIZE')
+  if (!Number.isSafeInteger(length) || length < minPlaintextSize || length > maxPlaintextSize) throw new ValidationError('INVALID_PLAINTEXT_SIZE')
   if (length <= 32) return 32
   const nextPower = 2 ** (Math.floor(Math.log2(length - 1)) + 1)
   const chunk = nextPower <= 256 ? 32 : nextPower / 8
@@ -39,7 +40,7 @@ export function calcPaddedLen (length) {
 }
 
 export function pad (plaintext) {
-  if (typeof plaintext !== 'string') throw new TypeError('PLAINTEXT_SHOULD_BE_A_STRING')
+  if (typeof plaintext !== 'string') throw new ValidationError('PLAINTEXT_SHOULD_BE_A_STRING')
   const bytes = encoder.encode(plaintext)
   const length = bytes.length
   calcPaddedLen(length)
@@ -52,17 +53,17 @@ export function pad (plaintext) {
 }
 
 export function unpad (padded) {
-  if (!(padded instanceof Uint8Array) || padded.length < 2) throw new Error('INVALID_PADDING')
+  if (!(padded instanceof Uint8Array) || padded.length < 2) throw new ValidationError('INVALID_PADDING')
   const view = new DataView(padded.buffer, padded.byteOffset, padded.byteLength)
   const shortLength = view.getUint16(0, false)
   const prefixLength = shortLength === 0 ? 6 : 2
-  if (padded.length < prefixLength) throw new Error('INVALID_PADDING')
+  if (padded.length < prefixLength) throw new ValidationError('INVALID_PADDING')
   const length = shortLength === 0 ? view.getUint32(2, false) : shortLength
-  if (shortLength === 0 && length < 0x10000) throw new Error('INVALID_PADDING')
+  if (shortLength === 0 && length < 0x10000) throw new ValidationError('INVALID_PADDING')
   let expected
-  try { expected = prefixLength + calcPaddedLen(length) } catch { throw new Error('INVALID_PADDING') }
-  if (padded.length !== expected || prefixLength + length > padded.length) throw new Error('INVALID_PADDING')
-  try { return decoder.decode(padded.subarray(prefixLength, prefixLength + length)) } catch { throw new Error('INVALID_UTF8') }
+  try { expected = prefixLength + calcPaddedLen(length) } catch (cause) { throw new ValidationError('INVALID_PADDING', { cause }) }
+  if (padded.length !== expected || prefixLength + length > padded.length) throw new ValidationError('INVALID_PADDING')
+  try { return decoder.decode(padded.subarray(prefixLength, prefixLength + length)) } catch (cause) { throw new ValidationError('INVALID_UTF8', { cause }) }
 }
 
 export function encodePayload (conversationKey, plaintext, nonce = randomBytes(32)) {
@@ -73,22 +74,22 @@ export function encodePayload (conversationKey, plaintext, nonce = randomBytes(3
 }
 
 export function decodePayload (conversationKey, payload) {
-  if (typeof payload !== 'string' || payload.length < 132 || payload.length > maxEncodedPayloadSize || payload[0] === '#') throw new Error('INVALID_NIP44_PAYLOAD')
-  if (payload.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(payload)) throw new Error('INVALID_BASE64')
+  if (typeof payload !== 'string' || payload.length < 132 || payload.length > maxEncodedPayloadSize || payload[0] === '#') throw new ValidationError('INVALID_NIP44_PAYLOAD')
+  if (payload.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(payload)) throw new ValidationError('INVALID_BASE64')
   const data = base64ToBytes(payload)
-  if (bytesToBase64(data) !== payload || data.length < 99 || data[0] !== 2) throw new Error('INVALID_NIP44_PAYLOAD')
+  if (bytesToBase64(data) !== payload || data.length < 99 || data[0] !== 2) throw new ValidationError('INVALID_NIP44_PAYLOAD')
   const nonce = data.subarray(1, 33)
   const ciphertext = data.subarray(33, -32)
   const mac = data.subarray(-32)
   const messageKeys = getMessageKeys(conversationKey, nonce)
   const calculated = hmac(sha256, messageKeys.hmacKey, concatBytes(nonce, ciphertext))
-  if (!equalBytes(mac, calculated)) throw new Error('INVALID_MAC')
+  if (!equalBytes(mac, calculated)) throw new ValidationError('INVALID_MAC')
   return unpad(chacha20(messageKeys.key, messageKeys.nonce, ciphertext))
 }
 
 export function extractConversationKey (sharedSecret, salt = 'nip44-v2') {
-  if (typeof salt !== 'string') throw new TypeError('SALT_SHOULD_BE_A_STRING')
+  if (typeof salt !== 'string') throw new ValidationError('SALT_SHOULD_BE_A_STRING')
   const saltBytes = encoder.encode(salt)
-  if (saltBytes.length === 0 || saltBytes.length > 32) throw new Error('INVALID_SALT')
+  if (saltBytes.length === 0 || saltBytes.length > 32) throw new ValidationError('INVALID_SALT')
   return extract(sha256, sharedSecret, saltBytes)
 }

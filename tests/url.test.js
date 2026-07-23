@@ -1,7 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { isValidPublicRelayUrl, normalizeRelayUrl } from '../url/index.js'
+import { ValidationError } from '../error/index.js'
+import { assertValidPublicRelayUrl, isValidPublicRelayUrl, normalizeRelayUrl } from '../url/index.js'
 
 test('normalizeRelayUrl canonicalizes relay URLs', () => {
   assert.equal(normalizeRelayUrl('HTTPS://EXAMPLE.COM:443//relay/?z=2&a=1#x'), 'wss://example.com/relay?a=1&z=2')
@@ -20,7 +21,9 @@ test('normalizeRelayUrl rejects unsupported or invalid URLs', () => {
 })
 
 test('isValidPublicRelayUrl accepts secure public relay URLs', () => {
-  assert.equal(isValidPublicRelayUrl('wss://relay.example.com'), true)
+  const value = 'wss://relay.example.com'
+  assert.equal(isValidPublicRelayUrl(value), true)
+  assert.equal(assertValidPublicRelayUrl(value), value)
   assert.equal(isValidPublicRelayUrl('https://relay.example.com/'), true)
   assert.equal(isValidPublicRelayUrl('relay.example.com'), true)
   assert.equal(isValidPublicRelayUrl('wss://8.8.8.8'), true)
@@ -46,5 +49,12 @@ test('isValidPublicRelayUrl rejects local, private and disguised relay URLs', ()
     'wss://example',
     'wss://npub1example.com',
     'wss://relay.example.com/https://other.example'
-  ]) assert.equal(isValidPublicRelayUrl(value), false, value)
+  ]) {
+    assert.equal(isValidPublicRelayUrl(value), false, value)
+    assert.throws(() => assertValidPublicRelayUrl(value), ValidationError)
+  }
+
+  assert.throws(() => assertValidPublicRelayUrl('ws://relay.example.com'), error => (
+    error instanceof ValidationError && error.code === 'INSECURE_RELAY_URL'
+  ))
 })

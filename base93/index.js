@@ -2,6 +2,8 @@
 // Apache-2.0. JSON-safe alphabet: space is included; double quote and
 // backslash are intentionally excluded.
 
+import { ValidationError } from '../error/index.js'
+
 export const BASE93_ALPHABET =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'()*+,-./:;<=>?@[]^_`{|}~ "
 
@@ -34,7 +36,11 @@ function asBytes (bytes) {
   if (bytes instanceof Uint8Array) return bytes
   if (ArrayBuffer.isView(bytes)) return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes)
-  return Uint8Array.from(bytes)
+  try {
+    return Uint8Array.from(bytes)
+  } catch (cause) {
+    throw new ValidationError('INVALID_BYTE_ARRAY', { cause })
+  }
 }
 
 export class Base93Encoder {
@@ -110,7 +116,7 @@ function decodeUnchecked (value) {
   for (let i = 0; i < value.length; i++) {
     const code = value.charCodeAt(i)
     if (code >= DECODING_TABLE.length || DECODING_TABLE[code] < 0) {
-      throw new Error(`Invalid Base93 character at offset ${i}.`)
+      throw new ValidationError('INVALID_BASE93_CHARACTER', { message: `Invalid Base93 character at offset ${i}.` })
     }
     const decoded = DECODING_TABLE[code]
     if (first === -1) {
@@ -134,14 +140,20 @@ function decodeUnchecked (value) {
 }
 
 export function decode (text, offset = 0, length = -1) {
-  if (typeof text !== 'string') throw new TypeError('Base93 input must be a string.')
-  if (!Number.isSafeInteger(offset) || offset < 0 || offset > text.length) throw new RangeError('Invalid Base93 offset.')
-  if (!Number.isSafeInteger(length) || length < -1) throw new RangeError('Invalid Base93 length.')
+  if (typeof text !== 'string') throw new ValidationError('INVALID_BASE93_TYPE', { message: 'Base93 input must be a string.' })
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > text.length) {
+    throw new ValidationError('INVALID_BASE93_OFFSET', { message: 'Invalid Base93 offset.' })
+  }
+  if (!Number.isSafeInteger(length) || length < -1) {
+    throw new ValidationError('INVALID_BASE93_LENGTH', { message: 'Invalid Base93 length.' })
+  }
 
   const end = length < 0 ? text.length : Math.min(text.length, offset + length)
   const encoded = text.slice(offset, end)
   const bytes = decodeUnchecked(encoded)
-  if (encode(bytes) !== encoded) throw new Error('Non-canonical or truncated Base93 input.')
+  if (encode(bytes) !== encoded) {
+    throw new ValidationError('NON_CANONICAL_BASE93', { message: 'Non-canonical or truncated Base93 input.' })
+  }
   return bytes
 }
 
@@ -149,7 +161,7 @@ function normalizeSource (source) {
   if (typeof source === 'function') source = source()
   if (typeof source === 'string') return [source]
   if (source?.[Symbol.asyncIterator] || source?.[Symbol.iterator]) return source
-  throw new TypeError('Base93 stream source must be iterable.')
+  throw new ValidationError('INVALID_BASE93_STREAM_SOURCE', { message: 'Base93 stream source must be iterable.' })
 }
 
 export class Base93Decoder {

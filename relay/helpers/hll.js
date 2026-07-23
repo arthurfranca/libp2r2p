@@ -1,9 +1,11 @@
+import { ValidationError } from '../../error/index.js'
+
 const REGISTER_COUNT = 256
 const HLL_HEX_LENGTH = REGISTER_COUNT * 2
 
 function assertRegisters (registers) {
   if (!(registers instanceof Uint8Array) || registers.length !== REGISTER_COUNT) {
-    throw new Error('INVALID_HLL_REGISTERS')
+    throw new ValidationError('INVALID_HLL_REGISTERS')
   }
 }
 

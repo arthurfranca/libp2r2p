@@ -1,3 +1,4 @@
+import { ValidationError } from '../../error/index.js'
 import { decodeHll, encodeHll, estimateHllCount, mergeHll } from '../helpers/hll.js'
 import { createPublishSettlements, firstFulfillment, publishSummary } from '../helpers/publish.js'
 import { maybeUnref } from '../helpers/timer.js'
@@ -221,7 +222,7 @@ export class RelayPool {
     signal
   } = {}) {
     if (!filter || typeof filter !== 'object' || Array.isArray(filter)) {
-      throw new Error('COUNT_FILTER_REQUIRED')
+      throw new ValidationError('COUNT_FILTER_REQUIRED')
     }
     if (signal?.aborted) throw new Error('Aborted')
 

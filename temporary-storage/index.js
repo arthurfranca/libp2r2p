@@ -1,3 +1,5 @@
+import { ValidationError } from '../error/index.js'
+
 export const TEMPORARY_STORAGE_KEYS_KEY = 'libp2r2p:temporary-storage:keys'
 
 function normalizeKeys (keys) {
@@ -54,7 +56,7 @@ export function createTemporaryStorage ({ storageArea = globalThis.sessionStorag
   }
 
   function setItem (key, value) {
-    if (typeof key !== 'string' || !key || key === TEMPORARY_STORAGE_KEYS_KEY) throw new Error('INVALID_TEMPORARY_STORAGE_KEY')
+    if (typeof key !== 'string' || !key || key === TEMPORARY_STORAGE_KEYS_KEY) throw new ValidationError('INVALID_TEMPORARY_STORAGE_KEY')
     trackTemporaryKey(key)
     storage().setItem(key, value)
   }

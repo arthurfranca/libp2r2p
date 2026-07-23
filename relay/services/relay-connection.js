@@ -1,4 +1,5 @@
-import { verifyEvent } from '../../event/index.js'
+import { isValidEvent } from '../../event/index.js'
+import { ValidationError } from '../../error/index.js'
 import { maybeUnref } from '../helpers/timer.js'
 
 const DEFAULT_CONNECT_TIMEOUT = 3000
@@ -8,13 +9,13 @@ function errorFrom (reason, fallback) {
   return reason instanceof Error ? reason : new Error(String(reason || fallback))
 }
 
-function prefixMatches (values, candidate) {
+function hasMatchingPrefix (values, candidate) {
   return !values || values.some(value => typeof value === 'string' && candidate.startsWith(value))
 }
 
-function matchFilter (filter, event) {
-  if (filter.ids && !prefixMatches(filter.ids, event.id)) return false
-  if (filter.authors && !prefixMatches(filter.authors, event.pubkey)) return false
+function doesEventMatchFilter (filter, event) {
+  if (filter.ids && !hasMatchingPrefix(filter.ids, event.id)) return false
+  if (filter.authors && !hasMatchingPrefix(filter.authors, event.pubkey)) return false
   if (filter.kinds && !filter.kinds.includes(event.kind)) return false
   if (filter.since != null && event.created_at < filter.since) return false
   if (filter.until != null && event.created_at > filter.until) return false
@@ -26,8 +27,8 @@ function matchFilter (filter, event) {
   return true
 }
 
-function matchFilters (filters, event) {
-  return filters.some(filter => matchFilter(filter, event))
+function doesEventMatchAnyFilter (filters, event) {
+  return filters.some(filter => doesEventMatchFilter(filter, event))
 }
 
 async function messageText (data) {
@@ -35,7 +36,7 @@ async function messageText (data) {
   if (data instanceof ArrayBuffer) return new TextDecoder().decode(data)
   if (ArrayBuffer.isView(data)) return new TextDecoder().decode(data)
   if (typeof data?.text === 'function') return await data.text()
-  throw new Error('INVALID_RELAY_MESSAGE')
+  throw new ValidationError('INVALID_RELAY_MESSAGE')
 }
 
 export class RelayConnection {
@@ -105,7 +106,7 @@ export class RelayConnection {
   }
 
   subscribe (filters, handlers = {}) {
-    if (!Array.isArray(filters) || !filters.length) throw new Error('SUBSCRIPTION_FILTERS_REQUIRED')
+    if (!Array.isArray(filters) || !filters.length) throw new ValidationError('SUBSCRIPTION_FILTERS_REQUIRED')
     const id = `p2r2p-sub:${++this.#serial}`
     let closed = false
     const close = () => {
@@ -126,14 +127,14 @@ export class RelayConnection {
   }
 
   publish (event) {
-    if (!verifyEvent(event)) return Promise.reject(new Error('INVALID_EVENT'))
+    if (!isValidEvent(event)) return Promise.reject(new Error('INVALID_EVENT'))
     return this.#sendEventOperation('EVENT', event, this.#publishes, 'PUBLISH_TIMEOUT')
   }
 
   async authenticate (getAuthEvent) {
     if (!this.#challenge) throw new Error('AUTH_CHALLENGE_MISSING')
     const event = await getAuthEvent({ relay: this.url, challenge: this.#challenge })
-    if (!verifyEvent(event)) throw new Error('INVALID_AUTH_EVENT')
+    if (!isValidEvent(event)) throw new ValidationError('INVALID_AUTH_EVENT')
     return await this.#sendEventOperation('AUTH', event, this.#authentications, 'AUTH_TIMEOUT')
   }
 
@@ -181,14 +182,17 @@ export class RelayConnection {
 
   async #handleMessage (message) {
     let data
-    try { data = JSON.parse(await messageText(message.data)) } catch { throw new Error('INVALID_RELAY_MESSAGE') }
-    if (!Array.isArray(data) || typeof data[0] !== 'string') throw new Error('INVALID_RELAY_MESSAGE')
+    try { data = JSON.parse(await messageText(message.data)) } catch (cause) {
+      if (cause instanceof ValidationError) throw cause
+      throw new ValidationError('INVALID_RELAY_MESSAGE', { cause })
+    }
+    if (!Array.isArray(data) || typeof data[0] !== 'string') throw new ValidationError('INVALID_RELAY_MESSAGE')
 
     if (data[0] === 'EVENT') {
       const subscription = this.#subscriptions.get(data[1])
       if (!subscription) return
       const event = data[2]
-      if (!verifyEvent(event) || !matchFilters(subscription.filters, event)) subscription.handlers.oninvalidevent?.(event)
+      if (!isValidEvent(event) || !doesEventMatchAnyFilter(subscription.filters, event)) subscription.handlers.oninvalidevent?.(event)
       else subscription.handlers.onevent?.(event)
       return
     }

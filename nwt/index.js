@@ -1,5 +1,6 @@
 import { base64UrlToBytes, bytesToBase64Url } from '../base64/index.js'
-import { verifyEvent } from '../event/index.js'
+import { ValidationError } from '../error/index.js'
+import { isValidEvent } from '../event/index.js'
 import { NWT } from '../kind/index.js'
 
 const textDecoder = new TextDecoder('utf-8', { fatal: true })
@@ -10,15 +11,15 @@ const SINGLE_CLAIMS = new Set(['iss', 'sub', 'iat', 'exp', 'nbf'])
 const TIMESTAMP_CLAIMS = new Set(['iat', 'exp', 'nbf'])
 const MAX_CLAIMS = 512
 
-function fail (code) {
-  throw new Error(code)
+function fail (code, { message = code, cause } = {}) {
+  throw new ValidationError(code, { message, cause })
 }
 
 function cloneTags (tags) {
   return tags.map(tag => tag.slice())
 }
 
-function equalTags (left, right) {
+function areTagsEqual (left, right) {
   return left.length === right.length && left.every((tag, index) => {
     const other = right[index]
     return tag.length === other.length && tag.every((value, valueIndex) => value === other[valueIndex])
@@ -106,7 +107,7 @@ function parseClaims (event) {
 }
 
 function parseVerifiedEvent (event) {
-  if (!verifyEvent(event)) fail('INVALID_NWT_EVENT')
+  if (!isValidEvent(event)) fail('INVALID_NWT_EVENT')
   if (event.kind !== NWT) fail('INVALID_NWT_KIND')
   return parseClaims(event)
 }
@@ -135,7 +136,7 @@ export async function createToken ({
   content = '',
   createdAt = Math.floor(Date.now() / 1000)
 } = {}) {
-  if (typeof signEvent !== 'function') throw new TypeError('SIGN_EVENT_SHOULD_BE_A_FUNCTION')
+  if (typeof signEvent !== 'function') fail('SIGN_EVENT_SHOULD_BE_A_FUNCTION')
   if (typeof content !== 'string') fail('INVALID_CONTENT')
 
   const tags = []
@@ -162,7 +163,7 @@ export async function createToken ({
     event.kind !== expected.kind ||
     event.created_at !== expected.created_at ||
     event.content !== expected.content ||
-    !equalTags(event.tags, expected.tags)
+    !areTagsEqual(event.tags, expected.tags)
   ) fail('SIGNED_NWT_EVENT_WAS_CHANGED')
   return event
 }
@@ -184,8 +185,8 @@ export function decodeToken (value) {
   try {
     bytes = base64UrlToBytes(token)
     if (bytesToBase64Url(bytes) !== token) fail('INVALID_NWT_ENCODING')
-  } catch {
-    fail('INVALID_NWT_ENCODING')
+  } catch (cause) {
+    fail('INVALID_NWT_ENCODING', { cause })
   }
 
   try {
@@ -193,8 +194,8 @@ export function decodeToken (value) {
     if (!event || typeof event !== 'object' || Array.isArray(event)) fail('INVALID_NWT_EVENT_JSON')
     return event
   } catch (error) {
-    if (error?.message === 'INVALID_NWT_EVENT_JSON') throw error
-    fail('INVALID_NWT_EVENT_JSON')
+    if (error instanceof ValidationError && error.code === 'INVALID_NWT_EVENT_JSON') throw error
+    fail('INVALID_NWT_EVENT_JSON', { cause: error })
   }
 }
 

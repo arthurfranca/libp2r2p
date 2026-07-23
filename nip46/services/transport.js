@@ -1,3 +1,4 @@
+import { ValidationError } from '../../error/index.js'
 import { getPublicKey } from '../../key/index.js'
 import { relayPool as defaultRelayPool } from '../../relay/index.js'
 import { DEFAULT_TIMEOUT, DEFAULT_TIMEOUT_AFTER_FIRST_EOSE } from '../constants/index.js'
@@ -14,9 +15,9 @@ function requestId () {
 
 function requestExtension (value) {
   if (value === undefined || value === null) return null
-  if (typeof value !== 'object' || Array.isArray(value)) throw new Error('NIP46_REQUEST_EXTENSION_REQUIRED')
+  if (typeof value !== 'object' || Array.isArray(value)) throw new ValidationError('NIP46_REQUEST_EXTENSION_REQUIRED')
   for (const key of ['id', 'method', 'params']) {
-    if (Object.hasOwn(value, key)) throw new Error(`NIP46_REQUEST_EXTENSION_CANNOT_SET_${key.toUpperCase()}`)
+    if (Object.hasOwn(value, key)) throw new ValidationError(`NIP46_REQUEST_EXTENSION_CANNOT_SET_${key.toUpperCase()}`)
   }
   return value
 }
@@ -46,7 +47,7 @@ export function waitForNip46 (promise, { timeout = null, signal, label = 'NIP46_
   })
 }
 
-export function sameRelays (left, right) {
+export function areRelaySetsEqual (left, right) {
   if (left.length !== right.length) return false
   const values = new Set(left)
   return right.every(value => values.has(value))
@@ -74,8 +75,8 @@ export class Nip46Transport {
     timeoutAfterFirstEose = DEFAULT_TIMEOUT_AFTER_FIRST_EOSE,
     onError
   } = {}) {
-    if (!(secretKey instanceof Uint8Array)) throw new Error('NIP46_SECRET_KEY_REQUIRED')
-    if (!relayPool?.getLiveEventsGenerator || !relayPool?.sendEvent) throw new Error('RELAY_POOL_REQUIRED')
+    if (!(secretKey instanceof Uint8Array)) throw new ValidationError('NIP46_SECRET_KEY_REQUIRED')
+    if (!relayPool?.getLiveEventsGenerator || !relayPool?.sendEvent) throw new ValidationError('RELAY_POOL_REQUIRED')
     this.#secretKey = secretKey
     this.#pubkey = getPublicKey(secretKey)
     this.#relayPool = relayPool
@@ -164,9 +165,9 @@ export class Nip46Transport {
     extension
   } = {}) {
     if (this.#closed) throw new Error('NIP46_CLOSED')
-    if (typeof method !== 'string' || !method) throw new Error('NIP46_METHOD_REQUIRED')
+    if (typeof method !== 'string' || !method) throw new ValidationError('NIP46_METHOD_REQUIRED')
     if (!Array.isArray(params) || !params.every(param => typeof param === 'string')) {
-      throw new Error('NIP46_PARAMS_REQUIRED')
+      throw new ValidationError('NIP46_PARAMS_REQUIRED')
     }
     if (signal?.aborted) throw new Error('Aborted')
     const context = this.#activeContext

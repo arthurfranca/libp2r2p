@@ -1,6 +1,7 @@
 import { schnorr, secp256k1 } from '@noble/curves/secp256k1.js'
 
 import { bytesToHex, hexToBytes } from '../base16/index.js'
+import { ValidationError } from '../error/index.js'
 import { finalizeEvent } from '../event/index.js'
 import { nsecDecode, nsecEncode, npubDecode, npubEncode } from '../nip19/index.js'
 
@@ -12,7 +13,7 @@ export function generateSecretKey () {
 
 export function getPublicKey (secretKey) {
   if (!(secretKey instanceof Uint8Array) || secretKey.length !== 32 || !secp256k1.utils.isValidSecretKey(secretKey)) {
-    throw new Error('INVALID_SECRET_KEY')
+    throw new ValidationError('INVALID_SECRET_KEY')
   }
   return bytesToHex(schnorr.getPublicKey(secretKey))
 }
@@ -39,8 +40,8 @@ export function keypairFromSeckey (raw) {
   } else {
     try {
       secretKey = hexToBytes(nsecDecode(raw))
-    } catch {
-      throw new Error('NOT_A_SECRET_KEY')
+    } catch (cause) {
+      throw new ValidationError('NOT_A_SECRET_KEY', { cause })
     }
   }
   const pubkey = getPublicKey(secretKey)
@@ -59,8 +60,8 @@ export function keypairFromSeckey (raw) {
 export function pubkeyFromNpub (npub) {
   try {
     return npubDecode(npub)
-  } catch {
-    throw new Error('NOT_AN_NPUB')
+  } catch (cause) {
+    throw new ValidationError('NOT_AN_NPUB', { cause })
   }
 }
 

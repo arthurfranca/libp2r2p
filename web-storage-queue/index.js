@@ -1,3 +1,5 @@
+import { ValidationError } from '../error/index.js'
+
 const encoder = new TextEncoder()
 const DEFAULT_EVICTION_HEADROOM_RATIO = 0.1
 const MAX_EVICTION_HEADROOM_BYTES = 64 * 1024 // 64 KiB
@@ -8,7 +10,7 @@ export function createQueue ({
   maxBytes,
   evictionPolicy = 'opposite-end' // 'opposite-end' = push evicts from head, unshift evicts from tail
 } = {}) {
-  if (!prefix) throw new Error('QUEUE_PREFIX_REQUIRED')
+  if (!prefix) throw new ValidationError('QUEUE_PREFIX_REQUIRED')
   const stateKey = `${prefix}:queue`
   const operationKey = `${prefix}:queue:operation`
   const itemPrefix = `${prefix}:queue:item:`
@@ -44,7 +46,7 @@ export function createQueue ({
     if (policy === 'opposite-end' || policy === undefined || policy === null) return 'opposite-end'
     if (policy === 'fifo' || policy === 'head') return 'head'
     if (policy === 'lifo' || policy === 'tail') return 'tail'
-    throw new Error('QUEUE_INVALID_EVICTION_POLICY')
+    throw new ValidationError('QUEUE_INVALID_EVICTION_POLICY')
   }
 
   function evictionDirectionFor (operation, { index = 0, length = 0 } = {}) {
@@ -251,7 +253,7 @@ export function createQueue ({
 
   function assertIndex (index, length, { allowEnd = false } = {}) {
     const max = allowEnd ? length : length - 1
-    if (!Number.isSafeInteger(index) || index < 0 || index > max) throw new Error('QUEUE_INDEX_OUT_OF_RANGE')
+    if (!Number.isSafeInteger(index) || index < 0 || index > max) throw new ValidationError('QUEUE_INDEX_OUT_OF_RANGE')
   }
 
   function itemForStorage (item) {
@@ -514,7 +516,7 @@ export function createQueue ({
   }
 
   function insertWhere (predicate, item, { appendIfMissing = false } = {}) {
-    if (typeof predicate !== 'function') throw new Error('QUEUE_PREDICATE_REQUIRED')
+    if (typeof predicate !== 'function') throw new ValidationError('QUEUE_PREDICATE_REQUIRED')
     const state = readState()
     const length = lengthFromState(state)
 
@@ -591,7 +593,7 @@ export function createQueue ({
   }
 
   function removeWhere (predicate) {
-    if (typeof predicate !== 'function') throw new Error('QUEUE_PREDICATE_REQUIRED')
+    if (typeof predicate !== 'function') throw new ValidationError('QUEUE_PREDICATE_REQUIRED')
     const state = readState()
     // Bulk predicate removal leaves holes on purpose; shift/pop skip them, and
     // callers that need contiguous positions can use removeAt for compaction.
@@ -613,7 +615,7 @@ export function createQueue ({
   }
 
   function some (predicate) {
-    if (typeof predicate !== 'function') throw new Error('QUEUE_PREDICATE_REQUIRED')
+    if (typeof predicate !== 'function') throw new ValidationError('QUEUE_PREDICATE_REQUIRED')
     const state = readState()
     for (let id = state.head; id < state.tail; id++) {
       const item = readItem(id)

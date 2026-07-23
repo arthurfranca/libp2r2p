@@ -1,3 +1,5 @@
+import { ValidationError } from '../error/index.js'
+
 function isIpv4Address (hostname) {
   const parts = hostname.split('.')
   return parts.length === 4 && parts.every(part =>
@@ -52,13 +54,20 @@ function removeEmptyQuerySegments (url) {
 }
 
 export function normalizeRelayUrl (value) {
-  if (typeof value !== 'string' || value.length === 0) throw new TypeError('URL_SHOULD_BE_A_STRING')
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new ValidationError('INVALID_RELAY_URL', { message: 'URL_SHOULD_BE_A_STRING' })
+  }
   let input = value.trim()
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(input)) input = `wss://${input}`
-  const url = new URL(input)
+  let url
+  try {
+    url = new URL(input)
+  } catch (cause) {
+    throw new ValidationError('INVALID_RELAY_URL', { cause })
+  }
   if (url.protocol === 'http:') url.protocol = 'ws:'
   else if (url.protocol === 'https:') url.protocol = 'wss:'
-  if (url.protocol !== 'ws:' && url.protocol !== 'wss:') throw new Error('INVALID_RELAY_PROTOCOL')
+  if (url.protocol !== 'ws:' && url.protocol !== 'wss:') throw new ValidationError('INVALID_RELAY_PROTOCOL')
   url.pathname = url.pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '')
   if (url.pathname === '/') url.pathname = ''
   if ((url.protocol === 'ws:' && url.port === '80') || (url.protocol === 'wss:' && url.port === '443')) url.port = ''
@@ -67,25 +76,26 @@ export function normalizeRelayUrl (value) {
   return url.toString().replace(/^(wss?:\/\/[^/?#]+)\/(?=[?#]|$)/, '$1')
 }
 
-export function isValidPublicRelayUrl (value) {
-  if (typeof value !== 'string') return false
+function publicRelayUrlError (value) {
+  if (typeof value !== 'string' || value.trim().length === 0) return 'INVALID_RELAY_URL'
   let input = value.trim()
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(input)) input = `wss://${input}`
   try {
-    if (decodeURIComponent(new URL(input).pathname).includes('://')) return false
+    if (decodeURIComponent(new URL(input).pathname).includes('://')) return 'RELAY_URL_NESTED_SCHEME'
   } catch {
-    return false
+    return 'INVALID_RELAY_URL'
   }
 
   let normalized
   try {
     normalized = normalizeRelayUrl(value)
-  } catch {
-    return false
+  } catch (error) {
+    return error instanceof ValidationError ? error.code : 'INVALID_RELAY_URL'
   }
 
   const url = new URL(normalized)
-  if (url.protocol !== 'wss:' || url.username || url.password) return false
+  if (url.protocol !== 'wss:') return 'INSECURE_RELAY_URL'
+  if (url.username || url.password) return 'RELAY_URL_CREDENTIALS_NOT_ALLOWED'
 
   const hostname = url.hostname.toLowerCase()
   if (
@@ -93,19 +103,29 @@ export function isValidPublicRelayUrl (value) {
     hostname.endsWith('.localhost') ||
     hostname.endsWith('.local') ||
     hostname.endsWith('.onion')
-  ) return false
+  ) return 'NON_PUBLIC_RELAY_HOST'
 
   const unwrappedHostname = hostname.replace(/^\[|\]$/g, '')
   if (isIpv4Address(unwrappedHostname)) {
-    if (!isPublicIpv4Address(unwrappedHostname)) return false
+    if (!isPublicIpv4Address(unwrappedHostname)) return 'NON_PUBLIC_RELAY_IP'
   } else if (unwrappedHostname.includes(':')) {
-    if (!isPublicIpv6Address(unwrappedHostname)) return false
+    if (!isPublicIpv6Address(unwrappedHostname)) return 'NON_PUBLIC_RELAY_IP'
   } else if (!hostname.includes('.')) {
-    return false
+    return 'INVALID_RELAY_HOST'
   }
 
   const lowerValue = normalized.toLowerCase()
-  if (lowerValue.includes('npub1') || lowerValue.includes('nprofile1')) return false
+  if (lowerValue.includes('npub1') || lowerValue.includes('nprofile1')) return 'RELAY_URL_NOSTR_ENTITY_NOT_ALLOWED'
 
-  return true
+  return null
+}
+
+export function isValidPublicRelayUrl (value) {
+  return publicRelayUrlError(value) === null
+}
+
+export function assertValidPublicRelayUrl (value) {
+  const code = publicRelayUrlError(value)
+  if (code) throw new ValidationError(code)
+  return value
 }
