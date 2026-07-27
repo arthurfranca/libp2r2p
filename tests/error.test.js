@@ -3,7 +3,6 @@ import { test } from 'node:test'
 
 import { base16ToBytes } from '../base16/index.js'
 import { ValidationError } from '../error/index.js'
-import { validateLocales } from '../i18n/index.js'
 import { waitForNip46 } from '../nip46/services/transport.js'
 import { validateToken } from '../nwt/index.js'
 
@@ -22,9 +21,6 @@ test('strict public validators and codecs use ValidationError', () => {
     error instanceof ValidationError &&
     error.code === 'INVALID_BASE16_LENGTH' &&
     error.message === 'Invalid Base16 length'
-  ))
-  assert.throws(() => validateLocales(null), error => (
-    error instanceof ValidationError && error.code === 'INVALID_LOCALES'
   ))
   assert.throws(() => validateToken('invalid'), error => (
     error instanceof ValidationError && error.code === 'INVALID_NWT_ENCODING'

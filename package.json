@@ -1,6 +1,6 @@
 {
   "name": "libp2r2p",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Peer-to-relay-to-peer",
   "keywords": [
     "p2r2p",
@@ -24,7 +24,6 @@
     "event",
     "idb",
     "idb-queue",
-    "i18n",
     "index.js",
     "key",
     "kind",
@@ -65,7 +64,6 @@
     "./event": "./event/index.js",
     "./idb": "./idb/index.js",
     "./idb-queue": "./idb-queue/index.js",
-    "./i18n": "./i18n/index.js",
     "./key": "./key/index.js",
     "./kind": "./kind/index.js",
     "./network": "./network/index.js",

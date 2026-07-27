@@ -326,60 +326,6 @@ Low-level relay sockets, subscriptions, message parsing, and serialization are
 internal implementation details; use `RelayPool` or the `relayPool` singleton
 from `libp2r2p/relay`.
 
-## Internationalization
-
-The dependency-free `libp2r2p/i18n` subpath exposes locale detection and a
-small translator suitable for keeping each component's translations beside
-that component. Translation keys are literal strings, not dotted paths.
-
-```js
-import { getT } from 'libp2r2p/i18n'
-
-const t = getT({
-  'Allow {{size}}': {
-    en: 'Allow {{size}}',
-    'pt-BR': 'Permitir {{size}}'
-  },
-  'Delete {{count}} items': {
-    en: {
-      one: 'Delete {{count}} item',
-      other: 'Delete {{count}} items'
-    }
-  }
-})
-
-t('Allow {{size}}', { size: '10 MiB' })
-```
-
-`getCurrentDeviceLocale()` prefers the locale resolved by `Intl`, then browser
-language hints, and preserves the full canonical BCP 47 locale. `getT()`
-matches exact and compatible language variants, falls back to English and then
-to the key itself, interpolates `{{name}}` values, and uses `Intl.PluralRules`
-when a locale value supplies plural forms. Missing interpolation values remain
-visible in the returned string.
-
-Catalog validation is opt-in. `validateLocales()` can be used independently,
-or `getT()` can validate once when creating the translator:
-
-```js
-import { getT, validateLocales } from 'libp2r2p/i18n'
-
-const validation = {
-  requiredLocales: ['en', 'pt-BR'],
-  referenceLocale: 'en',
-  requireReferenceKey: true
-}
-
-validateLocales(locales, validation)
-const t = getT(locales, { validation })
-```
-
-Validation checks catalog structure, required locales, plural `other` forms,
-and placeholder parity across every translation. `requireReferenceKey` also
-requires the reference locale's string, or its plural `other` form, to equal
-the literal translation key. Without `validation`, sparse catalogs continue
-to use the normal locale fallback behavior.
-
 ## Binary encodings
 
 Base16, Base36, Base62, Base64/Base64URL, and Base93 helpers are available
