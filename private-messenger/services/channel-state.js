@@ -25,6 +25,7 @@ clearing state owned by another instance of the same principal identity.
 function deferred () {
   let resolve
   let reject
+  // eslint-disable-next-line promise/param-names
   const promise = new Promise((nextResolve, nextReject) => {
     resolve = nextResolve
     reject = nextReject

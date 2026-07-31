@@ -198,8 +198,7 @@ export class Nip46Client {
   }
 
   #openResponseContext (pointer) {
-    let context
-    context = this.#transport.openContext({
+    const context = this.#transport.openContext({
       filter: {
         kinds: [NIP46_KIND],
         authors: [pointer.remoteSignerPubkey],

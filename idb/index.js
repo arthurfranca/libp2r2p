@@ -13,6 +13,7 @@ const READ_METHODS = new Set([
 function deferred () {
   let resolve
   let reject
+  // eslint-disable-next-line promise/param-names
   const promise = new Promise((nextResolve, nextReject) => {
     resolve = nextResolve
     reject = nextReject

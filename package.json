@@ -1,6 +1,6 @@
 {
   "name": "libp2r2p",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Peer-to-relay-to-peer",
   "keywords": [
     "p2r2p",
@@ -92,6 +92,9 @@
     "@scure/base": "2.0.0"
   },
   "devDependencies": {
-    "fake-indexeddb": "6.2.5"
+    "eslint": "^9.39.5",
+    "fake-indexeddb": "6.2.5",
+    "globals": "^17.8.0",
+    "neostandard": "^0.13.0"
   }
 }

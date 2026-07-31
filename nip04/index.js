@@ -1,7 +1,5 @@
 import { cbc } from '@noble/ciphers/aes.js'
 import { randomBytes } from '@noble/ciphers/utils.js'
-
-import { base16ToBytes } from '../base16/index.js'
 import { base64ToBytes, bytesToBase64 } from '../base64/index.js'
 import { sharedXOnlySecret } from '../ecdh/index.js'
 import { ValidationError } from '../error/index.js'

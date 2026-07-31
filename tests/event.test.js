@@ -16,7 +16,7 @@ import {
 } from '../event/index.js'
 import { ValidationError } from '../error/index.js'
 import { serializeEvent } from '../event/helpers/serialize.js'
-import { generateSecretKey, getPublicKey } from '../key/index.js'
+import { getPublicKey } from '../key/index.js'
 
 const secretKey = new Uint8Array(32).fill(1)
 

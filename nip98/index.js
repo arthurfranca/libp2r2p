@@ -27,6 +27,7 @@ export async function getToken ({
   payloadHash
 }) {
   if (typeof loginUrl !== 'string' || loginUrl.length === 0) throw new ValidationError('INVALID_LOGIN_URL')
+  // eslint-disable-next-line no-new
   try { new URL(loginUrl) } catch (cause) { throw new ValidationError('INVALID_LOGIN_URL', { cause }) }
   if (typeof httpMethod !== 'string' || httpMethod.trim().length === 0) throw new ValidationError('INVALID_HTTP_METHOD')
   if (typeof signEvent !== 'function') throw new ValidationError('SIGN_EVENT_SHOULD_BE_A_FUNCTION')

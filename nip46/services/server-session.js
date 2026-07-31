@@ -112,8 +112,7 @@ export class Nip46ServerSession {
   }
 
   #openContext (relays) {
-    let context
-    context = this.#transport.openContext({
+    const context = this.#transport.openContext({
       filter: {
         kinds: [NIP46_KIND],
         '#p': [this.#transport.pubkey],

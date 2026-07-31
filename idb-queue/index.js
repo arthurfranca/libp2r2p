@@ -34,6 +34,7 @@ The queue state record is absent while the queue is empty.
 function deferred () {
   let resolve
   let reject
+  // eslint-disable-next-line promise/param-names
   const promise = new Promise((nextResolve, nextReject) => {
     resolve = nextResolve
     reject = nextReject

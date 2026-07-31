@@ -175,7 +175,7 @@ export class RelayPool {
 
   // Disconnect from a relay
   async disconnect (url) {
-    const normalizedUrl = normalizeURL(url)
+    const normalizedUrl = normalizeRelayUrl(url)
     if (this.#relays.has(normalizedUrl)) {
       const relay = this.#relays.get(normalizedUrl)
       if (relay.ws?.readyState < 2) await relay.close()?.catch(console.log)
@@ -414,6 +414,7 @@ export class RelayPool {
         this.#getRelay(url).then(relay => {
           if (isResolved || !pending.has(url)) return
           let hasEvents = false
+          // eslint-disable-next-line prefer-const
           let sub
 
           // Actual EOSE and filter satisfaction share the same graceful close path.
@@ -658,14 +659,13 @@ export class RelayPool {
         // the historical gap is yielded before newer socket events.
         let liveBuffer = (gapSince !== null && gapSince > 0) ? [] : null
         let liveEose = false
-        let liveSub
 
         // Open the live sub first so the relay starts buffering incoming events
         // before we scan its database for the reconnect gap fill.
         // Forward until to the relay so it can enforce the boundary server-side.
         const liveFilter = { ...baseFilter, since: now, limit: 0 }
         if (filterUntil !== null) liveFilter.until = filterUntil
-        liveSub = relay.subscribe([liveFilter], {
+        const liveSub = relay.subscribe([liveFilter], {
           onevent: (event) => {
             // A limit:0 relay may still send retained events before EOSE. Do not
             // expose them from a strictly-live stream.

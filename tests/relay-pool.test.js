@@ -139,6 +139,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve))
 function deferred () {
   let resolve
   let reject
+  // eslint-disable-next-line promise/param-names
   const promise = new Promise((res, rej) => {
     resolve = res
     reject = rej
@@ -157,7 +158,9 @@ function startCollecting (gen) {
 }
 
 let _nextId = 1
+// eslint-disable-next-line camelcase
 function makeEvent ({ id, kind = 0, created_at = 100 } = {}) {
+  // eslint-disable-next-line camelcase
   return { id: id ?? String(_nextId++), kind, created_at, tags: [], content: '' }
 }
 
@@ -1722,6 +1725,7 @@ describe('RelayPool.sendEvent', () => {
     assert.equal(full.fulfilled, 1)
     assert.deepEqual(full.succeededRelays, ['wss://r1'])
     assert.equal(full.errors.length, 1)
+    // eslint-disable-next-line no-unused-vars
     assert.deepEqual(relayResults.map(({ reason, ...result }) => result), [{
       relay: 'wss://r1',
       success: true,

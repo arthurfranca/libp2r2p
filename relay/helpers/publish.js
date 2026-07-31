@@ -40,6 +40,7 @@ export function createPublishSettlements (promises, timeout, { onSettled } = {})
   let isFinished = false
   let resolve
 
+  // eslint-disable-next-line promise/param-names
   const promise = new Promise(nextResolve => { resolve = nextResolve })
   const finish = () => {
     if (isFinished) return

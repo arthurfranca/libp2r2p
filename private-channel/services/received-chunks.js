@@ -52,6 +52,7 @@ state, keyPath "key"
 function deferred () {
   let resolve
   let reject
+  // eslint-disable-next-line promise/param-names
   const promise = new Promise((nextResolve, nextReject) => {
     resolve = nextResolve
     reject = nextReject

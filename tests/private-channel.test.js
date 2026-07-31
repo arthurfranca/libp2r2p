@@ -42,6 +42,7 @@ function createMockEventsGenerator (subscribeMany) {
     let wake = Promise.withResolvers()
     let current = null
     let closed = false
+    // eslint-disable-next-line prefer-const
     let subscription
 
     const close = () => {
@@ -68,6 +69,7 @@ function createMockEventsGenerator (subscribeMany) {
       async next () {
         current?.resolve()
         current = null
+        // eslint-disable-next-line no-unmodified-loop-condition
         while (!closed && pending.length === 0) await wake.promise
         if (closed) return { done: true }
         current = pending.shift()
@@ -482,7 +484,6 @@ test('private broadcast wrappers share and normalize one deletion pubkey per log
       /INVALID_DELETION_PUBKEY/
     )
   }
-
 })
 
 test('publish splits relay-targeted routers by receiver subset with separate router pubkeys', async () => {
@@ -815,6 +816,7 @@ test('live-only subscribe closes its RelayPool stream', async () => {
 
   await reachedAbortWait
   subscription.close()
+  // eslint-disable-next-line no-unmodified-loop-condition
   for (let attempt = 0; attempt < 20 && !aborted; attempt++) {
     await new Promise(resolve => setImmediate(resolve))
   }
