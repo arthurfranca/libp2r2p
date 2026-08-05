@@ -32,3 +32,20 @@ throw `ValidationError` from `libp2r2p/error` with a stable uppercase
 snake-case code. Preserve ordinary operational errors for network, timeout,
 abort, quota, unavailable storage, and closed-state failures. Permissive
 parsers that use `null` for an expected mismatch keep that contract.
+
+## Tests
+
+During implementation, run the smallest directly related test files with
+`npm run test:files -- <relative-test-path> [...]`. Before completing a change,
+run the full deterministic suite with `npm test`.
+
+Tests that contact real external services use the `*.network-test.js` suffix,
+which keeps them out of the standard `*.test.js` suite. Run them explicitly
+with `npm run test:files -- <relative-network-test-path>` when changing network
+behavior, changing relay constants, or investigating service availability.
+External network tests are diagnostic and do not gate unrelated changes.
+
+If a full-suite failure appears unrelated to the current change, investigate
+enough to distinguish a regression from a pre-existing failure or external
+instability. Do not change unrelated production behavior merely to make the
+suite pass; report independently scoped problems separately.

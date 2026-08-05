@@ -4,7 +4,9 @@ export const seedRelays = [
   'wss://purplepag.es',
   'wss://user.kindpag.es',
   'wss://relay.nos.social',
-  'wss://nostr.land',
+  // Disabled 2026-08-05: accepted kind:10002 with OK but did not broadcast it
+  // to a live subscription within 15 seconds. Keep for future retesting.
+  // 'wss://nostr.land',
   'wss://indexer.coracle.social'
 ]
 
@@ -13,6 +15,12 @@ export const seedRelays = [
 export const freeRelays = [
   'wss://relay.44billion.net',
   'wss://nos.lol',
-  'wss://relay.primal.net',
-  'wss://relay.damus.io'
+  'wss://relay.primal.net'
+]
+
+// Shared app-discovery relays used by Nostr app launchers and uploaders.
+export const nappRelays = [
+  'wss://relay.44billion.net',
+  'wss://relay.ditto.pub',
+  'wss://relay.dreamith.to'
 ]

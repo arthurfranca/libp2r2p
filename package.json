@@ -1,6 +1,6 @@
 {
   "name": "libp2r2p",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "Peer-to-relay-to-peer",
   "keywords": [
     "p2r2p",
@@ -47,6 +47,7 @@
   ],
   "scripts": {
     "test": "node --test --experimental-test-module-mocks 'tests/**/*.test.js'",
+    "test:files": "node --test --experimental-test-module-mocks",
     "test:only": "node --test --test-only --experimental-test-module-mocks 'tests/**/*.test.js'"
   },
   "exports": {
