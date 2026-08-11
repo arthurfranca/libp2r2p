@@ -211,6 +211,7 @@ export class PrivateMessenger {
     _pickRelaysForPubkeys = pickRelaysForPubkeys,
     _subscribeRelayListUpdates = subscribeRelayListUpdates,
     _setTimeout = globalThis.setTimeout.bind(globalThis),
+    _clearTimeout = globalThis.clearTimeout.bind(globalThis),
     _setInterval = globalThis.setInterval.bind(globalThis),
     _clearInterval = globalThis.clearInterval.bind(globalThis),
     _storageSetInterval = globalThis.setInterval.bind(globalThis),
@@ -241,6 +242,7 @@ export class PrivateMessenger {
     this._pickRelaysForPubkeys = _pickRelaysForPubkeys
     this._subscribeRelayListUpdates = _subscribeRelayListUpdates
     this._setTimeout = _setTimeout
+    this._clearTimeout = _clearTimeout
     this._setInterval = _setInterval
     this._clearInterval = _clearInterval
     this._storageSetInterval = _storageSetInterval
@@ -260,6 +262,8 @@ export class PrivateMessenger {
     this.stateWriteTail = Promise.resolve()
     this.channels = new Map()
     this.stopByChannel = new Map()
+    this.reloadGapTimers = new Map()
+    this.watchRevisionByChannel = new Map()
     this.presenceTimers = new Map()
     this.stopRelayListWatcher = null
     this.relayListWatcherPubkey = ''
@@ -642,13 +646,13 @@ export class PrivateMessenger {
     this.lastStorageTouch = Date.now()
     if (updatesStoragePolicy) this.broadcastStoragePolicyChange()
 
-    await this.unwatch([...this.channels.keys()])
-    this.channels.clear()
+    await this.unwatch(removedPubkeys)
+    for (const pubkey of removedPubkeys) this.channels.delete(pubkey)
     for (const channel of nextChannels) this.channels.set(channel.pubkey, channel)
 
     await this.cleanupStaleChannels({ storageSnapshot })
     await this.applyRecoveryPolicies(nextChannels)
-    await this.watch()
+    await this.watch([...nextPubkeys])
     await this.reconcilePresencePublishers()
     if (this.storagePolicyRevision === storageSnapshot.policyRevision) {
       this.storagePolicyNeedsApply = false
@@ -1023,6 +1027,7 @@ export class PrivateMessenger {
         this.assertOpen()
       }
       this.stopByChannel.set(pubkey, stop)
+      this.watchRevisionByChannel.set(pubkey, (this.watchRevisionByChannel.get(pubkey) || 0) + 1)
       this.updateChannelState(pubkey, {
         lastWatchedAt: nowSeconds(),
         mode: channel.mode,
@@ -1048,6 +1053,8 @@ export class PrivateMessenger {
     const channelPubkeys = channels ? uniq(Array.isArray(channels) ? channels : [channels]) : [...this.stopByChannel.keys()]
     const closing = []
     for (const pubkey of channelPubkeys) {
+      this.cancelReloadGap(pubkey)
+      this.watchRevisionByChannel.set(pubkey, (this.watchRevisionByChannel.get(pubkey) || 0) + 1)
       const close = this.stopByChannel.get(pubkey)?.()
       if (close && typeof close.then === 'function') closing.push(close)
       this.stopByChannel.delete(pubkey)
@@ -1570,20 +1577,40 @@ export class PrivateMessenger {
   }
 
   scheduleReloadGap (pubkey) {
+    this.cancelReloadGap(pubkey)
     if (!this.offlineRecoverySecondsFor(pubkey)) return
     const current = this.readState().channels[pubkey]
     const start = current?.openOfflineStart || current?.lastSeenAt
     if (!start) return
-    this._setTimeout(async () => {
+    const revision = this.watchRevisionByChannel.get(pubkey) || 0
+    const token = {}
+    const timer = this._setTimeout(async () => {
+      const scheduled = this.reloadGapTimers.get(pubkey)
+      if (scheduled?.token !== token) return
+      this.reloadGapTimers.delete(pubkey)
+      if (this.closePromise || !this.channels.has(pubkey) || !this.stopByChannel.has(pubkey)) return
+      if ((this.watchRevisionByChannel.get(pubkey) || 0) !== revision) return
       this.addOfflineRange(pubkey, Math.max(0, start - this.offlineSkewSeconds), nowSeconds())
       await this.recoverOfflineRanges([pubkey])
     }, this.reloadGapDelayMs)
+    this.reloadGapTimers.set(pubkey, { timer, token, revision })
+  }
+
+  cancelReloadGap (pubkey) {
+    const scheduled = this.reloadGapTimers.get(pubkey)
+    if (!scheduled) return
+    this.reloadGapTimers.delete(pubkey)
+    this._clearTimeout(scheduled.timer)
   }
 
   // Browser-offline recovery owns durable gaps. Stop only the child live reads;
   // unwatch() would also stop seeder-presence publishing and alter channel state.
   #pauseLiveWatches () {
-    for (const stop of this.stopByChannel.values()) stop?.()
+    for (const [pubkey, stop] of this.stopByChannel) {
+      this.cancelReloadGap(pubkey)
+      this.watchRevisionByChannel.set(pubkey, (this.watchRevisionByChannel.get(pubkey) || 0) + 1)
+      stop?.()
+    }
     this.stopByChannel.clear()
   }
 
@@ -1623,32 +1650,49 @@ export class PrivateMessenger {
   }
 
   async askSeedersForMissingRange (channelPubkey, since, until) {
-    if (!this.offlineRecoverySecondsFor(channelPubkey)) return []
-    if (!this.channels.get(channelPubkey)?.signer) return []
+    const { asks } = await this.#askSeedersForMissingRangeAttempt(channelPubkey, since, until)
+    return asks
+  }
+
+  async #askSeedersForMissingRangeAttempt (channelPubkey, since, until) {
+    if (!this.offlineRecoverySecondsFor(channelPubkey)) return { asks: [], failures: [] }
+    if (!this.channels.get(channelPubkey)?.signer) return { asks: [], failures: [] }
     const seeders = this.recoverySeeders(channelPubkey)
-    if (!seeders.length || until < since) return []
+    if (!seeders.length || until < since) return { asks: [], failures: [] }
 
     const asks = []
+    const failures = []
     for (const seeder of seeders) {
       try {
-        asks.push(await this.ask({
+        const ask = await this.ask({
           channelPubkey,
           receiverPubkey: seeder,
           code: MISSING_MESSAGES_ASK_CODE,
           payload: { since, until }
-        }))
+        })
+        asks.push(ask)
+        const reports = ask?.delivery?.reports
+        if (!Array.isArray(reports) || !reports.length || reports.some(report => report?.success !== true)) {
+          throw new Error('PRIVATE_MESSAGE_NOT_PUBLISHED')
+        }
       } catch (err) {
+        failures.push({ seeder, error: err })
         console.warn('private-messenger seeder recovery ask failed', seeder, err?.message ?? err)
       }
     }
-    return asks
+    return { asks, failures }
   }
 
   async askSeedersForRelayLeftEdge (channelPubkey, range, fetchedEvents) {
+    const { asks } = await this.#askSeedersForRelayLeftEdgeAttempt(channelPubkey, range, fetchedEvents)
+    return asks
+  }
+
+  async #askSeedersForRelayLeftEdgeAttempt (channelPubkey, range, fetchedEvents) {
     const oldest = oldestCreatedAt(fetchedEvents)
     const until = oldest == null ? range.end : Math.min(range.end, oldest)
-    if (until < range.start) return []
-    return this.askSeedersForMissingRange(channelPubkey, range.start, until)
+    if (until < range.start) return { asks: [], failures: [] }
+    return this.#askSeedersForMissingRangeAttempt(channelPubkey, range.start, until)
   }
 
   async replyWithStoredSeeds (channelPubkey, message) {
@@ -1759,10 +1803,12 @@ export class PrivateMessenger {
       const recoverySeconds = this.offlineRecoverySecondsFor(channel)
       if (!recoverySeconds) continue
       const minStart = now - recoverySeconds
+      const processedRanges = new Set(current.offlineRanges.map(range => `${range.start}:${range.end}`))
 
       const remaining = []
       for (const range of current.offlineRanges) {
         if (range.end < minStart) continue
+        const watchRevision = this.watchRevisionByChannel.get(pubkey) || 0
         try {
           const fetchRelays = await this.resolveWatchRelays(channel)
           const fetchedEvents = await this._privateChannel.fetch({
@@ -1786,16 +1832,21 @@ export class PrivateMessenger {
             onContentKeyUsage: usage => this.handleContentKeyUsage(pubkey, usage),
             onError: err => { throw err }
           }) || []
-          await this.askSeedersForRelayLeftEdge(pubkey, range, fetchedEvents)
+          const attempt = await this.#askSeedersForRelayLeftEdgeAttempt(pubkey, range, fetchedEvents)
+          const lifecycleChanged = this.closePromise || !this.channels.has(pubkey) || !this.stopByChannel.has(pubkey) ||
+            (this.watchRevisionByChannel.get(pubkey) || 0) !== watchRevision
+          if (lifecycleChanged || attempt.failures.length) remaining.push(range)
         } catch (err) {
           this.onError?.(err)
           remaining.push(range)
         }
       }
       const fresh = this.readState()
+      const concurrentRanges = (fresh.channels[pubkey]?.offlineRanges || [])
+        .filter(range => !processedRanges.has(`${range.start}:${range.end}`))
       fresh.channels[pubkey] = {
         ...(fresh.channels[pubkey] || {}),
-        offlineRanges: remaining
+        offlineRanges: mergeRanges(concurrentRanges.concat(remaining))
       }
       this.writeState(fresh)
     }

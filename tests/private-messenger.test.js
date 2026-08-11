@@ -52,9 +52,9 @@ function signer (pubkey) {
   }
 }
 
-async function seedMessengerState (channels) {
+async function seedMessengerState (channels, userPubkey = 'user') {
   const state = await createChannelStateStore({
-    prefix: 'libp2r2p:private-messenger:user',
+    prefix: `libp2r2p:private-messenger:${userPubkey}`,
     indexedDB: globalThis.indexedDB
   })
   await state.update(channels)
@@ -87,7 +87,7 @@ function fakePrivateMessage () {
     },
     ask: async options => {
       sent.push({ method: 'ask', options })
-      return { question: { id: 'question-id', kind: ASK_KIND, pubkey: 'user' }, delivery: { reports: [] } }
+      return { question: { id: 'question-id', kind: ASK_KIND, pubkey: 'user' }, delivery: { reports: [{ success: true }] } }
     },
     reply: async options => {
       sent.push({ method: 'reply', options })
@@ -390,6 +390,51 @@ test('private messenger validates identity and stale-channel retention policies'
     messenger.update({ identityStorageRetentionSeconds: 0.5 }),
     /INVALID_IDENTITY_STORAGE_RETENTION_SECONDS/
   )
+  await messenger.close()
+})
+
+test('updating a maintained channel keeps its watch available to concurrent asks', async () => {
+  const pm = fakePrivateMessage()
+  const watched = new Set()
+  let releaseRewatch
+  let rewatchStarted
+  const rewatchGate = new Promise(resolve => { releaseRewatch = resolve })
+  const rewatchStartedPromise = new Promise(resolve => { rewatchStarted = resolve })
+  pm.watch = async options => {
+    pm.watchCalls.push(options)
+    if (pm.watchCalls.length > 1) {
+      rewatchStarted()
+      await rewatchGate
+    }
+    const pubkey = options.channels[0]
+    watched.add(pubkey)
+    return () => {
+      watched.delete(pubkey)
+      pm.stopped.push(pubkey)
+    }
+  }
+  pm.ask = async options => {
+    const pubkey = await options.privateChannelSigner.getPublicKey()
+    if (!watched.has(pubkey)) throw new Error('PRIVATE_MESSAGE_NOT_WATCHING')
+    pm.sent.push({ method: 'ask', options })
+    return { question: { id: 'question-id' }, delivery: { reports: [{ success: true }] } }
+  }
+
+  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  const updating = messenger.update({
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay-two.example'] }]
+  })
+  await rewatchStartedPromise
+
+  await messenger.ask({ channelPubkey: 'channel', receiverPubkey: 'peer', payload: 'during-update' })
+
+  releaseRewatch()
+  await updating
+  assert.equal(pm.stopped.includes('channel'), false)
   await messenger.close()
 })
 
@@ -1425,6 +1470,47 @@ test('watch schedules reload-gap recovery and fetches missing channel window', a
   assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [])
 })
 
+test('stale reload-gap timers do not run after rewatch, unwatch, or close', async () => {
+  const pm = fakePrivateMessage()
+  const timers = []
+  const fetches = []
+  const now = Math.floor(Date.now() / 1000)
+  await seedMessengerState({ channel: { lastSeenAt: now - 10, lastWatchedAt: now - 10 } })
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    _privateChannel: { fetch: async options => { fetches.push(options); return [] } },
+    _setTimeout: fn => {
+      const timer = { fn, cleared: false }
+      timers.push(timer)
+      return timer
+    },
+    _clearTimeout: timer => { timer.cleared = true }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  const initialTimer = timers.at(-1)
+  await messenger.update({
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay-two.example'] }]
+  })
+  assert.equal(initialTimer.cleared, true)
+  await initialTimer.fn()
+
+  const rewatchTimer = timers.at(-1)
+  await messenger.unwatch('channel')
+  assert.equal(rewatchTimer.cleared, true)
+  await rewatchTimer.fn()
+
+  await messenger.watch(['channel'])
+  const closeTimer = timers.at(-1)
+  await messenger.close()
+  assert.equal(closeTimer.cleared, true)
+  await closeTimer.fn()
+
+  assert.equal(fetches.length, 0)
+})
+
 test('reader-only channels fetch reload gaps with the reader signer', async () => {
   const pm = fakePrivateMessage()
   const fetches = []
@@ -1767,6 +1853,72 @@ test('recovery asks all configured seeders but caps discovered seeders', async (
 
   assert.deepEqual(configuredAsks.map(sent => sent.options.receiverPubkey), configuredSeeders)
   assert.deepEqual(discoveredAsks.map(sent => sent.options.receiverPubkey), discoveredSeeders.slice(0, 8))
+})
+
+test('recovery retains the full range until every seeder ask is delivered', async t => {
+  const now = Math.floor(Date.now() / 1000)
+  const range = { start: now - 20, end: now - 10 }
+  const cases = [
+    {
+      name: 'local ask failure',
+      seeders: ['one'],
+      ask: async () => { throw new Error('LOCAL_FAILURE') },
+      retained: true
+    },
+    {
+      name: 'delivery failure',
+      seeders: ['one'],
+      ask: async () => ({ question: { id: 'one' }, delivery: { reports: [{ success: false }] } }),
+      retained: true
+    },
+    {
+      name: 'one failed seeder among several',
+      seeders: ['one', 'two'],
+      ask: async options => ({
+        question: { id: options.receiverPubkey },
+        delivery: { reports: [{ success: options.receiverPubkey === 'one' }] }
+      }),
+      retained: true
+    },
+    {
+      name: 'all seeders delivered',
+      seeders: ['one', 'two'],
+      ask: async options => ({
+        question: { id: options.receiverPubkey },
+        delivery: { reports: [{ success: true }] }
+      }),
+      retained: false
+    }
+  ]
+
+  for (const [index, scenario] of cases.entries()) {
+    await t.test(scenario.name, async () => {
+      const userPubkey = `recovery-user-${index}`
+      await seedMessengerState({ channel: { offlineRanges: [range] } }, userPubkey)
+      const pm = fakePrivateMessage()
+      pm.ask = scenario.ask
+      const messenger = await new PrivateMessenger({
+        _privateMessage: pm,
+        _privateChannel: { fetch: async () => [] }
+      }).init({
+        userSigner: signer(userPubkey),
+        channels: [{
+          pubkey: 'channel',
+          signer: signer('channel'),
+          relays: ['wss://relay.example'],
+          seeders: scenario.seeders
+        }]
+      })
+
+      await messenger.recoverOfflineRanges(['channel'])
+
+      assert.deepEqual(
+        messenger.readState().channels.channel.offlineRanges,
+        scenario.retained ? [range] : []
+      )
+      await messenger.close()
+    })
+  }
 })
 
 test('missing-message replies ignore raw event rows', async () => {
