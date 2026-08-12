@@ -59,7 +59,7 @@ export class Nip46Transport {
   #secretKey
   #pubkey
   #relayPool
-  #networkTimeout
+  #operationTimeout
   #timeoutAfterFirstEose
   #onError
   #contexts = new Set()
@@ -80,7 +80,7 @@ export class Nip46Transport {
     this.#secretKey = secretKey
     this.#pubkey = getPublicKey(secretKey)
     this.#relayPool = relayPool
-    this.#networkTimeout = networkTimeout
+    this.#operationTimeout = networkTimeout
     this.#timeoutAfterFirstEose = timeoutAfterFirstEose
     this.#onError = onError
   }
@@ -111,7 +111,7 @@ export class Nip46Transport {
     return context
   }
 
-  async awaitContextReady (context, { timeout = this.#networkTimeout, signal } = {}) {
+  async awaitContextReady (context, { timeout = this.#operationTimeout, signal } = {}) {
     const report = await waitForNip46(context.stream.ready, {
       timeout,
       signal,
@@ -159,11 +159,14 @@ export class Nip46Transport {
     return true
   }
 
-  async sendRequest (peerPubkey, method, params = [], {
-    timeout = null,
-    signal,
-    extension
-  } = {}) {
+  async sendRequest (peerPubkey, method, params = [], options = {}) {
+    const {
+      // Undefined inherits the constructor-wide operation timeout. Passing
+      // null explicitly is the opt-out for RPCs that may wait indefinitely.
+      timeout = this.#operationTimeout,
+      signal,
+      extension
+    } = options
     if (this.#closed) throw new Error('NIP46_CLOSED')
     if (typeof method !== 'string' || !method) throw new ValidationError('NIP46_METHOD_REQUIRED')
     if (!Array.isArray(params) || !params.every(param => typeof param === 'string')) {
@@ -229,7 +232,7 @@ export class Nip46Transport {
     if (!relays.length) throw new Error('NIP46_NO_READY_RELAYS')
     const event = createNip46Event({ secretKey: this.#secretKey, recipientPubkey: peerPubkey, payload })
     const published = await this.#relayPool.sendEvent(event, relays, {
-      timeout: this.#networkTimeout,
+      timeout: this.#operationTimeout,
       timeoutUntilFirstFulfillment: null
     })
     if (!published.success) {

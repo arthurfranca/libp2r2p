@@ -217,6 +217,54 @@ test('waits for the live listener before publishing a connect request', async ()
   await signer.close()
 })
 
+test('connects to a bunker pointer without a one-use secret', async () => {
+  const clientSecretKey = generateSecretKey()
+  const remoteSecretKey = generateSecretKey()
+  const remoteSignerPubkey = getPublicKey(remoteSecretKey)
+  const relayPool = new FakeRelayPool()
+  const signer = BunkerSigner.fromBunker(clientSecretKey, {
+    remoteSignerPubkey,
+    relays: RELAYS,
+    secret: null
+  }, { relayPool })
+
+  const connecting = signer.connect()
+  await tick()
+  const request = requestPayload({ sent: relayPool.sent[0], remotePubkey: remoteSignerPubkey, clientSecretKey })
+  assert.equal(request.method, 'connect')
+  assert.deepEqual(request.params, [remoteSignerPubkey, ''])
+
+  relayPool.streams[0].stream.emit(responseEvent({
+    remoteSecretKey,
+    clientPubkey: getPublicKey(clientSecretKey),
+    response: { id: request.id, result: 'ack' }
+  }))
+  await tick()
+  const switchRequest = requestPayload({
+    sent: relayPool.sent[1],
+    remotePubkey: remoteSignerPubkey,
+    clientSecretKey
+  })
+  relayPool.streams[0].stream.emit(responseEvent({
+    remoteSecretKey,
+    clientPubkey: getPublicKey(clientSecretKey),
+    response: { id: switchRequest.id, result: 'null' }
+  }))
+
+  await connecting
+  await signer.close()
+})
+
+test('connect uses the configurable client timeout when the signer never replies', async () => {
+  const signer = BunkerSigner.fromBunker(generateSecretKey(), pointer(getPublicKey(generateSecretKey())), {
+    relayPool: new FakeRelayPool(),
+    timeout: 5
+  })
+
+  await assert.rejects(signer.connect(), /NIP46_REQUEST_TIMEOUT/)
+  await signer.close()
+})
+
 test('keeps a request pending across an auth URL and ignores another signer', async () => {
   const clientSecretKey = generateSecretKey()
   const remoteSecretKey = generateSecretKey()
@@ -678,11 +726,17 @@ test('generic client removes pending requests after timeout and abort', async ()
   const clientSecretKey = generateSecretKey()
   const remoteSignerPubkey = getPublicKey(generateSecretKey())
   const client = new Nip46Client(clientSecretKey, pointer(remoteSignerPubkey), {
-    relayPool: new FakeRelayPool()
+    relayPool: new FakeRelayPool(),
+    timeout: 5
   })
 
   await assert.rejects(
-    client.sendRequest('never_replies', [], { timeout: 5 }),
+    client.sendRequest('never_replies', []),
+    /NIP46_REQUEST_TIMEOUT/
+  )
+
+  await assert.rejects(
+    client.sendRequest('override_never_replies', [], { timeout: 1 }),
     /NIP46_REQUEST_TIMEOUT/
   )
 

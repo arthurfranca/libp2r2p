@@ -129,7 +129,9 @@ export class Nip46Client {
   get pointer () { return { ...this.#pointer, relays: [...this.#pointer.relays] } }
 
   // Connects and immediately asks the remote signer for its preferred relays.
-  async connect ({ requestedPermissions = [], clientMetadata, timeout = null, signal } = {}) {
+  // An omitted timeout inherits the configurable constructor timeout; null
+  // explicitly disables the response deadline.
+  async connect ({ requestedPermissions = [], clientMetadata, timeout, signal } = {}) {
     const permissions = Array.isArray(requestedPermissions)
       ? requestedPermissions.filter(permission => typeof permission === 'string' && permission).join(',')
       : ''

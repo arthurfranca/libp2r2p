@@ -278,6 +278,12 @@ NIP-44 v2 uses the interoperable `nip44-v2` salt by default. A custom UTF-8
 salt of at most 32 bytes may be passed to `getConversationKey()`, but messages
 derived with it are not interoperable with standard NIP-44 implementations.
 
+NIP-46 clients and bunker signers use a 30-second operation timeout by
+default. Set `timeout` in the `Nip46Client`/`BunkerSigner` constructor to
+choose another default, override it for an individual `connect()` or RPC, or
+pass `timeout: null` explicitly when an operation is intentionally allowed to
+wait indefinitely.
+
 Nostr Web Tokens are available from `libp2r2p/nwt`. Creation returns a signed
 kind `27519` event, while transport encoding is kept separate:
 
