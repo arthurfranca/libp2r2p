@@ -33,7 +33,11 @@ test('new public Nostr subpaths expose only the used surface', async () => {
     ],
     nip98: ['getToken'],
     nwt: ['createToken', 'decodeToken', 'encodeToken', 'validateToken'],
-    url: ['assertValidPublicRelayUrl', 'isValidPublicRelayUrl', 'normalizeRelayUrl']
+    url: [
+      'assertValidPublicBlossomServerUrl', 'assertValidPublicRelayUrl',
+      'isValidPublicBlossomServerUrl', 'isValidPublicRelayUrl',
+      'normalizeBlossomServerUrl', 'normalizeRelayUrl'
+    ]
   }
 
   for (const [subpath, names] of Object.entries(expected)) {

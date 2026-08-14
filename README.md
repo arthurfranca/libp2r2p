@@ -264,8 +264,17 @@ import {
 import { generateSecretKey, getPublicKey } from 'libp2r2p/key'
 import { eventKinds, classifyKind } from 'libp2r2p/kind'
 import * as nip44 from 'libp2r2p/nip44'
-import { assertValidPublicRelayUrl, normalizeRelayUrl } from 'libp2r2p/url'
+import {
+  assertValidPublicBlossomServerUrl,
+  assertValidPublicRelayUrl,
+  normalizeBlossomServerUrl,
+  normalizeRelayUrl
+} from 'libp2r2p/url'
 ```
+
+Blossom server normalization accepts root `http:` origins for local
+development. Public Blossom validation additionally requires `https:` and a
+public host, and rejects credentials, paths, query strings and fragments.
 
 `classifyEvent()` from `libp2r2p/event` combines the exact NIP-01 kind
 ranges with tag-defined behavior. The first `d` tag may add `replaceable` or

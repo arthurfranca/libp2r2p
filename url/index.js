@@ -53,6 +53,30 @@ function removeEmptyQuerySegments (url) {
   url.searchParams.sort()
 }
 
+function publicHostError (url, {
+  invalidHostCode,
+  nonPublicHostCode,
+  nonPublicIpCode
+}) {
+  const hostname = url.hostname.toLowerCase().replace(/\.+$/, '')
+  if (
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname.endsWith('.local') ||
+    hostname.endsWith('.onion')
+  ) return nonPublicHostCode
+
+  const unwrappedHostname = hostname.replace(/^\[|\]$/g, '')
+  if (isIpv4Address(unwrappedHostname)) {
+    if (!isPublicIpv4Address(unwrappedHostname)) return nonPublicIpCode
+  } else if (unwrappedHostname.includes(':')) {
+    if (!isPublicIpv6Address(unwrappedHostname)) return nonPublicIpCode
+  } else if (!hostname.includes('.')) {
+    return invalidHostCode
+  }
+  return null
+}
+
 export function normalizeRelayUrl (value) {
   if (typeof value !== 'string' || value.trim().length === 0) {
     throw new ValidationError('INVALID_RELAY_URL', { message: 'URL_SHOULD_BE_A_STRING' })
@@ -76,6 +100,36 @@ export function normalizeRelayUrl (value) {
   return url.toString().replace(/^(wss?:\/\/[^/?#]+)\/(?=[?#]|$)/, '$1')
 }
 
+// Canonicalizes the origin used by the root-level Blossom HTTP endpoints.
+export function normalizeBlossomServerUrl (value) {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new ValidationError('INVALID_BLOSSOM_SERVER_URL', { message: 'URL_SHOULD_BE_A_STRING' })
+  }
+  const input = value.trim()
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(input)) {
+    throw new ValidationError('INVALID_BLOSSOM_SERVER_URL', { message: 'ABSOLUTE_URL_REQUIRED' })
+  }
+  let url
+  try {
+    url = new URL(input)
+  } catch (cause) {
+    throw new ValidationError('INVALID_BLOSSOM_SERVER_URL', { cause })
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new ValidationError('INVALID_BLOSSOM_SERVER_PROTOCOL')
+  }
+  if (url.username || url.password) {
+    throw new ValidationError('BLOSSOM_SERVER_URL_CREDENTIALS_NOT_ALLOWED')
+  }
+  if (!/^\/*$/.test(url.pathname)) {
+    throw new ValidationError('BLOSSOM_SERVER_URL_PATH_NOT_ALLOWED')
+  }
+  if (url.search) throw new ValidationError('BLOSSOM_SERVER_URL_QUERY_NOT_ALLOWED')
+  if (url.hash) throw new ValidationError('BLOSSOM_SERVER_URL_FRAGMENT_NOT_ALLOWED')
+  url.hostname = url.hostname.replace(/\.+$/, '')
+  return url.origin
+}
+
 function publicRelayUrlError (value) {
   if (typeof value !== 'string' || value.trim().length === 0) return 'INVALID_RELAY_URL'
   let input = value.trim()
@@ -97,22 +151,12 @@ function publicRelayUrlError (value) {
   if (url.protocol !== 'wss:') return 'INSECURE_RELAY_URL'
   if (url.username || url.password) return 'RELAY_URL_CREDENTIALS_NOT_ALLOWED'
 
-  const hostname = url.hostname.toLowerCase()
-  if (
-    hostname === 'localhost' ||
-    hostname.endsWith('.localhost') ||
-    hostname.endsWith('.local') ||
-    hostname.endsWith('.onion')
-  ) return 'NON_PUBLIC_RELAY_HOST'
-
-  const unwrappedHostname = hostname.replace(/^\[|\]$/g, '')
-  if (isIpv4Address(unwrappedHostname)) {
-    if (!isPublicIpv4Address(unwrappedHostname)) return 'NON_PUBLIC_RELAY_IP'
-  } else if (unwrappedHostname.includes(':')) {
-    if (!isPublicIpv6Address(unwrappedHostname)) return 'NON_PUBLIC_RELAY_IP'
-  } else if (!hostname.includes('.')) {
-    return 'INVALID_RELAY_HOST'
-  }
+  const hostError = publicHostError(url, {
+    invalidHostCode: 'INVALID_RELAY_HOST',
+    nonPublicHostCode: 'NON_PUBLIC_RELAY_HOST',
+    nonPublicIpCode: 'NON_PUBLIC_RELAY_IP'
+  })
+  if (hostError) return hostError
 
   const lowerValue = normalized.toLowerCase()
   if (lowerValue.includes('npub1') || lowerValue.includes('nprofile1')) return 'RELAY_URL_NOSTR_ENTITY_NOT_ALLOWED'
@@ -126,6 +170,32 @@ export function isValidPublicRelayUrl (value) {
 
 export function assertValidPublicRelayUrl (value) {
   const code = publicRelayUrlError(value)
+  if (code) throw new ValidationError(code)
+  return value
+}
+
+function publicBlossomServerUrlError (value) {
+  let normalized
+  try {
+    normalized = normalizeBlossomServerUrl(value)
+  } catch (error) {
+    return error instanceof ValidationError ? error.code : 'INVALID_BLOSSOM_SERVER_URL'
+  }
+  const url = new URL(normalized)
+  if (url.protocol !== 'https:') return 'INSECURE_BLOSSOM_SERVER_URL'
+  return publicHostError(url, {
+    invalidHostCode: 'INVALID_BLOSSOM_SERVER_HOST',
+    nonPublicHostCode: 'NON_PUBLIC_BLOSSOM_SERVER_HOST',
+    nonPublicIpCode: 'NON_PUBLIC_BLOSSOM_SERVER_IP'
+  })
+}
+
+export function isValidPublicBlossomServerUrl (value) {
+  return publicBlossomServerUrlError(value) === null
+}
+
+export function assertValidPublicBlossomServerUrl (value) {
+  const code = publicBlossomServerUrlError(value)
   if (code) throw new ValidationError(code)
   return value
 }
