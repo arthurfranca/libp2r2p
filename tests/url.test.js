@@ -67,6 +67,35 @@ test('isValidPublicRelayUrl rejects local, private and disguised relay URLs', ()
   ))
 })
 
+test('isValidPublicRelayUrl accepts onion, standardized local relays and nostr entity URLs under policy', () => {
+  const onion = 'ws://oxtrdevav64z64yb7x6rjg4ntzqjhedm5b5zjqulugknhzr46ny2qbad.onion'
+  const policy = { onion: true, localRelay: true, nostrEntityUrls: true }
+
+  assert.equal(isValidPublicRelayUrl(onion, policy), true)
+  assert.equal(isValidPublicRelayUrl('ws://localhost:4869', policy), true)
+  assert.equal(isValidPublicRelayUrl('wss://relay.example/npub1abc', policy), true)
+  assert.equal(isValidPublicRelayUrl('wss://nprofile1.example', policy), true)
+  assert.equal(assertValidPublicRelayUrl(onion, policy), onion)
+
+  // Each exception stays opt-in: without the matching policy flag it is rejected.
+  assert.equal(isValidPublicRelayUrl(onion), false)
+  assert.equal(isValidPublicRelayUrl('ws://localhost:4869'), false)
+  assert.equal(isValidPublicRelayUrl('wss://npub1example.com', { nostrEntityUrls: true }), true)
+  assert.equal(isValidPublicRelayUrl('wss://npub1example.com'), false)
+
+  // Everything else keeps being rejected even with the policy enabled.
+  for (const value of [
+    'ws://relay.example.com',
+    'ws://localhost:8080',
+    'wss://localhost',
+    'ws://relay.onion.evil.example',
+    'ws://127.0.0.1:4869',
+    'ws://localhost:4869/other'
+  ]) {
+    assert.equal(isValidPublicRelayUrl(value, policy), false, value)
+  }
+})
+
 test('normalizeBlossomServerUrl canonicalizes root HTTP origins', () => {
   assert.equal(normalizeBlossomServerUrl(' HTTPS://BLOSSOM.EXAMPLE.COM:443/ '), 'https://blossom.example.com')
   assert.equal(normalizeBlossomServerUrl('http://localhost:3000////'), 'http://localhost:3000')

@@ -130,7 +130,14 @@ export function normalizeBlossomServerUrl (value) {
   return url.origin
 }
 
-function publicRelayUrlError (value) {
+function isPolicyRelayUrl (url, policy) {
+  const hostname = url.hostname.toLowerCase().replace(/\.+$/, '')
+  if (policy?.onion && hostname.endsWith('.onion')) return true
+  if (policy?.localRelay && hostname === 'localhost' && url.port === '4869' && (url.pathname === '/' || url.pathname === '')) return true
+  return false
+}
+
+function publicRelayUrlError (value, policy = {}) {
   if (typeof value !== 'string' || value.trim().length === 0) return 'INVALID_RELAY_URL'
   let input = value.trim()
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(input)) input = `wss://${input}`
@@ -148,28 +155,33 @@ function publicRelayUrlError (value) {
   }
 
   const url = new URL(normalized)
-  if (url.protocol !== 'wss:') return 'INSECURE_RELAY_URL'
+  const policyRelay = isPolicyRelayUrl(url, policy)
+  if (url.protocol !== 'wss:' && !policyRelay) return 'INSECURE_RELAY_URL'
   if (url.username || url.password) return 'RELAY_URL_CREDENTIALS_NOT_ALLOWED'
 
-  const hostError = publicHostError(url, {
-    invalidHostCode: 'INVALID_RELAY_HOST',
-    nonPublicHostCode: 'NON_PUBLIC_RELAY_HOST',
-    nonPublicIpCode: 'NON_PUBLIC_RELAY_IP'
-  })
-  if (hostError) return hostError
+  if (!policyRelay) {
+    const hostError = publicHostError(url, {
+      invalidHostCode: 'INVALID_RELAY_HOST',
+      nonPublicHostCode: 'NON_PUBLIC_RELAY_HOST',
+      nonPublicIpCode: 'NON_PUBLIC_RELAY_IP'
+    })
+    if (hostError) return hostError
+  }
 
-  const lowerValue = normalized.toLowerCase()
-  if (lowerValue.includes('npub1') || lowerValue.includes('nprofile1')) return 'RELAY_URL_NOSTR_ENTITY_NOT_ALLOWED'
+  if (!policy?.nostrEntityUrls) {
+    const lowerValue = normalized.toLowerCase()
+    if (lowerValue.includes('npub1') || lowerValue.includes('nprofile1')) return 'RELAY_URL_NOSTR_ENTITY_NOT_ALLOWED'
+  }
 
   return null
 }
 
-export function isValidPublicRelayUrl (value) {
-  return publicRelayUrlError(value) === null
+export function isValidPublicRelayUrl (value, policy) {
+  return publicRelayUrlError(value, policy) === null
 }
 
-export function assertValidPublicRelayUrl (value) {
-  const code = publicRelayUrlError(value)
+export function assertValidPublicRelayUrl (value, policy) {
+  const code = publicRelayUrlError(value, policy)
   if (code) throw new ValidationError(code)
   return value
 }

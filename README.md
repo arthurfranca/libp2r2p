@@ -341,6 +341,54 @@ Low-level relay sockets, subscriptions, message parsing, and serialization are
 internal implementation details; use `RelayPool` or the `relayPool` singleton
 from `libp2r2p/relay`.
 
+The same public subpath exports `getRelaysByPubkey(pubkeys)`, which discovers
+the latest NIP-65 relay list for every requested pubkey through `seedRelays`,
+normalizes and deduplicates its public relay URLs, and falls back to the first
+two `freeRelays` when no list is available. Its result can be passed directly
+to `pickRelaysForPubkeys(pubkeys, relaysByPubkey)` to batch authors that share
+read or write relays.
+
+`getRelaysByPubkey` accepts a few options:
+
+- `includeEvents` returns each pubkey's latest kind `10002` event alongside its
+  parsed relays (`{ read, write, event }`), for consumers that need the original
+  event (storage, re-signing, freshness tracking).
+- `forceRefresh` re-queries `seedRelays` even when the pubkey is cached, without
+  regressing a newer cached event when the relay returns an older one.
+- `timeout` / `timeoutAfterFirstEose` tune the relay-list query timing. The
+  default opens a short grace window after the first EOSE with events, matching
+  `RelayPool.getEvents`.
+- `emptyRelaysFallback` sets the relays returned when a pubkey has no relay
+  list (default: the first two `freeRelays`); pass `[]` to return empty
+  `read`/`write` arrays instead, keeping the free-relay decision with the
+  caller.
+- `relayUrlPolicy` opts into non-default URL validation: `onion` allows
+  `ws://`/`wss://` `.onion` hosts, `localRelay` allows the standardized
+  `ws://localhost:4869` local relay, and `nostrEntityUrls` stops rejecting
+  public URLs that contain `npub1`/`nprofile1`. All other non-public or
+  insecure URLs stay rejected.
+
+`parseRelayListEvent(event, relayUrlPolicy)` is exported from the same subpath
+for consumers that parse relay-list events they receive outside
+`getRelaysByPubkey`, so routing and persistence always agree on the parsed
+shape.
+
+`pickRelaysForPubkeys` also accepts `excludeRelaysByPubkey` (relays already
+queried per pubkey, as an object or `Map`) and `emptyRelaysFallback` (the
+relays used when a pubkey has no typed relays; pass `[]` to leave that pubkey
+unrouted). Together with `maxPerPubkey: Infinity` these express a second,
+exhaustive pass over the relays that were not yet tried for each author.
+
+For callers that want the whole two-pass flow, `getLatestEventsByPubkey`
+fetches the latest replaceable events (or addressable events when
+`dTagsByPubkey` maps pubkeys to their `d` tags) through NIP-65 write relays:
+the first pass routes through up to `maxPerPubkey` shared relays, and missing
+authors are retried on every remaining relay plus `fallbackRelays` (default:
+the first three `freeRelays`), excluding what was already queried. It accepts
+`relaysByPubkey` to reuse a previous discovery (only missing pubkeys are then
+discovered) and returns `{ events, byPubkey, relaysByPubkey }` so the merged
+relay map can be passed back on later calls.
+
 ## Binary encodings
 
 Base16, Base36, Base62, Base64/Base64URL, and Base93 helpers are available

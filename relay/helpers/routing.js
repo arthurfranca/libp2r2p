@@ -2,15 +2,30 @@ import { freeRelays } from '../constants/index.js'
 
 const DEFAULT_RELAYS_PER_PUBKEY = 2
 
+function excludedRelaysFor (excludeRelaysByPubkey, pubkey) {
+  if (!excludeRelaysByPubkey) return []
+  return excludeRelaysByPubkey instanceof Map
+    ? excludeRelaysByPubkey.get(pubkey) || []
+    : excludeRelaysByPubkey[pubkey] || []
+}
+
 // Given pubkeys and their relay mappings, picks the minimum set of relays
 // that covers all pubkeys (up to maxPerPubkey relays each), preferring
 // relays shared by more pubkeys. Returns Map<relayUrl, pubkey[]>.
-export function pickRelaysForPubkeys (pubkeys, relaysByPubkey, { maxPerPubkey = DEFAULT_RELAYS_PER_PUBKEY, relayType = 'write' } = {}) {
+export function pickRelaysForPubkeys (pubkeys, relaysByPubkey, {
+  maxPerPubkey = DEFAULT_RELAYS_PER_PUBKEY,
+  relayType = 'write',
+  excludeRelaysByPubkey,
+  emptyRelaysFallback = freeRelays.slice(0, DEFAULT_RELAYS_PER_PUBKEY)
+} = {}) {
   const type = relayType === 'read' ? 'read' : 'write'
   const pkToPossibleRelays = new Map()
   for (const pk of pubkeys) {
     const relays = relaysByPubkey[pk]?.[type] || []
-    pkToPossibleRelays.set(pk, new Set(relays.length ? relays : freeRelays.slice(0, DEFAULT_RELAYS_PER_PUBKEY)))
+    const excluded = new Set(excludedRelaysFor(excludeRelaysByPubkey, pk))
+    const candidates = (relays.length ? relays : emptyRelaysFallback)
+      .filter(relay => !excluded.has(relay))
+    pkToPossibleRelays.set(pk, new Set(candidates))
   }
 
   const relayCounts = new Map()
