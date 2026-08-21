@@ -1,5 +1,7 @@
 import { ValidationError } from '../error/index.js'
 
+export * from './app-url.js'
+
 function isIpv4Address (hostname) {
   const parts = hostname.split('.')
   return parts.length === 4 && parts.every(part =>

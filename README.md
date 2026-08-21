@@ -329,6 +329,21 @@ the Schnorr signature on every call; it never adds a cache marker to the
 event. Their `assert…` counterparts return the original event or throw a
 `ValidationError` with a stable code.
 
+NIP-27 text references live in `libp2r2p/nip27`. `extractMedia()` splits
+content into text, URL, profile, event, relay, NIP-05 and hashtag items in
+occurrence order, accepting the optional `@` and `nostr:` mention prefixes
+plus NIP-05 in its standard, root and custom compact spellings.
+`decodeReference()` parses a single reference, and `decodeMediaMetadata()`
+reads the file/media metadata carried in a URL fragment
+(`#m=image/png&dim=640x480&...`).
+
+User references (`npub`, `nprofile`, hex pubkeys and every NIP-05 spelling)
+are handled by `libp2r2p/nip27`: `decodeUserReference()` returns the decoded
+form with its canonical compact spelling, `encodeUserReference()` returns
+that canonical spelling, and `resolveUserReference()` resolves it to a
+pubkey. `libp2r2p/nip05` keeps only `queryProfile()`, the NIP-05 lookup, which
+accepts the compact custom forms directly.
+
 Public validity checks consistently use a non-throwing `is…` predicate plus an
 `assert…` counterpart when callers need the exact reason. Strict codecs,
 decoders, token validation, and malformed public arguments also throw

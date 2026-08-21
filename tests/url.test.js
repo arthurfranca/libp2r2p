@@ -2,9 +2,13 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { ValidationError } from '../error/index.js'
+import { appEncode, npubEncode, nprofileEncode } from '../nip19/index.js'
 import {
+  APP_URL_MIN_ENTITY_BODY_LENGTH,
   assertValidPublicBlossomServerUrl,
   assertValidPublicRelayUrl,
+  decodeAppUrl,
+  encodeAppUrl,
   isValidPublicBlossomServerUrl,
   isValidPublicRelayUrl,
   normalizeBlossomServerUrl,
@@ -117,6 +121,123 @@ test('normalizeBlossomServerUrl rejects ambiguous or non-Blossom base URLs', () 
       error instanceof ValidationError && error.code === code
     ), value)
   }
+})
+
+test('decodeAppUrl recognizes legacy NIP-19 app entities', () => {
+  const entity = appEncode({
+    dTag: 'apps',
+    pubkey: 'ab'.repeat(32),
+    kind: 35128
+  })
+  assert.deepEqual(decodeAppUrl(entity), { type: 'entity', entity })
+})
+
+test('decodeAppUrl parses named URLs without user and enforces the reserved entity length', () => {
+  assert.deepEqual(decodeAppUrl('+apps'), {
+    type: 'named',
+    prefix: '+',
+    channel: 'main',
+    appName: 'apps',
+    user: null
+  })
+  assert.deepEqual(decodeAppUrl('++app store'), {
+    type: 'named',
+    prefix: '++',
+    channel: 'next',
+    appName: 'app store',
+    user: null
+  })
+  assert.equal(decodeAppUrl(`+${'a'.repeat(APP_URL_MIN_ENTITY_BODY_LENGTH)}`), null)
+  assert.equal(decodeAppUrl('+'), null)
+  assert.equal(decodeAppUrl('+app/route'), null)
+})
+
+test('decodeAppUrl parses NIP-05 standard, root and custom extension forms', () => {
+  assert.deepEqual(decodeAppUrl('+app@bob@example.com').user, {
+    kind: 'nip05',
+    local: 'bob',
+    domain: 'example.com',
+    raw: 'bob.example.com'
+  })
+  assert.deepEqual(decodeAppUrl('+app@fiatjaf.com').user, {
+    kind: 'nip05',
+    local: '_',
+    domain: 'fiatjaf.com',
+    raw: 'fiatjaf.com'
+  })
+  assert.deepEqual(decodeAppUrl('+app@bob.xyz.abc.example.com').user, {
+    kind: 'nip05',
+    local: 'bob',
+    domain: 'xyz.abc.example.com',
+    raw: 'bob.xyz.abc.example.com'
+  })
+  assert.deepEqual(decodeAppUrl('+app@_@fiatjaf.com.br').user, {
+    kind: 'nip05',
+    local: '_',
+    domain: 'fiatjaf.com.br',
+    raw: '_@fiatjaf.com.br'
+  })
+})
+
+test('decodeAppUrl keeps @ inside app names and decodes percent-encoded UTF-8', () => {
+  const decoded = decodeAppUrl('+my%40app@bob@example.com')
+  assert.equal(decoded.type, 'named')
+  assert.equal(decoded.appName, 'my@app')
+  assert.equal(decoded.user.local, 'bob')
+
+  const unicode = decodeAppUrl('+caf%C3%A9%20%E6%97%A5%E6%9C%AC@fiatjaf.com')
+  assert.equal(unicode.appName, 'café 日本')
+  assert.equal(unicode.user.local, '_')
+})
+
+test('decodeAppUrl accepts npub, nprofile and hex users', () => {
+  const hex = 'ab'.repeat(32)
+  assert.equal(decodeAppUrl(`+app@${hex}`).user.kind, 'pubkey')
+  assert.equal(decodeAppUrl(`+app@${hex}`).user.pubkey, hex)
+
+  const npub = npubEncode(hex)
+  assert.equal(decodeAppUrl(`+app@${npub}`).user.kind, 'pubkey')
+  const nprofile = nprofileEncode({ pubkey: hex, relays: ['wss://relay.example'] })
+  const nprofileUser = decodeAppUrl(`+app@${nprofile}`).user
+  assert.equal(nprofileUser.kind, 'pubkey')
+  assert.deepEqual(nprofileUser.relays, ['wss://relay.example'])
+})
+
+test('encodeAppUrl round-trips through decodeAppUrl', () => {
+  const cases = [
+    { appName: 'apps', channel: 'main', user: 'fiatjaf.com' },
+    { appName: 'my@app', channel: 'main', user: 'bob@example.com' },
+    { appName: 'app store', channel: 'next', user: '_@fiatjaf.com.br' },
+    { appName: 'café 日本', channel: 'draft', user: 'ab'.repeat(32) },
+    { appName: 'my@app', channel: 'main', user: npubEncode('cd'.repeat(32)) }
+  ]
+  for (const input of cases) {
+    const encoded = encodeAppUrl(input)
+    const decoded = decodeAppUrl(encoded)
+    assert.equal(decoded.type, 'named')
+    assert.equal(decoded.channel, input.channel)
+    assert.equal(decoded.appName, input.appName)
+    assert.ok(decoded.user)
+  }
+})
+
+test('encodeAppUrl picks the shortest unambiguous NIP-05 form', () => {
+  assert.equal(
+    encodeAppUrl({ appName: 'app', channel: 'main', user: 'bob@example.com' }),
+    '+app@bob.example.com'
+  )
+  assert.equal(
+    encodeAppUrl({ appName: 'my@app', channel: 'main', user: 'bob@example.com' }),
+    '+my@app@bob@example.com'
+  )
+  assert.equal(
+    encodeAppUrl({ appName: 'app', channel: 'main', user: 'fiatjaf.com' }),
+    '+app@fiatjaf.com'
+  )
+  assert.equal(
+    encodeAppUrl({ appName: 'my@app', channel: 'main', user: 'fiatjaf.com' }),
+    '+my@app@_@fiatjaf.com'
+  )
 })
 
 test('isValidPublicBlossomServerUrl accepts secure public origins', () => {

@@ -1,6 +1,6 @@
 {
   "name": "libp2r2p",
-  "version": "0.10.6",
+  "version": "0.10.7",
   "description": "Peer-to-relay-to-peer",
   "keywords": [
     "p2r2p",
@@ -31,6 +31,7 @@
     "nip04",
     "nip05",
     "nip19",
+    "nip27",
     "nip44",
     "nip44-v3",
     "nip46",
@@ -71,6 +72,7 @@
     "./nip04": "./nip04/index.js",
     "./nip05": "./nip05/index.js",
     "./nip19": "./nip19/index.js",
+    "./nip27": "./nip27/index.js",
     "./nip44": "./nip44/index.js",
     "./nip44-v3": "./nip44-v3/index.js",
     "./nip46": "./nip46/index.js",

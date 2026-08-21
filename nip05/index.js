@@ -1,7 +1,7 @@
 import { normalizeRelayUrl } from '../url/index.js'
+import { decodeNip05Identifier } from './helpers/nip05-identifier.js'
 
 const PUBKEY = /^[0-9a-f]{64}$/
-const LOCAL_PART = /^[a-z0-9._-]+$/
 
 export async function queryProfile (identifier, {
   fetch: fetchImpl = globalThis.fetch,
@@ -9,17 +9,15 @@ export async function queryProfile (identifier, {
   timeoutMs = 5000
 } = {}) {
   if (typeof identifier !== 'string' || typeof fetchImpl !== 'function') return null
-  const normalized = identifier.trim().toLowerCase()
-  const separator = normalized.lastIndexOf('@')
-  if (separator <= 0 || separator === normalized.length - 1) return null
-  const name = normalized.slice(0, separator)
-  const domain = normalized.slice(separator + 1)
-  if (!LOCAL_PART.test(name) || /[/?#@]/.test(domain)) return null
+  const nip05 = decodeNip05Identifier(identifier)
+  if (!nip05) return null
+  const name = nip05.local
+  const domain = nip05.domain
 
   let url
   try {
     url = new URL(`https://${domain}/.well-known/nostr.json`)
-    if (url.hostname !== domain.split(':')[0] || url.username || url.password) return null
+    if (url.hostname !== domain || url.username || url.password) return null
     url.searchParams.set('name', name)
   } catch {
     return null

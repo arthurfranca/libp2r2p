@@ -41,3 +41,21 @@ test('NIP-05 propagates caller cancellation', async () => {
   controller.abort(new DOMException('cancelled', 'AbortError'))
   await assert.rejects(promise, { name: 'AbortError' })
 })
+
+test('queryProfile accepts root and compact custom NIP-05 forms', async () => {
+  const pubkey = 'ab'.repeat(32)
+  let requested
+  const fetchJson = names => async url => {
+    requested = String(url)
+    return new Response(JSON.stringify({ names, relays: {} }), { status: 200 })
+  }
+
+  await queryProfile('bob.fiatjaf.com', { fetch: fetchJson({ bob: pubkey }) })
+  assert.equal(requested, 'https://fiatjaf.com/.well-known/nostr.json?name=bob')
+
+  await queryProfile('fiatjaf.com', { fetch: fetchJson({ _: pubkey }) })
+  assert.equal(requested, 'https://fiatjaf.com/.well-known/nostr.json?name=_')
+
+  await queryProfile('_@fiatjaf.com.br', { fetch: fetchJson({ _: pubkey }) })
+  assert.equal(requested, 'https://fiatjaf.com.br/.well-known/nostr.json?name=_')
+})

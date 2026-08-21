@@ -8,7 +8,8 @@ import {
   isEphemeralKind,
   isRegularKind,
   isReplaceableKind,
-  PERSONAL_COPY
+  PERSONAL_COPY,
+  SITE_CURATION_SET
 } from '../kind/index.js'
 
 test('kind helpers follow the exact NIP-01 ranges', () => {
@@ -28,5 +29,7 @@ test('named kind exports and the aggregate retain project-specific kinds', () =>
   assert.equal(PERSONAL_COPY, 1006)
   assert.equal(eventKinds.PERSONAL_COPY, PERSONAL_COPY)
   assert.equal(eventKinds.BINARY_DATA_CHUNK, 34601)
+  assert.equal(SITE_CURATION_SET, 30499)
+  assert.equal(eventKinds.SITE_CURATION_SET, SITE_CURATION_SET)
   assert.equal(Object.isFrozen(eventKinds), true)
 })

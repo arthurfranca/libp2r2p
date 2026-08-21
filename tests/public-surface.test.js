@@ -10,9 +10,9 @@ test('new public Nostr subpaths expose only the used surface', async () => {
       'parseContentKeyEvent'
     ],
     event: [
-      'assertSerializableEvent', 'assertValidEvent', 'classifyEvent', 'finalizeEvent',
-      'getEventHash', 'isAddressableEvent', 'isEphemeralEvent', 'isRegularEvent',
-      'isReplaceableEvent', 'isSerializableEvent', 'isValidEvent'
+      'assertSerializableEvent', 'assertValidEvent', 'classifyEvent',
+      'finalizeEvent', 'getEventHash', 'isAddressableEvent', 'isEphemeralEvent',
+      'isRegularEvent', 'isReplaceableEvent', 'isSerializableEvent', 'isValidEvent'
     ],
     error: ['ValidationError'],
     key: [
@@ -23,6 +23,10 @@ test('new public Nostr subpaths expose only the used surface', async () => {
     kind: [],
     nip04: ['decrypt', 'encrypt'],
     nip05: ['queryProfile'],
+    nip27: [
+      'decodeMediaMetadata', 'decodeReference', 'decodeUserReference',
+      'encodeUserReference', 'extractMedia', 'resolveUserReference'
+    ],
     nip44: ['decrypt', 'encrypt', 'getConversationKey'],
     nip96: [
       'assertValidDelayedProcessingResponse', 'assertValidFileUploadResponse',
@@ -34,7 +38,9 @@ test('new public Nostr subpaths expose only the used surface', async () => {
     nip98: ['getToken'],
     nwt: ['createToken', 'decodeToken', 'encodeToken', 'validateToken'],
     url: [
+      'APP_URL_MIN_ENTITY_BODY_LENGTH', 'appUrlKindByChannel',
       'assertValidPublicBlossomServerUrl', 'assertValidPublicRelayUrl',
+      'decodeAppUrl', 'encodeAppUrl',
       'isValidPublicBlossomServerUrl', 'isValidPublicRelayUrl',
       'normalizeBlossomServerUrl', 'normalizeRelayUrl'
     ]
@@ -47,6 +53,7 @@ test('new public Nostr subpaths expose only the used surface', async () => {
       assert.ok(actual.includes('classifyKind'))
       assert.ok(actual.includes('isRegularKind'))
       assert.ok(actual.includes('PERSONAL_COPY'))
+      assert.ok(actual.includes('SITE_CURATION_SET'))
       continue
     }
     assert.deepEqual(actual, names.sort())
