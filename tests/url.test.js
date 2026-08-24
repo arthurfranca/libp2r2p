@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { ValidationError } from '../error/index.js'
-import { appEncode, npubEncode, nprofileEncode } from '../nip19/index.js'
+import { appEncode, naddrEncode, npubEncode, nprofileEncode } from '../nip19/index.js'
 import {
   APP_URL_MIN_ENTITY_BODY_LENGTH,
   assertValidPublicBlossomServerUrl,
@@ -130,6 +130,28 @@ test('decodeAppUrl recognizes legacy NIP-19 app entities', () => {
     kind: 35128
   })
   assert.deepEqual(decodeAppUrl(entity), { type: 'entity', entity })
+})
+
+test('decodeAppUrl canonicalizes site-manifest naddr entities', () => {
+  const pubkey = 'ab'.repeat(32)
+  for (const kind of [35128, 35129, 35130]) {
+    const naddr = naddrEncode({ identifier: 'my-app', pubkey, kind })
+    const expected = appEncode({ dTag: 'my-app', pubkey, kind })
+
+    assert.deepEqual(decodeAppUrl(naddr), { type: 'entity', entity: expected })
+    // A leading + marker is tolerated but not required.
+    assert.deepEqual(decodeAppUrl(`+${naddr}`), { type: 'entity', entity: expected })
+  }
+})
+
+test('decodeAppUrl rejects naddr that is not a site manifest', () => {
+  const naddr = naddrEncode({ identifier: 'note', pubkey: 'ab'.repeat(32), kind: 1 })
+  assert.equal(decodeAppUrl(naddr), null)
+  assert.equal(decodeAppUrl(`+${naddr}`), null)
+})
+
+test('decodeAppUrl rejects malformed naddr', () => {
+  assert.equal(decodeAppUrl('naddr1notavalidbech32'), null)
 })
 
 test('decodeAppUrl parses named URLs without user and enforces the reserved entity length', () => {

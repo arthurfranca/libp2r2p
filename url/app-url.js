@@ -9,10 +9,24 @@ import {
 } from '../nip27/helpers/user-reference.js'
 import {
   NAPP_ENTITY_REGEX,
-  appDecode
+  appDecode,
+  appEncode,
+  naddrDecode
 } from '../nip19/index.js'
+import {
+  DRAFT_SITE_MANIFEST,
+  MAIN_SITE_MANIFEST,
+  NEXT_SITE_MANIFEST
+} from '../kind/index.js'
 
 export const APP_URL_MIN_ENTITY_BODY_LENGTH = 48
+
+const SITE_MANIFEST_KINDS = new Set([
+  MAIN_SITE_MANIFEST,
+  NEXT_SITE_MANIFEST,
+  DRAFT_SITE_MANIFEST
+])
+const NADDR_PREFIX = 'naddr1'
 
 const APP_NAME_MAX_LENGTH = 260
 const CHANNEL_BY_PREFIX = { '+': 'main', '++': 'next', '+++': 'draft' }
@@ -38,6 +52,38 @@ function isValidAppName (appName) {
     !CONTROL_CHARS.test(appName)
 }
 
+// `naddr` already carries the event kind, so it does not need the `+`/`++`/
+// `+++` channel prefix (a leading prefix is still tolerated). Only site
+// manifests are app URLs; the result is canonicalized to the `appEncode`
+// entity so downstream code keeps working unchanged.
+function tryDecodeNaddr (value) {
+  if (typeof value !== 'string' || !value) return null
+  const body = value.replace(/^\+{1,3}/, '')
+  if (!body.startsWith(NADDR_PREFIX)) return null
+
+  let decoded
+  try {
+    decoded = naddrDecode(body)
+  } catch {
+    return null
+  }
+  if (!SITE_MANIFEST_KINDS.has(decoded.kind)) return null
+
+  try {
+    return {
+      type: 'entity',
+      entity: appEncode({
+        dTag: decoded.identifier,
+        pubkey: decoded.pubkey,
+        kind: decoded.kind,
+        relays: decoded.relays
+      })
+    }
+  } catch {
+    return null
+  }
+}
+
 // Decodes a raw (still percent-encoded) first path segment such as
 // `+apps` or `+caf%C3%A9@bob@example.com` or `+3swFhu...`.
 // Returns:
@@ -47,6 +93,9 @@ function isValidAppName (appName) {
 // - `null` when the segment is not a valid app URL.
 export function decodeAppUrl (segment) {
   if (typeof segment !== 'string' || !segment) return null
+  const decodedNaddr = tryDecodeNaddr(segment)
+  if (decodedNaddr) return decodedNaddr
+
   const prefixMatch = segment.match(/^\+{1,3}/)
   if (!prefixMatch) return null
   const prefix = prefixMatch[0]
