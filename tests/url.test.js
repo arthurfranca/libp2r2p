@@ -176,25 +176,25 @@ test('decodeAppUrl parses named URLs without user and enforces the reserved enti
 
 test('decodeAppUrl parses NIP-05 standard, root and custom extension forms', () => {
   assert.deepEqual(decodeAppUrl('+app@bob@example.com').user, {
-    kind: 'nip05',
+    type: 'nip05',
     local: 'bob',
     domain: 'example.com',
     raw: 'bob.example.com'
   })
   assert.deepEqual(decodeAppUrl('+app@fiatjaf.com').user, {
-    kind: 'nip05',
+    type: 'nip05',
     local: '_',
     domain: 'fiatjaf.com',
     raw: 'fiatjaf.com'
   })
   assert.deepEqual(decodeAppUrl('+app@bob.xyz.abc.example.com').user, {
-    kind: 'nip05',
+    type: 'nip05',
     local: 'bob',
     domain: 'xyz.abc.example.com',
     raw: 'bob.xyz.abc.example.com'
   })
   assert.deepEqual(decodeAppUrl('+app@_@fiatjaf.com.br').user, {
-    kind: 'nip05',
+    type: 'nip05',
     local: '_',
     domain: 'fiatjaf.com.br',
     raw: '_@fiatjaf.com.br'
@@ -214,14 +214,14 @@ test('decodeAppUrl keeps @ inside app names and decodes percent-encoded UTF-8', 
 
 test('decodeAppUrl accepts npub, nprofile and hex users', () => {
   const hex = 'ab'.repeat(32)
-  assert.equal(decodeAppUrl(`+app@${hex}`).user.kind, 'pubkey')
+  assert.equal(decodeAppUrl(`+app@${hex}`).user.type, 'pubkey')
   assert.equal(decodeAppUrl(`+app@${hex}`).user.pubkey, hex)
 
   const npub = npubEncode(hex)
-  assert.equal(decodeAppUrl(`+app@${npub}`).user.kind, 'pubkey')
+  assert.equal(decodeAppUrl(`+app@${npub}`).user.type, 'pubkey')
   const nprofile = nprofileEncode({ pubkey: hex, relays: ['wss://relay.example'] })
   const nprofileUser = decodeAppUrl(`+app@${nprofile}`).user
-  assert.equal(nprofileUser.kind, 'pubkey')
+  assert.equal(nprofileUser.type, 'pubkey')
   assert.deepEqual(nprofileUser.relays, ['wss://relay.example'])
 })
 

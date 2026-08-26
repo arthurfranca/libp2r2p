@@ -119,7 +119,7 @@ export function decodeReference (value) {
 
   const account = decodeUserReference(text)
   if (account) {
-    return account.kind === 'pubkey'
+    return account.type === 'pubkey'
       ? {
           type: 'pubkey',
           original,
@@ -350,7 +350,7 @@ export function extractMedia (content, { bareNip05 = false, getMimeType } = {}) 
 export async function resolveUserReference (value, options = {}) {
   const account = decodeUserReference(value)
   if (!account) return null
-  if (account.kind === 'pubkey') {
+  if (account.type === 'pubkey') {
     return { pubkey: account.pubkey, relays: account.relays, label: account.raw }
   }
 

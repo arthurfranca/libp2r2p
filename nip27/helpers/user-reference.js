@@ -24,8 +24,8 @@ function stripReferencePrefix (value) {
 }
 
 // Decodes a user reference without performing any network lookup.
-// Returns `{ kind: 'pubkey', pubkey, relays, raw }` for npub/nprofile/hex or
-// `{ kind: 'nip05', local, domain, raw }` for NIP-05 (standard or extended),
+// Returns `{ type: 'pubkey', pubkey, relays, raw }` for npub/nprofile/hex or
+// `{ type: 'nip05', local, domain, raw }` for NIP-05 (standard or extended),
 // where `raw` is always the most compact canonical spelling.
 export function decodeUserReference (value) {
   if (typeof value !== 'string') return null
@@ -34,13 +34,13 @@ export function decodeUserReference (value) {
 
   if (HEX_PUBKEY.test(text)) {
     const raw = text.toLowerCase()
-    return { kind: 'pubkey', pubkey: raw, relays: [], raw }
+    return { type: 'pubkey', pubkey: raw, relays: [], raw }
   }
 
   if (text.toLowerCase().startsWith('npub1')) {
     try {
       const raw = text.toLowerCase()
-      return { kind: 'pubkey', pubkey: npubDecode(raw), relays: [], raw }
+      return { type: 'pubkey', pubkey: npubDecode(raw), relays: [], raw }
     } catch {
       return null
     }
@@ -50,7 +50,7 @@ export function decodeUserReference (value) {
     try {
       const raw = text.toLowerCase()
       const { pubkey, relays } = nprofileDecode(raw)
-      return { kind: 'pubkey', pubkey, relays, raw }
+      return { type: 'pubkey', pubkey, relays, raw }
     } catch {
       return null
     }
@@ -59,7 +59,7 @@ export function decodeUserReference (value) {
   const nip05 = decodeNip05Identifier(text)
   if (!nip05) return null
   const raw = compactNip05Raw(nip05.local, nip05.domain)
-  return { kind: 'nip05', ...nip05, raw }
+  return { type: 'nip05', ...nip05, raw }
 }
 
 // Returns the canonical compact spelling for a user reference, either as a
@@ -68,12 +68,12 @@ export function encodeUserReference (value) {
   const ref = typeof value === 'string'
     ? decodeUserReference(value)
     : value && typeof value === 'object' &&
-        (value.kind === 'pubkey' || value.kind === 'nip05')
+        (value.type === 'pubkey' || value.type === 'nip05')
       ? value
       : null
   if (!ref) {
     throw new ValidationError('INVALID_USER_REFERENCE', { message: 'Invalid user reference' })
   }
-  if (ref.kind === 'pubkey') return ref.raw ?? ref.pubkey
+  if (ref.type === 'pubkey') return ref.raw ?? ref.pubkey
   return ref.raw ?? compactNip05Raw(ref.local, ref.domain)
 }

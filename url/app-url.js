@@ -126,7 +126,7 @@ export function decodeAppUrl (segment) {
     const domain = safeDecode(parts[parts.length - 1])
     const nip05 = nip05FromLocalDomain(local, domain)
     if (nip05) {
-      user = { kind: 'nip05', ...nip05, raw: compactNip05Raw(local, domain) }
+      user = { type: 'nip05', ...nip05, raw: compactNip05Raw(local, domain) }
       appName = parts.slice(0, -2).map(safeDecode).join('@')
     } else {
       appName = safeDecode(remainder)
@@ -163,7 +163,7 @@ export function encodeAppUrl ({ appName, channel = 'main', user }) {
 
   let encodedAppName = encodeURIComponent(appName)
   let userText
-  if (userRef.kind === 'nip05') {
+  if (userRef.type === 'nip05') {
     // Keep `@` raw inside the app name so the verbose NIP-05 form stays
     // readable (`+my@app@bob@example.com`).
     encodedAppName = encodedAppName.replace(/%40/g, '@')

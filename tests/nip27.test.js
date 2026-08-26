@@ -204,7 +204,7 @@ test('decodeMediaMetadata decodes fragment tags without depending on window', ()
 
 test('decodeUserReference handles pubkey and NIP-05 references', () => {
   const hex = 'ef'.repeat(32)
-  assert.deepEqual(decodeUserReference(hex), { kind: 'pubkey', pubkey: hex, relays: [], raw: hex })
+  assert.deepEqual(decodeUserReference(hex), { type: 'pubkey', pubkey: hex, relays: [], raw: hex })
   assert.equal(decodeUserReference('fiatjaf.com').local, '_')
   assert.equal(decodeUserReference('bob.xyz.abc.example.com').local, 'bob')
   assert.equal(decodeUserReference('bob@example.com').raw, 'bob.example.com')
@@ -224,11 +224,11 @@ test('encodeUserReference returns the canonical compact spelling', () => {
   assert.equal(encodeUserReference('bob@example.com'), 'bob.example.com')
   assert.equal(encodeUserReference('_@fiatjaf.com.br'), '_@fiatjaf.com.br')
   assert.equal(
-    encodeUserReference({ kind: 'nip05', local: 'bob', domain: 'example.com' }),
+    encodeUserReference({ type: 'nip05', local: 'bob', domain: 'example.com' }),
     'bob.example.com'
   )
   const hex = 'ef'.repeat(32)
-  assert.equal(encodeUserReference({ kind: 'pubkey', pubkey: hex, relays: [] }), hex)
+  assert.equal(encodeUserReference({ type: 'pubkey', pubkey: hex, relays: [] }), hex)
   assert.throws(() => encodeUserReference('nonsense'), error => (
     error instanceof ValidationError && error.code === 'INVALID_USER_REFERENCE'
   ))
