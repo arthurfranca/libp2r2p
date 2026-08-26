@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
+import { ValidationError } from '../error/index.js'
 import { queryProfile } from '../nip05/index.js'
 
 test('NIP-05 resolves a canonical profile and normalizes relay URLs', async () => {
@@ -21,7 +22,10 @@ test('NIP-05 resolves a canonical profile and normalizes relay URLs', async () =
 })
 
 test('NIP-05 returns null for malformed or unverified responses', async () => {
-  assert.equal(await queryProfile('wrong', { fetch: async () => { throw new Error('unused') } }), null)
+  await assert.rejects(
+    queryProfile('wrong', { fetch: async () => { throw new Error('unused') } }),
+    error => error instanceof ValidationError && error.code === 'INVALID_NIP05_IDENTIFIER'
+  )
   assert.equal(await queryProfile('a@example.com', {
     fetch: async () => new Response(JSON.stringify({ names: { a: 'AB'.repeat(32) } }), { status: 200 })
   }), null)

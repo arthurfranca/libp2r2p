@@ -17,7 +17,10 @@ import {
   decodeUserReference,
   encodeUserReference,
   extractMedia,
-  resolveUserReference
+  resolveUserReference,
+  tryDecodeMediaMetadata,
+  tryDecodeReference,
+  tryDecodeUserReference
 } from '../nip27/index.js'
 
 const hex = 'ab'.repeat(32)
@@ -108,10 +111,19 @@ test('decodeReference accepts @ and nostr: prefixes for NIP-19 entities', () => 
 })
 
 test('decodeReference rejects invalid references', () => {
-  assert.equal(decodeReference(''), null)
-  assert.equal(decodeReference('not-a-reference'), null)
-  assert.equal(decodeReference('@'), null)
-  assert.equal(decodeReference('nostr:'), null)
+  for (const value of ['', 'not-a-reference', '@', 'nostr:']) {
+    assert.throws(() => decodeReference(value), error => (
+      error instanceof ValidationError && error.code === 'INVALID_REFERENCE'
+    ), value)
+    assert.equal(tryDecodeReference(value), null)
+  }
+})
+
+test('decodeReference throws the underlying decoder error for malformed entities', () => {
+  assert.throws(() => decodeReference('note1notavalidbech32'), error => (
+    error instanceof ValidationError
+  ))
+  assert.equal(tryDecodeReference('note1notavalidbech32'), null)
 })
 
 test('extractMedia finds mentions, entities, URLs and hashtags', () => {
@@ -198,8 +210,37 @@ test('decodeMediaMetadata decodes fragment tags without depending on window', ()
   assert.equal(metadata.alt, 'Hello world')
   assert.deepEqual(metadata.x, ['a', 'b'])
 
-  assert.deepEqual(decodeMediaMetadata(''), {})
   assert.deepEqual(decodeMediaMetadata('https://example.com/no-fragment'), {})
+})
+
+test('decodeMediaMetadata rejects invalid urls, tag configs and dim values', () => {
+  assert.throws(() => decodeMediaMetadata(''), error => (
+    error instanceof ValidationError && error.code === 'INVALID_MEDIA_METADATA_URL'
+  ))
+  assert.throws(() => decodeMediaMetadata('https://example.com/a#dim=abc'), error => (
+    error instanceof ValidationError && error.code === 'INVALID_MEDIA_METADATA_DIM'
+  ))
+  assert.throws(() => decodeMediaMetadata('https://example.com/a', {
+    extraTags: { m: 'not-an-array' }
+  }), error => (
+    error instanceof ValidationError && error.code === 'INVALID_MEDIA_METADATA_TAGS'
+  ))
+  assert.equal(tryDecodeMediaMetadata(''), null)
+  assert.equal(tryDecodeMediaMetadata('https://example.com/a#dim=abc'), null)
+  assert.deepEqual(tryDecodeMediaMetadata('https://example.com/no-fragment'), {})
+})
+
+test('extractMedia rejects non-string content and tolerates malformed tokens', () => {
+  assert.throws(() => extractMedia(null), error => (
+    error instanceof ValidationError && error.code === 'INVALID_MEDIA_CONTENT'
+  ))
+
+  const badNote = `note1${'a'.repeat(60)}`
+  const items = extractMedia(`hello nostr:${badNote} world`)
+  assert.deepEqual(items, [
+    { key: 'text', text: { value: 'hello ' } },
+    { key: 'text', text: { value: ' world' } }
+  ])
 })
 
 test('decodeUserReference handles pubkey and NIP-05 references', () => {
@@ -218,6 +259,15 @@ test('decodeUserReference handles pubkey and NIP-05 references', () => {
   assert.equal(decodeUserReference(`@${npub}`).pubkey, hex)
   const nprofile = nprofileEncode({ pubkey: hex, relays: ['wss://relay.example'] })
   assert.deepEqual(decodeUserReference(`nostr:${nprofile}`).relays, ['wss://relay.example'])
+})
+
+test('decodeUserReference rejects invalid references', () => {
+  for (const value of ['', 'not-a-reference', '@', 'nostr:']) {
+    assert.throws(() => decodeUserReference(value), error => (
+      error instanceof ValidationError && error.code === 'INVALID_USER_REFERENCE'
+    ), value)
+    assert.equal(tryDecodeUserReference(value), null)
+  }
 })
 
 test('encodeUserReference returns the canonical compact spelling', () => {

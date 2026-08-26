@@ -5,7 +5,8 @@ import {
 } from '../nip05/helpers/nip05-identifier.js'
 import {
   decodeUserReference,
-  encodeUserReference
+  encodeUserReference,
+  tryDecodeUserReference
 } from '../nip27/helpers/user-reference.js'
 import {
   NAPP_ENTITY_REGEX,
@@ -55,8 +56,10 @@ function isValidAppName (appName) {
 // `naddr` already carries the event kind, so it does not need the `+`/`++`/
 // `+++` channel prefix (a leading prefix is still tolerated). Only site
 // manifests are app URLs; the result is canonicalized to the `appEncode`
-// entity so downstream code keeps working unchanged.
-function tryDecodeNaddr (value) {
+// entity so downstream code keeps working unchanged. Throws
+// `ValidationError('INVALID_APP_URL_NADDR')` for malformed naddr or
+// naddr that is not a site manifest.
+function decodeNaddrSegment (value) {
   if (typeof value !== 'string' || !value) return null
   const body = value.replace(/^\+{1,3}/, '')
   if (!body.startsWith(NADDR_PREFIX)) return null
@@ -64,10 +67,12 @@ function tryDecodeNaddr (value) {
   let decoded
   try {
     decoded = naddrDecode(body)
-  } catch {
-    return null
+  } catch (cause) {
+    throw new ValidationError('INVALID_APP_URL_NADDR', { message: 'INVALID_NADDR', cause })
   }
-  if (!SITE_MANIFEST_KINDS.has(decoded.kind)) return null
+  if (!SITE_MANIFEST_KINDS.has(decoded.kind)) {
+    throw new ValidationError('INVALID_APP_URL_NADDR', { message: 'NOT_SITE_MANIFEST' })
+  }
 
   try {
     return {
@@ -79,8 +84,8 @@ function tryDecodeNaddr (value) {
         relays: decoded.relays
       })
     }
-  } catch {
-    return null
+  } catch (cause) {
+    throw new ValidationError('INVALID_APP_URL_NADDR', { message: 'INVALID_APP_ENTITY', cause })
   }
 }
 
@@ -90,27 +95,34 @@ function tryDecodeNaddr (value) {
 // - `{ type: 'entity', entity }` for NIP-19 app entities;
 // - `{ type: 'named', prefix, channel, appName, user }` for named URLs
 //   (`user` is null when no user part is present or it is invalid);
-// - `null` when the segment is not a valid app URL.
+// Throws `ValidationError` when the segment is not a valid app URL; use
+// `tryDecodeAppUrl` when a null result is preferred.
 export function decodeAppUrl (segment) {
-  if (typeof segment !== 'string' || !segment) return null
-  const decodedNaddr = tryDecodeNaddr(segment)
+  if (typeof segment !== 'string' || !segment) {
+    throw new ValidationError('INVALID_APP_URL', { message: 'URL_SEGMENT_SHOULD_BE_A_NON_EMPTY_STRING' })
+  }
+  const decodedNaddr = decodeNaddrSegment(segment)
   if (decodedNaddr) return decodedNaddr
 
   const prefixMatch = segment.match(/^\+{1,3}/)
-  if (!prefixMatch) return null
+  if (!prefixMatch) {
+    throw new ValidationError('INVALID_APP_URL', { message: 'MISSING_APP_URL_PREFIX' })
+  }
   const prefix = prefixMatch[0]
 
   if (NAPP_ENTITY_REGEX.test(segment)) {
     try {
       appDecode(segment)
-    } catch {
-      return null
+    } catch (cause) {
+      throw new ValidationError('INVALID_APP_URL_ENTITY', { message: 'INVALID_APP_ENTITY', cause })
     }
     return { type: 'entity', entity: segment }
   }
 
   const remainder = segment.slice(prefix.length)
-  if (!remainder) return null
+  if (!remainder) {
+    throw new ValidationError('INVALID_APP_URL', { message: 'MISSING_APP_NAME' })
+  }
   const parts = remainder.split('@')
   let appName
   let user = null
@@ -120,7 +132,7 @@ export function decodeAppUrl (segment) {
   } else if (parts.length === 2) {
     const tail = safeDecode(parts[1])
     appName = safeDecode(parts[0])
-    user = tail === null ? null : decodeUserReference(tail)
+    user = tail === null ? null : tryDecodeUserReference(tail)
   } else {
     const local = safeDecode(parts[parts.length - 2])
     const domain = safeDecode(parts[parts.length - 1])
@@ -133,8 +145,12 @@ export function decodeAppUrl (segment) {
     }
   }
 
-  if (appName === null || !isValidAppName(appName)) return null
-  if (!user && appName.length >= APP_URL_MIN_ENTITY_BODY_LENGTH) return null
+  if (appName === null || !isValidAppName(appName)) {
+    throw new ValidationError('INVALID_APP_URL_NAME', { message: 'Invalid app URL name' })
+  }
+  if (!user && appName.length >= APP_URL_MIN_ENTITY_BODY_LENGTH) {
+    throw new ValidationError('INVALID_APP_URL_ENTITY', { message: 'ENTITY_LIKE_URL_WITHOUT_USER' })
+  }
 
   return {
     type: 'named',
@@ -142,6 +158,17 @@ export function decodeAppUrl (segment) {
     channel: CHANNEL_BY_PREFIX[prefix],
     appName,
     user
+  }
+}
+
+// Non-throwing variant of `decodeAppUrl`: returns the decoded app URL or
+// `null` when the segment is not a valid app URL.
+export function tryDecodeAppUrl (segment) {
+  try {
+    return decodeAppUrl(segment)
+  } catch (error) {
+    if (error instanceof ValidationError) return null
+    throw error
   }
 }
 
@@ -156,7 +183,15 @@ export function encodeAppUrl ({ appName, channel = 'main', user }) {
   if (!prefix) {
     throw new ValidationError('INVALID_APP_URL_CHANNEL', { message: 'Invalid app URL channel' })
   }
-  const userRef = decodeUserReference(user)
+  let userRef
+  try {
+    userRef = decodeUserReference(user)
+  } catch (cause) {
+    if (cause instanceof ValidationError) {
+      throw new ValidationError('INVALID_APP_URL_USER', { message: cause.message ?? 'Invalid app URL user', cause })
+    }
+    throw cause
+  }
   if (!userRef) {
     throw new ValidationError('INVALID_APP_URL_USER', { message: 'Invalid app URL user' })
   }

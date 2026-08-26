@@ -25,7 +25,8 @@ test('new public Nostr subpaths expose only the used surface', async () => {
     nip05: ['queryProfile'],
     nip27: [
       'decodeMediaMetadata', 'decodeReference', 'decodeUserReference',
-      'encodeUserReference', 'extractMedia', 'resolveUserReference'
+      'encodeUserReference', 'extractMedia', 'resolveUserReference',
+      'tryDecodeMediaMetadata', 'tryDecodeReference', 'tryDecodeUserReference'
     ],
     nip44: ['decrypt', 'encrypt', 'getConversationKey'],
     nip96: [
@@ -42,7 +43,7 @@ test('new public Nostr subpaths expose only the used surface', async () => {
       'assertValidPublicBlossomServerUrl', 'assertValidPublicRelayUrl',
       'decodeAppUrl', 'encodeAppUrl',
       'isValidPublicBlossomServerUrl', 'isValidPublicRelayUrl',
-      'normalizeBlossomServerUrl', 'normalizeRelayUrl'
+      'normalizeBlossomServerUrl', 'normalizeRelayUrl', 'tryDecodeAppUrl'
     ]
   }
 

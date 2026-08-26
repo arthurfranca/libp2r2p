@@ -1,3 +1,4 @@
+import { ValidationError } from '../../error/index.js'
 import { freeRelays } from '../constants/index.js'
 import { pickRelaysForPubkeys } from '../helpers/routing.js'
 import { relayPool } from './relay-pool.js'
@@ -99,7 +100,9 @@ export async function getLatestEventsByPubkey (pubkeys, {
 } = {}) {
   const authors = [...new Set(pubkeys || [])].filter(Boolean)
   if (!authors.length) return { events: [], byPubkey: {}, relaysByPubkey: {} }
-  if (!Array.isArray(kinds) || kinds.length === 0) throw new Error('Missing kinds')
+  if (!Array.isArray(kinds) || kinds.length === 0) {
+    throw new ValidationError('MISSING_EVENT_KINDS', { message: 'Missing kinds' })
+  }
   const type = relayType === 'read' ? 'read' : 'write'
 
   const relaysByAuthor = { ...(relaysByPubkey || {}) }

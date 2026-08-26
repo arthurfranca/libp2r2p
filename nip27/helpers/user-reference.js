@@ -26,11 +26,17 @@ function stripReferencePrefix (value) {
 // Decodes a user reference without performing any network lookup.
 // Returns `{ type: 'pubkey', pubkey, relays, raw }` for npub/nprofile/hex or
 // `{ type: 'nip05', local, domain, raw }` for NIP-05 (standard or extended),
-// where `raw` is always the most compact canonical spelling.
+// where `raw` is always the most compact canonical spelling. Throws
+// `ValidationError('INVALID_USER_REFERENCE')` when the value cannot be
+// decoded; use `tryDecodeUserReference` when a null result is preferred.
 export function decodeUserReference (value) {
-  if (typeof value !== 'string') return null
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new ValidationError('INVALID_USER_REFERENCE', { message: 'USER_REFERENCE_SHOULD_BE_A_NON_EMPTY_STRING' })
+  }
   const text = stripReferencePrefix(value)
-  if (!text) return null
+  if (!text) {
+    throw new ValidationError('INVALID_USER_REFERENCE', { message: 'EMPTY_USER_REFERENCE' })
+  }
 
   if (HEX_PUBKEY.test(text)) {
     const raw = text.toLowerCase()
@@ -41,8 +47,8 @@ export function decodeUserReference (value) {
     try {
       const raw = text.toLowerCase()
       return { type: 'pubkey', pubkey: npubDecode(raw), relays: [], raw }
-    } catch {
-      return null
+    } catch (cause) {
+      throw new ValidationError('INVALID_USER_REFERENCE', { message: 'INVALID_NPUB', cause })
     }
   }
 
@@ -51,15 +57,30 @@ export function decodeUserReference (value) {
       const raw = text.toLowerCase()
       const { pubkey, relays } = nprofileDecode(raw)
       return { type: 'pubkey', pubkey, relays, raw }
-    } catch {
-      return null
+    } catch (cause) {
+      throw new ValidationError('INVALID_USER_REFERENCE', { message: 'INVALID_NPROFILE', cause })
     }
   }
 
-  const nip05 = decodeNip05Identifier(text)
-  if (!nip05) return null
+  let nip05
+  try {
+    nip05 = decodeNip05Identifier(text)
+  } catch (cause) {
+    throw new ValidationError('INVALID_USER_REFERENCE', { message: 'INVALID_NIP05', cause })
+  }
   const raw = compactNip05Raw(nip05.local, nip05.domain)
   return { type: 'nip05', ...nip05, raw }
+}
+
+// Non-throwing variant of `decodeUserReference`: returns the decoded
+// reference or `null` when the value is not a valid user reference.
+export function tryDecodeUserReference (value) {
+  try {
+    return decodeUserReference(value)
+  } catch (error) {
+    if (error instanceof ValidationError) return null
+    throw error
+  }
 }
 
 // Returns the canonical compact spelling for a user reference, either as a

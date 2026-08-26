@@ -12,7 +12,8 @@ import {
   isValidPublicBlossomServerUrl,
   isValidPublicRelayUrl,
   normalizeBlossomServerUrl,
-  normalizeRelayUrl
+  normalizeRelayUrl,
+  tryDecodeAppUrl
 } from '../url/index.js'
 
 test('normalizeRelayUrl canonicalizes relay URLs', () => {
@@ -146,12 +147,19 @@ test('decodeAppUrl canonicalizes site-manifest naddr entities', () => {
 
 test('decodeAppUrl rejects naddr that is not a site manifest', () => {
   const naddr = naddrEncode({ identifier: 'note', pubkey: 'ab'.repeat(32), kind: 1 })
-  assert.equal(decodeAppUrl(naddr), null)
-  assert.equal(decodeAppUrl(`+${naddr}`), null)
+  for (const value of [naddr, `+${naddr}`]) {
+    assert.throws(() => decodeAppUrl(value), error => (
+      error instanceof ValidationError && error.code === 'INVALID_APP_URL_NADDR'
+    ), value)
+    assert.equal(tryDecodeAppUrl(value), null)
+  }
 })
 
 test('decodeAppUrl rejects malformed naddr', () => {
-  assert.equal(decodeAppUrl('naddr1notavalidbech32'), null)
+  assert.throws(() => decodeAppUrl('naddr1notavalidbech32'), error => (
+    error instanceof ValidationError && error.code === 'INVALID_APP_URL_NADDR'
+  ))
+  assert.equal(tryDecodeAppUrl('naddr1notavalidbech32'), null)
 })
 
 test('decodeAppUrl parses named URLs without user and enforces the reserved entity length', () => {
@@ -169,9 +177,29 @@ test('decodeAppUrl parses named URLs without user and enforces the reserved enti
     appName: 'app store',
     user: null
   })
-  assert.equal(decodeAppUrl(`+${'a'.repeat(APP_URL_MIN_ENTITY_BODY_LENGTH)}`), null)
-  assert.equal(decodeAppUrl('+'), null)
-  assert.equal(decodeAppUrl('+app/route'), null)
+  assert.throws(() => decodeAppUrl(`+${'a'.repeat(APP_URL_MIN_ENTITY_BODY_LENGTH)}`), error => (
+    error instanceof ValidationError && error.code === 'INVALID_APP_URL_ENTITY'
+  ))
+  assert.throws(() => decodeAppUrl('+'), error => (
+    error instanceof ValidationError && error.code === 'INVALID_APP_URL'
+  ))
+  assert.throws(() => decodeAppUrl('+app/route'), error => (
+    error instanceof ValidationError && error.code === 'INVALID_APP_URL_NAME'
+  ))
+})
+
+test('tryDecodeAppUrl returns null for invalid segments', () => {
+  for (const value of [
+    '',
+    'not-an-app-url',
+    '+',
+    '+app/route',
+    `+${'a'.repeat(APP_URL_MIN_ENTITY_BODY_LENGTH)}`,
+    'naddr1notavalidbech32',
+    naddrEncode({ identifier: 'note', pubkey: 'ab'.repeat(32), kind: 1 })
+  ]) {
+    assert.equal(tryDecodeAppUrl(value), null, value)
+  }
 })
 
 test('decodeAppUrl parses NIP-05 standard, root and custom extension forms', () => {

@@ -1,3 +1,4 @@
+import { ValidationError } from '../error/index.js'
 import { normalizeRelayUrl } from '../url/index.js'
 import { decodeNip05Identifier } from './helpers/nip05-identifier.js'
 
@@ -8,9 +9,11 @@ export async function queryProfile (identifier, {
   signal,
   timeoutMs = 5000
 } = {}) {
-  if (typeof identifier !== 'string' || typeof fetchImpl !== 'function') return null
+  if (typeof identifier !== 'string' || !identifier.trim()) {
+    throw new ValidationError('INVALID_NIP05_IDENTIFIER', { message: 'IDENTIFIER_SHOULD_BE_A_NON_EMPTY_STRING' })
+  }
+  if (typeof fetchImpl !== 'function') return null
   const nip05 = decodeNip05Identifier(identifier)
-  if (!nip05) return null
   const name = nip05.local
   const domain = nip05.domain
 

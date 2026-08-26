@@ -342,13 +342,17 @@ are handled by `libp2r2p/nip27`: `decodeUserReference()` returns the decoded
 form with its canonical compact spelling, `encodeUserReference()` returns
 that canonical spelling, and `resolveUserReference()` resolves it to a
 pubkey. `libp2r2p/nip05` keeps only `queryProfile()`, the NIP-05 lookup, which
-accepts the compact custom forms directly.
+accepts the compact custom forms directly. The decoders (`decodeReference`,
+`decodeMediaMetadata`, `decodeUserReference`, `decodeAppUrl`) throw
+`ValidationError` with a stable code; each has a `tryDecode…` counterpart
+that returns `null` when the value cannot be decoded.
 
 Public validity checks consistently use a non-throwing `is…` predicate plus an
 `assert…` counterpart when callers need the exact reason. Strict codecs,
 decoders, token validation, and malformed public arguments also throw
-`ValidationError` from `libp2r2p/error`. Network, timeout, abort, quota, and
-closed-state failures remain ordinary operational errors.
+`ValidationError` from `libp2r2p/error`; probing code can use the
+non-throwing `tryDecode…` variants instead of catching. Network, timeout,
+abort, quota, and closed-state failures remain ordinary operational errors.
 
 NIP-04 remains available at
 `libp2r2p/nip04` only for compatibility with older Nostr applications.

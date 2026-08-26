@@ -1,3 +1,4 @@
+import { ValidationError } from '../error/index.js'
 import {
   naddrDecode,
   neventDecode,
@@ -8,10 +9,11 @@ import { queryProfile } from '../nip05/index.js'
 import { normalizeRelayUrl } from '../url/index.js'
 import {
   decodeUserReference,
-  encodeUserReference
+  encodeUserReference,
+  tryDecodeUserReference
 } from './helpers/user-reference.js'
 
-export { decodeUserReference, encodeUserReference }
+export { decodeUserReference, encodeUserReference, tryDecodeUserReference }
 
 const BECH32_BODY = '[ac-hj-np-z02-9]'
 const BOUNDARY_PREFIX = /(?<=^|[\s"«„「¡¿:{([])/.source
@@ -107,18 +109,30 @@ function normalizeRelays (relays) {
     .filter(Boolean)
 }
 
+function looksLikeUserReference (text) {
+  return /^[0-9a-f]{64}$/i.test(text) ||
+    /^(?:npub1|nprofile1)/i.test(text) ||
+    text.includes('@') ||
+    /^[a-z0-9._-]+(?:\.[a-z0-9-]+)+$/i.test(text)
+}
+
 // Parses a single NIP-27-style reference (with optional `@`/`nostr:`
 // prefixes): NIP-05 (including the custom compact forms), npub/nprofile/hex
-// accounts, note/nevent/naddr events and nrelay relays.
+// accounts, note/nevent/naddr events and nrelay relays. Throws
+// `ValidationError` when the value cannot be decoded; use
+// `tryDecodeReference` when a null result is preferred.
 export function decodeReference (value) {
-  if (typeof value !== 'string') return null
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new ValidationError('INVALID_REFERENCE', { message: 'REFERENCE_SHOULD_BE_A_NON_EMPTY_STRING' })
+  }
   const original = value.trim()
-  if (!original) return null
   const text = stripReferencePrefix(original)
-  if (!text) return null
+  if (!text) {
+    throw new ValidationError('INVALID_REFERENCE', { message: 'EMPTY_REFERENCE' })
+  }
 
-  const account = decodeUserReference(text)
-  if (account) {
+  if (looksLikeUserReference(text)) {
+    const account = decodeUserReference(text)
     return account.type === 'pubkey'
       ? {
           type: 'pubkey',
@@ -137,34 +151,29 @@ export function decodeReference (value) {
   }
 
   if (text.startsWith('note1')) {
-    try {
-      return { type: 'note', original, value: text, id: noteDecode(text) }
-    } catch {
-      return null
-    }
+    return { type: 'note', original, value: text, id: noteDecode(text) }
   }
   if (text.startsWith('nevent1')) {
-    try {
-      return { type: 'nevent', original, value: text, ...neventDecode(text) }
-    } catch {
-      return null
-    }
+    return { type: 'nevent', original, value: text, ...neventDecode(text) }
   }
   if (text.startsWith('naddr1')) {
-    try {
-      return { type: 'naddr', original, value: text, ...naddrDecode(text) }
-    } catch {
-      return null
-    }
+    return { type: 'naddr', original, value: text, ...naddrDecode(text) }
   }
   if (text.startsWith('nrelay1')) {
-    try {
-      return { type: 'nrelay', original, value: text, relay: nrelayDecode(text) }
-    } catch {
-      return null
-    }
+    return { type: 'nrelay', original, value: text, relay: nrelayDecode(text) }
   }
-  return null
+  throw new ValidationError('INVALID_REFERENCE', { message: 'UNRECOGNIZED_REFERENCE' })
+}
+
+// Non-throwing variant of `decodeReference`: returns the decoded reference
+// or `null` when the value is not a valid reference.
+export function tryDecodeReference (value) {
+  try {
+    return decodeReference(value)
+  } catch (error) {
+    if (error instanceof ValidationError) return null
+    throw error
+  }
 }
 
 const NIP94_TAGS = {
@@ -185,11 +194,33 @@ const NIP94_TAGS = {
   caption: ['caption']
 }
 
+function validateTagConfigs (extraTags) {
+  if (!extraTags || typeof extraTags !== 'object' || Array.isArray(extraTags)) {
+    throw new ValidationError('INVALID_MEDIA_METADATA_TAGS', { message: 'EXTRA_TAGS_SHOULD_BE_AN_OBJECT' })
+  }
+  for (const [key, config] of Object.entries(extraTags)) {
+    const valid = Array.isArray(config) && config.length > 0 && config.every(entry =>
+      typeof entry === 'string' ||
+      (entry && typeof entry === 'object' && typeof entry.key === 'string' &&
+        (entry.type === undefined || entry.type === 'string' || entry.type === 'array'))
+    )
+    if (!valid) {
+      throw new ValidationError('INVALID_MEDIA_METADATA_TAGS', { message: `INVALID_TAG_CONFIG:${key}` })
+    }
+  }
+}
+
 // Decodes the file/media metadata carried in a URL fragment
 // (`#m=image/png&dim=640x480&alt=...`). Kept generic on purpose: the old
-// draft number (54) was taken by an unrelated NIP.
+// draft number (54) was taken by an unrelated NIP. Throws
+// `ValidationError` for invalid URLs, tag configs or malformed `dim` values;
+// use `tryDecodeMediaMetadata` when a null result is preferred. A URL
+// without a metadata fragment still decodes to `{}`.
 export function decodeMediaMetadata (url, { extraTags } = {}) {
-  if (typeof url !== 'string' || !url) return {}
+  if (typeof url !== 'string' || !url.trim()) {
+    throw new ValidationError('INVALID_MEDIA_METADATA_URL', { message: 'URL_SHOULD_BE_A_NON_EMPTY_STRING' })
+  }
+  if (extraTags !== undefined) validateTagConfigs(extraTags)
 
   const tags = extraTags ? { ...NIP94_TAGS, ...extraTags } : NIP94_TAGS
   const tagIndexes = {}
@@ -217,10 +248,24 @@ export function decodeMediaMetadata (url, { extraTags } = {}) {
     const { width, height } = obj.dim.match(
       /(?<width>[1-9]{1}[0-9]{0,10})(?:\s*[xX]\s*)(?<height>[1-9]{1}[0-9]{0,10})/
     )?.groups ?? {}
-    if (width !== undefined) obj.width = width
-    if (height !== undefined) obj.height = height
+    if (width === undefined || height === undefined) {
+      throw new ValidationError('INVALID_MEDIA_METADATA_DIM', { message: 'DIM_SHOULD_BE_WIDTHxHEIGHT' })
+    }
+    obj.width = width
+    obj.height = height
   }
   return obj
+}
+
+// Non-throwing variant of `decodeMediaMetadata`: returns the decoded
+// metadata or `null` when the URL/tags/dim cannot be decoded.
+export function tryDecodeMediaMetadata (url, options) {
+  try {
+    return decodeMediaMetadata(url, options)
+  } catch (error) {
+    if (error instanceof ValidationError) return null
+    throw error
+  }
 }
 
 function decodeFragmentValue (value) {
@@ -234,7 +279,13 @@ function decodeFragmentValue (value) {
 function getReferenceItem (original, groups, { getMimeType }) {
   if (groups.url) {
     const url = `${groups.protocol ? '' : 'https://'}${groups.url}`
-    const urlItem = { value: url, ...(groups.ext && { ext: groups.ext }), ...decodeMediaMetadata(url) }
+    let mediaMetadata = {}
+    try {
+      mediaMetadata = decodeMediaMetadata(url)
+    } catch (error) {
+      if (!(error instanceof ValidationError)) throw error
+    }
+    const urlItem = { value: url, ...(groups.ext && { ext: groups.ext }), ...mediaMetadata }
     if (!urlItem.m && typeof getMimeType === 'function') {
       const mime = getMimeType({ url, ext: groups.ext })
       if (mime) urlItem.m = mime
@@ -249,7 +300,7 @@ function getReferenceItem (original, groups, { getMimeType }) {
     groups.nip05BareRoot ||
     groups.nip05BareCustom
   ) {
-    const account = decodeUserReference(original)
+    const account = tryDecodeUserReference(original)
     if (!account) return null
     return {
       key: 'nip05',
@@ -266,7 +317,13 @@ function getReferenceItem (original, groups, { getMimeType }) {
     return { key: 'hashtag', hashtag: { value: groups.hashtag } }
   }
 
-  const ref = decodeReference(original)
+  let ref
+  try {
+    ref = decodeReference(original)
+  } catch (error) {
+    if (!(error instanceof ValidationError)) throw error
+    return null
+  }
   if (!ref) return null
   switch (ref.type) {
     case 'pubkey': {
@@ -320,7 +377,9 @@ function getReferenceItem (original, groups, { getMimeType }) {
 // `{ bareNip05: true }` is passed, since they are otherwise indistinguishable
 // from plain hostnames; prefixed forms (`@bob.example.com`) always work.
 export function extractMedia (content, { bareNip05 = false, getMimeType } = {}) {
-  if (typeof content !== 'string') return []
+  if (typeof content !== 'string') {
+    throw new ValidationError('INVALID_MEDIA_CONTENT', { message: 'CONTENT_SHOULD_BE_A_STRING' })
+  }
   const regex = getReferencesRegex(bareNip05)
   const items = []
   let end = 0
@@ -349,7 +408,6 @@ export function extractMedia (content, { bareNip05 = false, getMimeType } = {}) 
 // spellings); npub/nprofile/hex are resolved locally.
 export async function resolveUserReference (value, options = {}) {
   const account = decodeUserReference(value)
-  if (!account) return null
   if (account.type === 'pubkey') {
     return { pubkey: account.pubkey, relays: account.relays, label: account.raw }
   }

@@ -1,6 +1,7 @@
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 
+import { ValidationError } from '../error/index.js'
 import { clearRelayQueryCache } from '../relay/services/query.js'
 import { getLatestEventsByPubkey } from '../relay/services/events.js'
 
@@ -175,4 +176,13 @@ test('getLatestEventsByPubkey keeps the newest event per address', async () => {
   })
 
   assert.equal(result.byPubkey[alice].content, 'newer')
+})
+
+test('getLatestEventsByPubkey validates the kinds argument', async () => {
+  await assert.rejects(getLatestEventsByPubkey(['a'.repeat(64)], { kinds: [] }), error => (
+    error instanceof ValidationError && error.code === 'MISSING_EVENT_KINDS'
+  ))
+  await assert.rejects(getLatestEventsByPubkey(['a'.repeat(64)], {}), error => (
+    error instanceof ValidationError && error.code === 'MISSING_EVENT_KINDS'
+  ))
 })

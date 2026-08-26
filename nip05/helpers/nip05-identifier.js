@@ -1,3 +1,5 @@
+import { ValidationError } from '../../error/index.js'
+
 const NIP05_LOCAL = /^[a-z0-9._-]+$/
 const NIP05_DOMAIN = /^[a-z0-9.-]+$/
 
@@ -26,23 +28,36 @@ export function nip05FromLocalDomain (local, domain) {
 // - `local@domain` (standard NIP-05)
 // - `domain` with exactly one dot -> root `_@domain`
 // - `local.domain...` with more than one dot -> local part + domain (custom extension)
+// Throws `ValidationError('INVALID_NIP05_IDENTIFIER')` for malformed input.
 export function decodeNip05Identifier (value) {
-  if (typeof value !== 'string') return null
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new ValidationError('INVALID_NIP05_IDENTIFIER', { message: 'IDENTIFIER_SHOULD_BE_A_NON_EMPTY_STRING' })
+  }
   const text = value.trim().toLowerCase()
-  if (!text) return null
 
   const at = text.lastIndexOf('@')
   if (at !== -1) {
-    if (at === 0 || at === text.length - 1 || text.includes('@', at + 1)) return null
-    return nip05FromLocalDomain(text.slice(0, at), text.slice(at + 1))
+    if (at === 0 || at === text.length - 1 || text.includes('@', at + 1)) {
+      throw new ValidationError('INVALID_NIP05_IDENTIFIER', { message: 'INVALID_NIP05_FORMAT' })
+    }
+    const result = nip05FromLocalDomain(text.slice(0, at), text.slice(at + 1))
+    if (!result) {
+      throw new ValidationError('INVALID_NIP05_IDENTIFIER', { message: 'INVALID_NIP05_LOCAL_OR_DOMAIN' })
+    }
+    return result
   }
 
-  if (!text.includes('.')) return null
-  const firstDot = text.indexOf('.')
-  if (text.slice(firstDot + 1).includes('.')) {
-    return nip05FromLocalDomain(text.slice(0, firstDot), text.slice(firstDot + 1))
+  if (!text.includes('.')) {
+    throw new ValidationError('INVALID_NIP05_IDENTIFIER', { message: 'INVALID_NIP05_FORMAT' })
   }
-  return nip05FromLocalDomain('_', text)
+  const firstDot = text.indexOf('.')
+  const result = text.slice(firstDot + 1).includes('.')
+    ? nip05FromLocalDomain(text.slice(0, firstDot), text.slice(firstDot + 1))
+    : nip05FromLocalDomain('_', text)
+  if (!result) {
+    throw new ValidationError('INVALID_NIP05_IDENTIFIER', { message: 'INVALID_NIP05_LOCAL_OR_DOMAIN' })
+  }
+  return result
 }
 
 // Returns the most compact unambiguous NIP-05 spelling:
