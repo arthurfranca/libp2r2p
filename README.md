@@ -8,6 +8,10 @@ the transport and discovery surface. The package was born to distribute the
 private messenger reference implementation, and it also carries a few Nostr
 power-ups used by that messenger.
 
+For remote-work scheduling, see [`libp2r2p/network`](network/README.md):
+`isOnline` probes connectivity and `onOnline` shares recovery monitoring,
+including retries when the browser omits its native `online` event.
+
 ## Private Messenger
 
 The main API is `createPrivateMessenger` from `libp2r2p/private-messenger`.
