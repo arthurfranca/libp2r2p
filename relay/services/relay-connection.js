@@ -1,6 +1,7 @@
 import { isValidEvent } from '../../event/index.js'
 import { ValidationError } from '../../error/index.js'
 import { maybeUnref } from '../helpers/timer.js'
+import { categorizeRelayError, relayCloseError, relayTimeoutError } from '../helpers/error.js'
 
 const DEFAULT_CONNECT_TIMEOUT = 3000
 const DEFAULT_OPERATION_TIMEOUT = 30000
@@ -44,6 +45,7 @@ export class RelayConnection {
   #connectPromise = null
   #challenge = null
   #serial = 0
+  #lastTransportError = null
   #subscriptions = new Map()
   #publishes = new Map()
   #authentications = new Map()
@@ -60,14 +62,22 @@ export class RelayConnection {
     this.onauth = null
   }
 
+  // Exposes socket context to the pool's operation-wide publication deadline.
+  get lastTransportError () { return this.#lastTransportError }
+
   async connect ({ timeout = DEFAULT_CONNECT_TIMEOUT, signal } = {}) {
     if (this.ws?.readyState === 1) return
     if (this.#connectPromise) return await this.#connectPromise
     if (signal?.aborted) throw new Error('CONNECT_ABORTED')
-    if (typeof this.#WebSocket !== 'function') throw new Error('WEBSOCKET_UNAVAILABLE')
+    if (typeof this.#WebSocket !== 'function') throw categorizeRelayError(new Error('WEBSOCKET_UNAVAILABLE'), 'connection')
 
+    this.#lastTransportError = null
     this.#connectPromise = new Promise((resolve, reject) => {
-      const socket = new this.#WebSocket(this.url)
+      let socket
+      try { socket = new this.#WebSocket(this.url) } catch (error) {
+        reject(categorizeRelayError(error, 'connection'))
+        return
+      }
       this.ws = socket
       let settled = false
       const finish = (reason) => {
@@ -81,18 +91,21 @@ export class RelayConnection {
         } else resolve()
       }
       const onAbort = () => finish(new Error('CONNECT_ABORTED'))
-      const timer = timeout === null ? null : maybeUnref(setTimeout(() => finish(new Error('CONNECT_TIMEOUT')), timeout))
+      const timer = timeout === null ? null : maybeUnref(setTimeout(() => finish(relayTimeoutError('CONNECT_TIMEOUT')), timeout))
       signal?.addEventListener('abort', onAbort, { once: true })
 
       socket.onopen = () => finish()
       socket.onerror = event => {
-        const reason = errorFrom(event?.error, 'CONNECTION_ERROR')
+        const reason = categorizeRelayError(event?.error, settled ? 'transport' : 'connection', 'CONNECTION_ERROR')
         if (!settled) finish(reason)
-        else this.onerror?.(reason)
+        else {
+          this.#lastTransportError = reason
+          this.onerror?.(reason)
+        }
       }
       socket.onmessage = event => { this.#handleMessage(event).catch(reason => this.onerror?.(reason)) }
       socket.onclose = event => {
-        if (!settled) finish(new Error('CONNECTION_CLOSED'))
+        if (!settled) finish(relayCloseError(event, 'connection'))
         if (this.ws === socket) this.ws = null
         this.#handleClose(event)
       }
@@ -101,8 +114,11 @@ export class RelayConnection {
   }
 
   send (message) {
-    if (this.ws?.readyState !== 1) throw new Error('CONNECTION_CLOSED')
-    this.ws.send(message)
+    if (this.ws?.readyState !== 1) throw relayCloseError(null, 'transport', this.#lastTransportError)
+    try { this.ws.send(message) } catch (error) {
+      this.#lastTransportError = categorizeRelayError(error, 'transport')
+      throw this.#lastTransportError
+    }
   }
 
   subscribe (filters, handlers = {}) {
@@ -141,7 +157,7 @@ export class RelayConnection {
   #sendEventOperation (type, event, map, timeoutCode) {
     if (map.has(event.id)) return map.get(event.id).promise
     const deferred = Promise.withResolvers()
-    const timer = maybeUnref(setTimeout(() => this.#settleEvent(map, event.id, new Error(timeoutCode)), this.publishTimeout))
+    const timer = maybeUnref(setTimeout(() => this.#settleEvent(map, event.id, relayTimeoutError(timeoutCode, this.#lastTransportError)), this.publishTimeout))
     map.set(event.id, { ...deferred, timer, promise: deferred.promise })
     try { this.send(JSON.stringify([type, event])) } catch (error) {
       this.#settleEvent(map, event.id, error)
@@ -210,7 +226,7 @@ export class RelayConnection {
       return
     }
     if (data[0] === 'OK') {
-      const reason = data[2] === true ? null : errorFrom(data[3], 'EVENT_REJECTED')
+      const reason = data[2] === true ? null : categorizeRelayError(data[3], 'relay', 'EVENT_REJECTED')
       this.#settleEvent(this.#publishes, data[1], reason, data[3])
       this.#settleEvent(this.#authentications, data[1], reason, data[3])
       return
@@ -229,7 +245,7 @@ export class RelayConnection {
 
   #handleClose (event) {
     this.#challenge = null
-    const reason = errorFrom(event?.reason, 'CONNECTION_CLOSED')
+    const reason = relayCloseError(event, 'transport', this.#lastTransportError)
     for (const [id, subscription] of this.#subscriptions) {
       this.#subscriptions.delete(id)
       subscription.handlers.onclose?.(reason)
@@ -244,7 +260,7 @@ export class RelayConnection {
     const socket = this.ws
     this.ws = null
     this.#challenge = null
-    const reason = new Error('CONNECTION_CLOSED')
+    const reason = relayCloseError(null, 'transport', this.#lastTransportError)
     for (const [id, subscription] of this.#subscriptions) {
       this.#subscriptions.delete(id)
       subscription.handlers.onclose?.()

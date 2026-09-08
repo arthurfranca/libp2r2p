@@ -364,6 +364,26 @@ Low-level relay sockets, subscriptions, message parsing, and serialization are
 internal implementation details; use `RelayPool` or the `relayPool` singleton
 from `libp2r2p/relay`.
 
+`getEvents` and `getEventsGenerator` accept `deduplicateAcrossRelays` (boolean,
+default `true`). With `false`, a matching event is delivered once per relay,
+while repeated IDs from the same relay remain suppressed. Each occurrence owns
+its `meta.relay`; callbacks still run immediately and deadlines, EOSE handling,
+and per-relay filter limits are unchanged. The callback/generator item remains
+`{ type: 'event', event, relay }`, and the completed query remains
+`{ result, errors, success }`. The option does not extend to the live or feed
+generators. Callers that need replication coverage can aggregate the returned
+copies by event ID; missing responses do not prove absence from a relay.
+
+Publication errors retain their existing `reason` objects and may expose
+`category`: `connection` (WebSocket establishment), `transport` (socket send or
+close), `relay` (an explicit negative `OK`), or `timeout` (missing confirmation).
+Native messages, codes, nested causes and aggregate errors remain available;
+WebSocket closure details use `closeCode`, `closeReason`, and `wasClean` rather
+than overwriting a native `code`. A timeout can retain a preceding socket error
+as its cause without claiming that the relay rejected the event. Authentication
+wrappers preserve this context. Local failures can remain uncategorized.
+Event metadata is internal and is removed by `sendEvent` before serialization.
+
 The same public subpath exports `getRelaysByPubkey(pubkeys)`, which discovers
 the latest NIP-65 relay list for every requested pubkey through `seedRelays`,
 normalizes and deduplicates its public relay URLs, and falls back to the first

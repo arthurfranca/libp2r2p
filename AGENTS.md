@@ -35,6 +35,13 @@ parsers that use `null` for an expected mismatch keep that contract.
 
 ## Tests
 
+Preserve relay API envelopes and immediate delivery when changing transport
+behavior. `deduplicateAcrossRelays` belongs only to `getEvents` and
+`getEventsGenerator`; disabling it still deduplicates IDs within each relay.
+Replication tests must exercise the real pool with a controlled transport.
+Operational error categories supplement native errors; do not replace their
+messages, codes or causes, or reinterpret a timeout as an explicit rejection.
+
 During implementation, run the smallest directly related test files with
 `npm run test:files -- <relative-test-path> [...]`. Before completing a change,
 run the full deterministic suite with `npm test`.

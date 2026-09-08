@@ -1,7 +1,8 @@
 // Used only to discover users' NIP-65 relay lists (kind:10002).
 export const seedRelays = [
   'wss://relay.44billion.net',
-  'wss://purplepag.es',
+  // Disabled 2026-09-08: offline for some days
+  // 'wss://purplepag.es',
   'wss://user.kindpag.es',
   'wss://relay.nos.social',
   // Disabled 2026-08-05: accepted kind:10002 with OK but did not broadcast it
@@ -15,6 +16,7 @@ export const seedRelays = [
 export const freeRelays = [
   'wss://relay.44billion.net',
   'wss://nos.lol',
+  'wss://relay.dreamith.to',
   'wss://relay.primal.net'
 ]
 

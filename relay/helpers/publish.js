@@ -1,7 +1,8 @@
 import { maybeUnref } from './timer.js'
+import { relayTimeoutError } from './error.js'
 
 function publishTimeoutError () {
-  return new Error('PUBLISH_TIMEOUT')
+  return relayTimeoutError('PUBLISH_TIMEOUT')
 }
 
 // Resolves once any relay accepts the event, all relays reject, an optional

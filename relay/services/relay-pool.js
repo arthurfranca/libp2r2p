@@ -2,6 +2,7 @@ import { ValidationError } from '../../error/index.js'
 import { decodeHll, encodeHll, estimateHllCount, mergeHll } from '../helpers/hll.js'
 import { createPublishSettlements, firstFulfillment, publishSummary } from '../helpers/publish.js'
 import { maybeUnref } from '../helpers/timer.js'
+import { categorizeRelayError } from '../helpers/error.js'
 import { normalizeRelayUrl } from '../../url/index.js'
 import { RelayConnection } from './relay-connection.js'
 
@@ -102,6 +103,8 @@ class Nip42AuthenticationError extends Error {
   constructor (reason) {
     super(reason.message, { cause: reason })
     this.name = 'Nip42AuthenticationError'
+    if (reason.category) this.category = reason.category
+    if (reason.code !== undefined) this.code = reason.code
   }
 }
 
@@ -143,7 +146,7 @@ export class RelayPool {
       try {
         await relay.close()
       } catch {}
-      throw error
+      throw categorizeRelayError(error, error?.category ?? 'connection')
     }
 
     // Only reset idle timeout when no live subscriptions are holding this relay open.
@@ -335,8 +338,10 @@ export class RelayPool {
 
   // Collects a one-shot relay read. The first EOSE with events opens a short
   // grace window; null disables that window so callers wait for every relay or
-  // the operation deadline. Event ids are deduplicated across relay responses.
-  async getEvents (filter, relays, { timeout = 5000, timeoutAfterFirstEose = 500, callback, signal } = {}) {
+  // the operation deadline. Disabling cross-relay deduplication still suppresses
+  // repeated ids from the same relay; callbacks remain immediate in both modes.
+  async getEvents (filter, relays, { timeout = 5000, timeoutAfterFirstEose = 500, callback, signal, deduplicateAcrossRelays = true } = {}) {
+    if (typeof deduplicateAcrossRelays !== 'boolean') throw new ValidationError('INVALID_DEDUPLICATE_ACROSS_RELAYS')
     const urls = normalizedRelayUrls(relays)
     if (!urls.length) return { result: [], errors: [], success: false }
     if (signal?.aborted) throw new Error('Aborted')
@@ -346,7 +351,7 @@ export class RelayPool {
     const normalCloseUrls = new Set()
     const errors = []
     const events = []
-    const eventIds = new Set()
+    const eventIds = deduplicateAcrossRelays ? new Set() : null
     let completed = 0
     let isResolved = false
     let eoseTimer = null
@@ -411,6 +416,7 @@ export class RelayPool {
       if (timeout !== null) timeoutTimer = maybeUnref(setTimeout(timeoutPending, timeout))
 
       for (const url of urls) {
+        const seenIds = eventIds ?? new Set()
         this.#getRelay(url).then(relay => {
           if (isResolved || !pending.has(url)) return
           let hasEvents = false
@@ -432,10 +438,8 @@ export class RelayPool {
             onevent: (event) => {
               if (isResolved || !pending.has(url)) return
               hasEvents = true
-              // Keep filter-limit accounting per relay, but only expose one copy of
-              // a matching event when several relays return the same id.
-              if (!event?.id || !eventIds.has(event.id)) {
-                if (event?.id) eventIds.add(event.id)
+              if (!event?.id || !seenIds.has(event.id)) {
+                if (event?.id) seenIds.add(event.id)
                 event.meta = { relay: url }
                 events.push(event)
                 if (callback) callback({ type: 'event', event, relay: url })
@@ -859,6 +863,10 @@ export class RelayPool {
     // Starts before connection work so every relay shares one real deadline.
     const settlement = createPublishSettlements(sendPromises, timeout, {
       onSettled: (settlement, index) => {
+        if (settlement.reason?.category === 'timeout' && !settlement.reason.cause) {
+          const relay = this.#relays.get(normalizeRelayUrl(urls[index]))
+          if (relay?.lastTransportError) settlement.reason.cause = relay.lastTransportError
+        }
         notifyRelayResult(onRelayResult, relayResultForSettlement(urls[index], settlement))
       }
     })
