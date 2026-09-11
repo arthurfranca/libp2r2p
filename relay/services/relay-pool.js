@@ -1,6 +1,7 @@
 import { ValidationError } from '../../error/index.js'
 import { decodeHll, encodeHll, estimateHllCount, mergeHll } from '../helpers/hll.js'
 import { createPublishSettlements, firstFulfillment, publishSummary } from '../helpers/publish.js'
+import { drainableStream } from '../helpers/drainable-stream.js'
 import { maybeUnref } from '../helpers/timer.js'
 import { categorizeRelayError } from '../helpers/error.js'
 import { normalizeRelayUrl } from '../../url/index.js'
@@ -480,7 +481,11 @@ export class RelayPool {
       p = Promise.withResolvers()
     }
 
-    const methodPromise = this.getEvents(filter, relays, { ...options, callback })
+    // A drain stops receive callbacks without aborting consumption of this queue.
+    const networkSignal = options._stopSignal
+      ? AbortSignal.any([options._stopSignal, ...(options.signal ? [options.signal] : [])])
+      : options.signal
+    const methodPromise = this.getEvents(filter, relays, { ...options, signal: networkSignal, callback })
       .catch(err => { if (err?.message !== 'Aborted') console.error('Error in getEvents:', err) })
       .finally(() => {
         isDone = true
@@ -489,6 +494,7 @@ export class RelayPool {
 
     // eslint-disable-next-line no-unmodified-loop-condition
     while (!isDone || queue.length > 0) {
+      if (options.signal?.aborted) break
       if (queue.length > 0) yield queue.shift()
       else await p.promise
     }
@@ -501,7 +507,7 @@ export class RelayPool {
   getLiveEventsGenerator (filter, relays, options = {}) {
     const ready = Promise.withResolvers()
     const readyRelays = new Set()
-    const stream = this.#getLiveEventsGenerator(filter, relays, options, { ready, readyRelays })
+    const stream = drainableStream(options => this.#getLiveEventsGenerator(filter, relays, options, { ready, readyRelays }), options)
 
     Object.defineProperties(stream, {
       ready: {
@@ -521,6 +527,7 @@ export class RelayPool {
   // suppressing already-live events from another relay.
   async * #getLiveEventsGenerator (filter, relays, {
     signal,
+    _stopSignal,
     timeoutAfterFirstEose = 500,
     timeoutForReconnectGap = 5000,
     timeoutAfterFirstReconnectGapEose = 500,
@@ -530,6 +537,8 @@ export class RelayPool {
     const queue = []
     let p = Promise.withResolvers()
     let isDone = false
+    let draining = false
+    const gapTasks = new Set()
     const liveSubs = new Map() // url → live sub
     const retryTimers = new Map()
     const initialPending = new Set(urls)
@@ -537,7 +546,7 @@ export class RelayPool {
     let readyTimer = null
     let isReady = false
 
-    // Internal abort controller to cancel any in-flight reconnect gap fills on teardown
+    // Stop recovery input on teardown, preserving its accepted history for a drain.
     const gapAc = new AbortController()
 
     // Strip time-range fields — we manage them internally
@@ -565,9 +574,11 @@ export class RelayPool {
       }))
     }
 
-    const teardown = () => {
-      if (isDone) return
+    const teardown = (drain = false) => {
+      if (isDone && (drain || !draining)) return
+      draining = drain
       isDone = true
+      if (!drain) queue.length = 0
       clearTimeout(untilTimer)
       finishReady()
       gapAc.abort()
@@ -578,8 +589,9 @@ export class RelayPool {
       p.resolve()
     }
 
-    const pushEvent = (event, url) => {
-      if (isDone || (event.id && seenIds.has(event.id))) return
+    const pushEvent = (event, url, accepted = false) => {
+      // Recovery queues accepted these events before input was stopped.
+      if ((isDone && !(draining && accepted)) || (event.id && seenIds.has(event.id))) return
       if (event.id) {
         if (seenIds.size >= 500) seenIds.delete(seenIds.values().next().value) // evict oldest
         seenIds.add(event.id)
@@ -591,11 +603,14 @@ export class RelayPool {
       p = Promise.withResolvers()
     }
 
-    if (signal?.aborted) {
+    if (signal?.aborted || _stopSignal?.aborted) {
       finishReady()
       return
     }
-    signal?.addEventListener('abort', teardown, { once: true })
+    const abort = () => teardown()
+    const stop = () => teardown(true)
+    signal?.addEventListener('abort', abort, { once: true })
+    _stopSignal?.addEventListener('abort', stop, { once: true })
 
     const maybeFinishInitialReady = () => {
       if (initialPending.size === 0) finishReady()
@@ -630,7 +645,7 @@ export class RelayPool {
     // Schedule teardown when the wall clock reaches filter.until
     if (filterUntil !== null) {
       const msUntil = filterUntil * 1000 - Date.now()
-      untilTimer = maybeUnref(setTimeout(teardown, Math.max(0, msUntil)))
+      untilTimer = maybeUnref(setTimeout(() => teardown(true), Math.max(0, msUntil)))
     }
 
     // Runs a reconnect gap fill for a single relay and returns a promise that resolves
@@ -641,11 +656,12 @@ export class RelayPool {
       const gapGen = _gapEventsGenerator(gapFilter, [url], {
         timeout: timeoutForReconnectGap,
         timeoutAfterFirstEose: timeoutAfterFirstReconnectGapEose,
-        signal: gapAc.signal
+        signal,
+        _stopSignal: gapAc.signal
       })
       return (async () => {
         for await (const item of gapGen) {
-          if (item?.type === 'event') pushEvent(item.event, url)
+          if (item?.type === 'event') pushEvent(item.event, url, true)
         }
       })().catch(err => {
         if (!isDone) console.error(`Reconnect gap fill error for ${url}:`, err)
@@ -673,7 +689,7 @@ export class RelayPool {
           onevent: (event) => {
             // A limit:0 relay may still send retained events before EOSE. Do not
             // expose them from a strictly-live stream.
-            if (!liveEose) return
+            if (isDone || liveSubs.get(url) !== liveSub || !liveEose) return
             if (liveBuffer) liveBuffer.push(event)
             else pushEvent(event, url)
           },
@@ -700,12 +716,14 @@ export class RelayPool {
         liveSubs.set(url, liveSub)
 
         if (gapSince !== null && gapSince > 0) {
-          runReconnectGapFill(url, gapSince, now).then(() => {
-            if (isDone) return
+          const task = runReconnectGapFill(url, gapSince, now).finally(() => {
             const buf = liveBuffer
             liveBuffer = null
-            for (const event of buf) pushEvent(event, url)
+            for (const event of buf) pushEvent(event, url, true)
+            gapTasks.delete(task)
+            p.resolve()
           })
+          gapTasks.add(task)
         }
       }).catch(err => {
         readyRelays.delete(url)
@@ -729,12 +747,14 @@ export class RelayPool {
 
     try {
       // eslint-disable-next-line no-unmodified-loop-condition
-      while (!isDone || queue.length > 0) {
+      while (!isDone || (draining && gapTasks.size > 0) || queue.length > 0) {
+        if (signal?.aborted) break
         if (queue.length > 0) yield queue.shift()
-        else await p.promise
+        else { await p.promise; p = Promise.withResolvers() }
       }
     } finally {
-      signal?.removeEventListener('abort', teardown)
+      signal?.removeEventListener('abort', abort)
+      _stopSignal?.removeEventListener('abort', stop)
       for (const url of urls) this.#decrementLiveSub(url)
       teardown()
     }
@@ -752,17 +772,24 @@ export class RelayPool {
   //   relays when null.
   //
   // All underlying generators are injectable for testing.
-  async * getEventsFeedGenerator (filter, relays, {
+  getEventsFeedGenerator (filter, relays, options = {}) {
+    return drainableStream(options => this.#getEventsFeedGenerator(filter, relays, options), options)
+  }
+
+  async * #getEventsFeedGenerator (filter, relays, {
     signal,
+    _stopSignal,
     live = true,
     timeout = 5000,
     timeoutAfterFirstEose = 500,
     _liveGenerator = (...args) => this.getLiveEventsGenerator(...args),
     _eventsGenerator = (...args) => this.getEventsGenerator(...args)
   } = {}) {
+    if (signal.aborted || _stopSignal.aborted) return
     if (!live) {
-      const gen = _eventsGenerator(filter, relays, { timeout, timeoutAfterFirstEose, signal })
+      const gen = _eventsGenerator(filter, relays, { timeout, timeoutAfterFirstEose, signal, _stopSignal })
       for await (const item of gen) {
+        if (signal.aborted) return
         if (item?.type === 'event') yield item.event
       }
       return
@@ -770,7 +797,8 @@ export class RelayPool {
 
     // limit:0 means "no stored events, live only" — skip the initial fetch.
     if (filter.limit === 0) {
-      for await (const event of _liveGenerator(filter, relays, { signal })) {
+      for await (const event of _liveGenerator(filter, relays, { signal, _stopSignal })) {
+        if (signal.aborted) return
         yield event
       }
       return
@@ -780,7 +808,7 @@ export class RelayPool {
     // buffering incoming events before we query stored ones.
     // Relays always send stored matching events before EOSE (unless limit:0),
     // so the initial fetch + buffering is always needed.
-    const liveGen = _liveGenerator(filter, relays, { signal })
+    const liveGen = _liveGenerator(filter, relays, { signal, _stopSignal })
     const liveBuffer = []
     let liveDone = false
     let liveWake = Promise.withResolvers()
@@ -788,6 +816,7 @@ export class RelayPool {
     const bgLoop = (async () => {
       try {
         for await (const event of liveGen) {
+          if (signal.aborted) break
           liveBuffer.push(event)
           liveWake.resolve()
           liveWake = Promise.withResolvers()
@@ -800,10 +829,11 @@ export class RelayPool {
 
     try {
       // Yield stored events from the initial one-shot fetch
-      const fetchGen = _eventsGenerator(filter, relays, { timeout, timeoutAfterFirstEose, signal })
+      const fetchGen = _eventsGenerator(filter, relays, { timeout, timeoutAfterFirstEose, signal, _stopSignal })
 
       const seenIds = new Set()
       for await (const item of fetchGen) {
+        if (signal.aborted) return
         if (item?.type === 'event' && !seenIds.has(item.event.id)) {
           seenIds.add(item.event.id)
           yield item.event
@@ -813,6 +843,7 @@ export class RelayPool {
       // Flush buffered live events that arrived during the initial fetch, deduping
       // against stored ones (overlap is possible around the fetch's until boundary)
       while (liveBuffer.length > 0) {
+        if (signal.aborted) return
         const event = liveBuffer.shift()
         if (!seenIds.has(event.id)) {
           seenIds.add(event.id)
@@ -823,11 +854,14 @@ export class RelayPool {
       // Yield subsequent live events directly — no more overlap with stored events
       // eslint-disable-next-line no-unmodified-loop-condition
       while (!liveDone || liveBuffer.length > 0) {
-        while (liveBuffer.length > 0) yield liveBuffer.shift()
+        while (liveBuffer.length > 0) {
+          if (signal.aborted) return
+          yield liveBuffer.shift()
+        }
         if (!liveDone) await liveWake.promise
       }
     } finally {
-      liveGen.return()
+      await liveGen.return()
       await bgLoop
     }
   }

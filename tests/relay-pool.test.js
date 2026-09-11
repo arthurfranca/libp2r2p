@@ -834,8 +834,8 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       await tick()
       // Unblock live generator after fetch has yielded the stored event
       resolveFetch()
-      ac.abort()
       await promise
+      ac.abort()
 
       assert.equal(events[0].id, 'stored', 'stored event should come first')
       assert.equal(events[1].id, 'live', 'live event should come after')
@@ -997,7 +997,9 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       await promise
       assert.equal(capturedArgs.o.timeout, 3000)
       assert.equal(capturedArgs.o.timeoutAfterFirstEose, 200)
-      assert.equal(capturedArgs.o.signal, ac.signal)
+      assert.equal(capturedArgs.o.signal.aborted, false)
+      ac.abort()
+      assert.equal(capturedArgs.o.signal.aborted, true)
       assert.equal(events.length, 1)
       assert.equal(events[0].id, 'e1')
     })
@@ -1034,7 +1036,9 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       await promise
       assert.equal(capturedArgs.o.timeout, 4000)
       assert.equal(capturedArgs.o.timeoutAfterFirstEose, null)
-      assert.equal(capturedArgs.o.signal, ac.signal)
+      assert.equal(capturedArgs.o.signal.aborted, false)
+      ac.abort()
+      assert.equal(capturedArgs.o.signal.aborted, true)
       assert.equal(events.length, 1)
     })
 
@@ -1051,6 +1055,120 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       await promise
       assert.equal(events.length, 1)
     })
+  })
+})
+
+describe('relay stream stopAndDrain', () => {
+  beforeEach(() => {
+    relayRegistry.clear()
+    connectOverrides.clear()
+    autoEoseForLiveSubscriptions = true
+  })
+
+  for (const options of [{}, { live: false }, { limit: 0 }]) {
+    it(`preserves accepted events and rejects late callbacks: ${JSON.stringify(options)}`, { timeout: 3000 }, async () => {
+      const pool = createRelayPool()
+      const stream = pool.getEventsFeedGenerator(options.limit === 0 ? { limit: 0 } : {}, ['wss://r1'], options)
+      const first = stream.next()
+      await tick()
+      const relay = relayRegistry.get('wss://r1')
+      const live = relay.subscriptions.find(sub => sub.filters[0].limit === 0)
+      const history = relay.subscriptions.find(sub => sub.filters[0].limit !== 0)
+      history?.handlers.onevent(makeEvent({ id: 'history-1' }))
+      history?.handlers.onevent(makeEvent({ id: 'history-2' }))
+      live?.handlers.onevent(makeEvent({ id: 'live-1' }))
+      live?.handlers.onevent(makeEvent({ id: 'live-2' }))
+      stream.stopAndDrain()
+      stream.stopAndDrain()
+      assert.ok(relay.subscriptions.every(sub => sub.isClosed))
+      for (const sub of relay.subscriptions) sub.handlers.onevent(makeEvent({ id: 'late' }))
+      const events = [(await first).value]
+      for await (const event of stream) events.push(event)
+      assert.deepEqual(events.map(event => event.id), [
+        ...(history ? ['history-1', 'history-2'] : []),
+        ...(live ? ['live-1', 'live-2'] : [])
+      ])
+      assert.ok(events.every(event => Object.keys(event.meta).join() === 'relay'))
+      await pool.disconnectAll()
+    })
+  }
+
+  it('drains reconnect history and its live buffer while a recovery query is pending', { timeout: 4000 }, async () => {
+    const pool = createRelayPool()
+    const stream = pool.getLiveEventsGenerator({ since: 1 }, ['wss://r1'])
+    const first = stream.next()
+    await tick()
+    const relay = relayRegistry.get('wss://r1')
+    const old = relay.subscriptions[0]
+    old.close()
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    const live = relay.subscriptions.find(sub => !sub.isClosed && sub.filters[0].limit === 0)
+    const history = relay.subscriptions.find(sub => !sub.isClosed && sub.filters[0].limit !== 0)
+    assert.ok(live && history)
+    history.handlers.onevent(makeEvent({ id: 'gap-1' }))
+    history.handlers.onevent(makeEvent({ id: 'gap-2' }))
+    live.handlers.onevent(makeEvent({ id: 'buffered-live' }))
+    stream.stopAndDrain()
+    for (const sub of relay.subscriptions) {
+      assert.ok(sub.isClosed)
+      sub.handlers.onevent(makeEvent({ id: 'late' }))
+    }
+    const events = [(await first).value]
+    for await (const event of stream) events.push(event)
+    assert.deepEqual(events.map(event => event.id), ['gap-1', 'gap-2', 'buffered-live'])
+    await pool.disconnectAll()
+  })
+
+  it('allows caller abort to discard the remaining drain queue', async () => {
+    const pool = createRelayPool()
+    const ac = new AbortController()
+    const stream = pool.getEventsFeedGenerator({ limit: 0 }, ['wss://r1'], { signal: ac.signal })
+    const first = stream.next()
+    await tick()
+    const sub = relayRegistry.get('wss://r1').subscriptions[0]
+    sub.handlers.onevent(makeEvent({ id: 'first' }))
+    sub.handlers.onevent(makeEvent({ id: 'queued' }))
+    assert.equal((await first).value.id, 'first')
+    stream.stopAndDrain()
+    ac.abort()
+    assert.equal((await stream.next()).done, true)
+    await pool.disconnectAll()
+  })
+
+  it('stops before the first next without opening connections', async () => {
+    const pool = createRelayPool()
+    for (const method of ['getEventsFeedGenerator', 'getLiveEventsGenerator']) {
+      const stream = pool[method]({}, ['wss://r1'])
+      stream.stopAndDrain()
+      assert.equal((await stream.next()).done, true)
+    }
+    assert.equal(relayRegistry.size, 0)
+  })
+
+  it('return cancels a pending next and closes the network subscriptions', { timeout: 3000 }, async () => {
+    const pool = createRelayPool()
+    const stream = pool.getEventsFeedGenerator({}, ['wss://r1'])
+    const next = stream.next()
+    await tick()
+    await stream.return()
+    assert.equal((await next).done, true)
+    assert.ok(relayRegistry.get('wss://r1').subscriptions.every(sub => sub.isClosed))
+    await pool.disconnectAll()
+  })
+
+  it('stopping during connection setup prevents late subscriptions from opening', { timeout: 3000 }, async () => {
+    const connecting = deferred()
+    connectOverrides.set('wss://r1', () => connecting.promise)
+    const pool = createRelayPool()
+    const stream = pool.getEventsFeedGenerator({}, ['wss://r1'])
+    const next = stream.next()
+    await tick()
+    stream.stopAndDrain()
+    assert.equal((await next).done, true)
+    connecting.resolve()
+    await tick()
+    assert.equal(relayRegistry.get('wss://r1').subscriptions.length, 0)
+    await pool.disconnectAll()
   })
 })
 

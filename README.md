@@ -12,6 +12,35 @@ For remote-work scheduling, see [`libp2r2p/network`](network/README.md):
 `isOnline` probes connectivity and `onOnline` shares recovery monitoring,
 including retries when the browser omits its native `online` event.
 
+## Relay feed lifecycle
+
+`RelayPool.getEventsFeedGenerator(filter, relays, options)` yields events directly,
+including the existing `event.meta.relay` field. By default it combines an initial
+historical query with a live subscription. `live: false` selects history only;
+`filter.limit: 0` selects live only. `getLiveEventsGenerator` exposes the same
+lifecycle controls along with its existing `ready` and `readyRelays` properties.
+
+The returned iterator has a synchronous, idempotent `stopAndDrain()` method. It
+closes subscription input and cancels reconnections and outstanding historical
+queries, while retaining events already accepted by the library's receive
+callbacks. Continue consuming the iterator to obtain those events and observe
+completion. This includes initial history, buffered live events, and both history
+and live buffers from reconnect recovery. Calling it before the first `next()`
+prevents subscriptions from opening. No reception timestamp or new event metadata
+is added. Events rejected by ordinary filtering/deduplication remain excluded.
+
+Aborting `options.signal`, calling `return()` (including a `for await` break), or
+calling `throw()` cancels input and pending delivery instead. An event already
+delivered to the caller cannot be recalled. These operations also interrupt a
+drain. `stopAndDrain()` does not consume the iterator or return a completion
+promise: completion is the iterator's `{ done: true }` result.
+
+```js
+const stream = relayPool.getEventsFeedGenerator({ authors: [pubkey] }, [relay], { signal })
+// When this relay is removed, call stream.stopAndDrain() from the list handler.
+for await (const event of stream) await store(event)
+```
+
 ## Private Messenger
 
 The main API is `createPrivateMessenger` from `libp2r2p/private-messenger`.
