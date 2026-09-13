@@ -320,6 +320,14 @@ NIP-44 v2 uses the interoperable `nip44-v2` salt by default. A custom UTF-8
 salt of at most 32 bytes may be passed to `getConversationKey()`, but messages
 derived with it are not interoperable with standard NIP-44 implementations.
 
+NIP-44 v3 separates binary (`encryptBytes`/`decryptBytes`), UTF-8 text
+(`encrypt`/`decrypt`), and standard-Base64 plaintext
+(`encryptBase64`/`decryptBase64`) interfaces.
+The suffix describes plaintext; ciphertext is always
+standard Base64. NIP-46 uses the Base64 helpers, while browser NIP-07 APIs use
+`ArrayBuffer` plaintext; see [the interface guide](nip44-v3/README.md) before
+adapting a signer.
+
 NIP-46 clients and bunker signers use a 30-second operation timeout by
 default. Set `timeout` in the `Nip46Client`/`BunkerSigner` constructor to
 choose another default, override it for an individual `connect()` or RPC, or

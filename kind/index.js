@@ -7,6 +7,7 @@ export const DELETION = 5
 export const REPOST = 6
 export const REACTION = 7
 export const BADGE_AWARD = 8
+export const CHAT_MESSAGE = 9
 export const SEAL = 13
 export const PRIVATE_DIRECT_MESSAGE = 14
 export const GENERIC_REPOST = 16
@@ -146,6 +147,7 @@ export const eventKinds = /* @__PURE__ */ Object.freeze({
   REPOST,
   REACTION,
   BADGE_AWARD,
+  CHAT_MESSAGE,
   SEAL,
   PRIVATE_DIRECT_MESSAGE,
   GENERIC_REPOST,

@@ -113,6 +113,8 @@ export function encryptWithConversationKeyBytes (conversationKey, kind, scope, p
   return bytesToBase64(concatBytes(new Uint8Array([VERSION]), nonce, mac, stuffing))
 }
 
+// seckey/expectedScope: Uint8Array, pubkey: hex, ciphertext: standard Base64 string.
+// Verifies the expected kind/scope and returns plaintext bytes as Uint8Array.
 export function decryptBytes (seckey, pubkey, expectedKind, expectedScope, ciphertext) {
   return decryptWithConversationKeyBytes(deriveSharedConversationKey(seckey, pubkey), expectedKind, expectedScope, ciphertext)
 }
@@ -162,8 +164,7 @@ export function normalizeKind (kind) {
   return n
 }
 
-// String-oriented helpers for app-facing methods. Plaintext travels as
-// base64 on the NIP-07/46 wire so callers can encrypt arbitrary bytes.
+// UTF-8 convenience helpers. Binary callers use encryptBytes/decryptBytes.
 export function encrypt (seckey, pubkey, kind, scope, plaintext) {
   return encryptBytes(seckey, pubkey, normalizeKind(kind), utf8ToBytes(scope || ''), utf8ToBytes(plaintext))
 }
@@ -180,11 +181,14 @@ export function decryptWithConversationKey (conversationKey, kind, scope, cipher
   return textDecoder.decode(decryptWithConversationKeyBytes(conversationKey, normalizeKind(kind), utf8ToBytes(scope || ''), ciphertext))
 }
 
-export function nip07Encrypt (seckey, pubkey, kind, scope, plaintextB64) {
+// Base64 convenience helpers: the suffix describes plaintext input/output.
+// Ciphertext is always standard Base64. NIP-46 uses this plaintext format;
+// NIP-07 instead exposes ArrayBuffer plaintext at the browser API boundary.
+export function encryptBase64 (seckey, pubkey, kind, scope, plaintextB64) {
   return encryptBytes(seckey, pubkey, normalizeKind(kind), utf8ToBytes(scope || ''), base64ToBytes(plaintextB64))
 }
 
-export function nip07Decrypt (seckey, pubkey, kind, scope, ciphertext) {
+export function decryptBase64 (seckey, pubkey, kind, scope, ciphertext) {
   return bytesToBase64(decryptBytes(seckey, pubkey, normalizeKind(kind), utf8ToBytes(scope || ''), ciphertext))
 }
 

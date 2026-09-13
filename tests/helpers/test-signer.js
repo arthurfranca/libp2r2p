@@ -116,11 +116,11 @@ export default class TestSigner {
   }
 
   nip44v3Encrypt (peerPubkey, kind, scope, plaintextB64) {
-    return nip44v3.nip07Encrypt(secretKeys.get(this), peerPubkey, kind, scope, plaintextB64)
+    return nip44v3.encryptBase64(secretKeys.get(this), peerPubkey, kind, scope, plaintextB64)
   }
 
   nip44v3Decrypt (peerPubkey, kind, scope, ciphertext) {
-    return nip44v3.nip07Decrypt(secretKeys.get(this), peerPubkey, kind, scope, ciphertext)
+    return nip44v3.decryptBase64(secretKeys.get(this), peerPubkey, kind, scope, ciphertext)
   }
 
   contentKeyMaterial (requestedContentPubkey = '') {
@@ -159,7 +159,7 @@ export default class TestSigner {
     })
     const ciphertext = conversationKey
       ? nip44v3.encryptWithConversationKeyBytes(conversationKey, normalizedKind, nip44v3.toBytes(scope || ''), nip44v3.b64decode(plaintextB64))
-      : nip44v3.nip07Encrypt(secretKeys.get(this), peerPubkey, normalizedKind, scope, plaintextB64)
+      : nip44v3.encryptBase64(secretKeys.get(this), peerPubkey, normalizedKind, scope, plaintextB64)
     return [ciphertext, contentPubkey]
   }
 
@@ -179,7 +179,7 @@ export default class TestSigner {
     })
     return conversationKey
       ? nip44v3.b64encode(nip44v3.decryptWithConversationKeyBytes(conversationKey, normalizedKind, nip44v3.toBytes(scope || ''), ciphertext))
-      : nip44v3.nip07Decrypt(secretKeys.get(this), peerPubkey, normalizedKind, scope, ciphertext)
+      : nip44v3.decryptBase64(secretKeys.get(this), peerPubkey, normalizedKind, scope, ciphertext)
   }
 
   withSharedKey (peerPubkey, info) {

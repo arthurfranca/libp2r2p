@@ -62,12 +62,19 @@ test('nip44-v3 passes the vendored upstream self-test vectors', () => {
   assert.deepEqual(fails, [])
 })
 
-test('nip44-v3 byte payload helpers round-trip arbitrary bytes', () => {
+test('nip44-v3 Base64 helpers round-trip arbitrary bytes as standard Base64', () => {
   const alice = hexToBytes('1'.repeat(64))
   const bob = hexToBytes('2'.repeat(64))
   const plaintext = nip44v3.b64encode(new Uint8Array([0, 1, 2, 127, 128, 255]))
-  const ciphertext = nip44v3.nip07Encrypt(alice, getPublicKey(bob), '30078', 'spec.nostr.land/nip44v3', plaintext)
+  const ciphertext = nip44v3.encryptBase64(alice, getPublicKey(bob), '30078', 'spec.nostr.land/nip44v3', plaintext)
 
-  assert.equal(nip44v3.nip07Decrypt(bob, getPublicKey(alice), 30078, 'spec.nostr.land/nip44v3', ciphertext), plaintext)
-  assert.throws(() => nip44v3.nip07Decrypt(bob, getPublicKey(alice), 1, 'spec.nostr.land/nip44v3', ciphertext), /kind mismatch/)
+  assert.equal(nip44v3.decryptBase64(bob, getPublicKey(alice), 30078, 'spec.nostr.land/nip44v3', ciphertext), plaintext)
+  assert.throws(() => nip44v3.decryptBase64(bob, getPublicKey(alice), 1, 'spec.nostr.land/nip44v3', ciphertext), /kind mismatch/)
+  assert.throws(() => nip44v3.encryptBase64(alice, getPublicKey(bob), 9, '', '-_8='), { code: 'INVALID_BASE64' })
+  const bytes = new Uint8Array([251, 255])
+  const scope = new TextEncoder().encode('scope')
+  const encrypted = nip44v3.encryptBytes(alice, getPublicKey(bob), 9, scope, bytes)
+  assert.equal(nip44v3.decryptBase64(bob, getPublicKey(alice), 9, 'scope', encrypted), '+/8=')
+  const text = 'https://tabler.io/icons?icon=server-bolt 😀'
+  assert.equal(nip44v3.decrypt(bob, getPublicKey(alice), 9, '', nip44v3.encrypt(alice, getPublicKey(bob), 9, '', text)), text)
 })
