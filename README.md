@@ -371,12 +371,60 @@ event. Their `assert…` counterparts return the original event or throw a
 `ValidationError` with a stable code.
 
 NIP-27 text references live in `libp2r2p/nip27`. `extractMedia()` splits
-content into text, URL, profile, event, relay, NIP-05 and hashtag items in
+content into text, URL, profile, event, relay, NIP-05, app and hashtag items in
 occurrence order, accepting the optional `@` and `nostr:` mention prefixes
 plus NIP-05 in its standard, root and custom compact spellings.
 `decodeReference()` parses a single reference, and `decodeMediaMetadata()`
 reads the file/media metadata carried in a URL fragment
 (`#m=image/png&dim=640x480&...`).
+
+App references are a library extension to NIP-27. `extractMedia()` recognizes
+encoded `+…` app entities and named references such as `+hallway@fiatjaf.com`,
+`++myapp@bob@example.com` and `+++myapp@npub1…`, with optional `nostr:` before
+the entire reference. Named authors accept the NIP-05 spellings above, `npub`,
+`nprofile` and hex pubkeys; app names may be URL-encoded. The one-to-three `+`
+prefix selects `main`, `next` or `draft` respectively.
+
+Bare app names use the `defaultAppAuthor` option, which defaults to
+`'44billion.net'`: `+apps` identifies the same app as `+apps@44billion.net`.
+The option accepts a NIP-05 reference (including compact spellings), `npub`,
+`nprofile` or hex pubkey and is validated locally on every call. An invalid
+value throws `ValidationError` with code `INVALID_DEFAULT_APP_AUTHOR`.
+Explicit authors and encoded app entities are never overridden. Malformed
+explicit authors remain text instead of falling back to the default.
+
+```js
+extractMedia('+apps', { defaultAppAuthor: 'bob@example.com' })
+// app.user: { type: 'nip05', local: 'bob', domain: 'example.com', raw: 'bob.example.com' }
+// app.original remains '+apps'.
+```
+
+These references produce `{ key: 'app', app: { original, ...decoded } }`, where
+`decoded` is the result of `decodeAppUrl()` from `libp2r2p/url`, with a missing
+named author filled from `defaultAppAuthor` as described above. Named apps
+include `type: 'named'`, `prefix`, `channel`, `appName` (the manifest's `d` tag)
+and the decoded `user`; entities include `type: 'entity'` and `entity`, usable
+with `appDecode()` from `libp2r2p/nip19`. Extraction performs no network lookup
+and does not verify that the app exists. For example:
+
+```js
+extractMedia('Open nostr:++myapp@bob@example.com')
+// [
+//   { key: 'text', text: { value: 'Open ' } },
+//   { key: 'app', app: {
+//     original: 'nostr:++myapp@bob@example.com', type: 'named',
+//     prefix: '++', channel: 'next', appName: 'myapp',
+//     user: { type: 'nip05', local: 'bob', domain: 'example.com', raw: 'bob.example.com' }
+//   } }
+// ]
+```
+
+App references must be standalone inline tokens, not concatenated to event
+pointers or embedded in URL paths. Invalid app candidates remain text.
+Bare names can use letters, numbers, dots, underscores, hyphens and tildes;
+URL-encode spaces, `@` and other punctuation in them.
+`+naddr1…` is recognized as an app only for site-manifest kinds; unprefixed
+`naddr1…` and `nostr:naddr1…` keep their existing `event` item shape.
 
 `compactWhitespace(text, options?)` is also exported from `libp2r2p/nip27` as an
 opt-in display helper. It removes carriage returns, collapses spaces and

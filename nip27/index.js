@@ -1,12 +1,13 @@
 import { ValidationError } from '../error/index.js'
 import {
+  NAPP_ENTITY_REGEX,
   naddrDecode,
   neventDecode,
   noteDecode,
   nrelayDecode
 } from '../nip19/index.js'
 import { queryProfile } from '../nip05/index.js'
-import { normalizeRelayUrl } from '../url/index.js'
+import { normalizeRelayUrl, tryDecodeAppUrl } from '../url/index.js'
 import {
   decodeUserReference,
   encodeUserReference,
@@ -37,6 +38,15 @@ const NIP05_AT_CUSTOM = `@(?<nip05AtCustom>${NIP05_LOCAL}\\.${NIP05_DOMAIN})`
 const NIP05_BARE_ROOT = '(?<nip05BareRoot>[a-z0-9-]+\\.[a-z]{2,63})'
 const NIP05_BARE_CUSTOM = `(?<nip05BareCustom>${NIP05_LOCAL}\\.${NIP05_DOMAIN})`
 
+// App references are a library extension. Names may contain punctuation, but
+// author spellings and encoded entities delimit the token. decodeAppUrl owns
+// validation. Literal + inside a name must be encoded, so a named candidate
+// cannot consume a neighboring app reference. Prose punctuation stays outside.
+const APP_SOURCE = '(?:nostr:)?(?<app>' +
+  NAPP_ENTITY_REGEX.source.slice(1, -1) + '|' +
+  /\+{1,3}[^\s/<>+]+?@[a-zA-Z0-9._%@-]*[a-zA-Z0-9]/.source + '|' +
+  /\+{1,3}[\p{L}\p{N}._%~-]*[\p{L}\p{N}_%~-]/.source + ')'
+
 function entitySource (name) {
   const bodyLength = name === 'npub' ? '58' : (name === 'nrelay' ? '10,5000' : '58,5000')
   return `(?:@|nostr:)?(?<${name}>${name}1${BECH32_BODY}{${bodyLength}})`
@@ -66,6 +76,7 @@ function getReferencesRegex (bareNip05) {
   ]
   const alternatives = [
     URL_SOURCE,
+    APP_SOURCE,
     NIP05_STANDARD,
     ...nip05Compact,
     ...ENTITY_SOURCES,
@@ -277,7 +288,17 @@ function decodeFragmentValue (value) {
   }
 }
 
-function getReferenceItem (original, groups, { getMimeType }) {
+function getReferenceItem (original, groups, { getMimeType, defaultAppUser }) {
+  if (groups.app) {
+    const app = tryDecodeAppUrl(groups.app)
+    // An omitted author uses the configured default. An explicit but invalid
+    // author must never silently resolve to a different app.
+    if (app?.type === 'named' && !app.user && !groups.app.includes('@')) app.user = defaultAppUser
+    return app && (app.type === 'entity' || app.user)
+      ? { key: 'app', app: { original, ...app } }
+      : { key: 'text', text: { value: original } }
+  }
+
   if (groups.url) {
     const url = `${groups.protocol ? '' : 'https://'}${groups.url}`
     let mediaMetadata = {}
@@ -377,9 +398,19 @@ function getReferenceItem (original, groups, { getMimeType }) {
 // Bare compact NIP-05 spellings (`bob.example.com`) are only recognized when
 // `{ bareNip05: true }` is passed, since they are otherwise indistinguishable
 // from plain hostnames; prefixed forms (`@bob.example.com`) always work.
-export function extractMedia (content, { bareNip05 = false, getMimeType } = {}) {
+// App references (+encodedEntity, +app@author or +app, with optional nostr:) return
+// { key: 'app', app: { original, ...decodeAppUrlResult } } without resolution.
+// Missing app authors use defaultAppAuthor, validated as a user reference.
+export function extractMedia (content, { bareNip05 = false, getMimeType, defaultAppAuthor = '44billion.net' } = {}) {
   if (typeof content !== 'string') {
     throw new ValidationError('INVALID_MEDIA_CONTENT', { message: 'CONTENT_SHOULD_BE_A_STRING' })
+  }
+  let defaultAppUser
+  try {
+    defaultAppUser = decodeUserReference(defaultAppAuthor)
+  } catch (cause) {
+    if (!(cause instanceof ValidationError)) throw cause
+    throw new ValidationError('INVALID_DEFAULT_APP_AUTHOR', { cause })
   }
   const regex = getReferencesRegex(bareNip05)
   const items = []
@@ -392,7 +423,7 @@ export function extractMedia (content, { bareNip05 = false, getMimeType } = {}) 
     }
     const original = match[0]
     end = start + original.length
-    const item = getReferenceItem(original, match.groups, { getMimeType })
+    const item = getReferenceItem(original, match.groups, { getMimeType, defaultAppUser })
     if (item) items.push(item)
   }
 
