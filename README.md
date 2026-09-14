@@ -377,6 +377,9 @@ plus NIP-05 in its standard, root and custom compact spellings.
 `decodeReference()` parses a single reference, and `decodeMediaMetadata()`
 reads the file/media metadata carried in a URL fragment
 (`#m=image/png&dim=640x480&...`).
+URLs can contain literal `+` in their paths, including launcher links such as
+`https://44billion.net/+apps?by=fiatjaf.com`. They produce a single URL item
+with the full address, rather than an app item for the embedded reference.
 
 App references are a library extension to NIP-27. `extractMedia()` recognizes
 encoded `+…` app entities and named references such as `+hallway@fiatjaf.com`,

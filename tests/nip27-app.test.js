@@ -130,11 +130,11 @@ test('extractMedia preserves punctuation, whitespace and order around app refere
 
 test('extractMedia keeps app recognition separate from URLs, profiles, NIP-05 and event references', () => {
   const note = noteEncode(pubkey)
-  const content = `+hallway@fiatjaf.com https://example.com/app @bob@example.com ${npub} ${note} #apps`
+  const content = `+hallway@fiatjaf.com https://example.com/+app@bob@example.com @bob@example.com ${npub} ${note} #apps`
   for (const bareNip05 of [false, true]) {
     const items = extractMedia(content, { bareNip05 }).filter(item => item.key !== 'text')
     assert.deepEqual(items.map(item => item.key), ['app', 'url', 'nip05', 'profile', 'event', 'hashtag'])
-    assert.equal(items[1].url.value, 'https://example.com/app')
+    assert.equal(items[1].url.value, 'https://example.com/+app@bob@example.com')
   }
 })
 
@@ -154,7 +154,7 @@ test('extractMedia keeps invalid, ambiguous and concatenated app candidates as t
     '+my%ZZapp@bob@example.com', '+my%2Fapp@bob@example.com', '+my%00app@bob@example.com',
     `+${'a'.repeat(48)}`, `+${nonApp}`, `${note}${example}`, `${npub}${example}`,
     '+myapp@bob@example.com/route', '+myapp@bob@example.com+extra',
-    'https://example.com/+hallway@fiatjaf.com', '+my%ZZapp', '+my%2Fapp', '+my%00app'
+    '+my%ZZapp', '+my%2Fapp', '+my%00app'
   ]) {
     for (const prefix of ['', 'nostr:']) {
       const content = `before ${prefix}${value} after`
