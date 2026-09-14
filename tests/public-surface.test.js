@@ -24,7 +24,7 @@ test('new public Nostr subpaths expose only the used surface', async () => {
     nip04: ['decrypt', 'encrypt'],
     nip05: ['queryProfile'],
     nip27: [
-      'decodeMediaMetadata', 'decodeReference', 'decodeUserReference',
+      'compactWhitespace', 'decodeMediaMetadata', 'decodeReference', 'decodeUserReference',
       'encodeUserReference', 'extractMedia', 'resolveUserReference',
       'tryDecodeMediaMetadata', 'tryDecodeReference', 'tryDecodeUserReference'
     ],
@@ -62,6 +62,7 @@ test('new public Nostr subpaths expose only the used surface', async () => {
 
   const root = await import('libp2r2p')
   assert.equal(root.error.ValidationError, (await import('libp2r2p/error')).ValidationError)
+  assert.equal(root.nip27.compactWhitespace, (await import('libp2r2p/nip27')).compactWhitespace)
 })
 
 test('serialization and RelayConnection remain package-internal', async () => {

@@ -6,7 +6,6 @@ import { freeRelays, nappRelays, seedRelays } from 'libp2r2p/relay'
 test('exports the canonical seed relays', () => {
   assert.deepEqual(seedRelays, [
     'wss://relay.44billion.net',
-    'wss://purplepag.es',
     'wss://user.kindpag.es',
     'wss://relay.nos.social',
     'wss://indexer.coracle.social'
@@ -18,6 +17,7 @@ test('exports active fallback relays without the retired Damus relay', () => {
   assert.deepEqual(freeRelays, [
     'wss://relay.44billion.net',
     'wss://nos.lol',
+    'wss://relay.dreamith.to',
     'wss://relay.primal.net'
   ])
   assert.equal(freeRelays.includes('wss://relay.damus.io'), false)

@@ -14,6 +14,7 @@ import {
 } from './helpers/user-reference.js'
 
 export { decodeUserReference, encodeUserReference, tryDecodeUserReference }
+export { compactWhitespace } from './helpers/compact-whitespace.js'
 
 const BECH32_BODY = '[ac-hj-np-z02-9]'
 const BOUNDARY_PREFIX = /(?<=^|[\s"«„「¡¿:{([])/.source

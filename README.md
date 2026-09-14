@@ -378,6 +378,29 @@ plus NIP-05 in its standard, root and custom compact spellings.
 reads the file/media metadata carried in a URL fragment
 (`#m=image/png&dim=640x480&...`).
 
+`compactWhitespace(text, options?)` is also exported from `libp2r2p/nip27` as an
+opt-in display helper. It removes carriage returns, collapses spaces and
+tabs, removes spaces around line breaks, limits consecutive line breaks to
+two, keeps the first eight line breaks (replacing subsequent runs with a
+space), and trims the result. Empty strings are accepted; non-string inputs
+throw `ValidationError` with code `INVALID_WHITESPACE_TEXT`. It is not
+applied automatically by `extractMedia()`.
+
+The option `maxLineBreaks` (default `8`) sets the total limit and accepts a
+non-negative safe integer. Setting it to `0` replaces all line-break runs
+with spaces. `consecutiveLineBreakThreshold` (default `3`) sets the minimum
+run length that collapses to **two** line breaks; shorter runs are preserved.
+It accepts safe integers of at least `3`. Either option accepts `Infinity`
+to disable its rule. Runs are collapsed before applying the total limit,
+and trimming happens last. Invalid options throw `ValidationError` with
+code `INVALID_WHITESPACE_OPTIONS`.
+
+```js
+import { compactWhitespace } from 'libp2r2p/nip27'
+
+compactWhitespace(text, { maxLineBreaks: 12, consecutiveLineBreakThreshold: 5 })
+```
+
 User references (`npub`, `nprofile`, hex pubkeys and every NIP-05 spelling)
 are handled by `libp2r2p/nip27`: `decodeUserReference()` returns the decoded
 form with its canonical compact spelling, `encodeUserReference()` returns
