@@ -306,3 +306,16 @@ test('resolveUserReference resolves root, compact and prefixed references', asyn
   })
   assert.equal(compactResult.label, 'bob.example.com')
 })
+
+test('inline download intent requires exactly one explicit 0 or 1', () => {
+  for (const download of ['0', '1']) {
+    const url = `https://example.com/a.png#download=${download}`
+    assert.deepEqual(decodeMediaMetadata(url), { download })
+    assert.equal(extractMedia(url)[0].url.download, download)
+  }
+  for (const fragment of ['download', 'download=', 'download=2', 'download=true', 'download=01', 'download=1/foo', 'download=1:0', 'download=1,0', 'download=1=0', 'download=0&download=1']) {
+    const url = `https://example.com/a#${fragment}`
+    assert.throws(() => decodeMediaMetadata(url), { code: 'INVALID_MEDIA_METADATA_DOWNLOAD' })
+    assert.equal(tryDecodeMediaMetadata(url), null)
+  }
+})

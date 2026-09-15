@@ -56,3 +56,19 @@ If a full-suite failure appears unrelated to the current change, investigate
 enough to distinguish a regression from a pre-existing failure or external
 instability. Do not change unrelated production behavior merely to make the
 suite pass; report independently scoped problems separately.
+
+## IRFS and file metadata
+
+- `irfs` is storage/signer/network independent. Use 51,000-byte NMMR blocks,
+  deterministic identifiers and Base93 proofs/content. Retain a seekable immutable
+  input and hash tree; no temporary IndexedDB is needed. Every preparation owns
+  explicit `close()` and abort cleanup; retry iterators retain stable timestamps
+  supplied by callers. Empty files are currently rejected.
+- `nip94` documents an extended kind-1063 profile: optional SHA-256, `r` root,
+  `service`, and unchanged Base64 `thumbhash`. Never put MMR roots in `x` tags.
+  Validate nfile/root/MIME agreement. Renderer consumers read tags directly.
+- NIP-27 nfile URLs retain `localOnly=1` and metadata up to the codec's limit.
+
+- The optional download extension decodes to string '0'/'1'. Kind-1063 absence
+  means '0', a bare tag means '1'; inline URL fragments require explicit values.
+  Reject invalid/duplicate flags. Builders never emit the tag by default.

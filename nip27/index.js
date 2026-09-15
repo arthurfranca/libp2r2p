@@ -2,6 +2,7 @@ import { ValidationError } from '../error/index.js'
 import {
   NAPP_ENTITY_REGEX,
   naddrDecode,
+  nfileDecode,
   neventDecode,
   noteDecode,
   nrelayDecode
@@ -75,6 +76,7 @@ function getReferencesRegex (bareNip05) {
     ...(bareNip05 ? [NIP05_BARE_ROOT, NIP05_BARE_CUSTOM] : [])
   ]
   const alternatives = [
+    '(?<nfileUrl>https://nostr[.]alt/(?<nfileEntity>nfile1[ac-hj-np-z02-9]{1,4994})(?:[?]localOnly=1)?(?:#[-_+.A-Za-z0-9%=&*]{1,4000})?)',
     URL_SOURCE,
     APP_SOURCE,
     NIP05_STANDARD,
@@ -203,7 +205,8 @@ const NIP94_TAGS = {
   image: ['image'],
   summary: ['summary'],
   alt: ['alt'],
-  caption: ['caption']
+  caption: ['caption'],
+  download: ['download']
 }
 
 function validateTagConfigs (extraTags) {
@@ -236,11 +239,20 @@ export function decodeMediaMetadata (url, { extraTags } = {}) {
 
   const tags = extraTags ? { ...NIP94_TAGS, ...extraTags } : NIP94_TAGS
   const tagIndexes = {}
+  // Validate against the complete fragment before the generic bounded parser:
+  // punctuation must not turn an invalid value such as 1/foo into a valid 1.
+  const fragment = url.includes('#') ? url.slice(url.indexOf('#') + 1) : ''
+  const downloads = fragment.split('&').filter(item => decodeFragmentValue(item.split('=')[0]) === 'download')
+  if (downloads.length > 1 || downloads.some(item => {
+    const parts = item.split('=')
+    return parts.length !== 2 || !['0', '1'].includes(decodeFragmentValue(parts[1]))
+  })) throw new ValidationError('INVALID_MEDIA_METADATA_DOWNLOAD')
   const obj = (url.match(/(?<=#)[-_+.A-Za-z0-9%=&*]{1,4000}/)?.[0] || '')
     .split('&')
     .filter(Boolean)
     .reduce((memo, item) => {
-      let [key, value = ''] = item.split('=')
+      const parts = item.split('=')
+      let [key, value = ''] = parts
       key = decodeFragmentValue(key)
       value = decodeFragmentValue(value)
       const config = tags[key]
@@ -297,6 +309,14 @@ function getReferenceItem (original, groups, { getMimeType, defaultAppUser }) {
     return app && (app.type === 'entity' || app.user)
       ? { key: 'app', app: { original, ...app } }
       : { key: 'text', text: { value: original } }
+  }
+
+  if (groups.nfileUrl) {
+    try {
+      const file = nfileDecode(groups.nfileEntity)
+      const metadata = tryDecodeMediaMetadata(groups.nfileUrl) || {}
+      return { key: 'url', url: { ...metadata, value: groups.nfileUrl, nfile: file, ...(file.mime ? { m: file.mime } : {}) } }
+    } catch { return { key: 'text', text: { value: original } } }
   }
 
   if (groups.url) {

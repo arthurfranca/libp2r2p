@@ -555,3 +555,14 @@ bytes, while integer mode supports fixed-width identifiers.
 In NIP-5A, "no padding" means that no separate padding character such as `=`
 is used. Leading `0` digits are nevertheless required to make every Nsite
 Base36 value exactly 50 characters long.
+
+## Files
+
+[`libp2r2p/irfs`](irfs/README.md) prepares retryable chunk templates from files,
+with explicit cancellation and resource release. [`libp2r2p/nip94`](nip94/README.md)
+builds/interprets file metadata, including the local IRFS profile. NIP-27 extracts
+`https://nostr.alt/nfile1…?localOnly=1` up to the NIP-19 codec's 5,000-character
+limit, retaining the full URL and exposing decoded `url.nfile` and MIME `url.m`.
+
+The NIP-94 extension also carries optional `download` intent; see
+[nip94/README.md](nip94/README.md#download-intent) for event and inline URL forms.
