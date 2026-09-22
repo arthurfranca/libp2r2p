@@ -43,6 +43,7 @@ class FakeLiveStream {
   }
 
   emit (event) {
+    event = { type: 'event', event, relay: this.relays[0] }
     const waiter = this.#waiters.shift()
     if (waiter) waiter({ value: event, done: false })
     else this.#events.push(event)

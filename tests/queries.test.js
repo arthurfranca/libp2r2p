@@ -107,7 +107,7 @@ test('getRelaysByPubkey fetches latest relay lists and falls back when absent', 
     _getEvents: async (filter, relayUrls, options) => {
       calls.push({ filter, relayUrls })
       assert.deepEqual(options, { timeout: 5000, timeoutAfterFirstEose: 500 })
-      return { result: [relayListEvent('alice', 9, [['r', 'wss://alice.example', 'write']])] }
+      return { result: ([relayListEvent('alice', 9, [['r', 'wss://alice.example', 'write']])]).map(event => ({ event, relay: 'wss://fixture.example' })) }
     }
   })
 
@@ -137,7 +137,7 @@ test('getRelaysByPubkey returns the latest relay-list event with includeEvents',
   }
   const relays = await getRelaysByPubkey(['alice', 'bob'], {
     includeEvents: true,
-    _getEvents: async () => ({ result: [event] })
+    _getEvents: async () => ({ result: ([event]).map(event => ({ event, relay: 'wss://fixture.example' })) })
   })
 
   assert.deepEqual(relays.alice, {
@@ -181,7 +181,7 @@ test('getRelaysByPubkey forceRefresh re-queries cached pubkeys without regressin
   const first = await getRelaysByPubkey(['alice'], {
     _getEvents: async () => {
       calls++
-      return { result: [event(9, 'b'.repeat(64))] }
+      return { result: ([event(9, 'b'.repeat(64))]).map(event => ({ event, relay: 'wss://fixture.example' })) }
     }
   })
   assert.equal(calls, 1)
@@ -192,7 +192,7 @@ test('getRelaysByPubkey forceRefresh re-queries cached pubkeys without regressin
     includeEvents: true,
     _getEvents: async () => {
       calls++
-      return { result: [event(8, 'a'.repeat(64))] }
+      return { result: ([event(8, 'a'.repeat(64))]).map(event => ({ event, relay: 'wss://fixture.example' })) }
     }
   })
   assert.equal(calls, 2)
@@ -224,7 +224,7 @@ test('getRelaysByPubkey forceRefresh still shares concurrent requests', async ()
 
   const firstRequest = getRelaysByPubkey(['alice'], options)
   const secondRequest = getRelaysByPubkey(['alice'], options)
-  release({ result: [relayListEvent('alice', 1, [['r', 'wss://alice.example']])] })
+  release({ result: ([relayListEvent('alice', 1, [['r', 'wss://alice.example']])]).map(event => ({ event, relay: 'wss://fixture.example' })) })
   await Promise.all([firstRequest, secondRequest])
 
   assert.equal(calls, 1)
@@ -236,12 +236,12 @@ test('getRelaysByPubkey applies the relay URL policy to parsed lists', async () 
   const relays = await getRelaysByPubkey(['alice'], {
     relayUrlPolicy: policy,
     _getEvents: async () => ({
-      result: [relayListEvent('alice', 1, [
+      result: ([relayListEvent('alice', 1, [
         ['r', onion, 'write'],
         ['r', 'ws://localhost:4869'],
         ['r', 'wss://npub1example.com', 'read'],
         ['r', 'ws://localhost:8080', 'write']
-      ])]
+      ])]).map(event => ({ event, relay: 'wss://fixture.example' }))
     })
   })
 
@@ -273,7 +273,7 @@ test('getRelaysByPubkey shares concurrent queries for the same pubkey', async ()
 
   const firstRequest = getRelaysByPubkey(['alice'], options)
   const secondRequest = getRelaysByPubkey(['alice'], options)
-  release({ result: [relayListEvent('alice', 1, [['r', 'wss://alice.example']])] })
+  release({ result: ([relayListEvent('alice', 1, [['r', 'wss://alice.example']])]).map(event => ({ event, relay: 'wss://fixture.example' })) })
   const [first, second] = await Promise.all([firstRequest, secondRequest])
 
   assert.equal(calls, 1)
@@ -291,7 +291,7 @@ test('getIykcProofs finds latest content-key events through relay routing', asyn
 
   const found = await getIykcProofs([userPubkey], {
     _getRelaysByPubkey: async () => ({ [userPubkey]: { write: ['wss://one.example'] } }),
-    _getEvents: async () => ({ result: [olderEvent, newerEvent] })
+    _getEvents: async () => ({ result: ([olderEvent, newerEvent]).map(event => ({ event, relay: 'wss://fixture.example' })) })
   })
 
   assert.equal(found[userPubkey].iykcPubkey, await newer.getPublicKey())
@@ -302,8 +302,8 @@ test('subscribeRelayListUpdates only reports watched relay-type changes', async 
   let aborted = false
   async function * events (_filter, _relays, { signal }) {
     signal.addEventListener('abort', () => { aborted = true }, { once: true })
-    yield relayListEvent('alice', 1, [['r', 'wss://read.example', 'read']])
-    yield relayListEvent('alice', 2, [['r', 'wss://write.example', 'write']])
+    yield { type: 'event', event: relayListEvent('alice', 1, [['r', 'wss://read.example', 'read']]), relay: 'wss://fixture.example' }
+    yield { type: 'event', event: relayListEvent('alice', 2, [['r', 'wss://write.example', 'write']]), relay: 'wss://fixture.example' }
     await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))
   }
 

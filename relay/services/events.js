@@ -58,7 +58,7 @@ async function fetchLatestEventsByRelay (relayToAuthors, { kinds, dTagsByPubkey,
       const filter = { kinds, authors: dAuthors }
       if (d) filter['#d'] = [d]
       requests.push(getEvents(filter, [relay])
-        .then(response => ({ requested: new Set(dAuthors), events: response.result || [] })))
+        .then(response => ({ requested: new Set(dAuthors), events: (response.result || []).map(({ event }) => event) })))
     }
   }
 

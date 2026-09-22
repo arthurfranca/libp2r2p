@@ -903,10 +903,11 @@ export async function fetch ({ receiverSigner, iykcSigner, privateChannelSigner 
   if (until != null) filter.until = until
   if (limit != null) filter.limit = limit
 
-  const { result: events } = await _getEvents(filter, relays, {
+  const { result } = await _getEvents(filter, relays, {
     timeout: 5000,
     timeoutAfterFirstEose: null
   })
+  const events = result.map(({ event }) => event)
   events.sort((a, b) => a.created_at - b.created_at)
   const processOuterEvent = createProcessor({ receiverSigner, iykcSigner, privateChannelSigner, privateChannelSignersByPubkey, privateChannelReaderSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, receiverPubkey, mode, modeByPubkey, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, receivedChunkTtlMs, receivedChunkTtlMsByPubkey, receivedChunkMaxBytes, receivedChunkIndexedDB, ignoredGroupTtlMs, ignoredGroupMaxEntries })
   try {
@@ -940,9 +941,10 @@ export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = 
 
   async function consumeEvents () {
     try {
-      for await (const outer of events) {
+      for await (const item of events) {
         if (controller.signal.aborted) continue
-        await processOuterEvent(outer)
+        if (item.type === 'error') onError?.(item.error)
+        else if (item.type === 'event') await processOuterEvent(item.event)
       }
     } catch (error) {
       if (!controller.signal.aborted && error?.message !== 'Aborted') onError?.(error)

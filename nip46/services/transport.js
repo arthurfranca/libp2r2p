@@ -95,14 +95,16 @@ export class Nip46Transport {
     const controller = new AbortController()
     const stream = this.#relayPool.getLiveEventsGenerator(filter, relays, {
       signal: controller.signal,
+      timeout: this.#operationTimeout,
       timeoutAfterFirstEose: this.#timeoutAfterFirstEose
     })
     const context = { controller, stream, relays: [...relays], consume: null }
     this.#contexts.add(context)
     context.consume = (async () => {
       try {
-        for await (const event of stream) {
-          Promise.resolve(onEvent(event)).catch(error => this.#reportError(error))
+        for await (const item of stream) {
+          if (item.type === 'error') this.#reportError(item.error)
+          else if (item.type === 'event') Promise.resolve(onEvent(item.event)).catch(error => this.#reportError(error))
         }
       } catch (error) {
         if (!this.#closed && error?.message !== 'Aborted') this.#reportError(error)

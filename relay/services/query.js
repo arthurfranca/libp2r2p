@@ -191,7 +191,7 @@ export function subscribeRelayListUpdates (pubkeys, {
 
   async function consumeRelayListUpdates () {
     try {
-      for await (const event of _eventsFeedGenerator({
+      for await (const item of _eventsFeedGenerator({
         kinds: [10002],
         authors
       }, relays, {
@@ -199,6 +199,9 @@ export function subscribeRelayListUpdates (pubkeys, {
         timeout: 5000,
         timeoutAfterFirstEose: null
       })) {
+        if (item.type === 'error') { console.error('relay-list watch failed:', item.error); continue }
+        if (item.type !== 'event') continue
+        const { event } = item
         if (closed || !authors.includes(event.pubkey)) continue
         const update = cacheRelayListEvent(event, { cacheMs, relayUrlPolicy })
         if (!update || !relayTypeChanged(update.changes, relayType)) continue
@@ -238,7 +241,7 @@ async function loadMissingRelays (missingPubkeys, {
   })
 
   const latestByPubkey = {}
-  for (const event of events || []) {
+  for (const { event } of events || []) {
     if (!missingPubkeys.includes(event.pubkey)) continue
     if (isNewerRelayListEvent(event, latestByPubkey[event.pubkey])) latestByPubkey[event.pubkey] = event
   }

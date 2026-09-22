@@ -151,10 +151,22 @@ function deferred () {
 // promise that resolves when the generator ends.
 function startCollecting (gen) {
   const events = []
+  const items = []
   const promise = (async () => {
-    for await (const e of gen) events.push(e)
+    for await (const item of gen) {
+      items.push(item)
+      if (item.type === 'event') events.push(item.event)
+    }
   })()
-  return { events, promise }
+  return { events, items, promise }
+}
+
+async function nextEvent (stream) {
+  for (;;) {
+    const next = await stream.next()
+    if (next.done) return next
+    if (next.value.type === 'event') return { value: next.value.event, done: false }
+  }
 }
 
 let _nextId = 1
@@ -330,7 +342,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     ac.abort()
   })
 
-  it('sets event.meta.relay to the relay URL', async () => {
+  it('keeps live event provenance outside the event', async () => {
     const ac = new AbortController()
     const { events, promise } = startCollecting(
       nostr.getLiveEventsGenerator({ kinds: [0] }, ['wss://r1'], { signal: ac.signal })
@@ -342,7 +354,8 @@ describe('RelayPool.getLiveEventsGenerator', () => {
 
     ac.abort()
     await promise
-    assert.equal(events[0].meta.relay, 'wss://r1')
+    assert.equal(events[0].id, 'e1')
+    assert.ok(!Object.hasOwn(events[0], 'meta'))
   })
 
   it('abort closes the live sub', async () => {
@@ -816,7 +829,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       async function * mockLive () {
         // Simulates a live event arriving during the fetch
         await new Promise(resolve => { resolveFetch = resolve })
-        yield liveEvent
+        yield { type: 'event', event: liveEvent, relay: 'wss://r1' }
       }
       async function * mockEvents () {
         yield { type: 'event', event: storedEvent, relay: 'wss://r1' }
@@ -848,7 +861,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       // Live generator yields the shared event immediately (simulates it arriving while
       // the fetch is still running), then waits to keep the generator open
       async function * mockLive () {
-        yield sharedEvent
+        yield { type: 'event', event: sharedEvent, relay: 'wss://r1' }
         await new Promise(resolve => { resolveLive = resolve })
       }
       // Fetch also returns the same event (overlap around the time boundary)
@@ -903,7 +916,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
     it('skips initial fetch and delegates directly to _liveGenerator when filter.limit === 0', async () => {
       let fetchCalled = false
       let liveCalled = false
-      async function * mockLive () { liveCalled = true; yield makeEvent({ id: 'e1' }) }
+      async function * mockLive () { liveCalled = true; yield { type: 'event', event: makeEvent({ id: 'e1' }), relay: 'wss://r1' } }
       async function * mockEvents () { fetchCalled = true }
 
       const ac = new AbortController()
@@ -1004,17 +1017,18 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       assert.equal(events[0].id, 'e1')
     })
 
-    it('skips non-event items', async () => {
+    it('forwards error items alongside events', async () => {
       async function * mockEvents () {
         yield { type: 'error', error: new Error('oops'), relay: 'wss://r1' }
         yield { type: 'event', event: makeEvent({ id: 'e1' }), relay: 'wss://r1' }
       }
-      const { events, promise } = startCollecting(
+      const { events, items, promise } = startCollecting(
         nostr.getEventsFeedGenerator({}, ['wss://r1'], {
           live: false, timeoutAfterFirstEose: 500, _eventsGenerator: mockEvents
         })
       )
       await promise
+      assert.deepEqual(items.map(item => item.type), ['error', 'event'])
       assert.equal(events.length, 1)
       assert.equal(events[0].id, 'e1')
     })
@@ -1042,17 +1056,18 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       assert.equal(events.length, 1)
     })
 
-    it('skips non-event items', async () => {
+    it('forwards error items alongside events', async () => {
       async function * mockEvents () {
         yield { type: 'error', error: new Error('oops'), relay: 'wss://r1' }
         yield { type: 'event', event: makeEvent({ id: 'e1' }), relay: 'wss://r1' }
       }
-      const { events, promise } = startCollecting(
+      const { events, items, promise } = startCollecting(
         nostr.getEventsFeedGenerator({}, ['wss://r1'], {
           live: false, timeoutAfterFirstEose: null, _eventsGenerator: mockEvents
         })
       )
       await promise
+      assert.deepEqual(items.map(item => item.type), ['error', 'event'])
       assert.equal(events.length, 1)
     })
   })
@@ -1069,7 +1084,7 @@ describe('relay stream stopAndDrain', () => {
     it(`preserves accepted events and rejects late callbacks: ${JSON.stringify(options)}`, { timeout: 3000 }, async () => {
       const pool = createRelayPool()
       const stream = pool.getEventsFeedGenerator(options.limit === 0 ? { limit: 0 } : {}, ['wss://r1'], options)
-      const first = stream.next()
+      const first = nextEvent(stream)
       await tick()
       const relay = relayRegistry.get('wss://r1')
       const live = relay.subscriptions.find(sub => sub.filters[0].limit === 0)
@@ -1083,12 +1098,12 @@ describe('relay stream stopAndDrain', () => {
       assert.ok(relay.subscriptions.every(sub => sub.isClosed))
       for (const sub of relay.subscriptions) sub.handlers.onevent(makeEvent({ id: 'late' }))
       const events = [(await first).value]
-      for await (const event of stream) events.push(event)
+      for await (const item of stream) if (item.type === 'event') events.push(item.event)
       assert.deepEqual(events.map(event => event.id), [
         ...(history ? ['history-1', 'history-2'] : []),
         ...(live ? ['live-1', 'live-2'] : [])
       ])
-      assert.ok(events.every(event => Object.keys(event.meta).join() === 'relay'))
+      assert.ok(events.every(event => !Object.hasOwn(event, 'meta')))
       await pool.disconnectAll()
     })
   }
@@ -1096,7 +1111,7 @@ describe('relay stream stopAndDrain', () => {
   it('drains reconnect history and its live buffer while a recovery query is pending', { timeout: 4000 }, async () => {
     const pool = createRelayPool()
     const stream = pool.getLiveEventsGenerator({ since: 1 }, ['wss://r1'])
-    const first = stream.next()
+    const first = nextEvent(stream)
     await tick()
     const relay = relayRegistry.get('wss://r1')
     const old = relay.subscriptions[0]
@@ -1114,7 +1129,7 @@ describe('relay stream stopAndDrain', () => {
       sub.handlers.onevent(makeEvent({ id: 'late' }))
     }
     const events = [(await first).value]
-    for await (const event of stream) events.push(event)
+    for await (const item of stream) if (item.type === 'event') events.push(item.event)
     assert.deepEqual(events.map(event => event.id), ['gap-1', 'gap-2', 'buffered-live'])
     await pool.disconnectAll()
   })
@@ -1123,7 +1138,7 @@ describe('relay stream stopAndDrain', () => {
     const pool = createRelayPool()
     const ac = new AbortController()
     const stream = pool.getEventsFeedGenerator({ limit: 0 }, ['wss://r1'], { signal: ac.signal })
-    const first = stream.next()
+    const first = nextEvent(stream)
     await tick()
     const sub = relayRegistry.get('wss://r1').subscriptions[0]
     sub.handlers.onevent(makeEvent({ id: 'first' }))
@@ -1191,19 +1206,19 @@ describe('RelayPool.getEvents', () => {
     sub.handlers.oneose()
     const { result, errors, success } = await resultPromise
     assert.equal(result.length, 2)
-    assert.equal(result[0].id, 'e1')
-    assert.equal(result[1].id, 'e2')
+    assert.equal(result[0].event.id, 'e1')
+    assert.equal(result[1].event.id, 'e2')
     assert.equal(errors.length, 0)
     assert.ok(success)
   })
 
-  it('sets event.meta.relay', async () => {
+  it('keeps query event provenance outside the event', async () => {
     const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1'])
     await tick()
     relayRegistry.get('wss://r1').subscriptions[0].handlers.onevent(makeEvent({ id: 'e1' }))
     relayRegistry.get('wss://r1').subscriptions[0].handlers.oneose()
     const { result } = await resultPromise
-    assert.equal(result[0].meta.relay, 'wss://r1')
+    assert.equal(result[0].relay, 'wss://r1')
   })
 
   it('adds timeout errors for relays still pending at the overall deadline', async () => {
@@ -1291,7 +1306,7 @@ describe('RelayPool.getEvents', () => {
     relayRegistry.get('wss://r2').subscriptions[0].handlers.oneose()
 
     const { result, errors, success } = await resultPromise
-    assert.deepEqual(result.map(event => event.id), ['same-id'])
+    assert.deepEqual(result.map(({ event }) => event.id), ['same-id'])
     assert.deepEqual(errors, [])
     assert.ok(success)
   })
@@ -1339,7 +1354,7 @@ describe('RelayPool.getEvents', () => {
   it('returns immediately with an unsuccessful empty result when no relays are given', async () => {
     assert.deepEqual(
       await nostr.getEvents({ kinds: [0] }, []),
-      { result: [], errors: [], success: false }
+      { result: [], errors: [], success: false, relays: [] }
     )
   })
 
@@ -1399,18 +1414,18 @@ describe('RelayPool.getEvents EOSE grace', () => {
     sub.handlers.oneose()
     const { result, errors, success } = await resultPromise
     assert.equal(result.length, 1)
-    assert.equal(result[0].id, 'e1')
+    assert.equal(result[0].event.id, 'e1')
     assert.equal(errors.length, 0)
     assert.ok(success)
   })
 
-  it('sets event.meta.relay', async () => {
+  it('keeps query event provenance outside the event', async () => {
     const resultPromise = nostr.getEvents({ kinds: [0] }, ['wss://r1'])
     await tick()
     relayRegistry.get('wss://r1').subscriptions[0].handlers.onevent(makeEvent({ id: 'e1' }))
     relayRegistry.get('wss://r1').subscriptions[0].handlers.oneose()
     const { result } = await resultPromise
-    assert.equal(result[0].meta.relay, 'wss://r1')
+    assert.equal(result[0].relay, 'wss://r1')
   })
 
   it('starts short timer after first relay with events EOSEs, finalizes before second relay', async () => {
@@ -1760,7 +1775,7 @@ describe('RelayPool.getEventsGenerator', () => {
   })
 
   it('yields event items', async () => {
-    const { events: items, promise } = startCollecting(
+    const { items, promise } = startCollecting(
       nostr.getEventsGenerator({ kinds: [0] }, ['wss://r1'])
     )
     await tick()
@@ -1769,14 +1784,15 @@ describe('RelayPool.getEventsGenerator', () => {
     sub.handlers.onevent(makeEvent({ id: 'e2' }))
     sub.handlers.oneose()
     await promise
-    assert.equal(items.length, 2)
+    assert.equal(items.length, 3)
+    assert.equal(items.at(-1).type, 'eose')
     assert.equal(items[0].type, 'event')
     assert.equal(items[0].event.id, 'e1')
     assert.equal(items[0].relay, 'wss://r1')
   })
 
   it('yields error items when relay closes with error', async () => {
-    const { events: items, promise } = startCollecting(
+    const { items, promise } = startCollecting(
       nostr.getEventsGenerator({ kinds: [0] }, ['wss://r1'])
     )
     await tick()
@@ -1786,22 +1802,23 @@ describe('RelayPool.getEventsGenerator', () => {
   })
 
   it('completes once getEvents resolves', async () => {
-    const { events: items, promise } = startCollecting(
+    const { items, promise } = startCollecting(
       nostr.getEventsGenerator({ kinds: [0] }, ['wss://r1'])
     )
     await tick()
     relayRegistry.get('wss://r1').subscriptions[0].handlers.onevent(makeEvent({ id: 'e1' }))
     relayRegistry.get('wss://r1').subscriptions[0].handlers.oneose()
     await promise
-    assert.equal(items.length, 1)
+    assert.equal(items.length, 2)
+    assert.equal(items.at(-1).type, 'eose')
   })
 
   it('completes when getEvents reaches its overall timeout', async () => {
-    const { events: items, promise } = startCollecting(
+    const { items, promise } = startCollecting(
       nostr.getEventsGenerator({ kinds: [0] }, ['wss://r1'], { timeout: 30 })
     )
     await promise
-    assert.equal(items.length, 0)
+    assert.deepEqual(items.map(item => item.type), ['error', 'eose'])
   })
 })
 

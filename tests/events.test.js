@@ -44,7 +44,7 @@ test('getLatestEventsByPubkey runs two passes and batches missing authors on rem
       calls.push({ authors: filter.authors, relay: selectedRelays[0] })
       if (selectedRelays[0] !== 'wss://remaining.test') return { result: [] }
       return {
-        result: pubkeys.map((pubkey, index) => kind0Event(pubkey, index + 1))
+        result: (pubkeys.map((pubkey, index) => kind0Event(pubkey, index + 1))).map(event => ({ event, relay: 'wss://fixture.example' }))
       }
     }
   })
@@ -118,9 +118,9 @@ test('getLatestEventsByPubkey reuses provided relays and discovers only missing 
       return { [bob]: { write: ['wss://bob.test'] } }
     },
     _getEvents: async (_filter, selectedRelays) => ({
-      result: selectedRelays[0] === 'wss://alice.test'
+      result: (selectedRelays[0] === 'wss://alice.test'
         ? [kind0Event(alice, 1)]
-        : [kind0Event(bob, 2)]
+        : [kind0Event(bob, 2)]).map(event => ({ event, relay: 'wss://fixture.example' }))
     })
   })
 
@@ -144,14 +144,14 @@ test('getLatestEventsByPubkey fetches addressable events with d tags per pubkey'
     _getEvents: async filter => {
       calls.push(filter)
       return {
-        result: [{
+        result: ([{
           id: 'a'.repeat(64),
           kind: 30023,
           pubkey: alice,
           created_at: 1,
           tags: [['d', 'draft']],
           content: ''
-        }]
+        }]).map(event => ({ event, relay: 'wss://fixture.example' }))
       }
     }
   })
@@ -171,7 +171,7 @@ test('getLatestEventsByPubkey keeps the newest event per address', async () => {
     fallbackRelays: [],
     _getRelaysByPubkey: async () => ({ [alice]: { write: ['wss://one.test', 'wss://two.test'] } }),
     _getEvents: async (_filter, selectedRelays) => ({
-      result: selectedRelays[0] === 'wss://one.test' ? [older] : [newer]
+      result: (selectedRelays[0] === 'wss://one.test' ? [older] : [newer]).map(event => ({ event, relay: 'wss://fixture.example' }))
     })
   })
 

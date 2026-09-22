@@ -89,7 +89,12 @@ async function assertRelayWritesAndBroadcasts (relay, event) {
     signal: abortController.signal,
     timeoutAfterFirstEose: null
   })
-  const nextEvent = stream.next()
+  const nextEvent = (async () => {
+    for await (const item of stream) {
+      if (item.type === 'event') return { done: false, value: item.event }
+    }
+    return { done: true }
+  })()
   nextEvent.catch(() => {})
 
   try {

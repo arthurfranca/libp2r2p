@@ -80,6 +80,17 @@ function getEventsTimeoutError () {
   return new Error('GET_EVENTS_TIMEOUT')
 }
 
+function asError (error) {
+  return error instanceof Error ? error : new Error(String(error))
+}
+
+function assertReadOptions (filter, timeouts) {
+  if (!filter || typeof filter !== 'object' || Array.isArray(filter)) throw new ValidationError('INVALID_FILTER')
+  for (const value of Object.values(timeouts)) {
+    if (value !== null && (!Number.isFinite(value) || value < 0)) throw new ValidationError('INVALID_RELAY_TIMEOUT')
+  }
+}
+
 function normalizedRelayUrls (relays) {
   const urls = []
   const seen = new Set()
@@ -88,7 +99,7 @@ function normalizedRelayUrls (relays) {
     const normalizedUrl = normalizeRelayUrl(relay)
     if (seen.has(normalizedUrl)) continue
     seen.add(normalizedUrl)
-    // Keep the caller's first spelling in reports and metadata while using the
+    // Keep the caller's first spelling in reports and envelopes while using the
     // canonical spelling for pooled connection ownership.
     urls.push(relay)
   }
@@ -342,127 +353,115 @@ export class RelayPool {
   // the operation deadline. Disabling cross-relay deduplication still suppresses
   // repeated ids from the same relay; callbacks remain immediate in both modes.
   async getEvents (filter, relays, { timeout = 5000, timeoutAfterFirstEose = 500, callback, signal, deduplicateAcrossRelays = true } = {}) {
+    assertReadOptions(filter, { timeout, timeoutAfterFirstEose })
     if (typeof deduplicateAcrossRelays !== 'boolean') throw new ValidationError('INVALID_DEDUPLICATE_ACROSS_RELAYS')
-    const urls = normalizedRelayUrls(relays)
-    if (!urls.length) return { result: [], errors: [], success: false }
     if (signal?.aborted) throw new Error('Aborted')
-
+    const urls = normalizedRelayUrls(relays)
     const subscriptions = new Map()
-    const pending = new Set(urls)
-    const normalCloseUrls = new Set()
+    const outcomes = new Map()
     const errors = []
     const events = []
     const eventIds = deduplicateAcrossRelays ? new Set() : null
-    let completed = 0
     let isResolved = false
     let eoseTimer = null
     let timeoutTimer = null
 
     return await new Promise((resolve, reject) => {
-      const closeSubscriptions = () => {
-        for (const sub of subscriptions.values()) sub.close()
-        subscriptions.clear()
-      }
-
       const cleanup = () => {
         clearTimeout(timeoutTimer)
         clearTimeout(eoseTimer)
         signal?.removeEventListener('abort', onAbort)
-        closeSubscriptions()
+        for (const sub of subscriptions.values()) sub.close()
+        subscriptions.clear()
       }
-
-      const finish = () => {
+      const fail = error => {
+        if (isResolved) return
+        isResolved = true
+        cleanup()
+        reject(error)
+      }
+      const notify = item => {
+        try { callback?.(item) } catch (error) { fail(error) }
+      }
+      const settleRelay = (relay, status, error) => {
+        if (isResolved || outcomes.has(relay)) return
+        outcomes.set(relay, { relay, status, ...(error ? { error } : {}) })
+        if (error) {
+          errors.push({ relay, reason: error })
+          notify({ type: 'error', relay, error })
+        }
+      }
+      const finish = (pendingStatus = 'cutoff') => {
+        if (isResolved) return
+        for (const url of urls) {
+          if (!outcomes.has(url)) settleRelay(url, pendingStatus, pendingStatus === 'timeout' ? getEventsTimeoutError() : undefined)
+        }
+        if (isResolved) return
+        const relays = urls.map(url => outcomes.get(url))
+        notify({ type: 'eose', relays })
         if (isResolved) return
         isResolved = true
         cleanup()
         resolve({
           result: events,
           errors,
-          success: events.length > 0 || completed > 0
+          success: events.length > 0 || relays.some(({ status }) => ['eose', 'satisfied', 'closed'].includes(status)),
+          relays
         })
       }
-
-      const finishIfComplete = () => {
-        if (pending.size === 0) finish()
-      }
-
-      const settleRelay = (url, reason) => {
-        if (isResolved || !pending.delete(url)) return
-        subscriptions.delete(url)
-        if (reason) {
-          errors.push({ reason, relay: url })
-          if (callback) callback({ type: 'error', error: reason, relay: url })
-        } else {
-          completed++
-        }
-        finishIfComplete()
-      }
-
-      const onAbort = () => {
-        if (isResolved) return
-        isResolved = true
-        cleanup()
-        reject(new Error('Aborted'))
-      }
-
-      const timeoutPending = () => {
-        if (isResolved) return
-        for (const url of pending) {
-          errors.push({ reason: getEventsTimeoutError(), relay: url })
-        }
-        finish()
-      }
-
+      const finishIfComplete = () => { if (outcomes.size === urls.length) finish() }
+      const onAbort = () => fail(new Error('Aborted'))
       signal?.addEventListener('abort', onAbort, { once: true })
-      if (timeout !== null) timeoutTimer = maybeUnref(setTimeout(timeoutPending, timeout))
+      if (timeout !== null) timeoutTimer = maybeUnref(setTimeout(() => finish('timeout'), timeout))
+      if (!urls.length) { finish(); return }
 
       for (const url of urls) {
         const seenIds = eventIds ?? new Set()
         this.#getRelay(url).then(relay => {
-          if (isResolved || !pending.has(url)) return
+          if (isResolved || outcomes.has(url)) return
           let hasEvents = false
+          // Subscription callbacks may run before subscribe() returns.
           // eslint-disable-next-line prefer-const
           let sub
-
-          // Actual EOSE and filter satisfaction share the same graceful close path.
-          const handleEose = () => {
-            if (isResolved || !pending.has(url)) return
-            normalCloseUrls.add(url)
-            sub.close()
+          const complete = status => {
+            if (isResolved || outcomes.has(url)) return
+            settleRelay(url, status)
+            sub?.close()
+            subscriptions.delete(url)
             if (hasEvents && timeoutAfterFirstEose !== null && !eoseTimer && !isResolved) {
-              eoseTimer = maybeUnref(setTimeout(finish, timeoutAfterFirstEose))
+              eoseTimer = maybeUnref(setTimeout(() => finish('cutoff'), timeoutAfterFirstEose))
             }
+            finishIfComplete()
           }
-
-          const checkEarlyClose = makeEarlyCloseChecker(filter, handleEose)
+          const checkEarlyClose = makeEarlyCloseChecker(filter, () => complete('satisfied'))
           sub = relay.subscribe([filter], {
-            onevent: (event) => {
-              if (isResolved || !pending.has(url)) return
+            onevent: event => {
+              if (isResolved || outcomes.has(url)) return
               hasEvents = true
               if (!event?.id || !seenIds.has(event.id)) {
                 if (event?.id) seenIds.add(event.id)
-                event.meta = { relay: url }
-                events.push(event)
-                if (callback) callback({ type: 'event', event, relay: url })
+                events.push({ event, relay: url })
+                notify({ type: 'event', event, relay: url })
               }
               checkEarlyClose(event)
             },
             oninvalidevent: () => {
-              if (!isResolved && pending.has(url)) checkEarlyClose()
+              if (!isResolved && !outcomes.has(url)) checkEarlyClose()
             },
             onclose: error => {
-              const reason = normalCloseUrls.delete(url) || error === undefined
-                ? null
-                : error instanceof Error ? error : new Error(String(error))
-              settleRelay(url, reason)
+              if (isResolved || outcomes.has(url)) return
+              const reason = error === undefined ? undefined : asError(error)
+              settleRelay(url, reason ? 'error' : 'closed', reason)
+              subscriptions.delete(url)
+              finishIfComplete()
             },
-            oneose: handleEose
+            oneose: () => complete('eose')
           })
-          if (isResolved || !pending.has(url)) sub.close()
+          if (isResolved || outcomes.has(url)) sub.close()
           else subscriptions.set(url, sub)
         }).catch(error => {
-          const reason = error instanceof Error ? error : new Error(String(error))
-          settleRelay(url, reason)
+          settleRelay(url, 'error', asError(error))
+          finishIfComplete()
         })
       }
     })
@@ -472,39 +471,40 @@ export class RelayPool {
     const queue = []
     let p = Promise.withResolvers()
     let isDone = false
-
-    const userCallback = options.callback
+    let failure
+    const controller = new AbortController()
     const callback = item => {
       queue.push(item)
-      if (userCallback) userCallback(item)
       p.resolve()
       p = Promise.withResolvers()
+      options.callback?.(item)
     }
-
-    // A drain stops receive callbacks without aborting consumption of this queue.
-    const networkSignal = options._stopSignal
-      ? AbortSignal.any([options._stopSignal, ...(options.signal ? [options.signal] : [])])
-      : options.signal
-    const methodPromise = this.getEvents(filter, relays, { ...options, signal: networkSignal, callback })
-      .catch(err => { if (err?.message !== 'Aborted') console.error('Error in getEvents:', err) })
-      .finally(() => {
-        isDone = true
-        p.resolve()
-      })
-
-    // eslint-disable-next-line no-unmodified-loop-condition
-    while (!isDone || queue.length > 0) {
-      if (options.signal?.aborted) break
-      if (queue.length > 0) yield queue.shift()
-      else await p.promise
+    const signal = AbortSignal.any([controller.signal, ...[options.signal, options._stopSignal].filter(Boolean)])
+    // Attach rejection handling immediately, but propagate general failures to
+    // the consumer after accepted deliveries instead of swallowing them.
+    const methodPromise = this.getEvents(filter, relays, { ...options, signal, callback })
+      .catch(error => { if (!signal.aborted) failure = error })
+      .finally(() => { isDone = true; p.resolve() })
+    try {
+      // eslint-disable-next-line no-unmodified-loop-condition
+      while (!isDone || queue.length > 0) {
+        if (options.signal?.aborted) return
+        if (queue.length > 0) yield queue.shift()
+        else await p.promise
+      }
+      const report = await methodPromise
+      if (failure) throw failure
+      return report
+    } finally {
+      controller.abort()
+      queue.length = 0
     }
-
-    return await methodPromise
   }
 
   // Returns a strictly-live stream. `ready` reports the first initial EOSE window,
   // while `readyRelays` follows relays that are currently past their own EOSE.
   getLiveEventsGenerator (filter, relays, options = {}) {
+    assertReadOptions(filter, { timeout: options.timeout === undefined ? 5000 : options.timeout, timeoutAfterFirstEose: options.timeoutAfterFirstEose === undefined ? 500 : options.timeoutAfterFirstEose })
     const ready = Promise.withResolvers()
     const readyRelays = new Set()
     const stream = drainableStream(options => this.#getLiveEventsGenerator(filter, relays, options, { ready, readyRelays }), options)
@@ -528,6 +528,7 @@ export class RelayPool {
   async * #getLiveEventsGenerator (filter, relays, {
     signal,
     _stopSignal,
+    timeout = 5000,
     timeoutAfterFirstEose = 500,
     timeoutForReconnectGap = 5000,
     timeoutAfterFirstReconnectGapEose = 500,
@@ -542,7 +543,8 @@ export class RelayPool {
     const liveSubs = new Map() // url → live sub
     const retryTimers = new Map()
     const initialPending = new Set(urls)
-    const initialErrors = []
+    const initialOutcomes = new Map()
+    let readyTimeout = null
     let readyTimer = null
     let isReady = false
 
@@ -564,14 +566,28 @@ export class RelayPool {
     const seenIds = new Set()
 
     let untilTimer = null
-    const finishReady = () => {
+    const enqueue = item => {
+      queue.push(item)
+      p.resolve()
+      p = Promise.withResolvers()
+    }
+    const finishReady = (pendingStatus = 'cutoff', emit = true) => {
       if (isReady) return
       isReady = true
       clearTimeout(readyTimer)
+      clearTimeout(readyTimeout)
+      for (const relay of initialPending) {
+        const error = pendingStatus === 'timeout' ? getEventsTimeoutError() : undefined
+        initialOutcomes.set(relay, { relay, status: pendingStatus, ...(error ? { error } : {}) })
+        if (error && emit) enqueue({ type: 'error', relay, error })
+      }
+      initialPending.clear()
+      const relays = urls.map(url => initialOutcomes.get(url))
       ready.resolve(Object.freeze({
         relays: Object.freeze([...readyRelays]),
-        errors: Object.freeze([...initialErrors])
+        errors: Object.freeze(relays.filter(item => item.error).map(({ relay, error }) => ({ relay, reason: error })))
       }))
+      if (emit) enqueue({ type: 'eose', relays })
     }
 
     const teardown = (drain = false) => {
@@ -580,7 +596,7 @@ export class RelayPool {
       isDone = true
       if (!drain) queue.length = 0
       clearTimeout(untilTimer)
-      finishReady()
+      finishReady('closed', false)
       gapAc.abort()
       for (const timer of retryTimers.values()) clearTimeout(timer)
       retryTimers.clear()
@@ -597,14 +613,11 @@ export class RelayPool {
         seenIds.add(event.id)
       }
       if (event.created_at > (lastSeenAt ?? 0)) lastSeenAt = event.created_at
-      event.meta = { relay: url }
-      queue.push(event)
-      p.resolve()
-      p = Promise.withResolvers()
+      enqueue({ type: 'event', event, relay: url })
     }
 
     if (signal?.aborted || _stopSignal?.aborted) {
-      finishReady()
+      finishReady('closed', false)
       return
     }
     const abort = () => teardown()
@@ -612,24 +625,35 @@ export class RelayPool {
     signal?.addEventListener('abort', abort, { once: true })
     _stopSignal?.addEventListener('abort', stop, { once: true })
 
+    if (timeout !== null) readyTimeout = maybeUnref(setTimeout(() => finishReady('timeout'), timeout))
+
     const maybeFinishInitialReady = () => {
       if (initialPending.size === 0) finishReady()
     }
 
     const markInitialEose = (url) => {
       readyRelays.add(url)
-      if (isReady) return
-      initialPending.delete(url)
+      if (isReady || !initialPending.delete(url)) return
+      initialOutcomes.set(url, { relay: url, status: 'eose' })
       if (timeoutAfterFirstEose !== null && !readyTimer) {
-        readyTimer = maybeUnref(setTimeout(finishReady, timeoutAfterFirstEose))
+        readyTimer = maybeUnref(setTimeout(() => finishReady('cutoff'), timeoutAfterFirstEose))
       }
       maybeFinishInitialReady()
     }
 
-    const markInitialError = (url, reason) => {
-      if (!initialPending.delete(url)) return
-      initialErrors.push({ relay: url, reason })
-      maybeFinishInitialReady()
+    const reportFailure = (url, error) => {
+      if (isDone) return
+      enqueue({ type: 'error', relay: url, error })
+      if (!isReady && initialPending.delete(url)) {
+        initialOutcomes.set(url, { relay: url, status: 'error', error })
+        maybeFinishInitialReady()
+      }
+    }
+    const reportClosed = url => {
+      if (!isReady && initialPending.delete(url)) {
+        initialOutcomes.set(url, { relay: url, status: 'closed' })
+        maybeFinishInitialReady()
+      }
     }
 
     const scheduleReconnect = (url, reconnectDelay) => {
@@ -645,7 +669,7 @@ export class RelayPool {
     // Schedule teardown when the wall clock reaches filter.until
     if (filterUntil !== null) {
       const msUntil = filterUntil * 1000 - Date.now()
-      untilTimer = maybeUnref(setTimeout(() => teardown(true), Math.max(0, msUntil)))
+      untilTimer = maybeUnref(setTimeout(() => { finishReady('closed'); teardown(true) }, Math.max(0, msUntil)))
     }
 
     // Runs a reconnect gap fill for a single relay and returns a promise that resolves
@@ -662,9 +686,10 @@ export class RelayPool {
       return (async () => {
         for await (const item of gapGen) {
           if (item?.type === 'event') pushEvent(item.event, url, true)
+          else if (item?.type === 'error' && !isDone) enqueue(item)
         }
       })().catch(err => {
-        if (!isDone) console.error(`Reconnect gap fill error for ${url}:`, err)
+        reportFailure(url, asError(err))
       })
     }
 
@@ -697,11 +722,9 @@ export class RelayPool {
             if (liveSubs.get(url) === liveSub) liveSubs.delete(url)
             else if (liveSubs.has(url)) return
             readyRelays.delete(url)
-            if (!liveEose && !isDone) {
-              const reason = error instanceof Error
-                ? error
-                : new Error(error ? String(error) : 'LIVE_SUBSCRIPTION_CLOSED')
-              markInitialError(url, reason)
+            if (!isDone) {
+              if (error !== undefined) reportFailure(url, asError(error))
+              else if (!liveEose) reportClosed(url)
             }
             if (isDone) return
             scheduleReconnect(url, reconnectDelay)
@@ -728,15 +751,19 @@ export class RelayPool {
       }).catch(err => {
         readyRelays.delete(url)
         const reason = err instanceof Error ? err : new Error(String(err))
-        markInitialError(url, reason)
+        reportFailure(url, reason)
         if (isDone) return
-        console.error(`Live subscription error at ${url}:`, reason)
         scheduleReconnect(url, reconnectDelay)
       })
     }
 
     if (!urls.length) {
       finishReady()
+      try { yield queue.shift() } finally {
+        teardown()
+        signal?.removeEventListener('abort', abort)
+        _stopSignal?.removeEventListener('abort', stop)
+      }
       return
     }
 
@@ -773,6 +800,7 @@ export class RelayPool {
   //
   // All underlying generators are injectable for testing.
   getEventsFeedGenerator (filter, relays, options = {}) {
+    assertReadOptions(filter, { timeout: options.timeout === undefined ? 5000 : options.timeout, timeoutAfterFirstEose: options.timeoutAfterFirstEose === undefined ? 500 : options.timeoutAfterFirstEose })
     return drainableStream(options => this.#getEventsFeedGenerator(filter, relays, options), options)
   }
 
@@ -790,14 +818,14 @@ export class RelayPool {
       const gen = _eventsGenerator(filter, relays, { timeout, timeoutAfterFirstEose, signal, _stopSignal })
       for await (const item of gen) {
         if (signal.aborted) return
-        if (item?.type === 'event') yield item.event
+        yield item
       }
       return
     }
 
     // limit:0 means "no stored events, live only" — skip the initial fetch.
     if (filter.limit === 0) {
-      for await (const event of _liveGenerator(filter, relays, { signal, _stopSignal })) {
+      for await (const event of _liveGenerator(filter, relays, { timeout, timeoutAfterFirstEose, signal, _stopSignal })) {
         if (signal.aborted) return
         yield event
       }
@@ -808,19 +836,22 @@ export class RelayPool {
     // buffering incoming events before we query stored ones.
     // Relays always send stored matching events before EOSE (unless limit:0),
     // so the initial fetch + buffering is always needed.
-    const liveGen = _liveGenerator(filter, relays, { signal, _stopSignal })
+    const liveGen = _liveGenerator(filter, relays, { timeout, timeoutAfterFirstEose, signal, _stopSignal })
     const liveBuffer = []
     let liveDone = false
+    let liveFailure
     let liveWake = Promise.withResolvers()
 
     const bgLoop = (async () => {
       try {
         for await (const event of liveGen) {
           if (signal.aborted) break
-          liveBuffer.push(event)
+          if (event.type !== 'eose') liveBuffer.push(event)
           liveWake.resolve()
           liveWake = Promise.withResolvers()
         }
+      } catch (error) {
+        liveFailure = error
       } finally {
         liveDone = true
         liveWake.resolve()
@@ -836,20 +867,22 @@ export class RelayPool {
         if (signal.aborted) return
         if (item?.type === 'event' && !seenIds.has(item.event.id)) {
           seenIds.add(item.event.id)
-          yield item.event
-        }
+          yield item
+        } else if (item?.type !== 'event') yield item
       }
 
       // Flush buffered live events that arrived during the initial fetch, deduping
       // against stored ones (overlap is possible around the fetch's until boundary)
       while (liveBuffer.length > 0) {
         if (signal.aborted) return
-        const event = liveBuffer.shift()
-        if (!seenIds.has(event.id)) {
-          seenIds.add(event.id)
-          yield event
+        const item = liveBuffer.shift()
+        if (item.type !== 'event' || !seenIds.has(item.event.id)) {
+          if (item.type === 'event') seenIds.add(item.event.id)
+          yield item
         }
       }
+
+      seenIds.clear()
 
       // Yield subsequent live events directly — no more overlap with stored events
       // eslint-disable-next-line no-unmodified-loop-condition
@@ -860,6 +893,7 @@ export class RelayPool {
         }
         if (!liveDone) await liveWake.promise
       }
+      if (liveFailure) throw liveFailure
     } finally {
       await liveGen.return()
       await bgLoop

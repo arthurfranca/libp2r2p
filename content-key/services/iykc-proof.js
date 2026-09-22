@@ -103,7 +103,7 @@ export async function getIykcProofs (pubkeys, {
           timeout: 5000,
           timeoutAfterFirstEose: null
         })
-        return result
+        return result.map(({ event }) => event)
       })
   )
 

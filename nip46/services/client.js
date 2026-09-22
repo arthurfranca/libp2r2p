@@ -75,12 +75,16 @@ export class Nip46Client {
       limit: 0
     }, parsed.relays, {
       signal: controller.signal,
+      timeout: options.timeout ?? DEFAULT_TIMEOUT,
       timeoutAfterFirstEose: options.timeoutAfterFirstEose ?? DEFAULT_TIMEOUT_AFTER_FIRST_EOSE
     })
     const found = Promise.withResolvers()
     const consume = (async () => {
       try {
-        for await (const event of stream) {
+        for await (const item of stream) {
+          if (item.type === 'error') { options.onError?.(item.error); continue }
+          if (item.type !== 'event') continue
+          const { event } = item
           if (!isNip46EventFor(event, clientPubkey)) continue
           const response = decodeNip46Frame(event, clientSecretKey)
           if (response?.result === parsed.secret) {

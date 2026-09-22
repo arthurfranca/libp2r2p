@@ -36,7 +36,12 @@ parsers that use `null` for an expected mismatch keep that contract.
 ## Tests
 
 Preserve relay API envelopes and immediate delivery when changing transport
-behavior. `deduplicateAcrossRelays` belongs only to `getEvents` and
+behavior. Read generators emit `event`, `error`, and one initial aggregate
+`eose`; the latter reports actual EOSE, satisfaction, timeout, cutoff, normal
+closure, or error per relay. Never attach provenance to the Nostr event itself.
+`getEvents().result` contains `{ event, relay }` entries. Internal consumers must
+unwrap event envelopes and handle/ignore control items explicitly. Preserve
+`ready`, `readyRelays`, cancellation and drain behavior used by NIP-46. `deduplicateAcrossRelays` belongs only to `getEvents` and
 `getEventsGenerator`; disabling it still deduplicates IDs within each relay.
 Replication tests must exercise the real pool with a controlled transport.
 Operational error categories supplement native errors; do not replace their

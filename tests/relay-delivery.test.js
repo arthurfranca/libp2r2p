@@ -86,13 +86,13 @@ for (const deduplicateAcrossRelays of [undefined, true, false]) {
     await tick()
     const origins = deduplicateAcrossRelays === false ? [A, B] : [A]
     assert.deepEqual(callbacks.map(item => item.relay), origins)
-    assert.deepEqual(callbacks.map(item => item.event.meta.relay), origins)
+    assert.ok(callbacks.every(item => !Object.hasOwn(item.event, 'meta')))
     assert.ok(callbacks.every(item => item.type === 'event'))
     assert.equal(completed, false)
     sockets.get(A).eose()
     sockets.get(B).eose()
     const report = await pending
-    assert.deepEqual(report.result.map(event => event.meta.relay), origins)
+    assert.deepEqual(report.result.map(item => item.relay), origins)
     assert.equal(report.result.length, origins.length)
     assert.equal(report.success, true)
     assert.deepEqual(report.errors, [])
@@ -111,7 +111,7 @@ test('per-relay deduplication preserves limit and id-based early close', async t
       if (mode === 'limit') sockets.get(relay).event(event)
     }
     const report = await bounded(pending)
-    assert.deepEqual(report.result.map(event => event.meta.relay), [A, B])
+    assert.deepEqual(report.result.map(item => item.relay), [A, B])
     assert.ok([...sockets.values()].every(socket => socket.frames.some(frame => frame[0] === 'CLOSE')))
   }
 })
@@ -163,11 +163,12 @@ test('generator forwards the option and retains callback, yield and terminal rep
   assert.equal((await second).value.relay, B)
   sockets.get(A).eose()
   sockets.get(B).eose()
+  assert.equal((await generator.next()).value.type, 'eose')
   const end = await generator.next()
   assert.equal(end.done, true)
   assert.equal(end.value.result.length, 2)
   assert.equal(end.value.success, true)
-  assert.deepEqual(callbacks.map(item => item.event.meta.relay), [A, B])
+  assert.deepEqual(callbacks.filter(item => item.type === 'event').map(item => item.relay), [A, B])
 })
 
 test('connection failures retain empty AggregateError messages, codes and children', async t => {

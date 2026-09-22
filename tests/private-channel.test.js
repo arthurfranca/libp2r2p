@@ -73,7 +73,7 @@ function createMockEventsGenerator (subscribeMany) {
         while (!closed && pending.length === 0) await wake.promise
         if (closed) return { done: true }
         current = pending.shift()
-        return { value: current.event, done: false }
+        return { value: { type: 'event', event: current.event, relay: relays[0] }, done: false }
       },
       async return () {
         close()
@@ -796,7 +796,7 @@ test('live-only subscribe closes its RelayPool stream', async () => {
     liveOnly: true,
     onEvent: event => received.push(event),
     _liveEventsGenerator: (_filter, _relays, { signal }) => (async function * () {
-      yield wrapped
+      yield { type: 'event', event: wrapped, relay: 'wss://relay.example' }
       waitingForAbort()
       if (signal.aborted) {
         aborted = true

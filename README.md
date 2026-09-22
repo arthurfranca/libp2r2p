@@ -12,34 +12,94 @@ For remote-work scheduling, see [`libp2r2p/network`](network/README.md):
 `isOnline` probes connectivity and `onOnline` shares recovery monitoring,
 including retries when the browser omits its native `online` event.
 
-## Relay feed lifecycle
+## Relay reads and lifecycle
 
-`RelayPool.getEventsFeedGenerator(filter, relays, options)` yields events directly,
-including the existing `event.meta.relay` field. By default it combines an initial
-historical query with a live subscription. `live: false` selects history only;
-`filter.limit: 0` selects live only. `getLiveEventsGenerator` exposes the same
-lifecycle controls along with its existing `ready` and `readyRelays` properties.
+All three `RelayPool` read generators emit typed envelopes. The Nostr event is
+never decorated with `meta`; relay provenance belongs to its enclosing item:
 
-The returned iterator has a synchronous, idempotent `stopAndDrain()` method. It
-closes subscription input and cancels reconnections and outstanding historical
-queries, while retaining events already accepted by the library's receive
-callbacks. Continue consuming the iterator to obtain those events and observe
-completion. This includes initial history, buffered live events, and both history
-and live buffers from reconnect recovery. Calling it before the first `next()`
-prevents subscriptions from opening. No reception timestamp or new event metadata
-is added. Events rejected by ordinary filtering/deduplication remain excluded.
+```js
+{ type: 'event', event, relay }
+{ type: 'error', relay, error }
+{ type: 'eose', relays: [{ relay, status, error }] } // error is optional
+```
+
+`eose` means the **initial read attempt is complete**, including empty reads and
+partial results. Its report distinguishes actual relay EOSE from other outcomes:
+
+| Status | Meaning |
+| --- | --- |
+| `eose` | The relay sent EOSE. |
+| `satisfied` | The requested limit or IDs were satisfied, so the read closed early. |
+| `timeout` | The initial operation deadline elapsed. Also emits an error item. |
+| `cutoff` | The grace period after the first qualifying EOSE/early completion elapsed. |
+| `closed` | The subscription ended without EOSE or an explicit error. |
+| `error` | Connection or subscription failed. Also emits an error item. |
+
+Each normalized relay URL gets one report entry, preserving the first spelling
+provided by the caller. An empty relay list emits `{ type: 'eose', relays: [] }`.
+Caller cancellation never fabricates an initial completion. Individual relay
+failures do not prevent other relays from delivering; malformed arguments and
+general operation failures reject the call or iterator read.
+
+`getEvents(filter, relays, options)` resolves to
+`{ result: [{ event, relay }], errors: [{ relay, reason }], success, relays }`.
+Its optional `callback` receives the same event/error/EOSE envelopes immediately.
+`success` retains its existing meaning: an event was received or at least one
+relay completed without an error; it does not mean every relay sent EOSE.
+`getEventsGenerator` emits those envelopes and retains that report as its final
+iterator return value (not visible inside a `for await` loop).
+
+`getEventsFeedGenerator(filter, relays, options)` combines history and live
+subscription by default: history items, one historical `eose`, buffered live
+items, then ongoing live delivery. `live: false` ends after history and its marker;
+`filter.limit: 0` skips history and forwards the live stream's initial marker.
+Internal live/reconnect EOSEs do not produce additional feed markers.
+
+`getLiveEventsGenerator` discards retained events received before each relay's
+EOSE. A ready relay can deliver live events before the aggregate marker. Initial
+`timeout` defaults to 5000 ms (`null` disables it); expiration reports pending
+relays without stopping their connections or subsequent recovery. The grace
+period `timeoutAfterFirstEose` defaults to 500 ms (`null` disables it). Historical
+queries use these same defaults; their grace period starts only when a relay
+with events EOSEs or satisfies its filter. Reconnect-gap reads keep their separate
+`timeoutForReconnectGap` and `timeoutAfterFirstReconnectGapEose` options.
+
+The live iterator retains `ready: Promise<{ relays, errors }>` and the
+`readyRelays` getter. `ready` is the initial readiness snapshot, derived from the
+same outcomes as the marker; its errors use `{ relay, reason }`. `readyRelays`
+tracks currently ready relays and can change after that snapshot. Timeouts and
+cutoffs are not acknowledgements of readiness. Reconnections do not repeat the
+initial marker. Both APIs require consuming the iterator to start its work.
+
+Live and feed iterators have a synchronous, idempotent `stopAndDrain()` method.
+It closes subscription input and cancels reconnections and outstanding historical
+queries, while retaining items already accepted by receive callbacks. Continue
+consuming to obtain those items and completion. This includes initial history,
+buffered live events, and reconnect recovery buffers. Calling it before the
+first `next()` prevents subscriptions from opening. It does not synthesize EOSE.
 
 Aborting `options.signal`, calling `return()` (including a `for await` break), or
-calling `throw()` cancels input and pending delivery instead. An event already
-delivered to the caller cannot be recalled. These operations also interrupt a
-drain. `stopAndDrain()` does not consume the iterator or return a completion
-promise: completion is the iterator's `{ done: true }` result.
+calling `throw()` cancels input and pending delivery instead. An item already
+delivered cannot be recalled. These operations can also interrupt a drain.
+`stopAndDrain()` does not consume the iterator or return a completion promise:
+completion is the iterator's `{ done: true }` result.
 
 ```js
 const stream = relayPool.getEventsFeedGenerator({ authors: [pubkey] }, [relay], { signal })
 // When this relay is removed, call stream.stopAndDrain() from the list handler.
-for await (const event of stream) await store(event)
+for await (const item of stream) {
+  if (item.type === 'event') await store(item.event)
+  else if (item.type === 'error') reportError(item.relay, item.error)
+  else if (item.type === 'eose') initialReadFinished(item.relays)
+}
 ```
+
+Migration from 0.10.18: replace raw live/feed event reads with `item.event` after
+checking `item.type`, replace `event.meta.relay` with the envelope's `relay`, and
+unwrap each `getEvents().result` entry. There is no compatibility flag. Query,
+content-key, private-channel and NIP-46 helpers unwrap pool results internally
+and retain their higher-level event contracts. Count, publication and disconnect
+return formats are unchanged.
 
 ## Private Messenger
 
@@ -146,7 +206,7 @@ if (sent.delivery.deletionSeckey) {
     const deletion = finalizeEvent({
       kind: 5,
       created_at: Math.floor(Date.now() / 1000),
-      tags: [['k', '3560'], ...outerEvents.slice(offset, offset + 100).map(event => ['e', event.id])],
+      tags: [['k', '3560'], ...outerEvents.slice(offset, offset + 100).map(({ event }) => ['e', event.id])],
       content: ''
     }, deletionKey.secretKey)
     await relayPool.sendEvent(deletion, relays)
@@ -478,11 +538,11 @@ from `libp2r2p/relay`.
 `getEvents` and `getEventsGenerator` accept `deduplicateAcrossRelays` (boolean,
 default `true`). With `false`, a matching event is delivered once per relay,
 while repeated IDs from the same relay remain suppressed. Each occurrence owns
-its `meta.relay`; callbacks still run immediately and deadlines, EOSE handling,
-and per-relay filter limits are unchanged. The callback/generator item remains
-`{ type: 'event', event, relay }`, and the completed query remains
-`{ result, errors, success }`. The option does not extend to the live or feed
-generators. Callers that need replication coverage can aggregate the returned
+its envelope's `relay`; callbacks still run immediately and per-relay filter
+limits are unchanged. The callback/generator event item is
+`{ type: 'event', event, relay }`; the completed query is
+`{ result: [{ event, relay }], errors, success, relays }`. The option does not
+extend to the live or feed generators. Callers that need replication coverage can aggregate the returned
 copies by event ID; missing responses do not prove absence from a relay.
 
 Publication errors retain their existing `reason` objects and may expose
