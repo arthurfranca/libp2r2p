@@ -282,14 +282,14 @@ test('ask publishes an ask rumor and watch dispatches the reply with its questio
   assert.equal(keypairFromSeckey(result.delivery.deletionSeckey).pubkey, published.deletionPubkey)
   assert.throws(() => getEventHash(published.event), /INVALID_EVENT/)
 
-  calls[0].onEvent({
+  await calls[0].onEvent({
     kind: REPLY_KIND,
     id: 'reply-id',
     pubkey: 'receiver',
     created_at: 1,
     tags: [['q', result.question.id]],
     content: 'pong'
-  }, { created_at: 2 }, { channelPubkey: 'sender-channel' })
+  }, { created_at: 2 }, { channelPubkey: 'sender-channel', senderPubkey: 'receiver' })
 
   assert.equal(replies.length, 1)
   assert.equal(replies[0].question, undefined)
@@ -540,4 +540,73 @@ test('parseRumorContent only reads h tags for private message kinds', () => {
     parseRumorContent({ kind: 9001, content: JSON.stringify(['hello', 'NOTE']) }),
     ['hello', 'NOTE']
   )
+})
+
+test('forwarded rumors preserve author, timestamp and ID and require a timestamp', async () => {
+  const sender = pubkeyFixture(10)
+  const author = pubkeyFixture(11)
+  const rumor = { kind: 9, pubkey: author, created_at: 123, content: 'quoted', tags: [] }
+  rumor.id = getEventHash(rumor)
+  let wire
+  const options = { senderSigner: signer(sender), receiverPubkeys: [author], _publish: async o => { wire = o.event; return [] } }
+  const result = await broadcastRumor({ ...options, rumor })
+  assert.deepEqual(result.rumor, rumor)
+  assert.equal(wire.pubkey, author)
+  assert.equal(wire.created_at, 123)
+  assert.equal(wire.id, undefined)
+  await assert.rejects(broadcastRumor({ ...options, rumor: { ...rumor, id: 'bad' } }), /INVALID_RUMOR_ID/)
+  await assert.rejects(broadcastRumor({ ...options, rumor: { ...rumor, created_at: undefined } }), /FORWARDED_RUMOR_TIMESTAMP_REQUIRED/)
+})
+
+test('consumer sessions isolate a shared channel and hearsay cannot dispatch controls', async () => {
+  const { createPrivateMessageSession } = await import('../private-message/index.js')
+  const a = createPrivateMessageSession()
+  const b = createPrivateMessageSession()
+  const c = createPrivateMessageSession()
+  const { calls, closed, fakeSubscribe } = fakeSubscribeFactory()
+  const got = [[], [], []]
+  let asks = 0
+  for (const [index, session] of [a, b, c].entries()) {
+    await session.watch({
+      channels: ['same'], relays: ['wss://a.example'], receiverSigner: signer(index === 1 ? 'B' : 'A'), _subscribe: fakeSubscribe,
+      onMessage: message => got[index].push(message), onAsk: () => { asks++ }
+    })
+  }
+  assert.equal(new Set(calls.map(o => o.receivedChunkScope)).size, 3)
+  await calls[0].onEvent({ kind: ASK_KIND, pubkey: 'third', tags: [], content: '' }, {}, { channelPubkey: 'same', senderPubkey: 'B' })
+  assert.equal(asks, 0)
+  assert.equal(got[0][0].provenance, 'hearsay')
+  assert.equal(got[0][0].senderPubkey, 'B')
+  await a.unwatch()
+  assert.equal(closed.length, 1)
+  await calls[1].onEvent({ kind: 9, pubkey: 'A', tags: [], content: '' }, {}, { channelPubkey: 'same', senderPubkey: 'A' })
+  await calls[2].onEvent({ kind: 9, pubkey: 'B', tags: [], content: '' }, {}, { channelPubkey: 'same', senderPubkey: 'B' })
+  assert.equal(got[1].length, 1)
+  assert.equal(got[2].length, 1)
+  await b.unwatch(); await c.unwatch()
+})
+
+test('stopping an old watch handle cannot remove its replacement', async () => {
+  const { createPrivateMessageSession } = await import('../private-message/index.js')
+  const session = createPrivateMessageSession()
+  const { fakeSubscribe, closed } = fakeSubscribeFactory()
+  const args = { channels: ['shared'], receiverSigner: signer('owner'), relays: ['wss://example.test'], _subscribe: fakeSubscribe }
+  const stopFirst = await session.watch(args)
+  const stopSecond = await session.watch(args)
+  await stopFirst()
+  assert.equal(closed.length, 0)
+  await stopSecond()
+  assert.equal(closed.length, 1)
+})
+
+test('unwatch cancels a watch still resolving its receiver identity', async () => {
+  const { createPrivateMessageSession } = await import('../private-message/index.js')
+  const session = createPrivateMessageSession()
+  const { fakeSubscribe, calls } = fakeSubscribeFactory()
+  const pending = Promise.withResolvers()
+  const watching = session.watch({ channels: ['shared'], receiverSigner: { getPublicKey: () => pending.promise }, relays: ['wss://example.test'], _subscribe: fakeSubscribe })
+  await session.unwatch()
+  pending.resolve('owner')
+  await watching
+  assert.equal(calls.length, 0)
 })

@@ -126,8 +126,9 @@ const messenger = await createPrivateMessenger({
 })
 
 async function logMessages () {
-  for await (const message of messenger.messages()) {
+  for await (const { message, ack } of messenger.messages()) {
     console.log(message.type, message.payload)
+    await ack()
   }
 }
 
@@ -316,23 +317,101 @@ needed by private channels. For double-DH content-key use, pass a
 `contentKeySigner` or a signer implementation that handles content keys
 internally.
 
-Messages are stored in a bounded, durable IndexedDB queue until consumed or
+Messages are stored in a bounded, durable IndexedDB queue until acknowledged or
 until the principal identity has been inactive for 60 days:
 
 ```js
 async function handleMessages () {
-  for await (const message of messenger.messages()) {
-    if (message.type === 'message') {
-      console.log(message.payload)
-    }
+  for await (const { message, ack } of messenger.messages()) {
+    await persistMessageIdempotently(message)
+    await ack() // only after the destination commits
   }
 }
 
 handleMessages().catch(err => console.warn('private messenger messages failed', err))
 ```
 
-For one-at-a-time consumption, use `await messenger.nextMessage()`. Queue
-clearing is asynchronous too: `await messenger.clearChannel(channelPubkey)`.
+For one-at-a-time consumption, `await messenger.nextMessage()` returns
+`{ message, ack, nack }` or `null` if no record is currently available. `ack()`
+removes the reserved record; `nack()` releases it for another attempt. Both
+return a boolean and are idempotent for the same reservation. An expired or
+superseded reservation returns `false` and cannot delete a later delivery.
+
+Delivery leases last 30 seconds and renew every 10 seconds while held. Closing
+the messenger or returning the iterator releases its unacknowledged deliveries;
+returning an iterator also cancels an empty pending read. A crashed/suspended
+consumer's expired leases are reclaimable by another instance. Apps must save
+idempotently: a crash between their commit and `ack()` can repeat delivery.
+The queue is shared by identity, so concurrent consumers claim distinct records.
+
+The app-message queue defaults to 16 MiB and rejects writes at capacity, without
+evicting pending messages. Capacity pressure pauses ingestion and records a
+recovery gap; successful acknowledgments resume it when possible. While capacity-paused, a
+one-second capacity check also detects space released by another instance. Oversized
+records and storage failures report errors and pause with reason `storage`;
+after correcting the cause, call `resume('storage')`. Retention cleanup and
+explicit `clearQueue()`/`clearChannel()` remain destructive. The queue's budget
+bounds serialized storage, not the size of every intermediate decoded message.
+
+### Forwarded authors and isolated consumers
+
+`broadcastRumor({ rumor, ... })` accepts an optional `rumor.pubkey`. Omission
+means the sender; a different pubkey forwards that claimed author and requires
+the original `created_at`. A supplied ID must match the reconstructed event.
+The wire retains the original fields; recipients never overwrite an explicit
+author with the transport sender. Signed events retain their signature.
+
+Received messages expose `senderPubkey` and `provenance` alongside `event`,
+`outer`, `meta` and `payload`. Provenance is `direct`, `hearsay`, or `signed`,
+calculated by the receiver. Pending deduplication includes provenance, so an original can upgrade a queued
+hearsay copy of the same event. Private-channel callbacks also expose these fields
+in their metadata. Nothing is attached to the Nostr event. A rumor naming the
+recipient is still hearsay unless independently matched to a known original.
+Forwarded controls cannot invoke ask/reply/presence/recovery handlers in the
+name of another author. Direct rumors are not transferable signed proof.
+
+Each PrivateMessenger owns a `createPrivateMessageSession()` from
+`libp2r2p/private-message`. A session groups relay reads for one receiver and
+owns its watches, callbacks, and scoped receive-fragment progress. Independent
+sessions can watch the same channel, including with the same receiver, without
+overwriting or closing each other's reads. The module-level watch helpers are
+a convenience scope per receiver; use explicit sessions for separate consumers.
+`receivedChunkScope` can also scope lower-level private-channel reads; receiver
+pubkeys are included in fragment keys. Expiration/cleanup still use the shared
+receive-chunk database and budget.
+
+### Pause, resume and recovery
+
+`pause(reason)` and `resume(reason)` accept nonempty strings. Reasons compose:
+removing `network` cannot override an application's `vault` pause. Pause stops
+live watches, recovery fetches and presence publishing, but retains channel
+configuration and pending deliveries. Already-started operations can finish;
+failed ingestion remains recoverable. Send attempts while paused reject.
+
+`watch(channels)` declares desired subscriptions. `unwatch(channels)` removes
+that intent while retaining configuration and history. Browser `online` only
+clears the internal `network` pause, never restarts explicitly unwatched
+channels. Updating retained channel configuration preserves explicit unwatch;
+new channels are watched unless paused. Applications may explicitly watch again.
+
+Pauses, unwatch and close record the start of the gap, even for channels that
+have never received a message. Rewatch/resume uses live delivery plus historical
+recovery with overlap. A failed resume remains retryable under its pause reason.
+Before opening a watch, the messenger persists a pending recovery interval.
+A first watch scans the configured recovery window (seven days by default),
+including messages sent before this identity first opened the channel. Successful
+scans persist `recoveredThrough`, even when empty; later watches resume from the
+latest persisted message or scan checkpoint with overlap. Pending older ranges
+remain until successfully recovered, even if newer live messages arrive.
+This also covers abrupt termination without `close()` and channels with no
+messages. Applications still supply signers and desired channels on reopening;
+storage is scoped by origin and user pubkey, not the transient session ID.
+Failed ingestion or incomplete relay fetch reports never complete the gap.
+`lastSeenAt` tracks messages persisted in the incoming queue, not app commits.
+The default recovery window is seven days; recovery still depends on available
+relay/seeder data, and retention limits cannot guarantee indefinite delivery.
+
+Queue clearing remains asynchronous: `await messenger.clearChannel(channelPubkey)`.
 
 Use explicit subpath imports for bundle size. The package root re-exports the
 main messenger API for convenience, but applications that only need one piece
@@ -626,3 +705,22 @@ limit, retaining the full URL and exposing decoded `url.nfile` and MIME `url.m`.
 
 The NIP-94 extension also carries optional `download` intent; see
 [nip94/README.md](nip94/README.md#download-intent) for event and inline URL forms.
+
+## Reliable IndexedDB queue reservations
+
+`createQueue({ prefix, evictionPolicy: 'reject', maxBytes })` opts out of
+capacity eviction. Oversized items reject with `QUEUE_ITEM_TOO_LARGE`, full
+queues with `QUEUE_CAPACITY_EXCEEDED`; browser quota errors propagate without
+trimming existing records. Other eviction policies retain their cache behavior.
+Opening a reject-policy queue under a smaller budget preserves existing items.
+
+`queue.reserve({ leaseMs = 30000 })` returns `null` or
+`{ item, ack, nack, renew }`. Reservation token/deadline are internal record
+metadata, persisted atomically in the same IndexedDB transaction as selection.
+`renew()` extends a still-valid lease. Low-level callers own renewal and release;
+PrivateMessenger supplies both. Do not mix reservations with destructive or
+position-shifting queue operations on the same queue except explicit removal.
+A stale token cannot acknowledge a newly reserved or replaced record.
+
+`queue.getCapacity()` returns `{ usedBytes, maxBytes }`; capacity rejections
+also expose `requiredBytes` and `maxBytes`, without retaining the rejected item.

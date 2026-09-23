@@ -1,7 +1,8 @@
-import { getEventHash, isSerializableEvent, isValidEvent } from '../event/index.js'
+import { isValidEvent } from '../event/index.js'
 import { ValidationError } from '../error/index.js'
 import { generateKeypair } from '../key/index.js'
 import * as privateChannel from '../private-channel/index.js'
+import { normalizeRumor, deliveryInfo } from '../private-channel/helpers/rumor.js'
 
 export const ASK_KIND = 7329
 export const REPLY_KIND = 7330
@@ -10,10 +11,6 @@ export const TELL_KIND = 7331
 const RESUBSCRIBE_GRACE_MS = 500
 const PRIVATE_MESSAGE_KINDS = [ASK_KIND, REPLY_KIND, TELL_KIND]
 const HEX_PUBKEY = /^[0-9a-f]{64}$/i
-
-const watchesByChannel = new Map()
-const subsByRelay = new Map()
-let nextWatchRevision = 1
 
 function nowSeconds () {
   return Math.floor(Date.now() / 1000)
@@ -120,23 +117,13 @@ function cloneTags (tags) {
 async function makeOutgoingRumor ({ senderSigner, rumor }) {
   if (!senderSigner?.getPublicKey) throw new ValidationError('SENDER_SIGNER_REQUIRED')
   const senderPubkey = await senderSigner.getPublicKey()
-  // This is what gets sent. Id and pubkey are added later by recipient.
-  const wireEvent = {
-    kind: rumor.kind,
-    tags: cloneTags(rumor.tags),
-    content: rumor.content,
-    created_at: rumor.created_at !== undefined
-      ? rumor.created_at
-      : nowSeconds()
+  if (rumor.pubkey !== undefined && rumor.pubkey !== senderPubkey && rumor.created_at === undefined) {
+    throw new ValidationError('FORWARDED_RUMOR_TIMESTAMP_REQUIRED')
   }
-  const event = normalizeRumor(wireEvent, senderPubkey)
+  const event = normalizeRumor({ ...rumor, tags: cloneTags(rumor.tags), created_at: rumor.created_at === undefined ? nowSeconds() : rumor.created_at }, senderPubkey)
+  const { id: _, pubkey, ...template } = event
+  const wireEvent = pubkey === senderPubkey ? template : { ...template, pubkey }
   return { event, wireEvent }
-}
-
-function normalizeRumor (event, pubkey) {
-  const normalized = { ...event, pubkey }
-  if (!isSerializableEvent(normalized)) throw new ValidationError('INVALID_RUMOR')
-  return { ...normalized, id: getEventHash(normalized) }
 }
 
 function assertValidSignedEvent (event) {
@@ -155,308 +142,364 @@ async function ownPrivateChannelPubkey (signer) {
   return signer.getPublicKey()
 }
 
-function assertWatching (channelPubkey) {
-  if (!watchesByChannel.has(channelPubkey)) throw new Error('PRIVATE_MESSAGE_NOT_WATCHING')
-}
-
-function watchCallbacks (channelPubkey) {
-  return watchesByChannel.get(channelPubkey)?.callbacks || {}
-}
-
-function dispatchWatchedEvent (event, outer, meta) {
-  const callbacks = watchCallbacks(meta.channelPubkey)
-  const payload = parseRumorContent(event)
-  const message = { event, outer, meta, payload }
-
-  if (event.kind === ASK_KIND) {
-    callbacks.onAsk?.({ ...message, question: event })
-  } else if (event.kind === REPLY_KIND) {
-    const questionId = readTag(event, 'q')
-    callbacks.onReply?.({ ...message, questionId, reply: event })
-  } else if (event.kind === TELL_KIND) {
-    const receiverTag = readTag(event, 'r')
-    if (receiverTag) callbacks.onTell?.({ ...message, tell: event })
-    else callbacks.onYell?.({ ...message, yell: event })
+// A session owns its callbacks and relay reads. Other consumers, including
+// the other side of the same shared channel, cannot overwrite or stop them.
+export function createPrivateMessageSession () {
+  const watchesByChannel = new Map()
+  const subsByRelay = new Map()
+  let nextWatchRevision = 1
+  let requestSequence = 0
+  const watchRequests = new Map()
+  let identity
+  const receivedChunkScope = globalThis.crypto.randomUUID()
+  let subscribe = privateChannel.subscribe
+  function assertWatching (channelPubkey) {
+    if (!watchesByChannel.has(channelPubkey)) throw new Error('PRIVATE_MESSAGE_NOT_WATCHING')
   }
 
-  callbacks.onMessage?.(message)
-}
+  function watchCallbacks (channelPubkey) {
+    return watchesByChannel.get(channelPubkey)?.callbacks || {}
+  }
 
-function dispatchWatchedNymEvent (event, outer, meta) {
-  const callbacks = watchCallbacks(meta.channelPubkey)
-  callbacks.onNym?.({
-    event,
-    outer,
-    meta,
-    payload: parseRumorContent(event),
-    nym: event
-  })
-}
-
-function dispatchSeedEvent (seed) {
-  watchCallbacks(seed.channelPubkey).onSeed?.(seed)
-}
-
-function dispatchContentKeyUsage (usage) {
-  watchCallbacks(usage.channelPubkey).onContentKeyUsage?.(usage)
-}
-
-function handleChunk (chunk) {
-  watchCallbacks(chunk.channelPubkey).onChunk?.(chunk)
-}
-
-function desiredRelayState () {
-  const relayToChannels = new Map()
-  for (const [channelPubkey, watch] of watchesByChannel) {
-    for (const relay of watch.relays) {
-      if (!relayToChannels.has(relay)) relayToChannels.set(relay, new Set())
-      relayToChannels.get(relay).add(channelPubkey)
+  async function dispatchWatchedEvent (event, outer, meta) {
+    const callbacks = watchCallbacks(meta.channelPubkey)
+    const payload = parseRumorContent(event)
+    const info = deliveryInfo(event, meta.senderPubkey ?? meta.router?.tags?.find(tag => tag[0] === 'f')?.[1])
+    const message = { event, outer, meta, payload, ...info }
+    if (info.provenance === 'hearsay' || (info.senderPubkey && info.senderPubkey !== event.pubkey)) {
+      await callbacks.onMessage?.(message)
+      return
     }
-  }
-  return relayToChannels
-}
 
-function signersForChannels (channels) {
-  const out = {}
-  for (const channel of channels) {
-    const signer = watchesByChannel.get(channel)?.privateChannelSigner
-    if (signer) out[channel] = signer
-  }
-  return out
-}
-
-function readerSignersForChannels (channels) {
-  const out = {}
-  for (const channel of channels) {
-    const signer = watchesByChannel.get(channel)?.privateChannelReaderSigner
-    if (signer) out[channel] = signer
-  }
-  return out
-}
-
-function readerPubkeysForChannels (channels) {
-  const out = {}
-  for (const channel of channels) {
-    const pubkey = watchesByChannel.get(channel)?.privateChannelReaderPubkey
-    if (pubkey) out[channel] = pubkey
-  }
-  return out
-}
-
-function modesForChannels (channels) {
-  const out = {}
-  for (const channel of channels) out[channel] = watchesByChannel.get(channel)?.mode || 'leecher'
-  return out
-}
-
-function maxWatchNumber (channels, field) {
-  const values = channels
-    .map(channel => watchesByChannel.get(channel)?.[field])
-    .filter(value => Number.isFinite(value))
-  return values.length ? Math.max(...values) : undefined
-}
-
-function watchNumbersForChannels (channels, field) {
-  const out = {}
-  for (const channel of channels) {
-    const value = watchesByChannel.get(channel)?.[field]
-    if (Number.isFinite(value)) out[channel] = value
-  }
-  return out
-}
-
-function watchRevisionsForChannels (channels) {
-  return Object.fromEntries(channels.map(channel => [channel, watchesByChannel.get(channel)?.revision || 0]))
-}
-
-function doesSubscriptionMatch (current, channels) {
-  if (!current || !areSetsEqual(current.channels, channels)) return false
-  for (const channel of channels) {
-    if (current.revisions?.[channel] !== watchesByChannel.get(channel)?.revision) return false
-  }
-  return true
-}
-
-function firstWatchValue (channels, field) {
-  for (const channel of channels) {
-    const value = watchesByChannel.get(channel)?.[field]
-    if (value !== undefined) return value
-  }
-  return undefined
-}
-
-function closeSubscription (sub, gracefulClose) {
-  if (gracefulClose) {
-    setTimeout(() => Promise.resolve().then(() => sub.close()).catch(() => {}), RESUBSCRIBE_GRACE_MS)
-    return null
-  }
-  try {
-    return Promise.resolve(sub.close())
-  } catch (err) {
-    return Promise.reject(err)
-  }
-}
-
-function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, gracefulClose = true } = {}) {
-  const desired = desiredRelayState()
-  const closing = []
-
-  for (const [relay, current] of subsByRelay) {
-    const nextChannels = desired.get(relay)
-    if (nextChannels && doesSubscriptionMatch(current, nextChannels)) continue
-    if (!nextChannels) {
-      const close = closeSubscription(current.sub, gracefulClose)
-      if (close) closing.push(close)
-      subsByRelay.delete(relay)
+    if (event.kind === ASK_KIND) {
+      await callbacks.onAsk?.({ ...message, question: event })
+    } else if (event.kind === REPLY_KIND) {
+      const questionId = readTag(event, 'q')
+      await callbacks.onReply?.({ ...message, questionId, reply: event })
+    } else if (event.kind === TELL_KIND) {
+      const receiverTag = readTag(event, 'r')
+      if (receiverTag) await callbacks.onTell?.({ ...message, tell: event })
+      else await callbacks.onYell?.({ ...message, yell: event })
     }
+
+    await callbacks.onMessage?.(message)
   }
 
-  for (const [relay, channels] of desired) {
-    const current = subsByRelay.get(relay)
-    if (doesSubscriptionMatch(current, channels)) continue
-
-    const channelList = [...channels]
-    const firstWatch = watchesByChannel.get(channelList[0])
-    const sub = _subscribe({
-      receiverSigner: firstWatch.receiverSigner,
-      iykcSigner: firstWatch.iykcSigner,
-      privateChannelSigner: firstWatch.privateChannelSigner,
-      privateChannelSignersByPubkey: signersForChannels(channelList),
-      privateChannelReaderSigner: firstWatch.privateChannelReaderSigner,
-      privateChannelReaderSignersByPubkey: readerSignersForChannels(channelList),
-      privateChannelReaderPubkey: firstWatch.privateChannelReaderPubkey,
-      privateChannelReaderPubkeysByPubkey: readerPubkeysForChannels(channelList),
-      privateChannelPubkeys: channelList,
-      receiverPubkey: firstWatch.receiverPubkey,
-      relays: [relay],
-      mode: firstWatch.mode,
-      modeByPubkey: modesForChannels(channelList),
-      receivedChunkTtlMs: maxWatchNumber(channelList, 'receivedChunkTtlMs'),
-      receivedChunkTtlMsByPubkey: watchNumbersForChannels(channelList, 'receivedChunkTtlMs'),
-      receivedChunkMaxBytes: maxWatchNumber(channelList, 'receivedChunkMaxBytes'),
-      receivedChunkIndexedDB: firstWatchValue(channelList, 'receivedChunkIndexedDB'),
-      ignoredGroupTtlMs: maxWatchNumber(channelList, 'ignoredGroupTtlMs'),
-      ignoredGroupMaxEntries: maxWatchNumber(channelList, 'ignoredGroupMaxEntries'),
-      limit: 0,
-      since: nowSeconds(),
-      liveOnly: true,
-      onChunk: handleChunk,
-      onEvent: (event, outer, meta) => {
-        dispatchWatchedEvent(event, outer, meta)
-      },
-      onNymEvent: (event, outer, meta) => {
-        dispatchWatchedNymEvent(event, outer, meta)
-      },
-      onSeedEvent: (seed) => {
-        dispatchSeedEvent(seed)
-      },
-      onContentKeyUsage: dispatchContentKeyUsage,
-      onError: err => firstWatch.callbacks.onError?.(err)
+  async function dispatchWatchedNymEvent (event, outer, meta) {
+    const callbacks = watchCallbacks(meta.channelPubkey)
+    await callbacks.onNym?.({
+      event,
+      outer,
+      meta,
+      payload: parseRumorContent(event),
+      ...deliveryInfo(event, meta.senderPubkey ?? meta.carrier?.pubkey ?? event.pubkey),
+      nym: event
     })
-
-    subsByRelay.set(relay, {
-      channels: new Set(channels),
-      revisions: watchRevisionsForChannels(channelList),
-      sub
-    })
-    if (current) {
-      const close = closeSubscription(current.sub, gracefulClose)
-      if (close) closing.push(close)
-    }
-  }
-  return Promise.allSettled(closing)
-}
-
-export async function watch ({
-  channels,
-  relays,
-  receiverSigner,
-  iykcSigner,
-  privateChannelSigner = receiverSigner,
-  privateChannelReaderSigner = privateChannelSigner,
-  privateChannelReaderPubkey,
-  receiverPubkey,
-  mode = 'leecher',
-  onAsk,
-  onReply,
-  onTell,
-  onYell,
-  onNym,
-  onMessage,
-  onSeed,
-  onChunk,
-  onContentKeyUsage,
-  onError,
-  receivedChunkTtlMs,
-  receivedChunkMaxBytes,
-  receivedChunkIndexedDB,
-  ignoredGroupTtlMs,
-  ignoredGroupMaxEntries,
-  since = nowSeconds(),
-  _subscribe = privateChannel.subscribe
-}) {
-  if (!relays?.length) throw new ValidationError('NO_RELAYS')
-  const channelList = uniq(channels?.length ? channels : [await ownPrivateChannelPubkey(privateChannelSigner)])
-  const ownPubkey = receiverPubkey || await receiverSigner?.getPublicKey?.()
-  const callbacks = { onAsk, onReply, onTell, onYell, onNym, onMessage, onSeed, onChunk, onContentKeyUsage, onError }
-
-  let changed = false
-  for (const channel of channelList) {
-    const next = {
-      relays: uniq(relays),
-      receiverSigner,
-      iykcSigner,
-      privateChannelSigner,
-      privateChannelReaderSigner: privateChannelReaderSigner || privateChannelSigner,
-      privateChannelReaderPubkey,
-      receiverPubkey: ownPubkey,
-      mode,
-      receivedChunkTtlMs,
-      receivedChunkMaxBytes,
-      receivedChunkIndexedDB,
-      ignoredGroupTtlMs,
-      ignoredGroupMaxEntries,
-      callbacks,
-      since
-    }
-    const current = watchesByChannel.get(channel)
-    const areSettingsEqual = Boolean(
-      current &&
-      current.receiverSigner === next.receiverSigner &&
-      current.iykcSigner === next.iykcSigner &&
-      current.privateChannelSigner === next.privateChannelSigner &&
-      current.privateChannelReaderSigner === next.privateChannelReaderSigner &&
-      current.privateChannelReaderPubkey === next.privateChannelReaderPubkey &&
-      current.receiverPubkey === next.receiverPubkey &&
-      current.mode === next.mode &&
-      current.receivedChunkTtlMs === next.receivedChunkTtlMs &&
-      current.receivedChunkMaxBytes === next.receivedChunkMaxBytes &&
-      current.receivedChunkIndexedDB === next.receivedChunkIndexedDB &&
-      current.ignoredGroupTtlMs === next.ignoredGroupTtlMs &&
-      current.ignoredGroupMaxEntries === next.ignoredGroupMaxEntries
-    )
-    next.revision = areSettingsEqual ? current.revision : nextWatchRevision++
-    if (areSettingsEqual && areSetsEqual(new Set(current.relays), new Set(next.relays))) {
-      current.callbacks = callbacks
-      continue
-    }
-    watchesByChannel.set(channel, next)
-    changed = true
   }
 
-  if (changed) await rebuildSubscriptions({ _subscribe })
-  return () => unwatch(channelList)
+  function dispatchSeedEvent (seed) {
+    return watchCallbacks(seed.channelPubkey).onSeed?.(seed)
+  }
+
+  function dispatchContentKeyUsage (usage) {
+    watchCallbacks(usage.channelPubkey).onContentKeyUsage?.(usage)
+  }
+
+  function handleChunk (chunk) {
+    watchCallbacks(chunk.channelPubkey).onChunk?.(chunk)
+  }
+
+  function desiredRelayState () {
+    const relayToChannels = new Map()
+    for (const [channelPubkey, watch] of watchesByChannel) {
+      for (const relay of watch.relays) {
+        if (!relayToChannels.has(relay)) relayToChannels.set(relay, new Set())
+        relayToChannels.get(relay).add(channelPubkey)
+      }
+    }
+    return relayToChannels
+  }
+
+  function signersForChannels (channels) {
+    const out = {}
+    for (const channel of channels) {
+      const signer = watchesByChannel.get(channel)?.privateChannelSigner
+      if (signer) out[channel] = signer
+    }
+    return out
+  }
+
+  function readerSignersForChannels (channels) {
+    const out = {}
+    for (const channel of channels) {
+      const signer = watchesByChannel.get(channel)?.privateChannelReaderSigner
+      if (signer) out[channel] = signer
+    }
+    return out
+  }
+
+  function readerPubkeysForChannels (channels) {
+    const out = {}
+    for (const channel of channels) {
+      const pubkey = watchesByChannel.get(channel)?.privateChannelReaderPubkey
+      if (pubkey) out[channel] = pubkey
+    }
+    return out
+  }
+
+  function modesForChannels (channels) {
+    const out = {}
+    for (const channel of channels) out[channel] = watchesByChannel.get(channel)?.mode || 'leecher'
+    return out
+  }
+
+  function maxWatchNumber (channels, field) {
+    const values = channels
+      .map(channel => watchesByChannel.get(channel)?.[field])
+      .filter(value => Number.isFinite(value))
+    return values.length ? Math.max(...values) : undefined
+  }
+
+  function watchNumbersForChannels (channels, field) {
+    const out = {}
+    for (const channel of channels) {
+      const value = watchesByChannel.get(channel)?.[field]
+      if (Number.isFinite(value)) out[channel] = value
+    }
+    return out
+  }
+
+  function watchRevisionsForChannels (channels) {
+    return Object.fromEntries(channels.map(channel => [channel, watchesByChannel.get(channel)?.revision || 0]))
+  }
+
+  function doesSubscriptionMatch (current, channels) {
+    if (!current || !areSetsEqual(current.channels, channels)) return false
+    for (const channel of channels) {
+      if (current.revisions?.[channel] !== watchesByChannel.get(channel)?.revision) return false
+    }
+    return true
+  }
+
+  function firstWatchValue (channels, field) {
+    for (const channel of channels) {
+      const value = watchesByChannel.get(channel)?.[field]
+      if (value !== undefined) return value
+    }
+    return undefined
+  }
+
+  function closeSubscription (sub, gracefulClose) {
+    if (gracefulClose) {
+      setTimeout(() => Promise.resolve().then(() => sub.close()).catch(() => {}), RESUBSCRIBE_GRACE_MS)
+      return null
+    }
+    try {
+      return Promise.resolve(sub.close())
+    } catch (err) {
+      return Promise.reject(err)
+    }
+  }
+
+  function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, gracefulClose = true } = {}) {
+    subscribe = _subscribe === privateChannel.subscribe ? subscribe : _subscribe
+    _subscribe = subscribe
+    const desired = desiredRelayState()
+    const closing = []
+
+    for (const [relay, current] of subsByRelay) {
+      const nextChannels = desired.get(relay)
+      if (nextChannels && doesSubscriptionMatch(current, nextChannels)) continue
+      if (!nextChannels) {
+        const close = closeSubscription(current.sub, gracefulClose)
+        if (close) closing.push(close)
+        subsByRelay.delete(relay)
+      }
+    }
+
+    for (const [relay, channels] of desired) {
+      const current = subsByRelay.get(relay)
+      if (doesSubscriptionMatch(current, channels)) continue
+
+      const channelList = [...channels]
+      const firstWatch = watchesByChannel.get(channelList[0])
+      const sub = _subscribe({
+        receiverSigner: firstWatch.receiverSigner,
+        iykcSigner: firstWatch.iykcSigner,
+        privateChannelSigner: firstWatch.privateChannelSigner,
+        privateChannelSignersByPubkey: signersForChannels(channelList),
+        privateChannelReaderSigner: firstWatch.privateChannelReaderSigner,
+        privateChannelReaderSignersByPubkey: readerSignersForChannels(channelList),
+        privateChannelReaderPubkey: firstWatch.privateChannelReaderPubkey,
+        privateChannelReaderPubkeysByPubkey: readerPubkeysForChannels(channelList),
+        privateChannelPubkeys: channelList,
+        receiverPubkey: firstWatch.receiverPubkey,
+        relays: [relay],
+        mode: firstWatch.mode,
+        modeByPubkey: modesForChannels(channelList),
+        receivedChunkScope,
+        receivedChunkTtlMs: maxWatchNumber(channelList, 'receivedChunkTtlMs'),
+        receivedChunkTtlMsByPubkey: watchNumbersForChannels(channelList, 'receivedChunkTtlMs'),
+        receivedChunkMaxBytes: maxWatchNumber(channelList, 'receivedChunkMaxBytes'),
+        receivedChunkIndexedDB: firstWatchValue(channelList, 'receivedChunkIndexedDB'),
+        ignoredGroupTtlMs: maxWatchNumber(channelList, 'ignoredGroupTtlMs'),
+        ignoredGroupMaxEntries: maxWatchNumber(channelList, 'ignoredGroupMaxEntries'),
+        limit: 0,
+        since: nowSeconds(),
+        liveOnly: true,
+        onChunk: handleChunk,
+        onEvent: (event, outer, meta) => {
+          return dispatchWatchedEvent(event, outer, meta)
+        },
+        onNymEvent: (event, outer, meta) => {
+          return dispatchWatchedNymEvent(event, outer, meta)
+        },
+        onSeedEvent: (seed) => {
+          return dispatchSeedEvent(seed)
+        },
+        onContentKeyUsage: dispatchContentKeyUsage,
+        onError: err => firstWatch.callbacks.onError?.(err)
+      })
+
+      subsByRelay.set(relay, {
+        channels: new Set(channels),
+        revisions: watchRevisionsForChannels(channelList),
+        sub
+      })
+      if (current) {
+        const close = closeSubscription(current.sub, gracefulClose)
+        if (close) closing.push(close)
+      }
+    }
+    return Promise.allSettled(closing)
+  }
+
+  async function watch ({
+    channels,
+    relays,
+    receiverSigner,
+    iykcSigner,
+    privateChannelSigner = receiverSigner,
+    privateChannelReaderSigner = privateChannelSigner,
+    privateChannelReaderPubkey,
+    receiverPubkey,
+    mode = 'leecher',
+    onAsk,
+    onReply,
+    onTell,
+    onYell,
+    onNym,
+    onMessage,
+    onSeed,
+    onChunk,
+    onContentKeyUsage,
+    onError,
+    receivedChunkTtlMs,
+    receivedChunkMaxBytes,
+    receivedChunkIndexedDB,
+    ignoredGroupTtlMs,
+    ignoredGroupMaxEntries,
+    since = nowSeconds(),
+    _subscribe = privateChannel.subscribe
+  }) {
+    if (!relays?.length) throw new ValidationError('NO_RELAYS')
+    const request = ++requestSequence
+    const channelList = uniq(channels?.length ? channels : [await ownPrivateChannelPubkey(privateChannelSigner)])
+    for (const channel of channelList) {
+      if ((watchRequests.get(channel) || 0) < request) watchRequests.set(channel, request)
+    }
+    const ownPubkey = receiverPubkey || await receiverSigner?.getPublicKey?.()
+    if (identity !== undefined && identity !== ownPubkey) throw new ValidationError('PRIVATE_MESSAGE_IDENTITY_MISMATCH')
+    identity = ownPubkey
+    const callbacks = { onAsk, onReply, onTell, onYell, onNym, onMessage, onSeed, onChunk, onContentKeyUsage, onError }
+
+    let changed = false
+    for (const channel of channelList) {
+      if (watchRequests.get(channel) !== request) continue
+      const next = {
+        request,
+        relays: uniq(relays),
+        receiverSigner,
+        iykcSigner,
+        privateChannelSigner,
+        privateChannelReaderSigner: privateChannelReaderSigner || privateChannelSigner,
+        privateChannelReaderPubkey,
+        receiverPubkey: ownPubkey,
+        mode,
+        receivedChunkTtlMs,
+        receivedChunkMaxBytes,
+        receivedChunkIndexedDB,
+        ignoredGroupTtlMs,
+        ignoredGroupMaxEntries,
+        callbacks,
+        since
+      }
+      const current = watchesByChannel.get(channel)
+      const areSettingsEqual = Boolean(
+        current &&
+        current.receiverSigner === next.receiverSigner &&
+        current.iykcSigner === next.iykcSigner &&
+        current.privateChannelSigner === next.privateChannelSigner &&
+        current.privateChannelReaderSigner === next.privateChannelReaderSigner &&
+        current.privateChannelReaderPubkey === next.privateChannelReaderPubkey &&
+        current.receiverPubkey === next.receiverPubkey &&
+        current.mode === next.mode &&
+        current.receivedChunkTtlMs === next.receivedChunkTtlMs &&
+        current.receivedChunkMaxBytes === next.receivedChunkMaxBytes &&
+        current.receivedChunkIndexedDB === next.receivedChunkIndexedDB &&
+        current.ignoredGroupTtlMs === next.ignoredGroupTtlMs &&
+        current.ignoredGroupMaxEntries === next.ignoredGroupMaxEntries
+      )
+      next.revision = areSettingsEqual ? current.revision : nextWatchRevision++
+      if (areSettingsEqual && areSetsEqual(new Set(current.relays), new Set(next.relays))) {
+        current.callbacks = callbacks
+        current.request = request
+        continue
+      }
+      watchesByChannel.set(channel, next)
+      changed = true
+    }
+
+    if (changed) await rebuildSubscriptions({ _subscribe })
+    return () => {
+      const owned = channelList.filter(channel => watchRequests.get(channel) === request)
+      return unwatch(owned)
+    }
+  }
+
+  function unwatch (channels) {
+    const channelList = channels ? uniq(Array.isArray(channels) ? channels : [channels]) : [...watchRequests.keys()]
+    for (const channel of channelList) {
+      watchRequests.set(channel, ++requestSequence)
+      watchesByChannel.delete(channel)
+    }
+    return rebuildSubscriptions({ gracefulClose: false })
+  }
+
+  function clearChannelState (channelPubkey) {
+    if (watchesByChannel.has(channelPubkey)) return unwatch(channelPubkey)
+    return Promise.resolve([])
+  }
+
+  return {
+    watch, unwatch, clearChannelState,
+    ask: options => ask({ ...options, _assertWatching: assertWatching }),
+    reply, tell, yell, broadcastRumor, broadcastEvent, broadcastNymRumor, broadcastNymEvent
+  }
 }
 
-export function unwatch (channels) {
-  const channelList = channels ? uniq(Array.isArray(channels) ? channels : [channels]) : [...watchesByChannel.keys()]
-  for (const channel of channelList) watchesByChannel.delete(channel)
-  return rebuildSubscriptions({ gracefulClose: false })
+const defaultSessions = new Map()
+export async function watch (options) {
+  const identity = options.receiverPubkey || await options.receiverSigner?.getPublicKey?.() || ''
+  let session = defaultSessions.get(identity)
+  if (!session) defaultSessions.set(identity, (session = createPrivateMessageSession()))
+  return session.watch(options)
 }
-
-export function clearChannelState (channelPubkey) {
-  if (watchesByChannel.has(channelPubkey)) return unwatch(channelPubkey)
-  return Promise.resolve([])
+export async function unwatch (channels) {
+  await Promise.all([...defaultSessions.values()].map(session => session.unwatch(channels)))
+}
+export async function clearChannelState (channelPubkey) {
+  await Promise.all([...defaultSessions.values()].map(session => session.clearChannelState(channelPubkey)))
 }
 
 async function sendPrivateMessage ({
@@ -517,12 +560,19 @@ export async function ask ({
   deletionPubkey,
   deletionSeckey,
   autoDeletionCapability = true,
-  _publish = privateChannel.publish
+  _publish = privateChannel.publish,
+  _assertWatching
 }) {
   if (!receiverPubkey) throw new ValidationError('RECEIVER_PUBKEY_REQUIRED')
   if (!privateChannelSigner?.getPublicKey) throw new ValidationError('PRIVATE_CHANNEL_WRITER_REQUIRED')
   const privateChannelPubkey = await ownPrivateChannelPubkey(privateChannelSigner)
-  assertWatching(privateChannelPubkey)
+  if (_assertWatching) _assertWatching(privateChannelPubkey)
+  else {
+    const identity = await senderSigner?.getPublicKey?.()
+    const session = defaultSessions.get(identity)
+    if (!session) throw new Error('PRIVATE_MESSAGE_NOT_WATCHING')
+    return session.ask({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receiverPubkey, relays, relayToReceivers, recoveryRelays, message, code, payload, error, content, expirationSeconds, temporaryStorageArea, _getIykcProofs, deletionPubkey, deletionSeckey, autoDeletionCapability, _publish })
+  }
 
   const { event: question, wireEvent } = await makeOutgoingRumor({
     senderSigner,
@@ -716,6 +766,8 @@ export async function broadcastNymRumor ({
   _publish = privateChannel.publishNymEvent
 }) {
   if (!nymSigner?.getPublicKey) throw new ValidationError('NYM_SIGNER_REQUIRED')
+  if (!nymSigner?.getPublicKey) throw new ValidationError('NYM_SIGNER_REQUIRED')
+  if (rumor.pubkey !== undefined && rumor.pubkey !== await nymSigner.getPublicKey()) throw new ValidationError('NYM_RUMOR_AUTHOR_MISMATCH')
   const { event, wireEvent } = await makeOutgoingRumor({ senderSigner: nymSigner, rumor })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
   const reports = await sendNymMessage({ nymSigner, privateChannelSigner, privateChannelReaderPubkey, deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, _publish })

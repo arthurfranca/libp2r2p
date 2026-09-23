@@ -77,3 +77,19 @@ suite pass; report independently scoped problems separately.
 - The optional download extension decodes to string '0'/'1'. Kind-1063 absence
   means '0', a bare tag means '1'; inline URL fragments require explicit values.
   Reject invalid/duplicate flags. Builders never emit the tag by default.
+
+## Private messaging lifecycle
+
+- Rumors preserve an explicit author distinct from the transport sender. Keep
+  `senderPubkey` and `provenance` outside the event through live and recovery
+  paths; forwarded controls must not execute as direct sender commands.
+- PrivateMessenger owns an isolated private-message session. Keep callback and
+  fragment progress scoped by consumer and receiver, including shared DM keys.
+- `messages()` / `nextMessage()` deliver `{ message, ack, nack }`. Persist before
+  acknowledgment; cancellation releases reservations. Capacity pressure must
+  not evict pending app messages or complete an unpersisted recovery interval.
+- Desired watches and pause reasons are separate. Browser online clears only
+  the network reason; it never undoes explicit unwatch or another pause.
+- Persist the initial recovery interval before starting a watch. Empty successful
+  scans advance recoveredThrough; live progress never clears pending ranges.
+  First watches use the bounded recovery window, and crashes need no close hook.

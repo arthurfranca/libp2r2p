@@ -56,6 +56,7 @@ function byteLength (value) {
 
 function normalizeEvictionPolicy (policy) {
   if (policy === 'opposite-end' || policy === undefined || policy === null) return 'opposite-end'
+  if (policy === 'reject') return 'reject'
   if (policy === 'fifo' || policy === 'head') return 'head'
   if (policy === 'lifo' || policy === 'tail') return 'tail'
   throw new ValidationError('QUEUE_INVALID_EVICTION_POLICY')
@@ -468,6 +469,12 @@ export async function createQueue ({
   async function evictToFit (tx, state, requiredBytes, options = {}) {
     if (!hasByteLimit()) return
     if (requiredBytes > sessionMaxBytes) throw new Error('QUEUE_ITEM_TOO_LARGE')
+    if (configuredEvictionPolicy === 'reject') {
+      if (state.usedBytes + requiredBytes > sessionMaxBytes) {
+        throw Object.assign(new Error('QUEUE_CAPACITY_EXCEEDED'), { requiredBytes, maxBytes: sessionMaxBytes })
+      }
+      return
+    }
     // Make room for the write and retain eviction headroom for the next one.
     const targetBytes = targetBytesAfterWrite(requiredBytes)
     while (state.usedBytes + requiredBytes > targetBytes) {
@@ -477,7 +484,7 @@ export async function createQueue ({
   }
 
   async function evictToBytes (tx, state, targetBytes, options = {}) {
-    if (!hasByteLimit()) return
+    if (!hasByteLimit() || configuredEvictionPolicy === 'reject') return
     while (state.usedBytes > targetBytes) {
       if (!await evictOne(tx, state, options)) break
     }
@@ -590,7 +597,7 @@ export async function createQueue ({
         if (wakeWaiters) wake()
         return value
       } catch (err) {
-        if (retried || !hasByteLimit() || !isQuotaExceeded(err)) throw err
+        if (configuredEvictionPolicy === 'reject' || retried || !hasByteLimit() || !isQuotaExceeded(err)) throw err
         // Browser quota can be lower than the configured logical budget.
         // Retry once with a smaller in-memory budget after atomic rollback.
         lowerSessionMaxBytes(requiredBytes)
@@ -748,6 +755,61 @@ export async function createQueue ({
     })
   }
 
+  // Reservations are stored atomically with the item; another tab/process can
+  // reclaim an expired lease after a crash. Destructive/positional queue APIs
+  // must not be mixed with reservations on the same queue.
+  async function reserve ({ leaseMs = 30000, now = Date.now() } = {}) {
+    if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0 || !Number.isSafeInteger(now) || now < 0) throw new ValidationError('QUEUE_INVALID_LEASE')
+    const token = globalThis.crypto.randomUUID()
+    const reserved = await mutate(async tx => {
+      const p = deferred()
+      let cursor = (await run('openCursor', [], ITEMS_STORE, null, { tx, p })).result
+      while (cursor) {
+        const record = cursor.value
+        if (!record.reservation || record.reservation.until <= now) {
+          record.reservation = { token, until: now + leaseMs }
+          await putRecord(tx, record)
+          return record
+        }
+        cursor = await nextCursor(cursor, p)
+      }
+      return null
+    })
+    if (!reserved) return null
+    let settled = false
+    let completedAction
+    let completedResult
+    let tail = Promise.resolve()
+    const update = (action, at = Date.now()) => {
+      const operation = tail.then(async () => {
+        if (settled) return action === completedAction ? completedResult : false
+        const result = await mutate(async (tx, state) => {
+          const record = await getRecord(tx, reserved.position)
+          if (record?.reservation?.token !== token || record.reservation.until <= at) return false
+          if (action === 'ack') {
+            await deleteRecord(tx, record.position)
+            state.usedBytes = Math.max(0, state.usedBytes - record.byteSize)
+            await trimBounds(tx, state)
+          } else {
+            if (action === 'renew') record.reservation.until = at + leaseMs
+            else delete record.reservation
+            await putRecord(tx, record)
+          }
+          return true
+        }, { wakeWaiters: action !== 'renew' })
+        if (action !== 'renew' || !result) {
+          settled = true
+          completedAction = action
+          completedResult = result
+        }
+        return result
+      })
+      tail = operation.catch(() => {})
+      return operation
+    }
+    return { item: reserved.item, ack: () => update('ack'), nack: () => update('nack'), renew: () => update('renew') }
+  }
+
   async function snapshotStoredItems () {
     return snapshot(async tx => {
       const state = await readState(tx)
@@ -819,6 +881,8 @@ export async function createQueue ({
   })
 
   return {
+    reserve,
+    getCapacity: () => snapshot(async tx => ({ usedBytes: (await readState(tx)).usedBytes, maxBytes: sessionMaxBytes })),
     enqueue: push,
     push,
     pop,

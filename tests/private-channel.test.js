@@ -682,7 +682,7 @@ test('unwrapEvent returns the addressed receiver event or null', async () => {
   const bobPubkey = await bob.getPublicKey()
   const carolPubkey = await carol.getPublicKey()
   const alicePubkey = await alice.getPublicKey()
-  const original = { ...eventFixture('private'), pubkey: '0'.repeat(64), id: 'f'.repeat(64) }
+  const original = eventFixture('private')
   const [wrapped] = await wrapEvent({ senderSigner: alice, receivers: [bobPubkey, carolPubkey], event: original, _getIykcProofs: noContentKeys })
 
   assert.deepEqual(await unwrapEvent({ receiverSigner: bob, privateChannelSigner: alice, event: wrapped, receiverPubkey: bobPubkey }), unwrappedFixture(original, alicePubkey))
@@ -2118,4 +2118,95 @@ test('received chunk store resumes incremental parsing after reload', async () =
 
   assert.equal(secondDrain.complete, true)
   assert.deepEqual(lines, [line.trim()])
+})
+
+test('channel roundtrip preserves forwarded rumor authors and verifies supplied IDs', async () => {
+  const sender = signer()
+  const receiver = signer()
+  const author = await receiver.getPublicKey()
+  const original = { ...eventFixture('a quote attributed to the receiver'), pubkey: author }
+  original.id = getEventHash(original)
+  const args = { senderSigner: sender, receivers: [author], _getIykcProofs: noContentKeys }
+  const [outer] = await wrapEvent({ ...args, event: original })
+  const result = await unwrapEvent({ receiverSigner: receiver, privateChannelSigner: sender, event: outer, receiverPubkey: author })
+  assert.deepEqual(result, original)
+  const [bad] = await wrapEvent({ ...args, event: { ...original, id: 'f'.repeat(64) } })
+  await assert.rejects(unwrapEvent({ receiverSigner: receiver, privateChannelSigner: sender, event: bad, receiverPubkey: author }), /INVALID_RUMOR_ID/)
+  let metadata
+  await fetch({
+    receiverSigner: receiver, privateChannelSigner: sender, receiverPubkey: author, relays: ['wss://example.test'],
+    _getEvents: async () => ({ result: [{ event: outer }] }),
+    onEvent: (event, outer, meta) => { metadata = meta }
+  })
+  assert.equal(metadata.senderPubkey, await sender.getPublicKey())
+  assert.equal(metadata.provenance, 'hearsay')
+})
+
+test('a rejected delivery can replay the complete chunk group', async () => {
+  const sender = signer()
+  const receiver = signer()
+  const receiverPubkey = await receiver.getPublicKey()
+  const original = eventFixture('large'.repeat(12000))
+  const outers = await wrapEvent({ senderSigner: sender, receivers: [receiverPubkey], event: original, _getIykcProofs: noContentKeys })
+  let received = 0
+  let fail = true
+  const options = {
+    receiverSigner: receiver, privateChannelSigner: sender, receiverPubkey, receivedChunkScope: 'replay', relays: ['wss://example.test'],
+    _getEvents: async () => ({ result: outers.map(event => ({ event })) }),
+    onEvent: () => { if (fail) throw new Error('SAVE_FAILED'); received++ }, onError: error => { throw error }
+  }
+  await assert.rejects(fetch(options), /SAVE_FAILED/)
+  fail = false
+  await fetch(options)
+  assert.equal(received, 1)
+})
+
+test('recovery fetch rejects incomplete relay reports and observes cancellation', async () => {
+  const controller = new AbortController()
+  const options = { relays: ['wss://example.test'], onError: error => { throw error }, _getEvents: async () => ({ result: [], errors: [], relays: [{ relay: 'wss://example.test', status: 'timeout' }] }) }
+  await assert.rejects(fetch(options), /PRIVATE_CHANNEL_FETCH_INCOMPLETE/)
+  controller.abort()
+  await assert.rejects(fetch({ ...options, signal: controller.signal }), error => error.name === 'AbortError')
+})
+
+test('simultaneous receivers and consumers independently process the same channel chunks', async () => {
+  const { createPrivateMessageSession } = await import('../private-message/index.js')
+  const a = signer()
+  const b = signer()
+  const aPubkey = await a.getPublicKey()
+  const bPubkey = await b.getPublicKey()
+  const channelA = a.withSharedKey(bPubkey, 'dm')
+  const channelB = b.withSharedKey(aPubkey, 'dm')
+  assert.equal(await channelA.getPublicKey(), await channelB.getPublicKey())
+  const original = eventFixture('shared'.repeat(15000))
+  const outers = await wrapEvent({ senderSigner: a, privateChannelSigner: channelA, receivers: [aPubkey, bPubkey], event: original, _getIykcProofs: noContentKeys })
+  const sessions = [createPrivateMessageSession(), createPrivateMessageSession(), createPrivateMessageSession()]
+  const receivers = [a, b, b]
+  const got = [[], [], []]
+  const finished = []
+  try {
+    for (const [index, session] of sessions.entries()) {
+      await session.watch({
+        channels: [await channelA.getPublicKey()], relays: ['wss://example.test'], receiverSigner: receivers[index], privateChannelSigner: index ? channelB : channelA,
+        onMessage: message => got[index].push(message), onError: error => { throw error },
+        _subscribe: options => {
+          const done = Promise.withResolvers()
+          finished.push(done.promise)
+          return subscribe({
+            ...options, _liveEventsGenerator: async function * () {
+              try { for (const event of outers) yield { type: 'event', event } } finally { done.resolve() }
+            }
+          })
+        }
+      })
+    }
+    await Promise.all(finished)
+    await Promise.all(sessions.map(session => session.unwatch()))
+    for (const messages of got) {
+      assert.equal(messages.length, 1)
+      assert.equal(messages[0].event.content, original.content)
+      assert.equal(messages[0].senderPubkey, aPubkey)
+      assert.equal(messages[0].provenance, 'direct')
+    }
+  } finally { await Promise.all(sessions.map(session => session.unwatch())) }
 })

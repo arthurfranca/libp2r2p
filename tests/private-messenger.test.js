@@ -10,12 +10,21 @@ import {
   MISSING_MESSAGES_ASK_CODE,
   MISSING_MESSAGES_REPLY_CODE,
   NYM_CARRIER_SEED_RECORD_TYPE,
-  PrivateMessenger,
+  PrivateMessenger as RealPrivateMessenger,
   ROUTER_SEED_RECORD_TYPE,
   SEEDER_PRESENCE_CODE
 } from '../private-messenger/index.js'
 import { TEMPORARY_STORAGE_KEYS_KEY } from '../temporary-storage/index.js'
 import { createChannelStateStore } from '../private-messenger/services/channel-state.js'
+
+// Unit fixtures never contact public relays, even when a restart schedules a gap.
+const instances = new Set()
+class PrivateMessenger extends RealPrivateMessenger {
+  constructor (options = {}) {
+    super({ _privateChannel: { fetch: async () => [] }, ...options })
+    instances.add(this)
+  }
+}
 
 const data = new Map()
 const sessionData = new Map()
@@ -39,11 +48,20 @@ function resetIndexedDb () {
 
 resetIndexedDb()
 
-afterEach(() => {
+afterEach(async () => {
+  await Promise.all([...instances].map(instance => instance.close()))
+  instances.clear()
   globalThis.localStorage.clear()
   globalThis.sessionStorage.clear()
   resetIndexedDb()
 })
+
+async function takeMessage (messenger) {
+  const delivery = await messenger.nextMessage()
+  if (!delivery) return null
+  await delivery.ack()
+  return delivery.message
+}
 
 function signer (pubkey) {
   return {
@@ -192,8 +210,8 @@ test('private messenger persists queued messages in IndexedDB across instances',
     channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
   })
 
-  assert.equal((await second.nextMessage()).event.id, 'durable-id')
-  assert.equal(await second.nextMessage(), null)
+  assert.equal((await takeMessage(second)).event.id, 'durable-id')
+  assert.equal(await takeMessage(second), null)
 })
 
 test('private messenger persists per-channel recovery state in IndexedDB', async () => {
@@ -292,7 +310,7 @@ test('private messenger watches channels and queues received leecher rumors', as
     tell: { id: 'tell-id' }
   })
 
-  const item = (await messenger.nextMessage())
+  const item = (await takeMessage(messenger))
   assert.equal(item.type, 'tell')
   assert.equal(item.channelPubkey, 'channel')
   assert.equal(item.event.id, 'tell-id')
@@ -308,7 +326,7 @@ test('private messenger watches channels and queues received leecher rumors', as
     reply: { id: 'reply-id' }
   })
 
-  const reply = (await messenger.nextMessage())
+  const reply = (await takeMessage(messenger))
   assert.equal(reply.type, 'reply')
   assert.equal(reply.question, null)
   assert.equal(reply.questionId, 'question-id')
@@ -321,7 +339,7 @@ test('private messenger watches channels and queues received leecher rumors', as
     payload: ['raw-payload', 'not-a-private-message-code']
   })
 
-  const raw = (await messenger.nextMessage())
+  const raw = (await takeMessage(messenger))
   assert.equal(raw.type, 'message')
   assert.equal(raw.event.id, 'raw-id')
   assert.deepEqual(raw.payload, ['raw-payload', 'not-a-private-message-code'])
@@ -482,7 +500,7 @@ test('identity and stale-channel retention silently cap recovery without replaci
     assert.equal(messenger.readState().channels.channel.offlineRecoverySeconds, 500)
     assert.equal(messenger.offlineRecoverySecondsFor('channel'), 30)
     assert.equal(await messenger.seedQueue.someBy('bySeedKey', 'capped-seed'), false)
-    assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [{ start: now - 30, end: now - 10 }])
+    assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [{ start: now - 30, end: now }])
     assert.equal(pm.watchCalls.at(-1).receivedChunkTtlMs, 30 * 1000)
 
     await messenger.update({ identityStorageRetentionSeconds: 120 })
@@ -562,8 +580,8 @@ test('private messenger applies reduced channel recovery policies immediately wi
 
     assert.equal(await messenger.seedQueue.someBy('bySeedKey', 'short-seed'), false)
     assert.equal(await messenger.seedQueue.someBy('bySeedKey', 'long-seed'), true)
-    assert.deepEqual(messenger.readState().channels.short.offlineRanges, [{ start: now - 60, end: now - 10 }])
-    assert.equal(messenger.readState().channels.short.openOfflineStart, now - 60)
+    assert.deepEqual(messenger.readState().channels.short.offlineRanges, [{ start: now - 60, end: now }])
+    assert.equal(messenger.readState().channels.short.openOfflineStart, undefined)
 
     await messenger.update({
       channels: [
@@ -690,7 +708,7 @@ test('offline recovery zero disables durable recovery while preserving live tech
   await messenger.close()
 })
 
-test('private messenger pauses live watches offline, restarts them before durable recovery, and keeps presence running', async () => {
+test('private messenger pauses live watches offline, restarts them before durable recovery, and suspends presence publishing', async () => {
   const originalWindow = globalThis.window
   const originalDateNow = Date.now
   const events = new EventTarget()
@@ -731,8 +749,8 @@ test('private messenger pauses live watches offline, restarts them before durabl
     events.dispatchEvent(new Event('offline'))
     assert.deepEqual(pm.stopped, ['channel'])
     assert.equal(messenger.stopByChannel.size, 0)
-    assert.equal(messenger.presenceTimers.get('channel'), 'presence-timer')
-    assert.deepEqual(clearedIntervals, [])
+    assert.equal(messenger.presenceTimers.has('channel'), false)
+    assert.deepEqual(clearedIntervals, ['presence-timer'])
     assert.ok(messenger.readState().channels.channel.openOfflineStart)
 
     now += 1_000
@@ -751,8 +769,8 @@ test('private messenger pauses live watches offline, restarts them before durabl
     }
     await pm.watchCalls[0].onTell(message)
     await pm.watchCalls[1].onTell(message)
-    assert.equal((await messenger.nextMessage()).event.id, 'offline-duplicate')
-    assert.equal(await messenger.nextMessage(), null)
+    assert.equal((await takeMessage(messenger)).event.id, 'offline-duplicate')
+    assert.equal(await takeMessage(messenger), null)
   } finally {
     await messenger?.close()
     Date.now = originalDateNow
@@ -790,11 +808,11 @@ test('private messenger queues nym messages without dispatching helper kinds', a
     nym: { id: 'nym-ask-id' }
   })
 
-  const item = (await messenger.nextMessage())
+  const item = (await takeMessage(messenger))
   assert.equal(item.type, 'nym')
   assert.equal(item.event.kind, ASK_KIND)
   assert.equal(item.event.pubkey, 'nym')
-  assert.equal((await messenger.nextMessage()), null)
+  assert.equal((await takeMessage(messenger)), null)
 })
 
 test('private messenger skips duplicate pending app messages by channel type and event id', async () => {
@@ -814,11 +832,11 @@ test('private messenger skips duplicate pending app messages by channel type and
   pm.watchCalls[0].onTell(message)
   pm.watchCalls[0].onTell({ ...message, outer: { id: 'outer-duplicate-id', created_at: 12 } })
 
-  const queued = await messenger.nextMessage()
+  const queued = await takeMessage(messenger)
   assert.equal(queued.event.id, 'tell-id')
   assert.equal(Object.hasOwn(queued, '__p2r2pMessageDedupeKey'), false)
   assert.equal(Object.hasOwn(queued, 'id'), false)
-  assert.equal((await messenger.nextMessage()), null)
+  assert.equal((await takeMessage(messenger)), null)
   assert.equal(messenger.readState().channels.channel.lastSeenAt, 12)
 })
 
@@ -1084,7 +1102,7 @@ test('private messenger reload-gap fetch uses all local read relays when channel
   await scheduled()
 
   assert.deepEqual(fetches[0].relays, userReadRelays)
-  assert.equal((await messenger.nextMessage()), null)
+  assert.equal((await takeMessage(messenger)), null)
 })
 
 test('private messenger refreshes NIP-65-derived watch relays from relay-list updates', async () => {
@@ -1144,7 +1162,7 @@ test('private messenger refreshes NIP-65-derived watch relays from relay-list up
   assert.deepEqual(fetches[0].relays, ['wss://user.old-two.example', 'wss://user.new.example'])
   assert.ok(fetches[0].since <= now - 20)
   assert.ok(fetches[0].until >= now)
-  assert.equal((await messenger.nextMessage()).event.id, 'missed-id')
+  assert.equal((await takeMessage(messenger)).event.id, 'missed-id')
   assert.deepEqual(messenger.readState().channels.derived.relays, ['wss://user.old-two.example', 'wss://user.new.example'])
   assert.deepEqual(messenger.readState().channels.explicit.relays, ['wss://explicit.example'])
 })
@@ -1265,7 +1283,7 @@ test('private messenger reader-only channels watch and drain but reject sends', 
     tell: { id: 'tell-id' }
   })
 
-  assert.equal((await messenger.nextMessage()).event.id, 'tell-id')
+  assert.equal((await takeMessage(messenger)).event.id, 'tell-id')
   await assert.rejects(
     () => messenger.tell({ channelPubkey: 'channel', receiverPubkey: 'alice', payload: 'note' }),
     /PRIVATE_CHANNEL_WRITER_REQUIRED/
@@ -1421,9 +1439,9 @@ test('clearChannel removes queued items and channel state without clearing other
 
   await messenger.clearChannel('one')
 
-  const item = (await messenger.nextMessage())
+  const item = (await takeMessage(messenger))
   assert.equal(item.channelPubkey, 'two')
-  assert.equal((await messenger.nextMessage()), null)
+  assert.equal((await takeMessage(messenger)), null)
   assert.equal(messenger.channels.has('one'), false)
   assert.equal(messenger.readState().channels.one, undefined)
   assert.ok(messenger.readState().channels.two)
@@ -1466,7 +1484,7 @@ test('watch schedules reload-gap recovery and fetches missing channel window', a
   assert.ok(fetches[0].since <= now - 10)
   assert.ok(fetches[0].until >= now)
   assert.equal(fetches[0].receivedChunkTtlMs, 7 * 24 * 60 * 60 * 1000)
-  assert.equal((await messenger.nextMessage()).event.id, 'ask-id')
+  assert.equal((await takeMessage(messenger)).event.id, 'ask-id')
   assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [])
 })
 
@@ -1545,7 +1563,7 @@ test('reader-only channels fetch reload gaps with the reader signer', async () =
   assert.equal(fetches.length, 1)
   assert.equal(fetches[0].privateChannelSigner, null)
   assert.equal(fetches[0].privateChannelReaderSigner.getPublicKey(), 'reader')
-  assert.equal((await messenger.nextMessage()).event.id, 'missed-id')
+  assert.equal((await takeMessage(messenger)).event.id, 'missed-id')
 })
 
 test('seeder channels publish presence immediately and on interval', async () => {
@@ -1629,10 +1647,10 @@ test('seeder channels store router seeds separately, consume messages, and answe
     tell: { id: 'tell-id' }
   })
 
-  const item = (await messenger.nextMessage())
+  const item = (await takeMessage(messenger))
   assert.equal(item.type, 'tell')
   assert.equal(item.event.id, 'tell-id')
-  assert.equal((await messenger.nextMessage()), null)
+  assert.equal((await takeMessage(messenger)), null)
 
   await pm.watchCalls[0].onAsk({
     event: {
@@ -1658,7 +1676,7 @@ test('seeder channels store router seeds separately, consume messages, and answe
   assert.equal(records[0].router.kind, 26300)
   assert.equal(Buffer.from(records[0].router.content, 'base64').toString(), `${payloadRow()}\n${userRow}\n`)
   assert.deepEqual(records[0].router.tags, [['f', 'alice'], ['c', '0', '1']])
-  assert.equal((await messenger.nextMessage()), null)
+  assert.equal((await takeMessage(messenger)), null)
 })
 
 test('router seed rows dedupe by proven inner id without content-key pubkey', async () => {
@@ -1725,7 +1743,7 @@ test('watchtower channels store router seeds without consuming normal messages',
     tell: { id: 'tell-id' }
   })
 
-  assert.equal((await messenger.nextMessage()), null)
+  assert.equal((await takeMessage(messenger)), null)
 
   await pm.watchCalls[0].onAsk({
     event: {
@@ -1749,7 +1767,7 @@ test('watchtower channels store router seeds without consuming normal messages',
   assert.equal(records.length, 1)
   assert.equal(records[0].recordType, ROUTER_SEED_RECORD_TYPE)
   assert.equal(Buffer.from(records[0].router.content, 'base64').toString(), `${payloadRow()}\n${userRow}\n`)
-  assert.equal((await messenger.nextMessage()), null)
+  assert.equal((await takeMessage(messenger)), null)
 })
 
 test('missing-message asks without stored seeds do not send empty replies', async () => {
@@ -1816,7 +1834,7 @@ test('recovery asks online seeders for the relay-uncovered left edge', async () 
     yell: { id: 'presence-id' }
   })
 
-  assert.equal((await messenger.nextMessage()), null)
+  assert.equal((await takeMessage(messenger)), null)
 
   await scheduled()
 
@@ -1825,7 +1843,7 @@ test('recovery asks online seeders for the relay-uncovered left edge', async () 
   assert.equal(ask.options.receiverPubkey, 'seeder')
   assert.ok(ask.options.payload.since <= now - 20)
   assert.equal(ask.options.payload.until, now - 5)
-  assert.equal((await messenger.nextMessage()).event.id, 'relay-id')
+  assert.equal((await takeMessage(messenger)).event.id, 'relay-id')
 })
 
 test('recovery asks all configured seeders but caps discovered seeders', async () => {
@@ -1910,11 +1928,12 @@ test('recovery retains the full range until every seeder ask is delivered', asyn
         }]
       })
 
+      const pendingRanges = messenger.readState().channels.channel.offlineRanges
       await messenger.recoverOfflineRanges(['channel'])
 
       assert.deepEqual(
         messenger.readState().channels.channel.offlineRanges,
-        scenario.retained ? [range] : []
+        scenario.retained ? pendingRanges : []
       )
       await messenger.close()
     })
@@ -1944,7 +1963,7 @@ test('missing-message replies ignore raw event rows', async () => {
     reply: { id: 'reply-id' }
   })
 
-  assert.equal((await messenger.nextMessage()), null)
+  assert.equal((await takeMessage(messenger)), null)
 })
 
 test('missing-message replies can recover router-only seed records', async () => {
@@ -2008,8 +2027,8 @@ test('missing-message replies can recover router-only seed records', async () =>
   assert.equal(unwrapCall.privateChannelReaderPubkey, 'reader')
   assert.equal(syntheticRouter.content, jsonlContent(payloadRow(), userRow))
   assert.deepEqual(syntheticRouter.tags, [['f', 'alice'], ['c', '0', '1']])
-  assert.equal((await messenger.nextMessage()).event.id, 'missed-id')
-  assert.equal((await messenger.nextMessage()), null)
+  assert.equal((await takeMessage(messenger)).event.id, 'missed-id')
+  assert.equal((await takeMessage(messenger)), null)
 })
 
 test('nym carrier seeds are replied to and recovered as nym queue items', async () => {
@@ -2082,11 +2101,11 @@ test('nym carrier seeds are replied to and recovered as nym queue items', async 
     reply: { id: 'reply-id' }
   })
 
-  const item = (await messenger.nextMessage())
+  const item = (await takeMessage(messenger))
   assert.equal(item.type, 'nym')
   assert.equal(item.event.kind, ASK_KIND)
   assert.equal(item.meta.recoveredFromSeeder, 'seeder')
-  assert.equal((await messenger.nextMessage()), null)
+  assert.equal((await takeMessage(messenger)), null)
 })
 
 test('missing-message reply packer streams compact seed routers only', async () => {
@@ -2235,4 +2254,303 @@ test('event reply packer still sends an empty final marker after prior chunks', 
   assert.equal(replies[1].payload.index, 1)
   assert.equal(replies[1].payload.isLast, true)
   assert.equal(replies[1].payload.jsonl, '')
+})
+
+test('unacknowledged deliveries survive close, nack and iterator cancellation', async () => {
+  const pm = fakePrivateMessage()
+  const init = { userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] }
+  const first = await new PrivateMessenger({ _privateMessage: pm }).init(init)
+  const message = { event: { kind: 9, id: 'one', pubkey: 'peer', tags: [], created_at: 1, content: 'hello' }, senderPubkey: 'peer', outer: { created_at: 1 } }
+  await pm.watchCalls[0].onMessage(message)
+  const delivery = await first.nextMessage()
+  assert.equal(delivery.message.provenance, 'direct')
+  assert.equal(await first.nextMessage(), null)
+  await first.close()
+  const second = await new PrivateMessenger({ _privateMessage: fakePrivateMessage() }).init(init)
+  try {
+    const stream = second.messages()
+    const received = (await stream.next()).value
+    assert.equal(received.message.event.id, 'one')
+    await stream.return()
+    assert.equal(await received.ack(), false)
+    const again = await second.nextMessage()
+    assert.equal(again.message.event.id, 'one')
+    assert.equal(await again.ack(), true)
+    assert.equal(await again.ack(), true)
+    const waiting = second.messages()
+    const pending = waiting.next()
+    await waiting.return()
+    assert.equal((await pending).done, true)
+  } finally { await second.close() }
+})
+
+test('unwatch intent survives online, update and independent pause reasons', async () => {
+  const pm = fakePrivateMessage()
+  const channel = { signer: signer('channel'), relays: ['wss://relay.example'] }
+  const messenger = await new PrivateMessenger({ _privateMessage: pm, _privateChannel: { fetch: async () => [] } }).init({ userSigner: signer('owner'), channels: [channel] })
+  try {
+    await messenger.unwatch('channel')
+    await messenger.pause('network')
+    await messenger.resume('network')
+    await messenger.update({ channels: [channel] })
+    assert.equal(pm.watchCalls.length, 1)
+    await messenger.pause('vault')
+    await messenger.pause('network')
+    await messenger.watch(['channel'])
+    assert.ok(messenger.readState().channels.channel.openOfflineStart)
+    await messenger.resume('network')
+    assert.equal(pm.watchCalls.length, 1)
+    await messenger.resume('vault')
+    assert.equal(pm.watchCalls.length, 2)
+    assert.equal(messenger.pauseReasons.size, 0)
+  } finally { await messenger.close() }
+})
+
+test('capacity pauses ingestion without eviction and ack resumes durable recovery', async () => {
+  const pm = fakePrivateMessage()
+  let recovered = 0
+  const errors = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm, messageQueueMaxBytes: 850, onError: err => errors.push(err),
+    _privateChannel: { fetch: async () => { recovered++; return [] } }
+  }).init({
+    userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  try {
+    const now = Math.floor(Date.now() / 1000)
+    const message = id => ({ event: { kind: 9, id, pubkey: 'peer', tags: [], created_at: now, content: 'a'.repeat(250) }, outer: { created_at: now }, senderPubkey: 'peer' })
+    await pm.watchCalls[0].onMessage(message('one'))
+    await assert.rejects(pm.watchCalls[0].onMessage(message('two')), /QUEUE_CAPACITY_EXCEEDED/)
+    assert.equal(messenger.pauseReasons.has('capacity'), true)
+    assert.ok(messenger.readState().channels.channel.openOfflineStart)
+    const first = await messenger.nextMessage()
+    assert.equal(first.message.event.id, 'one')
+    await first.ack()
+    if (messenger.capacityCheck) await messenger.capacityCheck
+    if (messenger.resumeWork) await messenger.resumeWork
+    assert.equal(messenger.pauseReasons.size, 0)
+    assert.equal(recovered, 1)
+    assert.equal(await messenger.nextMessage(), null)
+    assert.ok(errors.some(err => err.message === 'QUEUE_CAPACITY_EXCEEDED'))
+  } finally { await messenger.close() }
+})
+
+test('failed recovery ingestion retains its range and does not advance lastSeenAt', async () => {
+  const pm = fakePrivateMessage()
+  const now = Math.floor(Date.now() / 1000)
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm, messageQueueMaxBytes: 100, onError: () => {},
+    _privateChannel: {
+      fetch: async options => {
+        await options.onEvent({ kind: 9, id: 'large', pubkey: 'peer', tags: [], created_at: now, content: 'x'.repeat(300) }, { created_at: now }, { senderPubkey: 'peer' })
+        return []
+      }
+    }
+  }).init({ userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+  try {
+    messenger.addOfflineRange('channel', now - 10, now)
+    await messenger.recoverOfflineRanges()
+    const state = messenger.readState().channels.channel
+    assert.equal(state.lastSeenAt, undefined)
+    assert.ok(state.offlineRanges.length)
+    assert.equal(messenger.pauseReasons.has('storage'), true)
+  } finally { await messenger.close() }
+})
+
+test('failed resume remains paused and can be retried', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm, _privateChannel: { fetch: async () => [] } }).init({ userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+  try {
+    await messenger.pause('vault')
+    const watch = pm.watch
+    pm.watch = async () => { throw new Error('SIGNER_LOCKED') }
+    await assert.rejects(messenger.resume('vault'), /SIGNER_LOCKED/)
+    assert.equal(messenger.pauseReasons.has('vault'), true)
+    pm.watch = watch
+    await messenger.resume('vault')
+    assert.equal(messenger.pauseReasons.size, 0)
+    assert.equal(messenger.stopByChannel.size, 1)
+  } finally { await messenger.close() }
+})
+
+test('capacity monitor resumes after another instance acknowledges a delivery', { timeout: 5000 }, async () => {
+  const pm = fakePrivateMessage()
+  const resumed = Promise.withResolvers()
+  const watch = pm.watch
+  pm.watch = async options => { const stop = await watch(options); if (pm.watchCalls.length > 1) resumed.resolve(); return stop }
+  const init = { userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] }
+  const first = await new PrivateMessenger({ _privateMessage: pm, messageQueueMaxBytes: 850, onError: () => {} }).init(init)
+  const second = await new PrivateMessenger({ _privateMessage: fakePrivateMessage(), messageQueueMaxBytes: 850 }).init(init)
+  try {
+    const now = Math.floor(Date.now() / 1000)
+    const message = id => ({ event: { kind: 9, id, pubkey: 'peer', tags: [], created_at: now, content: 'a'.repeat(250) }, outer: { created_at: now }, senderPubkey: 'peer' })
+    await pm.watchCalls[0].onMessage(message('one'))
+    await assert.rejects(pm.watchCalls[0].onMessage(message('two')), /QUEUE_CAPACITY_EXCEEDED/)
+    await (await second.nextMessage()).ack()
+    // Keep the test process alive while the production polling timer is unref'ed.
+    const keepAlive = setTimeout(() => resumed.reject(new Error('capacity did not resume')), 3000)
+    try { await resumed.promise } finally { clearTimeout(keepAlive) }
+    if (first.capacityCheck) await first.capacityCheck
+    assert.equal(first.pauseReasons.has('capacity'), false)
+  } finally { await first.close(); await second.close() }
+})
+
+test('pause reports state persistence errors and flush repairs the interruption', async () => {
+  const messenger = await new PrivateMessenger({ _privateMessage: fakePrivateMessage(), onError: () => {} }).init({ userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+  const update = messenger.stateStore.update.bind(messenger.stateStore)
+  try {
+    messenger.stateStore.update = async () => { throw new Error('DISK_UNAVAILABLE') }
+    await assert.rejects(messenger.pause('vault'), /DISK_UNAVAILABLE/)
+    assert.equal(messenger.pauseReasons.has('vault'), true)
+    messenger.stateStore.update = update
+    await messenger.flushStateWrites()
+    const stored = await messenger.stateStore.load()
+    assert.ok(stored.channel.openOfflineStart)
+  } finally { messenger.stateStore.update = update; await messenger.close() }
+})
+
+test('a pending hearsay does not suppress a direct original of the same event', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({ userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+  try {
+    const event = { id: 'same', kind: 9, pubkey: 'author', tags: [], content: 'quote', created_at: 1 }
+    await pm.watchCalls[0].onMessage({ event, senderPubkey: 'forwarder' })
+    await pm.watchCalls[0].onMessage({ event, senderPubkey: 'author' })
+    await pm.watchCalls[0].onMessage({ event, senderPubkey: 'author' })
+    assert.equal((await takeMessage(messenger)).provenance, 'hearsay')
+    assert.equal((await takeMessage(messenger)).provenance, 'direct')
+    assert.equal(await messenger.nextMessage(), null)
+  } finally { await messenger.close() }
+})
+
+test('first watch commits the bounded initial window before live delivery', async t => {
+  const now = 1800000000
+  t.mock.method(Date, 'now', () => now * 1000)
+  const pm = fakePrivateMessage()
+  const watch = pm.watch
+  const fetches = []
+  let scheduled
+  pm.watch = async options => {
+    const store = await createChannelStateStore({ prefix: 'libp2r2p:private-messenger:user' })
+    try {
+      const state = await store.load()
+      assert.deepEqual(state.channel.offlineRanges, [{ start: now - 7 * 86400, end: now }])
+    } finally { await store.close() }
+    const stop = await watch(options)
+    await options.onMessage({
+      event: { id: 'live', kind: 9, pubkey: 'peer', created_at: now, tags: [], content: 'new' },
+      outer: { created_at: now }, senderPubkey: 'peer'
+    })
+    return stop
+  }
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    _setTimeout: fn => { scheduled = fn },
+    _privateChannel: { fetch: async options => { fetches.push(options); return [] } }
+  }).init({ userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+  await scheduled()
+  assert.equal(fetches[0].since, now - 7 * 86400)
+  assert.equal(fetches[0].until, now)
+  assert.equal(messenger.readState().channels.channel.lastSeenAt, now)
+  assert.equal(messenger.readState().channels.channel.recoveredThrough, now)
+})
+
+test('abrupt restart of an empty channel uses its completed scan, not its heartbeat', async t => {
+  let now = 1800000000
+  t.mock.method(Date, 'now', () => now * 1000)
+  let scheduled
+  const init = { userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] }
+  const first = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(), _setTimeout: fn => { scheduled = fn }
+  }).init(init)
+  await scheduled()
+  now += 3600
+  await first.runStorageHeartbeat()
+  // Copy exactly the committed state at termination, without invoking close/unwatch.
+  const snapshot = await first.stateStore.load()
+  assert.equal(snapshot.channel.lastSeenAt, undefined)
+  assert.equal(snapshot.channel.openOfflineStart, undefined)
+  assert.equal(snapshot.channel.recoveredThrough, now - 3600)
+  assert.equal(snapshot.channel.lastWatchedAt, now)
+  const restartedDb = new IDBFactory()
+  const store = await createChannelStateStore({ prefix: first.prefix, indexedDB: restartedDb })
+  await store.update(snapshot)
+  await store.close()
+  now += 3600
+  const fetches = []
+  const second = await new PrivateMessenger({
+    _indexedDB: restartedDb, _privateMessage: fakePrivateMessage(),
+    _setTimeout: fn => { scheduled = fn },
+    _privateChannel: { fetch: async options => { fetches.push(options); return [] } }
+  }).init(init)
+  await scheduled()
+  assert.equal(fetches[0].since, now - 7200 - second.offlineSkewSeconds)
+  assert.equal(fetches[0].until, now)
+  assert.equal((await second.stateStore.load()).channel.recoveredThrough, now)
+})
+
+test('failed initial recovery survives restart despite newer live progress', async t => {
+  let now = 1800000000
+  t.mock.method(Date, 'now', () => now * 1000)
+  let scheduled
+  const pm = fakePrivateMessage()
+  const init = { userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] }
+  const first = await new PrivateMessenger({
+    _privateMessage: pm, _setTimeout: fn => { scheduled = fn }, onError: () => {},
+    _privateChannel: { fetch: async () => { throw new Error('offline') } }
+  }).init(init)
+  await scheduled()
+  await pm.watchCalls[0].onMessage({
+    event: { id: 'recent', kind: 9, pubkey: 'peer', created_at: now, tags: [], content: '' },
+    outer: { created_at: now }, senderPubkey: 'peer'
+  })
+  await first.flushStateWrites()
+  const snapshot = await first.stateStore.load()
+  assert.equal(snapshot.channel.recoveredThrough, 0)
+  assert.deepEqual(snapshot.channel.offlineRanges, [{ start: now - 7 * 86400, end: now }])
+  const restartedDb = new IDBFactory()
+  const store = await createChannelStateStore({ prefix: first.prefix, indexedDB: restartedDb })
+  await store.update(snapshot)
+  await store.close()
+  now += 60
+  const fetches = []
+  await new PrivateMessenger({
+    _indexedDB: restartedDb, _privateMessage: fakePrivateMessage(),
+    _setTimeout: fn => { scheduled = fn },
+    _privateChannel: { fetch: async options => { fetches.push(options); return [] } }
+  }).init(init)
+  await scheduled()
+  assert.equal(fetches[0].since, now - 7 * 86400)
+  assert.equal(fetches[0].until, now)
+})
+
+test('ack by A does not prevent first-open historical delivery to B on the same channel', async t => {
+  const now = 1800000000
+  t.mock.method(Date, 'now', () => now * 1000)
+  const event = { id: 'shared', kind: 9, pubkey: 'peer', created_at: now - 100, tags: [], content: 'hello' }
+  const seenReceivers = []
+  const timers = []
+  const create = owner => new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(), _setTimeout: fn => { timers.push(fn) },
+    offlineRecoverySeconds: 600,
+    _privateChannel: {
+      fetch: async options => {
+        assert.equal(options.since, now - 600)
+        seenReceivers.push(options.receiverPubkey)
+        await options.onEvent(event, { created_at: event.created_at }, { channelPubkey: 'channel', senderPubkey: 'peer' })
+        return []
+      }
+    }
+  }).init({ userSigner: signer(owner), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+  const a = await create('A')
+  await timers.shift()()
+  const deliveryA = await a.nextMessage()
+  assert.equal(await deliveryA.ack(), true)
+  const b = await create('B')
+  await timers.shift()()
+  const deliveryB = await b.nextMessage()
+  assert.equal(deliveryB.message.event.id, event.id)
+  assert.equal(await a.nextMessage(), null)
+  assert.deepEqual(seenReceivers, ['A', 'B'])
+  assert.equal(await deliveryB.ack(), true)
 })

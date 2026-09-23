@@ -13,7 +13,7 @@ channels, keyPath "pubkey"
   pubkey  watched channel public key
   value   evolving channel-recovery state, including last-seen/watched times,
           mode, relays, seeders, requested offline-recovery retention, offline
-          ranges, active offline-range start,
+          ranges, active offline-range start, recoveredThrough (last successful scan end),
           per-seeder activity, and sent/received content-key usage
 
 Changed channel records are upserted individually and explicit removals are

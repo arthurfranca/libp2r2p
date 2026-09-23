@@ -20,7 +20,7 @@ IndexedDB schema, scoped per received-chunk prefix:
 database `${prefix}:idb`, version 2
 
 groups, keyPath "groupKey"
-  groupKey                  `${channelPubkey}:${routerPubkey}`
+  groupKey                  optional consumer scope + `${channelPubkey}:${routerPubkey}`
   channelPubkey/routerPubkey private-channel coordinates
   total                     expected chunk count
   received/receivedCount    sparse received-index map and its count
@@ -181,6 +181,7 @@ function wait (ms) {
 
 export function createReceivedChunkStore ({
   prefix = DEFAULT_PREFIX,
+  scope = '',
   indexedDB = globalThis.indexedDB,
   ttlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS,
   maxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES
@@ -220,7 +221,7 @@ export function createReceivedChunkStore ({
   }
 
   function groupKeyFor (channelPubkey, routerPubkey) {
-    return `${channelPubkey}:${routerPubkey}`
+    return `${scope ? `${scope}:` : ''}${channelPubkey}:${routerPubkey}`
   }
 
   async function readUsage (tx) {

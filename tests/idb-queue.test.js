@@ -163,3 +163,40 @@ test('idb queue close is idempotent and lets an active transaction finish', asyn
   await firstClose
   await assert.rejects(queue.push({ value: 'too-late' }), /QUEUE_CLOSED/)
 })
+
+test('reject capacity preserves pending records across failed writes and reopen', async () => {
+  const factory = new IDBFactory()
+  const q = await queueFor(factory, 'reliable', { maxBytes: 220, evictionPolicy: 'reject' })
+  await q.push({ value: 'a'.repeat(120) })
+  await assert.rejects(q.push({ value: 'b'.repeat(120) }), /QUEUE_CAPACITY_EXCEEDED/)
+  await assert.rejects(q.push({ value: 'c'.repeat(300) }), /QUEUE_ITEM_TOO_LARGE/)
+  await q.close()
+  const reopened = await queueFor(factory, 'reliable', { maxBytes: 80, evictionPolicy: 'reject' })
+  assert.equal((await reopened.shift()).value, 'a'.repeat(120))
+  await reopened.close()
+})
+
+test('reservations are exclusive, renewable, recoverable and token checked', async () => {
+  const factory = new IDBFactory()
+  const a = await queueFor(factory, 'leases', { evictionPolicy: 'reject' })
+  const b = await queueFor(factory, 'leases', { evictionPolicy: 'reject' })
+  try {
+    await a.push({ id: 'one' })
+    const first = await a.reserve()
+    assert.equal(first.item.id, 'one')
+    assert.equal(await b.reserve(), null)
+    assert.equal(await first.renew(), true)
+    assert.equal(await first.nack(), true)
+    assert.equal(await first.nack(), true)
+    assert.equal(await first.ack(), false)
+    const second = await b.reserve({ now: Date.now() - 100, leaseMs: 1 })
+    const third = await a.reserve()
+    assert.equal(third.item.id, 'one')
+    assert.equal(await second.ack(), false)
+    assert.equal(await third.ack(), true)
+    assert.equal(await third.ack(), true)
+    await a.push({ id: 'two' }) // reused position must not accept an old token
+    assert.equal(await second.nack(), false)
+    assert.equal((await b.reserve()).item.id, 'two')
+  } finally { await a.close(); await b.close() }
+})
