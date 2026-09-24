@@ -30,7 +30,7 @@ partial results. Its report distinguishes actual relay EOSE from other outcomes:
 | --- | --- |
 | `eose` | The relay sent EOSE. |
 | `satisfied` | The requested limit or IDs were satisfied, so the read closed early. |
-| `timeout` | The initial operation deadline elapsed. Also emits an error item. |
+| `timeout` | The initial relay attempt deadline elapsed. Also emits an error item. |
 | `cutoff` | The grace period after the first qualifying EOSE/early completion elapsed. |
 | `closed` | The subscription ended without EOSE or an explicit error. |
 | `error` | Connection or subscription failed. Also emits an error item. |
@@ -71,7 +71,7 @@ tracks currently ready relays and can change after that snapshot. Timeouts and
 cutoffs are not acknowledgements of readiness. Reconnections do not repeat the
 initial marker. Both APIs require consuming the iterator to start its work.
 
-Live and feed iterators have a synchronous, idempotent `stopAndDrain()` method.
+Read iterators have a synchronous, idempotent `stopAndDrain()` method.
 It closes subscription input and cancels reconnections and outstanding historical
 queries, while retaining items already accepted by receive callbacks. Continue
 consuming to obtain those items and completion. This includes initial history,
@@ -100,6 +100,72 @@ unwrap each `getEvents().result` entry. There is no compatibility flag. Query,
 content-key, private-channel and NIP-46 helpers unwrap pool results internally
 and retain their higher-level event contracts. Count, publication and disconnect
 return formats are unchanged.
+
+### Read admission and bounded snapshots (0.10.21)
+
+Each pool coordinates event reads by normalized connection URL. Constructor
+options are `maxSubscriptionsPerRelay: 28`,
+`maxConcurrentHistoryPerRelay: 2`, and `maxQueuedReadsPerRelay: 256`.
+These are local budgets, not negotiated relay limits. A stricter relay can still
+reject subscriptions. Count and publication contracts are unchanged and do not
+consume event-read slots.
+
+Admission is FIFO per connection. A history+live feed reserves two slots
+atomically before either REQ opens; completing history releases only its slot.
+One-shot queries and reconnect gap reads share this budget. Reconnection reserves
+live+history together when recovery is needed. Caller cancellation removes queued
+work; `disconnect(url)` also rejects queued work for that connection. Existing
+live streams retain their reconnect behavior until cancelled by their owner.
+
+All event reads accept `queueTimeout: 30000` (milliseconds, `null` disables).
+The network `timeout` starts **after admission for each relay**, including its
+connection setup; time in the queue does not consume it. The first-EOSE grace
+can still cut short other relay attempts. Admission failures are ordinary error
+envelopes/report entries, with `error.code`, `error.relay` and
+`error.phase === 'admission'`: `RELAY_READ_QUEUE_FULL`,
+`RELAY_READ_QUEUE_TIMEOUT`, `RELAY_READ_CAPACITY`, or `RELAY_DISCONNECTED`.
+Cancellation rejects an outstanding direct `getEvents()` call; cancelled iterators
+stop delivering. Failures on one relay continue to allow results from others.
+
+Live and feed readers limit each pending live buffer to 1,000 envelopes and
+8 MiB of serialized UTF-8 data. Options `maxBufferedLiveEvents` and
+`maxBufferedLiveBytes` customize those positive limits. They cover consumer
+backlog and reconnect buffers as well as live events waiting for history. These
+are bounds on queued data, not a measurement of total JavaScript heap usage.
+Overflow fails the attempt with `RELAY_LIVE_BUFFER_FULL` (`phase: 'live-buffer'`),
+closes input and discards pending live data. Callers decide whether to retry;
+events already delivered are not recalled. Ordinary relay failures retain the
+existing partial-result behavior; they do not automatically discard the feed.
+
+With `snapshot: true`, a feed waits for its initial live readiness window before
+capturing the historical `until`. `filter.since` defaults to zero; `filter.until`
+can provide an earlier cutoff but cannot extend a snapshot into the future.
+The historical completion includes the actual inclusive bounds:
+
+```js
+const stream = relayPool.getEventsFeedGenerator(
+  { authors: [pubkey], kinds: [1], since: lastConfirmed - 600, limit: 200 },
+  [relay],
+  { snapshot: true, timeoutAfterFirstEose: null, signal }
+)
+// Historical completion:
+// { type: 'eose', relays: [...], snapshot: { since, until } }
+```
+
+Only history is bounded: the live REQ has no `until` in this mode. Events around
+the boundary can appear in both sources and are deduplicated by ID. Empty history
+still reports its bounds. With `live: false`, the cutoff is captured when the
+iterator starts; `limit: 0` remains live-only, without a historical snapshot.
+Default `snapshot: false` retains the existing filter time-range behavior.
+
+This is a bounded time interval, not a transactional relay snapshot or proof of
+complete coverage. Check each relay's outcome, exhaust pagination and commit
+received events before checkpointing. `satisfied` can mean a truncated page;
+EOSE can also terminate a limited response. A consumer that rejects a historical
+attempt can call `return()`/abort when it receives its report, before the buffered
+live events are released. Use `stopAndDrain()` only when those pending events
+should be preserved. Slow/failed live readiness is still reported by the live
+stream according to the existing partial-failure rules.
 
 ## Private Messenger
 

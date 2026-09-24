@@ -93,3 +93,12 @@ suite pass; report independently scoped problems separately.
 - Persist the initial recovery interval before starting a watch. Empty successful
   scans advance recoveredThrough; live progress never clears pending ranges.
   First watches use the bounded recovery window, and crashes need no close hook.
+
+## Read admission
+
+Event readers share per-connection admission. Reserve feed/reconnect history and
+live slots atomically; network deadlines start after admission, separately from
+queueTimeout. Release leases on every completion/cancellation path and preserve
+partial relay outcomes. Snapshot bounds describe only the historical attempt;
+they neither end live input nor prove complete persisted coverage. Keep live
+buffers bounded and surface overflow explicitly, never as successful EOSE.

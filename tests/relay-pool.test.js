@@ -2246,3 +2246,207 @@ describe('RelayPool.sendEvent', () => {
     })
   })
 })
+
+describe('RelayPool read admission and snapshots', () => {
+  beforeEach(() => {
+    relayRegistry.clear()
+    connectOverrides.clear()
+    autoEoseForLiveSubscriptions = true
+  })
+
+  const configuredPool = options => new RelayPool({ _createRelay: url => new FakeRelay(url), ...options })
+  const active = relay => relay?.subscriptions.filter(sub => !sub.isClosed) ?? []
+
+  it('coordinates 24 feeds on one normalized connection with at most two historical REQs', async () => {
+    const pool = configuredPool({})
+    const controller = new AbortController()
+    const reports = []
+    const tasks = Array.from({ length: 24 }, (_, index) => (async () => {
+      const url = index % 2 ? 'wss://r1/' : 'wss://r1'
+      for await (const item of pool.getEventsFeedGenerator({ authors: [String(index)], kinds: [1] }, [url], { signal: controller.signal })) {
+        if (item.type === 'eose') reports.push(item)
+      }
+    })())
+    try {
+      for (let turn = 0; turn < 40 && reports.length < 24; turn++) {
+        await tick()
+        const subs = active(relayRegistry.get('wss://r1'))
+        const history = subs.filter(sub => sub.filters[0].limit !== 0)
+        assert.ok(subs.length <= 28)
+        assert.ok(history.length <= 2)
+        for (const sub of history) sub.handlers.oneose()
+      }
+      assert.equal(reports.length, 24)
+      assert.equal(active(relayRegistry.get('wss://r1')).length, 24)
+    } finally { controller.abort(); await Promise.all(tasks) }
+    assert.equal(active(relayRegistry.get('wss://r1')).length, 0)
+  })
+
+  it('does not open queued feed live input and starts network timeout only after admission', async () => {
+    const pool = configuredPool({ maxSubscriptionsPerRelay: 2, maxConcurrentHistoryPerRelay: 1 })
+    const hold = pool.getEvents({}, ['wss://r1'], { timeout: null })
+    await tick()
+    const relay = relayRegistry.get('wss://r1')
+    const stream = pool.getEventsFeedGenerator({ kinds: [1] }, ['wss://r1'], { timeout: 10, queueTimeout: 1000 })
+    const first = stream.next()
+    await new Promise(resolve => setTimeout(resolve, 25))
+    assert.equal(relay.subscriptions.length, 1)
+    relay.subscriptions[0].handlers.oneose()
+    await hold
+    await tick()
+    assert.equal(active(relay).length, 2)
+    active(relay).find(sub => sub.filters[0].limit !== 0).handlers.oneose()
+    assert.equal((await first).value.relays[0].status, 'eose')
+    await stream.return()
+    assert.equal(active(relay).length, 0)
+  })
+
+  it('return cancels queued one-shot and feed reads immediately without later REQs', async () => {
+    const pool = configuredPool({ maxConcurrentHistoryPerRelay: 1 })
+    const hold = pool.getEvents({}, ['wss://r1'], { timeout: null })
+    await tick()
+    for (const method of ['getEventsGenerator', 'getEventsFeedGenerator']) {
+      const stream = pool[method]({}, ['wss://r1'])
+      const pending = stream.next()
+      await tick()
+      await stream.return()
+      assert.equal((await pending).done, true)
+    }
+    const relay = relayRegistry.get('wss://r1')
+    relay.subscriptions[0].handlers.oneose()
+    await hold
+    await tick()
+    assert.equal(relay.subscriptions.length, 1)
+  })
+
+  it('reports queue expiry for one relay while preserving another relay result', async () => {
+    const pool = configuredPool({ maxConcurrentHistoryPerRelay: 1 })
+    const hold = pool.getEvents({}, ['wss://r1'], { timeout: null })
+    await tick()
+    const pending = pool.getEvents({}, ['wss://r1', 'wss://r2'], { queueTimeout: 10, timeoutAfterFirstEose: null })
+    await tick()
+    const second = relayRegistry.get('wss://r2').subscriptions[0]
+    second.handlers.onevent(makeEvent({ id: 'available' }))
+    second.handlers.oneose()
+    await new Promise(resolve => setTimeout(resolve, 20))
+    const report = await pending
+    assert.equal(report.result[0].event.id, 'available')
+    assert.equal(report.relays[0].error.code, 'RELAY_READ_QUEUE_TIMEOUT')
+    assert.equal(report.relays[1].status, 'eose')
+    relayRegistry.get('wss://r1').subscriptions[0].handlers.oneose()
+    await hold
+  })
+
+  it('snapshot waits for live readiness, reports its bounds and keeps live past until', async () => {
+    autoEoseForLiveSubscriptions = false
+    const pool = configuredPool({})
+    const now = Math.floor(Date.now() / 1000)
+    const stream = pool.getEventsFeedGenerator({ since: now - 600, until: now }, ['wss://r1'], { snapshot: true, timeoutAfterFirstEose: null })
+    const next = stream.next()
+    await tick()
+    const relay = relayRegistry.get('wss://r1')
+    assert.equal(relay.subscriptions.length, 1)
+    const live = relay.subscriptions[0]
+    assert.equal(live.filters[0].until, undefined)
+    live.handlers.oneose()
+    await tick()
+    const history = relay.subscriptions[1]
+    assert.equal(history.filters[0].until, now)
+    const overlap = makeEvent({ id: 'overlap', created_at: now })
+    live.handlers.onevent(overlap)
+    history.handlers.onevent(overlap)
+    history.handlers.oneose()
+    assert.equal((await next).value.event.id, 'overlap')
+    const marker = (await stream.next()).value
+    assert.deepEqual(marker.snapshot, { since: now - 600, until: now })
+    live.handlers.onevent(makeEvent({ id: 'later', created_at: now + 1 }))
+    assert.equal((await stream.next()).value.event.id, 'later')
+    await stream.return()
+    assert.equal(active(relay).length, 0)
+  })
+
+  it('snapshot reports bounds even with no relays or no history', async () => {
+    const pool = configuredPool({})
+    const empty = pool.getEventsFeedGenerator({ since: 12 }, [], { snapshot: true })
+    const { value } = await empty.next()
+    assert.equal(value.snapshot.since, 12)
+    assert.ok(value.snapshot.until > 12)
+    assert.deepEqual(value.relays, [])
+    assert.equal((await empty.next()).done, true)
+    const historyOnly = pool.getEventsFeedGenerator({ since: 1, until: 3 }, [], { snapshot: true, live: false })
+    assert.deepEqual((await historyOnly.next()).value.snapshot, { since: 1, until: 3 })
+    await historyOnly.return()
+  })
+
+  for (const capacity of [{ maxBufferedLiveEvents: 1 }, { maxBufferedLiveBytes: 1 }]) {
+    it(`fails explicitly and frees subscriptions when live exceeds ${Object.keys(capacity)[0]}`, async () => {
+      const pool = configuredPool({ maxConcurrentHistoryPerRelay: 1 })
+      const stream = pool.getEventsFeedGenerator({}, ['wss://r1'], { ...capacity, timeout: null })
+      const failure = assert.rejects(stream.next(), { code: 'RELAY_LIVE_BUFFER_FULL', phase: 'live-buffer' })
+      await tick()
+      const relay = relayRegistry.get('wss://r1')
+      const live = relay.subscriptions.find(sub => sub.filters[0].limit === 0)
+      live.handlers.onevent(makeEvent({ id: 'one' }))
+      live.handlers.onevent(makeEvent({ id: 'two' }))
+      await failure
+      assert.equal(active(relay).length, 0)
+      const retry = pool.getEvents({}, ['wss://r1'])
+      await tick()
+      active(relay)[0].handlers.oneose()
+      assert.equal((await retry).relays[0].status, 'eose')
+    })
+  }
+
+  it('consumer can reject a failed historical attempt before pending live is released', async () => {
+    const pool = configuredPool({})
+    const stream = pool.getEventsFeedGenerator({}, ['wss://r1'])
+    const first = stream.next()
+    await tick()
+    const relay = relayRegistry.get('wss://r1')
+    relay.subscriptions.find(sub => sub.filters[0].limit === 0).handlers.onevent(makeEvent({ id: 'pending-live' }))
+    relay.subscriptions.find(sub => sub.filters[0].limit !== 0).handlers.onclose(new Error('rejected'))
+    assert.equal((await first).value.type, 'error')
+    assert.equal((await stream.next()).value.relays[0].status, 'error')
+    await stream.return()
+    assert.equal((await stream.next()).done, true)
+    assert.equal(active(relay).length, 0)
+  })
+  it('reports overflow of even an empty live marker as a buffer error', async () => {
+    const pool = configuredPool({})
+    await assert.rejects(pool.getLiveEventsGenerator({}, [], { maxBufferedLiveBytes: 1 }).next(), { code: 'RELAY_LIVE_BUFFER_FULL' })
+  })
+
+  it('stopAndDrain removes queued feed reservations without opening live input', async () => {
+    const pool = configuredPool({ maxConcurrentHistoryPerRelay: 1 })
+    const hold = pool.getEvents({}, ['wss://r1'], { timeout: null })
+    await tick()
+    const stream = pool.getEventsFeedGenerator({}, ['wss://r1'], { snapshot: true })
+    const pending = stream.next()
+    await tick()
+    stream.stopAndDrain()
+    assert.equal((await pending).done, true)
+    const relay = relayRegistry.get('wss://r1')
+    relay.subscriptions[0].handlers.oneose()
+    await hold
+    await tick()
+    assert.equal(relay.subscriptions.length, 1)
+  })
+
+  it('bounds reconnect buffers and cancels their historical REQs on overflow', async () => {
+    const pool = configuredPool({ maxConcurrentHistoryPerRelay: 1 })
+    const stream = pool.getLiveEventsGenerator({ since: 1 }, ['wss://r1'], { maxBufferedLiveEvents: 1 })
+    assert.equal((await stream.next()).value.type, 'eose')
+    const relay = relayRegistry.get('wss://r1')
+    relay.subscriptions[0].close()
+    assert.equal((await stream.next()).value.type, 'error')
+    const failure = assert.rejects(stream.next(), { code: 'RELAY_LIVE_BUFFER_FULL' })
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    const live = active(relay).find(sub => sub.filters[0].limit === 0)
+    assert.ok(live)
+    assert.equal(active(relay).length, 2)
+    live.handlers.onevent(makeEvent({ id: 'buffered-1' }))
+    live.handlers.onevent(makeEvent({ id: 'buffered-2' }))
+    await failure
+    assert.equal(active(relay).length, 0)
+  })
+})
