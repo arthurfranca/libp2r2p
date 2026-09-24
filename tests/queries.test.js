@@ -303,6 +303,8 @@ test('subscribeRelayListUpdates only reports watched relay-type changes', async 
   async function * events (_filter, _relays, { signal }) {
     signal.addEventListener('abort', () => { aborted = true }, { once: true })
     yield { type: 'event', event: relayListEvent('alice', 1, [['r', 'wss://read.example', 'read']]), relay: 'wss://fixture.example' }
+    yield { type: 'live-progress', relay: 'wss://fixture.example', epoch: 1, since: 1, until: 2 }
+    yield { type: 'future-control' }
     yield { type: 'event', event: relayListEvent('alice', 2, [['r', 'wss://write.example', 'write']]), relay: 'wss://fixture.example' }
     await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))
   }

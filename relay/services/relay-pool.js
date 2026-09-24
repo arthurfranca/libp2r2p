@@ -13,6 +13,8 @@ const COUNT_TIMEOUT_MS = 5000
 const COUNT_TIMEOUT_AFTER_FIRST_COUNT_MS = 500
 const SEND_TIMEOUT_UNTIL_FIRST_FULFILLMENT_MS = 3000
 const SEND_TIMEOUT_MS = 30000
+const LIVE_OVERLAP_SECONDS = 600
+const LIVE_PROGRESS_INTERVAL_MS = 60000
 
 // Returns a function that should be called for each received event (valid or invalid).
 // Calls onSatisfied() and stops counting once the filter is fully satisfied per relay:
@@ -607,8 +609,34 @@ export class RelayPool {
     // Preserve until for forwarding to the live sub filter and the teardown timer
     const filterUntil = filter.until > 0 ? filter.until : null
 
-    // lastSeenAt: the highest created_at received so far; used as since on reconnect gap fill
-    let lastSeenAt = (filter.since > 0) ? filter.since : null
+    // Recovery uses each relay's received timestamps, or its opening time when empty.
+    const lastSeenAt = new Map()
+    const openedAt = new Map()
+    const pendingGaps = new Map()
+    const attempts = new Map()
+    let nextEpoch = 0
+    const sinceFloor = Math.max(0, filter.since ?? 0)
+    const overlappingSince = timestamp => Math.max(sinceFloor, timestamp - LIVE_OVERLAP_SECONDS)
+    const observeEvent = (event, url) => {
+      // Every relay advances independently, including cross-relay duplicates.
+      // Future-dated events cannot hide an offline interval during recovery.
+      const timestamp = Math.min(event.created_at, Math.floor(Date.now() / 1000))
+      if (Number.isFinite(timestamp) && timestamp > (lastSeenAt.get(url) ?? -Infinity)) lastSeenAt.set(url, timestamp)
+    }
+    const scheduleProgress = attempt => {
+      if (isDone || attempt.closed || attempts.get(attempt.url) !== attempt ||
+          attempt.since === null || !attempt.recovered || attempt.timer) return
+      attempt.timer = maybeUnref(setTimeout(() => {
+        attempt.timer = null
+        if (isDone || attempt.closed || attempts.get(attempt.url) !== attempt) return
+        const until = Math.min(filterUntil ?? Infinity, Math.floor(Date.now() / 1000))
+        if (until > attempt.lastProgress && until >= attempt.since) {
+          enqueue({ type: 'live-progress', relay: attempt.url, epoch: attempt.epoch, since: attempt.since, until })
+          attempt.lastProgress = until
+        }
+        scheduleProgress(attempt)
+      }, LIVE_PROGRESS_INTERVAL_MS))
+    }
 
     // Bounded dedup set to handle overlap between reconnect gap fill and live sub.
     const seenIds = new Set()
@@ -661,6 +689,10 @@ export class RelayPool {
       clearTimeout(untilTimer)
       finishReady('closed', false)
       gapAc.abort()
+      for (const attempt of attempts.values()) {
+        clearTimeout(attempt.timer)
+        attempt.stop.abort()
+      }
       for (const timer of retryTimers.values()) clearTimeout(timer)
       retryTimers.clear()
       liveSubs.forEach(sub => sub.close())
@@ -677,7 +709,6 @@ export class RelayPool {
         if (seenIds.size >= 500) seenIds.delete(seenIds.values().next().value) // evict oldest
         seenIds.add(event.id)
       }
-      if (event.created_at > (lastSeenAt ?? 0)) lastSeenAt = event.created_at
       enqueue({ type: 'event', event, relay: url })
     }
 
@@ -714,10 +745,10 @@ export class RelayPool {
         maybeFinishInitialReady()
       }
     }
-    const reportClosed = url => {
+    const reportClosed = (url, error) => {
       if (!isReady && initialPending.delete(url)) {
         clearTimeout(readyTimeouts.get(url))
-        initialOutcomes.set(url, { relay: url, status: 'closed' })
+        initialOutcomes.set(url, { relay: url, status: 'closed', error })
         maybeFinishInitialReady()
       }
     }
@@ -727,7 +758,7 @@ export class RelayPool {
       const nextDelay = Math.min(reconnectDelay * 2, 5 * 60_000)
       const timer = maybeUnref(setTimeout(() => {
         retryTimers.delete(url)
-        subscribeToRelay(url, lastSeenAt, nextDelay)
+        subscribeToRelay(url, pendingGaps.get(url) ?? lastSeenAt.get(url) ?? openedAt.get(url) ?? null, nextDelay)
       }, reconnectDelay))
       retryTimers.set(url, timer)
     }
@@ -740,24 +771,35 @@ export class RelayPool {
 
     // Runs a reconnect gap fill for a single relay and returns a promise that resolves
     // when it completes. now is shared with the live sub so both use the same boundary.
-    const runReconnectGapFill = (url, gapSince, now, slots) => {
+    const runReconnectGapFill = (url, gapSince, now, slots, attempt) => {
       const gapUntil = filterUntil !== null ? Math.min(now, filterUntil) : now
-      const gapFilter = { ...baseFilter, since: gapSince, until: gapUntil }
+      const gapFilter = { ...baseFilter, since: overlappingSince(gapSince), until: gapUntil }
       const gapGen = _gapEventsGenerator(gapFilter, [url], {
         _admissions: new Map([[url, Promise.resolve(slots)]]),
         queueTimeout,
         timeout: timeoutForReconnectGap,
         timeoutAfterFirstEose: timeoutAfterFirstReconnectGapEose,
         signal,
-        _stopSignal: gapAc.signal
+        _stopSignal: AbortSignal.any([gapAc.signal, attempt.stop.signal])
       })
       return (async () => {
+        let completed = false
+        let failed = false
         for await (const item of gapGen) {
-          if (item?.type === 'event') pushEvent(item.event, url, true)
-          else if (item?.type === 'error' && !isDone) enqueue(item)
+          if (item?.type === 'event') {
+            observeEvent(item.event, url)
+            pushEvent(item.event, url, true)
+          } else if (item?.type === 'error') {
+            failed = true
+            if (!isDone) enqueue(item)
+          } else if (item?.type === 'eose') {
+            completed = item.relays?.length === 1 && ['eose', 'satisfied'].includes(item.relays[0].status)
+          }
         }
+        return completed && !failed
       })().catch(err => {
         reportFailure(url, asError(err))
+        return false
       }).finally(() => slots.history.release())
     }
 
@@ -766,7 +808,10 @@ export class RelayPool {
       // Don't reconnect if we're past the until boundary
       if (filterUntil !== null && now >= filterUntil) return
       const reservation = !initialAdmissions.has(url) && _admissions?.get(url)
-      const recovering = gapSince !== null && gapSince > 0
+      const recovering = gapSince !== null
+      if (recovering) pendingGaps.set(url, gapSince)
+      const attempt = { url, epoch: ++nextEpoch, since: null, lastProgress: -Infinity, recovered: !recovering, timer: null, closed: false, stop: new AbortController() }
+      attempts.set(url, attempt)
       let recoveryLease
       initialAdmissions.add(url)
       Promise.resolve(reservation || this.#admission.acquire(normalizeRelayUrl(url), { live: true, history: recovering, signal: gapAc.signal, queueTimeout })).then(async slots => {
@@ -790,20 +835,22 @@ export class RelayPool {
 
         // Buffer post-EOSE live events while a reconnect gap fill is running so
         // the historical gap is yielded before newer socket events.
-        let liveBuffer = (gapSince !== null && gapSince > 0) ? [] : null
+        let liveBuffer = recovering ? [] : null
         let liveEose = false
         let bufferedBytes = 0
 
         // Open the live sub first so the relay starts buffering incoming events
         // before we scan its database for the reconnect gap fill.
         // Forward until to the relay so it can enforce the boundary server-side.
-        const liveFilter = { ...baseFilter, since: now, limit: 0 }
+        if (!openedAt.has(url)) openedAt.set(url, now)
+        const liveFilter = { ...baseFilter, since: overlappingSince(now), limit: 0 }
         if (filterUntil !== null) liveFilter.until = filterUntil
         const liveSub = relay.subscribe([liveFilter], {
           onevent: (event) => {
             // A limit:0 relay may still send retained events before EOSE. Do not
             // expose them from a strictly-live stream.
-            if (isDone || liveSubs.get(url) !== liveSub || !liveEose) return
+            if (isDone || liveSubs.get(url) !== liveSub || attempt.closed || !liveEose) return
+            observeEvent(event, url)
             if (liveBuffer) {
               const bytes = encoder.encode(JSON.stringify(event)).byteLength
               if (liveBuffer.length >= maxBufferedLiveEvents || bufferedBytes + bytes > maxBufferedLiveBytes) {
@@ -815,33 +862,44 @@ export class RelayPool {
             } else pushEvent(event, url)
           },
           onclose: error => {
+            if (attempt.closed || attempts.get(url) !== attempt) return
+            attempt.closed = true
+            clearTimeout(attempt.timer)
+            attempt.stop.abort()
             if (liveSubs.get(url) === liveSub) liveSubs.delete(url)
-            else if (liveSubs.has(url)) return
             lease.release()
             if (liveLeases.get(url) === lease) liveLeases.delete(url)
             readyRelays.delete(url)
-            if (!isDone) {
-              if (error !== undefined) reportFailure(url, asError(error))
-              else if (!liveEose) reportClosed(url)
-            }
             if (isDone) return
+            if (error !== undefined) reportFailure(url, asError(error))
+            else {
+              const interruption = Object.assign(categorizeRelayError(new Error('RELAY_LIVE_INTERRUPTED'), 'transport'), { code: 'RELAY_LIVE_INTERRUPTED' })
+              enqueue({ type: 'error', relay: url, error: interruption })
+              reportClosed(url, interruption)
+            }
             scheduleReconnect(url, reconnectDelay)
           },
           oneose: () => {
-            if (isDone || (liveSubs.has(url) && liveSubs.get(url) !== liveSub)) return
+            if (isDone || attempt.closed || attempts.get(url) !== attempt || liveEose) return
             liveEose = true
+            attempt.since = Math.max(sinceFloor, Math.floor(Date.now() / 1000))
             markInitialEose(url)
+            scheduleProgress(attempt)
           }
         })
         if (isDone) { liveSub.close(); recoveryLease?.release(); return }
         liveSubs.set(url, liveSub)
 
-        if (gapSince !== null && gapSince > 0) {
-          const task = runReconnectGapFill(url, gapSince, now, slots).finally(() => {
+        if (recovering) {
+          const task = runReconnectGapFill(url, gapSince, now, slots, attempt).then(recovered => {
+            attempt.recovered = recovered
+            if (recovered && !attempt.closed && attempts.get(url) === attempt) pendingGaps.delete(url)
+          }).finally(() => {
             const buf = liveBuffer
             liveBuffer = null
             for (const event of buf) pushEvent(event, url, true)
             gapTasks.delete(task)
+            scheduleProgress(attempt)
             p.resolve()
           })
           gapTasks.add(task)
@@ -939,7 +997,7 @@ export class RelayPool {
 
     // limit:0 is a live-only stream and reports that stream's initial window.
     if (filter.limit === 0) {
-      yield * _liveGenerator(filter, relays, options)
+      yield * _liveGenerator(filter, relays, { ...options, maxBufferedLiveEvents, maxBufferedLiveBytes })
       return
     }
 

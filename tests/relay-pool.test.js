@@ -316,7 +316,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     await promise
   })
 
-  it('opens only a live sub (limit:0, since:now) — no initial fetch', async () => {
+  it('opens only an overlapping live sub (limit:0) — no initial fetch', async () => {
     const ac = new AbortController()
     startCollecting(nostr.getLiveEventsGenerator(
       { kinds: [0], since: 500 }, // since is set but should NOT trigger initial fetch
@@ -385,7 +385,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     await new Promise(resolve => setTimeout(resolve, 1100))
     await tick()
 
-    assert.equal(relay.subscriptions.length, 2, 'new live sub opened after reconnect')
+    assert.equal(relay.subscriptions.length, 3, 'new live and recovery subscriptions opened after reconnect')
 
     ac.abort()
     await promise
@@ -470,7 +470,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     }
   })
 
-  it('reconnect opens a gap fill sub using lastSeenAt as since', async () => {
+  it('reconnect overlaps the last received timestamp by ten minutes', async () => {
     const ac = new AbortController()
     let capturedArgs
     async function * mockGapEvents (f, r, o) {
@@ -496,7 +496,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     await tick()
 
     assert.ok(capturedArgs, '_gapEventsGenerator should have been called on reconnect')
-    assert.equal(capturedArgs.f.since, 750, 'reconnect gap fill uses lastSeenAt as since')
+    assert.equal(capturedArgs.f.since, 150, 'reconnect gap fill includes ten minutes before lastSeenAt')
     assert.ok(capturedArgs.f.until > 0)
     assert.deepEqual(capturedArgs.r, ['wss://r1'])
 
@@ -504,7 +504,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     await promise
   })
 
-  it('reconnect uses filter.since as gap baseline when no events have been seen', async () => {
+  it('reconnect uses opening time as gap baseline when no events have been seen', async () => {
     const ac = new AbortController()
     let capturedSince
     async function * mockGapEvents (f) { capturedSince = f.since }
@@ -521,7 +521,7 @@ describe('RelayPool.getLiveEventsGenerator', () => {
     await new Promise(resolve => setTimeout(resolve, 1100))
     await tick()
 
-    assert.equal(capturedSince, 500)
+    assert.equal(capturedSince, relayRegistry.get('wss://r1').subscriptions[0].filters[0].since)
 
     ac.abort()
     await promise

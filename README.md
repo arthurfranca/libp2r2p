@@ -21,6 +21,7 @@ never decorated with `meta`; relay provenance belongs to its enclosing item:
 { type: 'event', event, relay }
 { type: 'error', relay, error }
 { type: 'eose', relays: [{ relay, status, error }] } // error is optional
+{ type: 'live-progress', relay, epoch, since, until } // live and live-enabled feeds only
 ```
 
 `eose` means the **initial read attempt is complete**, including empty reads and
@@ -100,6 +101,51 @@ unwrap each `getEvents().result` entry. There is no compatibility flag. Query,
 content-key, private-channel and NIP-46 helpers unwrap pool results internally
 and retain their higher-level event contracts. Count, publication and disconnect
 return formats are unchanged.
+
+### Live overlap and progress (0.10.22)
+
+Every live subscription opens with `since = max(filter.since ?? 0, now - 600, 0)`,
+including its first connection. This accepts events that arrive after opening
+but carry a timestamp up to ten minutes earlier. Explicit filter boundaries still
+apply, and retained events before EOSE remain excluded from strictly-live output.
+
+Reconnect recovery overlaps each relay's last received timestamp by 600 seconds,
+without going below the caller's `since` or zero. Empty connections use their
+opening time instead. Cursors advance independently even for events deduplicated
+across relays; future timestamps are capped at their local receipt time. Failed
+or interrupted recoveries retain their earlier baseline for the next reconnect.
+
+Live readers automatically enqueue a `live-progress` envelope every 60 seconds
+while ready, including when no events arrive. There is no enabling option.
+`epoch` is a numeric connection-attempt identifier scoped to this iterator;
+compare it together with `relay`, not across separate iterators. `since` is the
+local EOSE time (or the explicit filter lower bound if later), and `until` is the
+local time at the tick, both inclusive Unix seconds. Repeated markers describe
+the same continuous epoch with an increasing `until`.
+
+Progress starts only after that relay's EOSE and successful completion of any
+pending recovery. It pauses on disconnection, does not span connection epochs,
+and stops on cancellation, draining or `until`. History-only and empty-relay
+reads do not emit it. Timers never issue extra network queries.
+
+Markers share the bounded queue with events and follow all earlier received
+items. A feed preserves that ordering behind its initial history and queued live
+events. Consumers must finish persisting preceding events before persisting
+progress, and must not treat a marker as proof of historical completeness or as
+coverage of a disconnected interval. This is client-observed continuity, not a
+relay acknowledgement; delayed relay delivery or clock skew beyond the overlap
+can still leave gaps. A backward local clock cannot regress an emitted boundary.
+
+Every involuntary live close emits an error and still permits automatic recovery.
+A close without an explicit cause uses `error.code === 'RELAY_LIVE_INTERRUPTED'`
+and `category === 'transport'`; a pre-EOSE close retains status `closed` in the
+initial report. Explicit causes are preserved. Caller cancellation, draining and
+expiry of `filter.until` do not manufacture interruption errors.
+
+Process Nostr events only under `item.type === 'event'`. Handle controls you need
+and ignore unknown types; a new control is neither an event nor stream completion.
+The internal query, private-channel and NIP-46 consumers retain their existing
+higher-level event-only contracts.
 
 ### Read admission and bounded snapshots (0.10.21)
 

@@ -157,14 +157,17 @@ test('live errors remain observable after the initial readiness window', async t
   assert.deepEqual((await stream.next()).value, { type: 'error', relay: A, error })
 })
 
-test('live normal close before readiness is distinct from an error', async t => {
+test('live normal close emits an interruption and retains closed readiness status', async t => {
   const { pool, sub } = fixture(t)
   const stream = pool.getLiveEventsGenerator({}, [A])
   t.after(() => stream.return())
   const first = stream.next()
   await tick()
   sub().close()
-  assert.deepEqual((await first).value, { type: 'eose', relays: [{ relay: A, status: 'closed' }] })
+  const interruption = (await first).value
+  assert.equal(interruption.type, 'error')
+  assert.equal(interruption.error.code, 'RELAY_LIVE_INTERRUPTED')
+  assert.deepEqual((await stream.next()).value, { type: 'eose', relays: [{ relay: A, status: 'closed', error: interruption.error }] })
 })
 
 test('feed delivers history, its single completion, then buffered live events', async t => {
@@ -199,7 +202,7 @@ test('feed forwards initial errors and propagates general live generator failure
 })
 
 test('reconnection updates readiness without repeating initial completion', { timeout: 3000 }, async t => {
-  const { pool, sub } = fixture(t)
+  const { pool, sub, relays } = fixture(t)
   const controller = new AbortController()
   const stream = pool.getLiveEventsGenerator({}, [A], { signal: controller.signal })
   const items = []
@@ -211,8 +214,10 @@ test('reconnection updates readiness without repeating initial completion', { ti
   sub().close()
   assert.deepEqual(stream.readyRelays, [])
   await new Promise(resolve => setTimeout(resolve, 1100))
-  sub().handlers.oneose()
-  sub().handlers.onevent(event)
+  const resumed = relays.get(A).subs.findLast(sub => sub.filters[0].limit === 0)
+  resumed.handlers.oneose()
+  sub().handlers.oneose() // recovered history precedes the queued live event
+  resumed.handlers.onevent(event)
   await tick()
   assert.deepEqual(stream.readyRelays, [A])
   assert.equal(items.filter(item => item.type === 'eose').length, 1)

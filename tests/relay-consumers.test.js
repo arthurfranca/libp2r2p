@@ -49,12 +49,37 @@ function network (t) {
     }
   }
   const pool = new RelayPool({ _createRelay: url => new RelayConnection(url, { WebSocket: Socket }) })
+  let controlsDelivered = 0
+  // The real transport still supplies events; insert unfamiliar controls at the
+  // pool boundary to verify that higher-level protocols do not interpret them.
+  const originalLive = pool.getLiveEventsGenerator.bind(pool)
+  pool.getLiveEventsGenerator = (...args) => {
+    const source = originalLive(...args)
+    const pending = []
+    return {
+      get ready () { return source.ready },
+      get readyRelays () { return source.readyRelays },
+      [Symbol.asyncIterator] () { return this },
+      async next () {
+        if (pending.length) return pending.shift()
+        const result = await source.next()
+        if (!result.done && result.value.type === 'event') {
+          controlsDelivered += 2
+          pending.push({ value: { type: 'future-control', relay }, done: false }, result)
+          return { value: { type: 'live-progress', relay, epoch: 1, since: 0, until: 1 }, done: false }
+        }
+        return result
+      },
+      return () { pending.length = 0; return source.return() },
+      stopAndDrain () { source.stopAndDrain() }
+    }
+  }
   t.after(() => pool.disconnectAll())
-  return { pool, history }
+  return { pool, history, controlsDelivered: () => controlsDelivered }
 }
 
 test('NIP-46 client and server exchange RPC through typed real pool streams', { timeout: 5000 }, async t => {
-  const { pool } = network(t)
+  const { pool, controlsDelivered } = network(t)
   const secret = generateSecretKey()
   const server = new Nip46ServerSession(secret, {
     relays: [relay], secret: 'test-secret', relayPool: pool,
@@ -72,10 +97,13 @@ test('NIP-46 client and server exchange RPC through typed real pool streams', { 
   await client.connect({ timeout: 1000 })
   await client.ping({ timeout: 1000 })
   assert.equal(await client.sendRequest('echo', ['envelopes'], { timeout: 1000 }), 'envelopes')
+  assert.ok(controlsDelivered() > 0)
+  await client.close()
+  await server.close()
 })
 
 test('private-channel reads history and live events through real pool envelopes', { timeout: 5000 }, async t => {
-  const { pool, history } = network(t)
+  const { pool, history, controlsDelivered } = network(t)
   const alice = NsecSigner.getOrCreate(bytesToHex(generateSecretKey()))
   const bob = NsecSigner.getOrCreate(bytesToHex(generateSecretKey()))
   const owner = await alice.getPublicKey()
@@ -113,4 +141,6 @@ test('private-channel reads history and live events through real pool envelopes'
   const published = await pool.sendEvent(await makeOuter('live'), [relay])
   assert.equal(published.success, true)
   assert.equal((await delivered.promise).content, 'live')
+  assert.ok(controlsDelivered() > 0)
+  await subscription.close()
 })

@@ -37,7 +37,8 @@ parsers that use `null` for an expected mismatch keep that contract.
 
 Preserve relay API envelopes and immediate delivery when changing transport
 behavior. Read generators emit `event`, `error`, and one initial aggregate
-`eose`; the latter reports actual EOSE, satisfaction, timeout, cutoff, normal
+`eose`, plus automatic `live-progress` controls during ready live input. The initial
+marker reports actual EOSE, satisfaction, timeout, cutoff, normal
 closure, or error per relay. Never attach provenance to the Nostr event itself.
 `getEvents().result` contains `{ event, relay }` entries. Internal consumers must
 unwrap event envelopes and handle/ignore control items explicitly. Preserve
@@ -102,3 +103,16 @@ queueTimeout. Release leases on every completion/cancellation path and preserve
 partial relay outcomes. Snapshot bounds describe only the historical attempt;
 they neither end live input nor prove complete persisted coverage. Keep live
 buffers bounded and surface overflow explicitly, never as successful EOSE.
+
+## Live coverage controls
+
+Live readers use a hard-coded ten-minute opening/recovery overlap and per-relay
+recovery cursors (including duplicates, capped at receipt time). Empty relays use
+opening time; failed recovery never advances its pending baseline. Automatic
+60-second `live-progress` controls follow earlier events through the same bounded
+queues, with a per-attempt epoch. They describe client-observed continuous live
+input, never historical completeness or disconnected periods. Stop timers on
+close/cancellation/drain; do not emit while waiting for EOSE or recovery. Report
+involuntary closes even without a remote error. Consumers must explicitly select
+`type: 'event'` and tolerate unknown control types; test private-channel and
+NIP-46 against the real pool with controlled transport and injected controls.
