@@ -725,6 +725,34 @@ export async function createQueue ({
     })
   }
 
+  async function putBy (indexName, item, { existingOnly = false } = {}) {
+    const definition = indexDefinitions.find(index => index.name === indexName)
+    if (!definition?.unique || definition.multiEntry) throw new ValidationError('QUEUE_PUT_INDEX_INVALID')
+    // Snapshot before awaiting IndexedDB so the lookup key and stored value
+    // cannot diverge if the caller changes its object during the transaction.
+    const value = structuredClone(item)
+    const readKey = path => path.split('.').reduce((part, key) => part?.[key], value)
+    const key = Array.isArray(definition.keyPath) ? definition.keyPath.map(readKey) : readKey(definition.keyPath)
+    try { indexedDB.cmp(key, key) } catch { throw new ValidationError('QUEUE_PUT_KEY_INVALID') }
+    const requiredBytes = itemForStorage(0, value).byteSize
+    const written = await mutate(async (tx, state) => {
+      const { result: previous } = await run('get', [key], ITEMS_STORE, indexName, { tx })
+      if (previous) {
+        const index = previous.position - state.head
+        await putItem(tx, state, previous.position, value, {
+          direction: evictionDirectionFor('setAt', { index, length: state.tail - state.head }),
+          protectedPositions: new Set([previous.position])
+        })
+      } else {
+        if (existingOnly) return false
+        await pushInTransaction(tx, state, value)
+      }
+      return true
+    }, { requiredBytes })
+    if (written) wake()
+    return written
+  }
+
   async function getBy (indexName, query) {
     // Explicit index operations avoid scanning queue values in JavaScript.
     return snapshot(async tx => {
@@ -899,6 +927,7 @@ export async function createQueue ({
     removeWhere,
     some,
     clear,
+    putBy,
     getBy,
     someBy,
     removeBy,

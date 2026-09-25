@@ -820,6 +820,24 @@ The NIP-94 extension also carries optional `download` intent; see
 
 ## Reliable IndexedDB queue reservations
 
+`queue.putBy(indexName, item, { existingOnly = false })` atomically inserts or
+replaces an item through a declared unique, non-multiEntry index. Its key is
+extracted from the item's index keyPath, including nested paths and compound
+keys. Existing items retain their position; new keys append to the tail. It
+returns `true` after commit, or `false` without inserting when `existingOnly`
+is true and the key is absent. This allows late progress checkpoints to avoid
+recreating a cancelled record. Values are cloned before asynchronous work.
+
+Unknown, non-unique or multiEntry indexes throw `ValidationError` with
+`QUEUE_PUT_INDEX_INVALID`; missing or invalid IndexedDB keys use
+`QUEUE_PUT_KEY_INVALID`. Cloning, storage and other unique-index failures retain
+their operational errors. Lookup, replacement and byte accounting share one
+transaction and roll back together. Capacity policy matches `setAt` for a
+replacement and `push` for an insertion. Replacing a reserved item invalidates
+the old token: its `ack`, `nack` and `renew` return false. Successful writes wake
+local waiting consumers. Like the other indexed methods, `putBy` is exclusive
+to `idb-queue`; the Web Storage queue's common API is unchanged.
+
 `createQueue({ prefix, evictionPolicy: 'reject', maxBytes })` opts out of
 capacity eviction. Oversized items reject with `QUEUE_ITEM_TOO_LARGE`, full
 queues with `QUEUE_CAPACITY_EXCEEDED`; browser quota errors propagate without

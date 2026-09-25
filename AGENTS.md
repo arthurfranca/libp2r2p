@@ -81,6 +81,13 @@ suite pass; report independently scoped problems separately.
 
 ## Private messaging lifecycle
 
+- `idb-queue.putBy` performs an atomic upsert through a declared unique,
+  non-multiEntry index. `existingOnly` checkpoints must never recreate removed
+  items. Preserve queue position on replacement, transactional byte accounting,
+  capacity policy and reservation-token invalidation. Indexed methods are
+  extensions beyond the common Web Storage queue API; keep parity tests scoped
+  to that common API.
+
 - Rumors preserve an explicit author distinct from the transport sender. Keep
   `senderPubkey` and `provenance` outside the event through live and recovery
   paths; forwarded controls must not execute as direct sender commands.
