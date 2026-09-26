@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { createConnectivityMonitor, isOnline } from '../network/index.js'
+import { createConnectivityMonitor, isOnline, onOnline } from '../network/index.js'
 
 const flush = () => new Promise(resolve => setImmediate(resolve))
 
@@ -141,4 +141,89 @@ test('isOnline shares concurrent fetches and respects abort and the offline flag
   Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { onLine: false } })
   assert.equal(await isOnline(), false)
   assert.equal(calls, 2)
+})
+
+test('hedged probes start the remaining candidates after one second', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  t.after(() => t.mock.timers.reset())
+  const calls = []
+  t.mock.method(globalThis, 'fetch', (url, options) => {
+    const call = { url, options }
+    call.promise = new Promise((resolve, reject) => {
+      call.resolve = resolve
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
+    })
+    calls.push(call)
+    return call.promise
+  })
+  const online = isOnline()
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].options.mode, 'no-cors')
+  t.mock.timers.tick(1000)
+  await flush()
+  assert.equal(calls.length, 4)
+  calls[1].resolve(new Response())
+  assert.equal(await online, true)
+  await flush()
+  assert.equal(calls[0].options.signal.aborted, true)
+  assert.equal(calls[2].options.signal.aborted, true)
+  assert.equal(calls[3].options.signal.aborted, true)
+})
+
+test('strict probes require CORS, an ok response and the expected body', async t => {
+  const modes = []
+  t.mock.method(globalThis, 'fetch', (url, options) => {
+    modes.push(options.mode)
+    return Promise.resolve(new Response(url.includes('captive.apple.com') ? 'Success' : 'ip=203.0.113.1'))
+  })
+  assert.equal(await isOnline({ strict: true }), true)
+  assert.deepEqual([...new Set(modes)], ['cors'])
+})
+
+test('strict probes reject captive portals and HTTP errors', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  t.after(() => t.mock.timers.reset())
+  t.mock.method(globalThis, 'fetch', url => Promise.resolve(new Response('Sign in to continue', { status: url.includes('cdn-cgi/trace') ? 500 : 200 })))
+  const online = isOnline({ strict: true })
+  await flush()
+  t.mock.timers.tick(1000)
+  await flush()
+  assert.equal(await online, false)
+})
+
+test('onOnline strict mode uses strict probes', async t => {
+  const modes = []
+  t.mock.method(globalThis, 'fetch', (url, options) => {
+    modes.push(options.mode)
+    return Promise.resolve(new Response(url.includes('captive.apple.com') ? 'Success' : 'ip=203.0.113.1'))
+  })
+  let notified = 0
+  const stop = onOnline(() => { notified++ }, { strict: true })
+  await flush()
+  await flush()
+  assert.equal(notified, 1)
+  assert.deepEqual([...new Set(modes)], ['cors'])
+  stop()
+})
+
+test('a fast first failure starts the remaining candidates immediately', async t => {
+  const calls = []
+  t.mock.method(globalThis, 'fetch', (url, options) => {
+    const call = { url, options }
+    call.promise = new Promise((resolve, reject) => {
+      call.resolve = resolve
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
+    })
+    calls.push(call)
+    if (calls.length === 1) return Promise.reject(new Error('NETWORK'))
+    return call.promise
+  })
+  const online = isOnline()
+  await flush()
+  assert.equal(calls.length, 4)
+  calls[1].resolve(new Response())
+  assert.equal(await online, true)
+  await flush()
+  assert.equal(calls[2].options.signal.aborted, true)
+  assert.equal(calls[3].options.signal.aborted, true)
 })
