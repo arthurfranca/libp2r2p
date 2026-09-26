@@ -136,11 +136,21 @@ export class RelayPool {
   #liveSubCounts = new Map() // url -> number of active live subscriptions
   #timeout = 30000 // 30 seconds
   #createRelay
+  #WebSocket
   #admission
 
-  constructor ({ _createRelay = url => new RelayConnection(url), ...capacity } = {}) {
-    this.#createRelay = _createRelay
+  constructor ({ _createRelay, WebSocket: WebSocketImpl, ...capacity } = {}) {
+    this.#WebSocket = WebSocketImpl
+    this.#createRelay = _createRelay ?? (url => new RelayConnection(url, this.#WebSocket ? { WebSocket: this.#WebSocket } : undefined))
     this.#admission = new ReadAdmission(capacity)
+  }
+
+  // Injects the WebSocket implementation used by new pooled connections (e.g.
+  // a launcher-owned relay multiplexer). Existing connections keep the
+  // implementation they were created with.
+  setWebSocket (WebSocketImpl) {
+    if (typeof WebSocketImpl !== 'function') throw new ValidationError('INVALID_WEBSOCKET_IMPLEMENTATION')
+    this.#WebSocket = WebSocketImpl
   }
 
   #scheduleIdleDisconnect (url) {
