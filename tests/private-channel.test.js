@@ -2169,6 +2169,61 @@ test('recovery fetch rejects incomplete relay reports and observes cancellation'
   await assert.rejects(fetch({ ...options, signal: controller.signal }), error => error.name === 'AbortError')
 })
 
+test('incomplete fetch diagnoses status-only failures without inventing native causes', async t => {
+  for (const status of ['timeout', 'closed', 'cutoff', 'error']) {
+    await t.test(status, async () => {
+      await assert.rejects(fetch({
+        relays: ['wss://healthy.test', 'wss://failed.test'], privateChannelPubkeys: ['channel'], receiverPubkey: 'receiver', since: 10, until: 20,
+        _getEvents: async () => ({ result: [], relays: [{ relay: 'wss://healthy.test', status: 'eose' }, { relay: 'wss://failed.test', status }] })
+      }), error => {
+        assert.ok(error instanceof AggregateError)
+        assert.equal(error.code, 'PRIVATE_CHANNEL_FETCH_INCOMPLETE')
+        assert.deepEqual(error.errors, [])
+        assert.match(error.message, new RegExp(`wss://failed.test \\[${status}\\]`))
+        assert.equal(error.relays[0].status, 'eose')
+        assert.deepEqual(error.request, { relays: ['wss://healthy.test', 'wss://failed.test'], channelPubkeys: ['channel'], receiverPubkey: 'receiver', since: 10, until: 20, limit: undefined, timeoutMs: 5000 })
+        assert.equal(error.receivedEventCount, 0)
+        assert.ok(error.elapsedMs >= 0)
+        return true
+      })
+    })
+  }
+})
+
+test('incomplete fetch keeps relay attribution and native causes after delivering partial results', async () => {
+  const sender = signer()
+  const receiver = signer()
+  const receiverPubkey = await receiver.getPublicKey()
+  const original = eventFixture('private payload that must not enter diagnostics')
+  const outers = await wrapEvent({ senderSigner: sender, receivers: [receiverPubkey], event: original, _getIykcProofs: noContentKeys })
+  const cause = new Error('socket closed')
+  const reason = Object.assign(new Error('GET_EVENTS_TIMEOUT', { cause }), { category: 'timeout' })
+  const reportOnlyError = new Error('relay closed')
+  const orphanError = new Error('admission failed')
+  let received = 0
+  await assert.rejects(fetch({
+    receiverSigner: receiver, privateChannelSigner: sender, receiverPubkey,
+    relays: ['wss://healthy.test', 'wss://failed.test', 'wss://closed.test', 'wss://queued.test'],
+    onEvent: event => { assert.equal(event.content, original.content); received++ },
+    _getEvents: async () => ({
+      result: outers.map(event => ({ event, relay: 'wss://healthy.test' })),
+      errors: [{ relay: 'wss://failed.test', reason }, { relay: 'wss://queued.test', reason: orphanError }],
+      relays: [{ relay: 'wss://healthy.test', status: 'eose' }, { relay: 'wss://failed.test', status: 'timeout', error: reason }, { relay: 'wss://closed.test', status: 'closed', error: reportOnlyError }]
+    })
+  }), error => {
+    assert.equal(received, 1)
+    assert.equal(error.receivedEventCount, outers.length)
+    assert.deepEqual(error.errors, [reason, orphanError, reportOnlyError])
+    assert.equal(error.errors[0].cause, cause)
+    assert.equal(error.relayErrors[0].relay, 'wss://failed.test')
+    assert.equal(error.relays[1].error, reason)
+    assert.match(error.message, /wss:\/\/failed.test \[timeout\]: \[timeout\] GET_EVENTS_TIMEOUT/)
+    assert.match(error.message, /wss:\/\/queued.test: admission failed/)
+    assert.doesNotMatch(JSON.stringify(error), /private payload/)
+    return true
+  })
+})
+
 test('simultaneous receivers and consumers independently process the same channel chunks', async () => {
   const { createPrivateMessageSession } = await import('../private-message/index.js')
   const a = signer()
@@ -2209,4 +2264,74 @@ test('simultaneous receivers and consumers independently process the same channe
       assert.equal(messages[0].provenance, 'direct')
     }
   } finally { await Promise.all(sessions.map(session => session.unwatch())) }
+})
+
+for (const liveOnly of [false, true]) {
+  test(`subscription errors retain relay context without mutating shared errors (liveOnly=${liveOnly})`, async () => {
+    const sender = signer()
+    const receiver = signer()
+    const receiverPubkey = await receiver.getPublicKey()
+    const original = eventFixture('delivery continues after a transport error')
+    const [outer] = await wrapEvent({ senderSigner: sender, receivers: [receiverPubkey], event: original, _getIykcProofs: noContentKeys })
+    const cause = new Error('underlying socket failure')
+    const native = Object.freeze(Object.assign(new Error('CONNECTION_CLOSED', { cause }), {
+      code: 'NATIVE_CODE', category: 'transport', closeCode: 1006, closeReason: '', wasClean: false
+    }))
+    const errors = []
+    const events = []
+    const waiting = Promise.withResolvers()
+    let aborted = false
+    const generator = (_filter, _relays, { signal }) => (async function * () {
+      yield { type: 'error', relay: 'wss://first.example', error: native }
+      yield { type: 'error', relay: 'wss://second.example', error: native }
+      yield { type: 'live-progress', relay: 'wss://second.example' }
+      yield { type: 'event', relay: 'wss://second.example', event: outer }
+      waiting.resolve()
+      await new Promise(resolve => signal.addEventListener('abort', () => { aborted = true; resolve() }, { once: true }))
+    })()
+    const sub = subscribe({
+      receiverSigner: receiver, receiverPubkey, privateChannelSigner: sender,
+      relays: ['wss://first.example', 'wss://second.example'], liveOnly,
+      _liveEventsGenerator: generator, _eventsFeedGenerator: generator,
+      onError: error => errors.push(error), onEvent: event => events.push(event)
+    })
+    try {
+      await waiting.promise
+      assert.equal(errors.length, 2)
+      assert.deepEqual(errors.map(error => error.relay), ['wss://first.example', 'wss://second.example'])
+      for (const error of errors) {
+        assert.equal(error.operation, 'private-channel.subscribe')
+        for (const key of ['name', 'message', 'code', 'category', 'closeCode', 'closeReason', 'wasClean']) assert.equal(error[key], native[key])
+        assert.equal(error.cause, native)
+        assert.equal(error.cause.cause, cause)
+      }
+      assert.equal(native.relay, undefined)
+      assert.equal(native.operation, undefined)
+      assert.deepEqual(events, [unwrappedFixture(original, await sender.getPublicKey())])
+    } finally { await sub.close() }
+    assert.equal(aborted, true)
+  })
+}
+
+test('subscription context preserves aggregates and does not guess a missing relay', async () => {
+  const original = Object.freeze(new AggregateError([new Error('nested failure')], 'aggregate failure'))
+  const errors = []
+  const finished = Promise.withResolvers()
+  const sub = subscribe({
+    privateChannelSigner: signer(), relays: ['wss://one.example', 'wss://two.example'],
+    onError: error => errors.push(error),
+    _eventsFeedGenerator: () => (async function * () {
+      yield { type: 'error', error: original }
+      yield { type: 'error', relay: 'wss://one.example', error: 'non-Error failure' }
+      finished.resolve()
+    })()
+  })
+  await finished.promise
+  await sub.close()
+  assert.ok(errors[0] instanceof AggregateError)
+  assert.deepEqual(errors[0].errors, original.errors)
+  assert.equal(errors[0].cause, original)
+  assert.equal(errors[0].relay, undefined)
+  assert.equal(errors[1].relay, 'wss://one.example')
+  assert.equal(errors[1].message, 'non-Error failure')
 })

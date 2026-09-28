@@ -2554,3 +2554,30 @@ test('ack by A does not prevent first-open historical delivery to B on the same 
   assert.deepEqual(seenReceivers, ['A', 'B'])
   assert.equal(await deliveryB.ack(), true)
 })
+
+test('incomplete fetch reaches onError unchanged and remains pending until a successful retry', async t => {
+  const now = 1800000000
+  t.mock.method(Date, 'now', () => now * 1000)
+  let scheduled
+  let fail = true
+  const reason = new Error('GET_EVENTS_TIMEOUT')
+  const failure = Object.assign(new AggregateError([reason], 'PRIVATE_CHANNEL_FETCH_INCOMPLETE: wss://relay.example [timeout]'), {
+    code: 'PRIVATE_CHANNEL_FETCH_INCOMPLETE', relays: [{ relay: 'wss://relay.example', status: 'timeout', error: reason }]
+  })
+  const errors = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(), _setTimeout: fn => { scheduled = fn },
+    onError: error => errors.push(error),
+    _privateChannel: { fetch: async () => { if (fail) throw failure; return [] } }
+  }).init({ userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+  await scheduled()
+  assert.equal(errors[0], failure)
+  let state = (await messenger.stateStore.load()).channel
+  assert.equal(state.recoveredThrough, 0)
+  assert.deepEqual(state.offlineRanges, [{ start: now - 7 * 86400, end: now }])
+  fail = false
+  await messenger.recoverOfflineRanges(['channel'])
+  state = (await messenger.stateStore.load()).channel
+  assert.equal(state.recoveredThrough, now)
+  assert.deepEqual(state.offlineRanges, [])
+})

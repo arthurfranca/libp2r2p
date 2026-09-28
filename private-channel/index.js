@@ -6,6 +6,8 @@ import { isValidContentKeyProof, isValidIykcProof, makeContentKeyEventForPubkey,
 import { getIykcProofs } from '../content-key/index.js'
 import { ValidationError } from '../error/index.js'
 import { normalizeRumor, deliveryInfo } from './helpers/rumor.js'
+import { incompleteFetchError } from './helpers/fetch-error.js'
+import { subscriptionError } from './helpers/subscription-error.js'
 import * as nip44v3 from '../nip44-v3/index.js'
 import { relayPool } from '../relay/index.js'
 import { JSONL_CHUNK_BYTES, NYM_CARRIER_CHUNK_CHARS } from './helpers/chunk-size.js'
@@ -907,11 +909,14 @@ export async function fetch ({ signal, receiverSigner, iykcSigner, privateChanne
   if (until != null) filter.until = until
   if (limit != null) filter.limit = limit
 
+  const timeoutMs = 5000
+  const startedAt = performance.now()
   const { result, errors = [], relays: report = [] } = await _getEvents(filter, relays, {
-    timeout: 5000,
+    timeout: timeoutMs,
     timeoutAfterFirstEose: null,
     ...(signal ? { signal } : {})
   })
+  const elapsedMs = Math.round(performance.now() - startedAt)
   const events = result.map(({ event }) => event)
   events.sort((a, b) => a.created_at - b.created_at)
   const processOuterEvent = createProcessor({ receiverSigner, iykcSigner, privateChannelSigner, privateChannelSignersByPubkey, privateChannelReaderSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, receiverPubkey, mode, modeByPubkey, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, receivedChunkScope, receivedChunkTtlMs, receivedChunkTtlMsByPubkey, receivedChunkMaxBytes, receivedChunkIndexedDB, ignoredGroupTtlMs, ignoredGroupMaxEntries })
@@ -922,7 +927,10 @@ export async function fetch ({ signal, receiverSigner, iykcSigner, privateChanne
     }
     signal?.throwIfAborted()
     if (errors.length || report.some(entry => !['eose', 'satisfied'].includes(entry.status))) {
-      throw new AggregateError(errors.map(entry => entry.reason), 'PRIVATE_CHANNEL_FETCH_INCOMPLETE')
+      throw incompleteFetchError({
+        errors, report, elapsedMs, receivedEventCount: events.length,
+        request: { relays: [...relays], channelPubkeys: [...authors], receiverPubkey, since, until, limit, timeoutMs }
+      })
     }
     return events
   } finally {
@@ -955,7 +963,7 @@ export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = 
     try {
       for await (const item of events) {
         if (controller.signal.aborted) continue
-        if (item.type === 'error') onError?.(item.error)
+        if (item.type === 'error') onError?.(subscriptionError(item.error, item.relay))
         else if (item.type === 'event') await processOuterEvent(item.event)
       }
     } catch (error) {

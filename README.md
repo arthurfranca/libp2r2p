@@ -519,6 +519,29 @@ This also covers abrupt termination without `close()` and channels with no
 messages. Applications still supply signers and desired channels on reopening;
 storage is scoped by origin and user pubkey, not the transient session ID.
 Failed ingestion or incomplete relay fetch reports never complete the gap.
+`private-channel.fetch` reports incomplete reads as an `AggregateError` with
+stable `code: 'PRIVATE_CHANNEL_FETCH_INCOMPLETE'`. Its message names relays,
+completion statuses and native failure messages, including status-only failures.
+`relays` retains all `{ relay, status, error? }` outcomes; `relayErrors` preserves
+`{ relay, reason }` attribution and `errors` retains unique native causes from
+both sources. `request` records selected relays, channel pubkeys, receiver pubkey,
+`since`/`until`/`limit` and the 5000ms read timeout. `elapsedMs` measures the read
+including admission wait, excluding decryption/storage; `receivedEventCount`
+counts fetched outer events, not delivered messages. No event bodies or signers
+are attached. These diagnostics reach the messenger's `onError` unchanged.
+A single incomplete relay keeps the interval pending even if another relay
+returned events; received messages may already have been queued. This is a
+history completeness failure, not evidence that an outgoing message failed.
+Existing rewatch/resume and relay-list refresh paths retry pending intervals;
+there is no dedicated periodic retry timer for a failed history fetch.
+Subscription relay errors forwarded to `onError` include `relay` when known
+and `operation: 'private-channel.subscribe'`. A per-notification wrapper retains
+the native message, name, code, category and WebSocket close fields; `cause`
+references the untouched original error, including its stack and causes.
+Aggregate errors keep their nested errors. This also works with frozen/shared
+errors without leaking attribution between subscribers. Missing relay metadata
+is not inferred from the selected relay list. This does not change reconnection,
+delivery or error classification; processing errors keep their existing path.
 `lastSeenAt` tracks messages persisted in the incoming queue, not app commits.
 The default recovery window is seven days; recovery still depends on available
 relay/seeder data, and retention limits cannot guarantee indefinite delivery.

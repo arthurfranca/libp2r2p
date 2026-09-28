@@ -123,3 +123,14 @@ close/cancellation/drain; do not emit while waiting for EOSE or recovery. Report
 involuntary closes even without a remote error. Consumers must explicitly select
 `type: 'event'` and tolerate unknown control types; test private-channel and
 NIP-46 against the real pool with controlled transport and injected controls.
+
+- Incomplete private-channel reads preserve per-relay outcomes, native errors and
+  request metadata under `PRIVATE_CHANNEL_FETCH_INCOMPLETE`. Keep status-only
+  failures visible even when AggregateError.errors is empty. Never attach event
+  payloads/signers to diagnostics or relax recovery completeness for one healthy
+  relay. Read elapsed time includes admission, not decryption or storage.
+
+- Private-channel subscription error notifications retain the generator's relay
+  URL and `private-channel.subscribe` operation. Do not mutate shared native
+  transport errors; keep the original as cause and preserve message/code/category,
+  close details and AggregateError children. Do not guess absent relay metadata.
