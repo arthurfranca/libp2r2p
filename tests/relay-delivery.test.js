@@ -306,3 +306,37 @@ test('the connection operation deadline retains a preceding transport error', as
     return true
   })
 })
+
+test('default publication waits past three seconds and returns on the first acknowledgement', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const { pool, sockets } = fixture(t)
+  const event = signedEvent()
+  let result
+  const pending = pool.sendEvent(event, [A, B]).then(value => { result = value; return value })
+  await tick()
+  t.mock.timers.tick(8939)
+  await tick()
+  assert.equal(result, undefined, 'the old three-second cutoff must not fail a pending publication')
+  sockets.get(A).receive(['OK', event.id, true, ''])
+  await tick()
+  assert.equal(result?.success, true, 'first acknowledgement returns without waiting for the other relay')
+  t.mock.timers.tick(8309)
+  sockets.get(B).receive(['OK', event.id, true, ''])
+  assert.equal((await (await pending).promise).fulfilled, 2)
+})
+
+test('default publication still ends at thirty seconds without acknowledgement', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const { pool } = fixture(t)
+  let result
+  const pending = pool.sendEvent(signedEvent(), [A, B]).then(value => { result = value; return value })
+  await tick()
+  t.mock.timers.tick(29999)
+  await tick()
+  assert.equal(result, undefined)
+  t.mock.timers.tick(1)
+  const report = await (await pending).promise
+  assert.equal(result.success, false)
+  assert.equal(report.errors.length, 2)
+  assert.ok(report.errors.every(({ reason }) => reason.message === 'PUBLISH_TIMEOUT'))
+})

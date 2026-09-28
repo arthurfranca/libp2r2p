@@ -11,7 +11,6 @@ import { RelayConnection } from './relay-connection.js'
 const CONNECTION_TIMEOUT_MS = 3000
 const COUNT_TIMEOUT_MS = 5000
 const COUNT_TIMEOUT_AFTER_FIRST_COUNT_MS = 500
-const SEND_TIMEOUT_UNTIL_FIRST_FULFILLMENT_MS = 3000
 const SEND_TIMEOUT_MS = 30000
 const LIVE_OVERLAP_SECONDS = 600
 const LIVE_PROGRESS_INTERVAL_MS = 60000
@@ -1120,8 +1119,8 @@ export class RelayPool {
     }
   }
 
-  // Returns after the first acknowledgement window. timeout is one deadline for
-  // the whole operation, while timeoutUntilFirstFulfillment controls only this
+  // Returns on the first acknowledgement, all failures, or the 30s deadline.
+  // An optional timeoutUntilFirstFulfillment imposes an earlier deadline on this
   // initial return and closes pending reports when it fails. null disables either
   // timer independently. onRelayResult receives one
   // { relay, success, outcome, reason? } result per relay as it settles; outcome
@@ -1130,7 +1129,7 @@ export class RelayPool {
   // Await `promise` for the complete report, including every relay outcome.
   async sendEvent (event, relays, {
     timeout = SEND_TIMEOUT_MS,
-    timeoutUntilFirstFulfillment = SEND_TIMEOUT_UNTIL_FIRST_FULFILLMENT_MS,
+    timeoutUntilFirstFulfillment = null,
     getAuthEvent,
     onRelayResult
   } = {}) {

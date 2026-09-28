@@ -1,6 +1,6 @@
 {
   "name": "libp2r2p",
-  "version": "0.10.25",
+  "version": "0.10.26",
   "description": "Peer-to-relay-to-peer",
   "keywords": [
     "p2r2p",
@@ -97,7 +97,7 @@
     "@noble/curves": "2.2.0",
     "@noble/hashes": "2.2.0",
     "@scure/base": "2.0.0",
-    "nmmr": "2.0.0"
+    "nmmr": "2.0.1"
   },
   "devDependencies": {
     "eslint": "^9.39.5",

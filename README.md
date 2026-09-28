@@ -854,3 +854,16 @@ A stale token cannot acknowledge a newly reserved or replaced record.
 
 `queue.getCapacity()` returns `{ usedBytes, maxBytes }`; capacity rejections
 also expose `requiredBytes` and `maxBytes`, without retaining the rejected item.
+
+
+### Publication acknowledgement deadlines
+
+`RelayPool.sendEvent` returns immediately when the first relay accepts an event,
+when all relays fail, or when the operation's `timeout` expires (30 seconds by
+default, including connection work). `timeoutUntilFirstFulfillment` now defaults
+to `null`, removing the former 3-second cutoff. Explicit shorter deadlines remain
+supported and still finalize pending reports as timeouts. `promise` provides the
+complete per-relay report without delaying the first-success return. Connection
+establishment retains its separate 3-second deadline. PrivateMessenger inherits
+this publication policy, including seeder/recovery messages. A timeout indicates
+missing acknowledgement and cannot prove that the recipient did not receive it.
