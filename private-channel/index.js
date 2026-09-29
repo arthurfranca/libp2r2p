@@ -18,12 +18,13 @@ import {
   prepareEnvelopeRows,
   preparedRowIndexesForReceivers,
   readChunkContent,
+  readPreparedRow,
   receiverPubkeys,
   receiverPubkeysWithoutContentKeys,
   writeChunksFromPreparedRows
 } from './helpers/chunks.js'
 import { EXPIRATION_SECONDS, MAX_EVENT_BYTES, NYM_CARRIER_KIND, PRIVATE_BROADCAST_KIND, ROUTER_KIND } from './constants/index.js'
-import { eventByteLength, hasImkcTag, makeNymCarrierEvent, makeRouterEvent, nowSeconds, readChunkTag, readIdTag, readImkcProof, readImkcTag, readReceiverTag, readSenderTag } from './helpers/event.js'
+import { eventByteLength, hasImkcTag, makeNymCarrierEvent, makeRouterEvent, nowSeconds, readChunkTag, readFileChunkIndex, readIdTag, readImkcProof, readImkcTag, readReceiverTag, readSenderTag } from './helpers/event.js'
 import { createReceivedChunkStore, DEFAULT_RECEIVED_CHUNK_MAX_BYTES, DEFAULT_RECEIVED_CHUNK_TTL_MS } from './services/received-chunks.js'
 
 export { EXPIRATION_SECONDS, MAX_EVENT_BYTES, NYM_CARRIER_KIND, PRIVATE_BROADCAST_KIND, ROUTER_KIND } from './constants/index.js'
@@ -131,7 +132,7 @@ async function prepareRoutedMessage ({ senderSigner, imkcSigner, privateChannelS
   }
 }
 
-async function * wrapPreparedEvents ({ privateChannelSigner, receivers, receiverTag, deletionPubkey, expirationSeconds = EXPIRATION_SECONDS, context }) {
+async function * wrapPreparedEvents ({ privateChannelSigner, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey, expirationSeconds = EXPIRATION_SECONDS, context }) {
   const routerSeckey = generateSecretKey()
   const routerPubkey = getPublicKey(routerSeckey)
   const receiverPubkeyList = receiverPubkeys(receivers)
@@ -144,6 +145,13 @@ async function * wrapPreparedEvents ({ privateChannelSigner, receivers, receiver
   const temporaryStorage = context.preparedRows.temporaryStorage
 
   try {
+    if (onPreparedSeed) {
+      const router = makeRouterEvent({ pubkey: routerPubkey, senderPubkey: context.senderPubkey, imkcPubkey: context.imkcPubkey, imkcProof: context.imkcProof, receiverPubkey: routerReceiverTag, chunkIndex: 0, chunkTotal: 1, fileChunkIndex, content: '' })
+      const payloadRow = readPreparedRow(context.preparedRows, 0)
+      for (const rowIndex of rowIndexes) {
+        await onPreparedSeed({ channelPubkey: context.channelPubkey, router, jsonl: `${payloadRow}\n${readPreparedRow(context.preparedRows, rowIndex)}\n` })
+      }
+    }
     for (let index = 0; index < total; index++) {
       const content = readChunkContent(id, index, temporaryStorage)
       const router = finalizeEvent(makeRouterEvent({
@@ -152,6 +160,7 @@ async function * wrapPreparedEvents ({ privateChannelSigner, receivers, receiver
         imkcPubkey: context.imkcPubkey,
         imkcProof: context.imkcProof,
         receiverPubkey: routerReceiverTag,
+        fileChunkIndex,
         chunkIndex: index,
         chunkTotal: total,
         content
@@ -172,7 +181,7 @@ async function * wrapPreparedEvents ({ privateChannelSigner, receivers, receiver
 }
 
 // Streaming version of wrapEvent
-export async function * wrapEvents ({ senderSigner, imkcSigner, privateChannelSigner = senderSigner, privateChannelReaderPubkey, receivers, receiverTag, deletionPubkey, event, expirationSeconds = EXPIRATION_SECONDS, temporaryStorageArea, _getIykcProofs = getIykcProofs }) {
+export async function * wrapEvents ({ senderSigner, imkcSigner, privateChannelSigner = senderSigner, privateChannelReaderPubkey, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey, event, expirationSeconds = EXPIRATION_SECONDS, temporaryStorageArea, _getIykcProofs = getIykcProofs }) {
   const normalizedDeletionPubkey = normalizeDeletionPubkey(deletionPubkey)
   const context = await prepareRoutedMessage({
     senderSigner,
@@ -185,7 +194,7 @@ export async function * wrapEvents ({ senderSigner, imkcSigner, privateChannelSi
     _getIykcProofs
   })
   try {
-    yield * wrapPreparedEvents({ privateChannelSigner, receivers, receiverTag, deletionPubkey: normalizedDeletionPubkey, expirationSeconds, context })
+    yield * wrapPreparedEvents({ privateChannelSigner, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey: normalizedDeletionPubkey, expirationSeconds, context })
   } finally {
     cleanupEnvelopeRows(context.preparedRows)
   }
@@ -415,6 +424,12 @@ export async function unwrapEvent ({ receiverSigner, privateChannelSigner = rece
     channelReaderSigner,
     channelReaderPubkey: privateChannelReaderPubkey
   })
+  return unwrapRouterEvent({ router, receiverSigner, receiverPubkey, channelPubkey })
+}
+
+// Recovery records contain an encrypted recipient row, not the original outer
+// signature. Authenticate the control response before invoking this decoder.
+export async function unwrapRouterEvent ({ router, receiverSigner, receiverPubkey, channelPubkey }) {
   if (router.kind !== ROUTER_KIND) throw new ValidationError('INVALID_ROUTER_KIND')
   if (receiverPubkey && readReceiverTag(router) && readReceiverTag(router) !== receiverPubkey) return null
 
@@ -506,7 +521,7 @@ function withRecoveryRelays (relays, recoveryRelays) {
   return uniq([...(relays || []), ...(recoveryRelays || [])])
 }
 
-export async function publish ({ senderSigner, imkcSigner, privateChannelSigner = senderSigner, privateChannelReaderPubkey, receivers, receiverTag, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, _getIykcProofs = getIykcProofs, _publish = sendToRelays }) {
+export async function publish ({ senderSigner, imkcSigner, privateChannelSigner = senderSigner, privateChannelReaderPubkey, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, _getIykcProofs = getIykcProofs, _publish = sendToRelays }) {
   const normalizedDeletionPubkey = normalizeDeletionPubkey(deletionPubkey)
   const results = []
   // Relays are grouped only when they have the exact same recipient pubkey set
@@ -524,7 +539,7 @@ export async function publish ({ senderSigner, imkcSigner, privateChannelSigner 
     })
     try {
       for (const group of groups) {
-        for await (const wrappedEvent of wrapPreparedEvents({ privateChannelSigner, receivers: group.receivers, receiverTag, deletionPubkey: normalizedDeletionPubkey, expirationSeconds, context })) {
+        for await (const wrappedEvent of wrapPreparedEvents({ privateChannelSigner, receivers: group.receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey: normalizedDeletionPubkey, expirationSeconds, context })) {
           results.push(await _publish(wrappedEvent, withRecoveryRelays(group.relays, recoveryRelays)))
         }
       }
@@ -534,7 +549,7 @@ export async function publish ({ senderSigner, imkcSigner, privateChannelSigner 
     return results
   }
 
-  for await (const wrappedEvent of wrapEvents({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag, deletionPubkey: normalizedDeletionPubkey, event, expirationSeconds, temporaryStorageArea, _getIykcProofs })) {
+  for await (const wrappedEvent of wrapEvents({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey: normalizedDeletionPubkey, event, expirationSeconds, temporaryStorageArea, _getIykcProofs })) {
     results.push(await _publish(wrappedEvent, withRecoveryRelays(relays, recoveryRelays)))
   }
   return results
@@ -765,6 +780,7 @@ function createProcessor ({
       const senderPubkey = readSenderTag(router)
       if (receiverPubkey && readReceiverTag(router) && readReceiverTag(router) !== receiverPubkey && senderPubkey !== receiverPubkey) return
       const { index, total } = readChunkTag(router)
+      readFileChunkIndex(router)
       groupKey = receivedChunks.groupKeyFor(channelPubkey, router.pubkey)
       if (ignoredGroups.has(groupKey)) return
 
@@ -773,6 +789,7 @@ function createProcessor ({
       const meta = await receivedChunks.put({
         channelPubkey,
         routerPubkey: router.pubkey,
+        descriptor: JSON.stringify(router.tags.filter(tag => tag[0] !== 'c')),
         index,
         total,
         contentBytes: base64ToBytes(router.content),
@@ -976,6 +993,7 @@ export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = 
   const consumePromise = consumeEvents()
 
   return {
+    ready: events.ready || Promise.resolve(),
     close () {
       controller.abort()
       return consumePromise

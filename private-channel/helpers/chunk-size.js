@@ -16,7 +16,7 @@ function routerPlaintextByteLengthForChunk (jsonlByteLength) {
     kind: ROUTER_KIND,
     pubkey: SAMPLE_PUBKEY,
     created_at: MAX_TIME_SECONDS,
-    tags: [['f', SAMPLE_PUBKEY], ['imkc', SAMPLE_PUBKEY, `${MAX_TIME_SECONDS}:${SAMPLE_SIGNATURE}`], ['c', MAX_CHUNK_TAG_VALUE, MAX_CHUNK_TAG_VALUE], ['r', SAMPLE_PUBKEY]],
+    tags: [['f', SAMPLE_PUBKEY], ['imkc', SAMPLE_PUBKEY, `${MAX_TIME_SECONDS}:${SAMPLE_SIGNATURE}`], ['c', MAX_CHUNK_TAG_VALUE, MAX_CHUNK_TAG_VALUE], ['p', SAMPLE_PUBKEY], ['i', String(Number.MAX_SAFE_INTEGER)]],
     content: 'A'.repeat(base64EncodedByteLength(jsonlByteLength)),
     id: SAMPLE_PUBKEY,
     sig: SAMPLE_SIGNATURE

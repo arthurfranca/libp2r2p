@@ -156,7 +156,7 @@ function setPreparedRow (id, index, row, temporaryStorage) {
   storageFor(temporaryStorage).setItem(rowTempKey(id, index), row)
 }
 
-function readPreparedRow (preparedRows, index) {
+export function readPreparedRow (preparedRows, index) {
   const row = storageFor(preparedRows.temporaryStorage).getItem(rowTempKey(preparedRows.id, index))
   if (typeof row !== 'string') throw new ValidationError('MISSING_PREPARED_ROW')
   return row

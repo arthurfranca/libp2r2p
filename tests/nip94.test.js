@@ -55,3 +55,19 @@ test('download intent defaults to 0, supports a bare event tag and rejects ambig
   }
   assert.throws(() => createFileMetadata({ url: 'https://example.com/a', mime: 'image/png', download: true }), { code: 'INVALID_FILE_METADATA_DOWNLOAD' })
 })
+
+test('thumbnail root extensions are unordered, strict and independent from the original', () => {
+  const root = 'ab'.repeat(32)
+  const thumb = 'cd'.repeat(32)
+  const metadata = { url: `https://nostr.alt/${nfileEncode({ root, mime: 'image/jpeg' })}?localOnly=1`, root, mime: 'image/jpeg', size: 120000, thumbnail: { root: thumb, size: 12345, url: `https://nostr.alt/${nfileEncode({ root: thumb, mime: 'image/png' })}?localOnly=1` } }
+  const event = createFileMetadata(metadata)
+  assert.deepEqual(decodeFileMetadata(event).thumbnail, metadata.thumbnail)
+  const reference = event.tags.find(tag => tag[0] === 'r' && tag[1] === thumb)
+  reference.splice(2, 2, 'size 12345', 'future extension', 'mark thumb')
+  assert.deepEqual(decodeFileMetadata(event).thumbnail, metadata.thumbnail)
+  reference.push('size 12345')
+  assert.throws(() => decodeFileMetadata(event), /INVALID_FILE_METADATA_ROOT_REFERENCE/)
+  reference.pop()
+  reference[1] = root
+  assert.throws(() => decodeFileMetadata(event), /FILE_METADATA_NFILE_MISMATCH/)
+})

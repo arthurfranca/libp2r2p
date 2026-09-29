@@ -134,3 +134,19 @@ NIP-46 against the real pool with controlled transport and injected controls.
   URL and `private-channel.subscribe` operation. Do not mutate shared native
   transport errors; keep the original as cause and preserve message/code/category,
   close details and AggregateError children. Do not guess absent relay metadata.
+
+## Private file channels
+
+- The public `private-messenger/file` coordinator owns file transfer/recovery;
+  callers provide resolved signers and persisted IRFS chunk adapters. All data,
+  including thumbnails, uses `dm:media:<canonical root>`; requests use the parent
+  conversation, compact replies use the file channel. Do not create permanent
+  watched seeder channels per file or alter ordinary DM temporal recovery.
+- Router 26300 uses `p`, never legacy `r`, for recipient routing; carrier 26400
+  has no recipient tag. Inner control `r` and NIP-94 root `r` keep their meanings.
+  Router `i` identifies the IRFS index; `c` identifies transport fragmentation.
+- Persist ciphertext seeds before publication. File seeds have a separate 64 MiB
+  FIFO budget and parent retention; include their DB in identity maintenance.
+  Completion depends on validated persisted chunks, never reply terminal markers.
+- Parse NIP-94 root extensions by field name, not ordinal position. Only the root
+  is fixed at tag[1]. Preserve ThumbHash Base64 and optional thumbnail SHA-256.

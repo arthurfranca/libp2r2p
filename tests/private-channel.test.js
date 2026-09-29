@@ -655,7 +655,7 @@ test('publishNymEvent mirrors carrier chunks to recovery relays', async () => {
 })
 
 test('received chunk default cap is 16 MiB', () => {
-  assert.equal(getJsonlChunkByteSize(), 30159)
+  assert.equal(getJsonlChunkByteSize(), 30141)
   assert.equal(DEFAULT_RECEIVED_CHUNK_MAX_BYTES, 16 * 1024 * 1024)
 })
 
@@ -1605,7 +1605,7 @@ test('wrapEvent chunks large jsonl without oversize events and unwraps reassembl
     routers.push(await decryptPrivateBroadcast(alice, await alice.getPublicKey(), event.content))
   }
   assert.equal(routers[0].kind, ROUTER_KIND)
-  assert.equal(routers[0].tags.find(t => t[0] === 'r')?.[1], bobPubkey)
+  assert.equal(routers[0].tags.find(t => t[0] === 'p')?.[1], bobPubkey)
   assert.equal(routers[0].tags.find(t => t[0] === 'imkc')?.[1], imkcPubkey)
   assert.ok(routers[0].tags.find(t => t[0] === 'imkc')?.[2])
   assert.equal(routers.length, Number(routers[0].tags.find(t => t[0] === 'c')[2]))

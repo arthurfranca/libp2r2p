@@ -38,3 +38,16 @@ A bare/empty/duplicate/invalid value throws `INVALID_MEDIA_METADATA_DOWNLOAD`;
 `extractMedia()` carries the string flag for ordinary URLs and nfile URLs,
 including long nfile entities and `?localOnly=1`. Metadata fragments do not
 change the bytes or root of a file; clients strip them from download routes.
+
+## Thumbnails
+
+`thumbnail: { url, root?, size?, sha256? }` emits a `thumb` tag and, when a root
+is supplied, `['r', root, 'mark thumb', 'size <bytes>']`. `sha256` is the optional
+third thumb-tag value. Original `r` stays unmarked. Decode validates nfile/root
+agreement separately for original and thumbnail.
+
+Only `r[1]` has a fixed position. `parseRootReference(tag)` parses the variadic
+fields by their names; `mark` and `size` may appear in either order. Unknown
+extensions are ignored. Duplicate recognized fields, ambiguous roots and unsafe
+sizes are rejected. ThumbHash remains unchanged Base64, including through
+percent-encoded NIP-27 `thumbhash` fragments; legacy `blurhash` still parses.

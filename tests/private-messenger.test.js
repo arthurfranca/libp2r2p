@@ -2581,3 +2581,21 @@ test('incomplete fetch reaches onError unchanged and remains pending until a suc
   assert.equal(state.recoveredThrough, now)
   assert.deepEqual(state.offlineRanges, [])
 })
+
+test('outgoing seeder capture precedes publication and does not require a network echo', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://recipient-only.example'], mode: 'seeder' }]
+  })
+  const seed = { channelPubkey: 'channel', router: { kind: 26300, pubkey: 'router', created_at: Math.floor(Date.now() / 1000), tags: [['f', 'user'], ['p', 'recipient']], content: jsonlContent(payloadRow(), JSON.stringify(['recipient', 'ciphertext'])) } }
+  pm.broadcastRumor = async options => {
+    await options.onPreparedSeed(seed)
+    assert.equal(await messenger.seedQueue.some(item => item.receiverPubkey === 'recipient'), true)
+    return { delivery: { reports: [{ success: true }] } }
+  }
+  await messenger.broadcastRumor({ receiverPubkeys: ['recipient'], rumor: { kind: 9, tags: [], content: 'hello' } })
+  await messenger.enqueueSeed('channel', seed)
+  assert.equal((await Array.fromAsync(messenger.seedQueue.storedItems())).length, 1, 'echo deduplicates against the local ciphertext')
+  await messenger.close()
+})

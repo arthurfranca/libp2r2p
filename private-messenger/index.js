@@ -265,6 +265,7 @@ export class PrivateMessenger {
     this.state = { channels: {} }
     this.stateWriteTail = Promise.resolve()
     this.stateWriteError = null
+    this.extensions = new Set()
     this.channels = new Map()
     this.stopByChannel = new Map()
     this.desiredChannels = new Set()
@@ -1128,6 +1129,7 @@ export class PrivateMessenger {
 
   unwatch (channels) {
     const pubkeys = channels ? uniq(Array.isArray(channels) ? channels : [channels]) : [...this.desiredChannels]
+    for (const extension of this.extensions) extension.unwatch?.(pubkeys)
     for (const pubkey of pubkeys) this.desiredChannels.delete(pubkey)
     this.recordInterruption(pubkeys)
     for (const controller of this.recoveryControllers) {
@@ -1140,6 +1142,7 @@ export class PrivateMessenger {
     if (typeof reason !== 'string' || !reason.trim()) throw new ValidationError('PAUSE_REASON_REQUIRED')
     this.assertOpen()
     this.pauseReasons.add(reason)
+    for (const extension of this.extensions) extension.pause?.()
     this.recordInterruption(this.desiredChannels)
     for (const controller of this.recoveryControllers) controller.abort()
     return Promise.all([this.stopWatches([...this.desiredChannels]), this.flushStateWrites()])
@@ -1164,6 +1167,7 @@ export class PrivateMessenger {
       if (this.pauseReasons.size || this.closePromise) return
       await this.reconcilePresencePublishers()
       await this.recoverOfflineRanges(channels)
+      for (const extension of this.extensions) await extension.resume?.()
     })()
     this.resumeWork = work
     try { await work } catch (err) {
@@ -1238,6 +1242,7 @@ export class PrivateMessenger {
   async handleAsk (channelPubkey, message) {
     if (message.provenance === 'hearsay') return this.enqueueRumor('message', channelPubkey, message)
     this.trackSeederActivity(channelPubkey, message)
+    for (const extension of this.extensions) if (await extension.handleAsk?.(channelPubkey, message)) return
     if (doesModeStoreRecoverySeeds(this.channels.get(channelPubkey)?.mode) && messageCode(message) === MISSING_MESSAGES_ASK_CODE) {
       await this.replyWithStoredSeeds(channelPubkey, message)
       return
@@ -1327,6 +1332,11 @@ export class PrivateMessenger {
     this.wakeDeliveries()
     this.debug('enqueue', debugMessageInfo(type, channelPubkey, message))
     this.onMessageQueued?.()
+  }
+
+  outgoingSeedHandler (channelPubkey) {
+    if (!doesModeStoreRecoverySeeds(this.channels.get(channelPubkey)?.mode) || !this.offlineRecoverySecondsFor(channelPubkey)) return undefined
+    return seed => this.enqueueSeed(channelPubkey, seed)
   }
 
   async enqueueSeed (channelPubkey, seed) {
@@ -1494,6 +1504,7 @@ export class PrivateMessenger {
       payload,
       error,
       content,
+      onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
       _getIykcProofs: this.contentKeyLookup()
     })
   }
@@ -1520,6 +1531,7 @@ export class PrivateMessenger {
       payload,
       error,
       content,
+      onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
       _getIykcProofs: this.contentKeyLookup()
     })
   }
@@ -1544,6 +1556,7 @@ export class PrivateMessenger {
       payload,
       error,
       content,
+      onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
       _getIykcProofs: this.contentKeyLookup()
     })
   }
@@ -1568,6 +1581,7 @@ export class PrivateMessenger {
       payload,
       error,
       content,
+      onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
       _getIykcProofs: this.contentKeyLookup()
     })
   }
@@ -1588,6 +1602,7 @@ export class PrivateMessenger {
       deletionPubkey,
       autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       rumor,
+      onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
       _getIykcProofs: this.contentKeyLookup()
     })
   }
@@ -1608,6 +1623,7 @@ export class PrivateMessenger {
       deletionPubkey,
       autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       event,
+      onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
       _getIykcProofs: this.contentKeyLookup()
     })
   }
@@ -1664,6 +1680,7 @@ export class PrivateMessenger {
       autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       code: SEEDER_PRESENCE_CODE,
       payload: {},
+      onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
       _getIykcProofs: this.contentKeyLookup()
     })
   }
@@ -2177,6 +2194,7 @@ export class PrivateMessenger {
       let unwatchError
       try { await unwatchPromise } catch (err) { unwatchError = err }
       await initSettledPromise
+      await Promise.all([...this.extensions].map(extension => extension.close?.()))
       await this.stampActiveChannelActivity()
       await this.queueOperationTail
       await Promise.allSettled([...this.recoveries.values()])

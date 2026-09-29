@@ -12,7 +12,7 @@ export function eventByteLength (event) {
 }
 
 export function readReceiverTag (event) {
-  return event.tags?.find(t => t[0] === 'r')?.[1] || ''
+  return event.tags?.find(t => t[0] === 'p')?.[1] || ''
 }
 
 export function readSenderTag (event) {
@@ -47,14 +47,18 @@ export function readChunkTag (event) {
   return { index, total }
 }
 
-export function makeRouterEvent ({ pubkey, senderPubkey, imkcPubkey, imkcProof, receiverPubkey, chunkIndex, chunkTotal, content }) {
+export function makeRouterEvent ({ pubkey, senderPubkey, imkcPubkey, imkcProof, receiverPubkey, chunkIndex, chunkTotal, fileChunkIndex, content }) {
   const tags = [['f', senderPubkey]]
   if (imkcPubkey) {
     if (!imkcProof) throw new ValidationError('INVALID_IMKC_PROOF')
     tags.push(['imkc', imkcPubkey, imkcProof])
   }
+  if (fileChunkIndex !== undefined) {
+    if (!Number.isSafeInteger(fileChunkIndex) || fileChunkIndex < 0) throw new ValidationError('INVALID_FILE_CHUNK_INDEX')
+    tags.push(['i', String(fileChunkIndex)])
+  }
   tags.push(['c', String(chunkIndex), String(chunkTotal)])
-  if (receiverPubkey) tags.push(['r', receiverPubkey])
+  if (receiverPubkey) tags.push(['p', receiverPubkey])
   return { kind: ROUTER_KIND, pubkey, created_at: nowSeconds(), tags, content }
 }
 
@@ -66,4 +70,11 @@ export function makeNymCarrierEvent ({ innerId, chunkIndex, chunkTotal, content,
     tags: [['id', innerId], ['c', String(chunkIndex), String(chunkTotal)]],
     content
   }
+}
+
+export function readFileChunkIndex (event) {
+  const tags = event.tags?.filter(tag => tag[0] === 'i') || []
+  if (!tags.length) return undefined
+  if (tags.length !== 1 || tags[0].length !== 2 || !/^(0|[1-9][0-9]*)$/.test(tags[0][1]) || !Number.isSafeInteger(Number(tags[0][1]))) throw new ValidationError('INVALID_FILE_CHUNK_INDEX')
+  return Number(tags[0][1])
 }

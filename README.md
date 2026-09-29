@@ -890,3 +890,18 @@ complete per-relay report without delaying the first-success return. Connection
 establishment retains its separate 3-second deadline. PrivateMessenger inherits
 this publication policy, including seeder/recovery messages. A timeout indicates
 missing acknowledgement and cannot prove that the recipient did not receive it.
+
+## Private file channels (0.11)
+
+`libp2r2p/private-messenger/file` provides `createPrivateFileTransfer` for
+separate per-root media channels, bounded indexed recovery and persisted-byte
+progress. [The file API and protocol](private-messenger/file/README.md) document
+signer/storage adapters and lifecycle. All original and thumbnail chunks belong
+to `dm:media:<root>`; small authenticated recovery requests stay on `dm`.
+NIP-94 supports `thumbnail` metadata with unordered `mark`/`size` root extensions.
+
+This release changes the encrypted router recipient tag from `r` to `p` without
+legacy fallback. Upgrade communicating consumers together. Inner ask/reply/tell
+`r` tags, file-reference `r` tags, and carrier 26400 are unchanged. Seeders now
+capture outgoing recipient ciphertext before publishing, even without relay echo.
+No group derivation or multi-device seed replication is introduced.

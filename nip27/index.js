@@ -201,6 +201,7 @@ const NIP94_TAGS = {
   magnet: ['magnet'],
   i: ['i'],
   blurhash: ['blurhash'],
+  thumbhash: ['thumbhash'],
   thumb: ['thumb'],
   image: ['image'],
   summary: ['summary'],

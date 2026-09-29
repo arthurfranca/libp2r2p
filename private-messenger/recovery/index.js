@@ -193,7 +193,7 @@ function compactNymCarriersFromSeed (seed, { since, until }) {
   }]
 }
 
-function compactRecordsFromSeed (seed, { receiverPubkey, since, until }) {
+export function compactRecordsFromSeed (seed, { receiverPubkey, since, until }) {
   if (seed?.recordType === NYM_CARRIER_SEED_RECORD_TYPE) {
     return compactNymCarriersFromSeed(seed, { since, until })
   }

@@ -135,6 +135,7 @@ function normalizeMeta (meta, fallbackTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS) {
   return {
     groupKey: String(meta.groupKey),
     channelPubkey: String(meta.channelPubkey || ''),
+    descriptor: meta.descriptor,
     routerPubkey: String(meta.routerPubkey || ''),
     total,
     received: normalizeReceived(meta.received),
@@ -274,7 +275,7 @@ export function createReceivedChunkStore ({
     return cleanupStaleRaw(nowMs)
   }
 
-  async function putOnce ({ channelPubkey, routerPubkey, index, total, contentBytes, ttlMs }) {
+  async function putOnce ({ channelPubkey, routerPubkey, index, total, contentBytes, ttlMs, descriptor }) {
     const groupKey = groupKeyFor(channelPubkey, routerPubkey)
     const bytes = normalizeBytes(contentBytes)
     const now = Date.now()
@@ -287,6 +288,7 @@ export function createReceivedChunkStore ({
         await deleteGroupInTransaction(tx, groupKey, usage, meta)
         meta = null
       }
+      if (meta && meta.descriptor !== descriptor) throw new ValidationError('INCONSISTENT_ROUTER_DESCRIPTOR')
       if (meta && meta.total !== total) {
         await deleteGroupInTransaction(tx, groupKey, usage, meta)
         meta = null
@@ -296,6 +298,7 @@ export function createReceivedChunkStore ({
           groupKey,
           channelPubkey,
           routerPubkey,
+          descriptor,
           total,
           received: {},
           receivedCount: 0,
@@ -364,7 +367,7 @@ export function createReceivedChunkStore ({
     })
   }
 
-  async function put ({ channelPubkey, routerPubkey, index, total, contentBytes, ttlMs }) {
+  async function put ({ channelPubkey, routerPubkey, index, total, contentBytes, ttlMs, descriptor }) {
     if (!channelPubkey || !routerPubkey) throw new ValidationError('RECEIVED_CHUNK_GROUP_REQUIRED')
     if (!Number.isSafeInteger(index) || !Number.isSafeInteger(total) || index < 0 || total < 1 || index >= total) {
       throw new ValidationError('INVALID_RECEIVED_CHUNK_INDEX')
@@ -373,7 +376,7 @@ export function createReceivedChunkStore ({
     await ready()
     while (true) {
       try {
-        const result = await putOnce({ channelPubkey, routerPubkey, index, total, contentBytes: bytes, ttlMs })
+        const result = await putOnce({ channelPubkey, routerPubkey, index, total, contentBytes: bytes, ttlMs, descriptor })
         if (result.tooLarge) throw new Error('RECEIVED_CHUNK_GROUP_TOO_LARGE')
         return result.meta
       } catch (err) {
