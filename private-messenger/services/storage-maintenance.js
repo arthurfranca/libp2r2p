@@ -187,6 +187,7 @@ function storageDatabaseNames (userPubkey) {
     `${prefix}:idb-queue`,
     `${prefix}:seeds:idb-queue`,
     `${prefix}:file-seeds:idb-queue`,
+    `${prefix}:file-authorizations:idb-queue`,
     `${prefix}:state:idb`
   ]
 }

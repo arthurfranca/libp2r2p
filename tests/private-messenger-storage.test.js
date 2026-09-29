@@ -116,6 +116,8 @@ test('private messenger keeps an inactive storage set for 59 days and removes it
   try {
     const messenger = await createMessenger(indexedDB, userPubkey)
     await messenger.queue.enqueue({ id: 'unconsumed' })
+    const catalog = await openDatabase(indexedDB, `libp2r2p:private-messenger:${userPubkey}:file-authorizations:idb-queue`)
+    catalog.close()
     await messenger.close()
 
     now += PRIVATE_MESSENGER_IDENTITY_STORAGE_RETENTION_MS - 24 * 60 * 60 * 1000
@@ -128,6 +130,7 @@ test('private messenger keeps an inactive storage set for 59 days and removes it
     names = await databaseNames(indexedDB)
     assert.equal(names.has(`libp2r2p:private-messenger:${userPubkey}:idb-queue`), false)
     assert.equal(names.has(`libp2r2p:private-messenger:${userPubkey}:seeds:idb-queue`), false)
+    assert.equal(names.has(`libp2r2p:private-messenger:${userPubkey}:file-authorizations:idb-queue`), false)
     assert.equal(names.has(`libp2r2p:private-messenger:${userPubkey}:state:idb`), false)
     assert.equal(await readRegistryRecord(indexedDB, userPubkey), null)
   } finally {

@@ -1,6 +1,6 @@
 {
   "name": "libp2r2p",
-  "version": "0.10.28",
+  "version": "0.11.0",
   "description": "Peer-to-relay-to-peer",
   "keywords": [
     "p2r2p",
@@ -86,6 +86,7 @@
     "./private-channel": "./private-channel/index.js",
     "./private-message": "./private-message/index.js",
     "./private-messenger": "./private-messenger/index.js",
+    "./private-messenger/file": "./private-messenger/file/index.js",
     "./private-messenger/recovery": "./private-messenger/recovery/index.js",
     "./relay": "./relay/index.js",
     "./temporary-storage": "./temporary-storage/index.js",

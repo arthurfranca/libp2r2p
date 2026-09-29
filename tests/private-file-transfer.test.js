@@ -129,9 +129,10 @@ test('unknown-size manual download learns the total and checks the final size', 
   } finally { await f.close() }
 })
 
-test('publication captures durable recipient seeds and replies on data, never on dm', async () => {
+test('watchtower keeps durable recipient seeds and replies on data, never on dm', async () => {
   const f = await fixture()
   await f.close()
+  f.messenger.channels.get(control).mode = 'watchtower'
   // Reuse the same isolated messenger/database with a controlled publication adapter.
   const replies = []
   const manager = createPrivateFileTransfer({

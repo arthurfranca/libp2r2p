@@ -1,3 +1,5 @@
+import NMMR from 'nmmr'
+import { createFileCatalog } from './helpers/catalog.js'
 import { ValidationError } from '../../error/index.js'
 import { IRFS_CHUNK_BYTES, decodeIrfsChunk } from '../../irfs/index.js'
 import { createQueue } from '../../idb-queue/index.js'
@@ -8,6 +10,7 @@ import { compactSeedRouterRows, compactRecordsFromSeed, createEventReplyPacker, 
 
 export const FILE_CHUNKS_REQUEST_CODE = 'fileChunksRequest_p5cc'
 export const FILE_CHUNKS_REPLY_CODE = 'fileChunksReply_p5cc'
+export const IRFS_CHUNK_RECORD_TYPE = 'irfsChunk_v1'
 export const AUTO_DOWNLOAD_BYTES = 1024 * 1024
 export const FILE_REQUEST_CHUNKS = 16
 const HEX = /^[0-9a-f]{64}$/
@@ -59,7 +62,7 @@ function waitForTransfer (promise, signal) {
 
 // One coordinator per account. Signer derivation and the local IRFS database
 // belong to the caller; recovery, validation and scheduling belong here.
-export function createPrivateFileTransfer ({ messenger, resolveChannel, storage, onError = () => {}, _transport = channelTransport, _messages = messages, _hedgeMs = 2000, _idleMs = 30000 }) {
+export function createPrivateFileTransfer ({ messenger, resolveChannel, storage, onError = () => {}, _transport = channelTransport, _messages = messages, _hedgeMs = 2000, _idleMs = 30000, _now = now }) {
   if (!messenger?.extensions || typeof resolveChannel !== 'function' || !storage?.read || !storage?.save) throw new ValidationError('INVALID_FILE_TRANSFER_OPTIONS')
   const registrations = new Map()
   const jobs = new Map()
@@ -72,6 +75,8 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
   let closed = false
   let queuePromise
   const queue = () => (queuePromise ??= createQueue({ prefix: `${messenger.prefix}:file-seeds`, indexedDB: messenger._indexedDB, maxBytes: 64 * 1024 * 1024, evictionPolicy: 'fifo', indexes: { key: { keyPath: 'key', unique: true }, channel: 'fileChannelPubkey' } }))
+  const catalog = createFileCatalog({ messenger, now: _now })
+  catalog.ready.catch(onError)
   const keyFor = (control, root) => `${control}:${root}`
   const emit = job => { for (const listener of listeners) listener({ root: job.file.root, controlChannelPubkey: job.file.controlChannelPubkey, status: job.status, completed: job.completed, total: job.file.size, error: job.error }) }
   const usable = file => {
@@ -79,14 +84,16 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     messenger.requireWritableChannel(file.controlChannelPubkey)
     if (!messenger.desiredChannels.has(file.controlChannelPubkey)) throw new Error('FILE_TRANSFER_CHANNEL_UNWATCHED')
   }
-  async function register ({ controlChannelPubkey, peerPubkey, root, size }) {
+  async function register ({ controlChannelPubkey, peerPubkey, root, size, sharedAt }) {
     fileChannelInfo(root)
     if (!HEX.test(controlChannelPubkey) || !HEX.test(peerPubkey) || (size !== undefined && (!Number.isSafeInteger(size) || size < 1))) throw new ValidationError('INVALID_FILE_TRANSFER_DESCRIPTOR')
+    if (sharedAt !== undefined && (!Number.isSafeInteger(sharedAt) || sharedAt < 0)) throw new ValidationError('INVALID_FILE_SHARED_AT')
     const key = keyFor(controlChannelPubkey, root)
     const previous = registrations.get(key)
     if (previous && (previous.peerPubkey !== peerPubkey || (size !== undefined && previous.size !== undefined && previous.size !== size))) throw new ValidationError('CONFLICTING_FILE_TRANSFER_DESCRIPTOR')
     const file = previous || { controlChannelPubkey, peerPubkey, root }
     if (size !== undefined) file.size = size
+    if (sharedAt !== undefined) file.sharedAt = Math.max(file.sharedAt ?? 0, sharedAt)
     registrations.set(key, file)
     file.ready ||= (async () => {
       file.signer = await resolveChannel({ controlChannelPubkey, peerPubkey, root, info: fileChannelInfo(root) })
@@ -100,22 +107,30 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     const parent = messenger.channels.get(file.controlChannelPubkey)
     return ['seeder', 'watchtower'].includes(parent?.mode) && messenger.offlineRecoverySecondsFor(parent) > 0
   }
+  async function authorizeSeeding (descriptor, { receiverPubkeys, sharedAt } = {}) {
+    if (!Array.isArray(receiverPubkeys) || !receiverPubkeys.length || !receiverPubkeys.every(key => typeof key === 'string' && HEX.test(key))) throw new ValidationError('INVALID_FILE_AUTHORIZATION_RECEIVERS')
+    if (!Number.isSafeInteger(sharedAt) || sharedAt < 0) throw new ValidationError('INVALID_FILE_SHARED_AT')
+    const file = await register(descriptor)
+    usable(file)
+    await catalog.authorize(file, [...new Set(receiverPubkeys)], sharedAt)
+  }
   async function prune () {
+    await catalog.prune()
     if (!queuePromise) return
     await (await queue()).removeWhere(row => {
       const parent = messenger.channels.get(row.controlChannelPubkey)
-      return !parent || !seedEnabled(row) || row.expiresAt <= now() || row.receivedAt + messenger.offlineRecoverySecondsFor(parent) <= now()
+      return parent?.mode !== 'watchtower' || !seedEnabled(row) || row.expiresAt <= _now() || row.receivedAt + messenger.offlineRecoverySecondsFor(parent) <= _now()
     })
   }
   async function saveSeed (file, seed) {
-    if (!seedEnabled(file)) return
+    if (messenger.channels.get(file.controlChannelPubkey)?.mode !== 'watchtower' || !seedEnabled(file)) return
     const index = readFileChunkIndex(seed.router)
     if (index === undefined) return
     const db = await queue()
     for (const row of compactSeedRouterRows(seed)) {
       if (![file.peerPubkey, messenger.userPubkey].includes(row.receiverPubkey)) continue
       const key = `${file.controlChannelPubkey}:${file.fileChannelPubkey}:${row.receiverPubkey}:${index}`
-      await db.putBy('key', { ...row, key, root: file.root, controlChannelPubkey: file.controlChannelPubkey, fileChannelPubkey: file.fileChannelPubkey, peerPubkey: file.peerPubkey, chunkIndex: index, receivedAt: now(), expiresAt: now() + messenger.offlineRecoverySecondsFor(file.controlChannelPubkey) })
+      await db.putBy('key', { ...row, key, root: file.root, controlChannelPubkey: file.controlChannelPubkey, fileChannelPubkey: file.fileChannelPubkey, peerPubkey: file.peerPubkey, chunkIndex: index, receivedAt: _now(), expiresAt: _now() + messenger.offlineRecoverySecondsFor(file.controlChannelPubkey) })
     }
     await prune()
   }
@@ -135,7 +150,8 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     const file = await register(descriptor)
     usable(file)
     const decoded = checked(file, event)
-    const options = { ...sendOptions(file, await routing(file, file.peerPubkey)), receiverPubkeys: [file.peerPubkey], fileChunkIndex: decoded.index, onPreparedSeed: seed => saveSeed(file, seed) }
+    await catalog.ready
+    const options = { ...sendOptions(file, await routing(file, file.peerPubkey)), receiverPubkeys: [file.peerPubkey], fileChunkIndex: decoded.index, ...(messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? { onPreparedSeed: seed => saveSeed(file, seed) } : {}) }
     const result = event.sig ? await _messages.broadcastEvent({ ...options, event }) : await _messages.broadcastRumor({ ...options, rumor: event })
     assertPublished(result)
     // A scheduler turn between chunks lets queued text/control publications run.
@@ -149,8 +165,40 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     const payload = message.payload.payload
     if (!HEX.test(payload?.fileChannelPubkey)) throw new ValidationError('INVALID_FILE_TRANSFER_DESCRIPTOR')
     const indices = new Set(decodeMissingRanges(payload.missingRanges))
-    const db = await queue()
     await prune()
+    const grant = await catalog.find(controlChannelPubkey, payload.fileChannelPubkey, question.pubkey)
+    if (grant) {
+      const file = await register(grant)
+      usable(file)
+      if (file.fileChannelPubkey !== payload.fileChannelPubkey) throw new ValidationError('FILE_CHANNEL_MISMATCH')
+      const routes = await routing(file, question.pubkey)
+      const packer = createEventReplyPacker({
+        messenger: {
+          reply: async options => {
+            usable(file)
+            if (!await catalog.find(controlChannelPubkey, file.fileChannelPubkey, question.pubkey)) return
+            return _messages.reply({ ...sendOptions(file, routes), ...options })
+          }
+        },
+        channelPubkey: file.fileChannelPubkey, question, receiverPubkey: question.pubkey,
+        code: FILE_CHUNKS_REPLY_CODE, eventsPerChunk: 1, recordsFromInput: record => [record]
+      })
+      for (const index of indices) {
+        usable(file)
+        if (!await catalog.find(controlChannelPubkey, file.fileChannelPubkey, question.pubkey)) break
+        const event = await storage.read(file.root, index, file)
+        if (!event) continue
+        let decoded
+        try { decoded = checked(file, event, index) } catch (error) { if (error instanceof ValidationError) { onError(error); continue } throw error }
+        const proof = event.tags.find(tag => tag[0] === 'mmr')[3]
+        await packer.update({ recordType: IRFS_CHUNK_RECORD_TYPE, index, total: decoded.total, proof, content: event.content })
+        await new Promise(resolve => setTimeout(resolve, 0))
+      }
+      await packer.finalize()
+      return true
+    }
+    if (messenger.channels.get(controlChannelPubkey)?.mode !== 'watchtower') return true
+    const db = await queue()
     let packer
     for await (const seed of db.storedItemsBy('channel', payload.fileChannelPubkey)) {
       if (seed.controlChannelPubkey !== controlChannelPubkey || seed.receiverPubkey !== question.pubkey || !indices.has(seed.chunkIndex) || !seedEnabled(seed)) continue
@@ -209,6 +257,13 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
           for (const line of rows) {
             let record
             try { record = JSON.parse(line) } catch { throw new ValidationError('INVALID_FILE_CHUNK_REPLY') }
+            if (record.recordType === IRFS_CHUNK_RECORD_TYPE) {
+              if (!Number.isSafeInteger(record.index) || record.index < 0 || !Number.isSafeInteger(record.total) || record.total <= record.index || typeof record.content !== 'string' || record.content.length > 100000 || typeof record.proof !== 'string' || record.proof.length > 8192) throw new ValidationError('INVALID_FILE_CHUNK_REPLY')
+              const chunk = { kind: 34601, created_at: event.created_at, tags: [['d', NMMR.deriveChunkId(file.root, record.index)], ['mmr', String(record.index), String(record.total), record.proof]], content: record.content }
+              await accept(chunk, record.index)
+              successes.set(event.pubkey, Date.now())
+              continue
+            }
             if (record.recordType !== ROUTER_SEED_RECORD_TYPE) continue
             const index = readFileChunkIndex(record.router)
             if (index === undefined) throw new ValidationError('INVALID_FILE_CHUNK_INDEX')
@@ -220,6 +275,9 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
           const index = readFileChunkIndex(meta.router)
           if (index === undefined) throw new ValidationError('INVALID_FILE_CHUNK_INDEX')
           await accept(event, index)
+          // Only direct, validated delivery proves this identity was a recipient.
+          // Local cache hits and recovery replies never create/renew a grant.
+          if (file.sharedAt !== undefined) await authorizeSeeding(file, { receiverPubkeys: [messenger.userPubkey], sharedAt: file.sharedAt })
         }
       })
       // Malformed remote records do not poison the ingestion chain. Operational
@@ -238,7 +296,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
       if (total !== undefined && persisted.size === total) return
       const parent = messenger.requireWritableChannel(file.controlChannelPubkey)
       const relays = await messenger.resolveWatchRelays(parent)
-      const options = { receiverSigner: messenger.userSigner, privateChannelSigner: file.signer, privateChannelPubkey: file.fileChannelPubkey, receiverPubkey: messenger.userPubkey, relays, receivedChunkIndexedDB: messenger._indexedDB, receivedChunkScope: `${messenger.userPubkey}:file:${file.fileChannelPubkey}`, onEvent: consume, onSeedEvent: seed => saveSeed(file, seed), mode: seedEnabled(file) ? 'seeder' : 'leecher', onError }
+      const options = { receiverSigner: messenger.userSigner, privateChannelSigner: file.signer, privateChannelPubkey: file.fileChannelPubkey, receiverPubkey: messenger.userPubkey, relays, receivedChunkIndexedDB: messenger._indexedDB, receivedChunkScope: `${messenger.userPubkey}:file:${file.fileChannelPubkey}`, onEvent: consume, onSeedEvent: seed => saveSeed(file, seed), mode: messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? 'watchtower' : 'leecher', onError }
       sub = _transport.subscribe({ ...options, liveOnly: true })
       const stop = () => { sub?.close() }
       signal.addEventListener('abort', stop, { once: true })
@@ -328,7 +386,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     while (replying < 2 && requests.length) {
       const [channel, message] = requests.shift()
       replying++
-      const task = replyToRequest(channel, message).catch(onError).finally(() => { replying--; work.delete(task); drainRequests() })
+      const task = replyToRequest(channel, message).catch(error => { if (!(closed && error.message === 'FILE_TRANSFER_CLOSED')) onError(error) }).finally(() => { replying--; work.delete(task); drainRequests() })
       work.add(task)
     }
   }
@@ -346,10 +404,10 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
       for (const job of jobs.values()) if (job.pauseRequested && job.status !== 'complete') download(job.file, { manual: job.manual, thumbnail: job.thumbnail }).catch(onError)
     },
     unwatch (channels) { for (const job of jobs.values()) if (channels.includes(job.file.controlChannelPubkey)) cancelJob(job) },
-    async close () { if (closed) return; closed = true; extension.pause(); clearInterval(timer); await Promise.allSettled([...work]); if (queuePromise) await (await queuePromise).close(); messenger.extensions.delete(extension); listeners.clear() }
+    async close () { if (closed) return; closed = true; extension.pause(); clearInterval(timer); await Promise.allSettled([...work]); await catalog.close(); if (queuePromise) await (await queuePromise).close(); messenger.extensions.delete(extension); listeners.clear() }
   }
   const timer = setInterval(() => { prune().catch(onError) }, 60000)
   timer.unref?.()
   messenger.extensions.add(extension)
-  return { register, publishChunk, download, close: extension.close, cancel (control, root) { const job = jobs.get(keyFor(control, root)); if (job) { job.pauseRequested = false; cancelJob(job) } }, observe (listener) { listeners.add(listener); for (const job of jobs.values()) emit(job); return () => listeners.delete(listener) } }
+  return { register, authorizeSeeding, publishChunk, download, close: extension.close, cancel (control, root) { const job = jobs.get(keyFor(control, root)); if (job) { job.pauseRequested = false; cancelJob(job) } }, observe (listener) { listeners.add(listener); for (const job of jobs.values()) emit(job); return () => listeners.delete(listener) } }
 }

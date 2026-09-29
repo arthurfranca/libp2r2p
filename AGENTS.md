@@ -145,8 +145,10 @@ NIP-46 against the real pool with controlled transport and injected controls.
 - Router 26300 uses `p`, never legacy `r`, for recipient routing; carrier 26400
   has no recipient tag. Inner control `r` and NIP-94 root `r` keep their meanings.
   Router `i` identifies the IRFS index; `c` identifies transport fragmentation.
-- Persist ciphertext seeds before publication. File seeds have a separate 64 MiB
-  FIFO budget and parent retention; include their DB in identity maintenance.
+- File seeders store durable per-recipient authorizations and serve local verified
+  chunks as `irfsChunk_v1`; only file watchtowers retain ciphertext seeds (64 MiB
+  FIFO). Explicit sharing timestamps bound grants; retries cannot renew them.
+  Include both file DBs in identity maintenance; catalog entries never pin chunks.
   Completion depends on validated persisted chunks, never reply terminal markers.
 - Parse NIP-94 root extensions by field name, not ordinal position. Only the root
   is fixed at tag[1]. Preserve ThumbHash Base64 and optional thumbnail SHA-256.

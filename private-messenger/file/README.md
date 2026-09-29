@@ -5,7 +5,8 @@ creates one account coordinator attached to an initialized PrivateMessenger.
 It does not create permanent watched channels for files. The application resolves
 channel signers and supplies `storage.read(root, index, descriptor)` and
 `storage.save(event, descriptor)`. The latter must resolve only after persistence.
-The descriptor is `{ controlChannelPubkey, peerPubkey, root, size? }`.
+The descriptor is `{ controlChannelPubkey, peerPubkey, root, size?, sharedAt? }`.
+`sharedAt` is a stable sharing timestamp, never a read/retry timestamp.
 
 For one-to-one chats, resolve the signer with
 `withSharedKey(peerPubkey, fileChannelInfo(root))`: the canonical context is
@@ -14,8 +15,13 @@ channels under the same convention. Do not put this context in a public tag or
 append it to the thumbnail URL. This is not a group-key derivation scheme.
 
 - `register(descriptor)` resolves and checks the file channel without watching it.
+- `authorizeSeeding(descriptor, { receiverPubkeys, sharedAt })` durably grants
+  the listed identities indexed recovery of this root on this control/data pair.
+  The application calls it for an explicit share, using its persisted message
+  timestamp (standalone 1063 uses its own timestamp). Registration, cache hits
+  and incoming requests never grant access. Missing router `p` is not a wildcard.
 - `publishChunk(descriptor, event)` checks a 34601 proof and the descriptor,
-  stores its ciphertext seed locally, and publishes to the recipient's relays.
+  captures ciphertext only in watchtower mode, and publishes to the recipient's relays.
   Every wrapper must receive at least one relay acceptance. Yield between calls
   so text/control sends can run. Publish all file chunks before announcing 1063/9.
 - `download(descriptor, { manual, thumbnail, signal })` returns the verified,
@@ -48,6 +54,19 @@ The authenticated direct request travels on the conversation's `dm` channel:
 } }
 ```
 
+A seeder replies from `storage.read`, skipping unavailable indices and validating
+local proofs before sending. Each JSONL record is:
+
+```js
+{ recordType: 'irfsChunk_v1', index, total, proof, content }
+```
+
+`proof` and `content` use Base93. The receiver reconstructs a 34601 template,
+checks its proof against the expected root, and persists it without claiming the
+original announcer authored the reconstructed event. The outer reply remains
+individually encrypted for its recipient. Watchtowers continue replying with
+`routerEnvelopeRow_v1`; they need not decrypt original bytes.
+
 The reply travels on the **file** channel, with code `fileChunksReply_p5cc` and
 the existing compact-record JSONL packer's `index`, `isLast`, and `jsonl` fields.
 The inner reply's `q` references the request event. No new terminal availability
@@ -72,18 +91,36 @@ The existing 65,536-byte event ceiling includes the additional router overhead.
 
 ## Storage and scope
 
-Ciphertext seeds live in
-`libp2r2p:private-messenger:<owner>:file-seeds:idb-queue`, independently of DM
-seeds, with a 64 MiB FIFO budget. `items` has unique `key` and `channel` indexes;
-`state` retains the ordinary idb-queue accounting. A seed records control/data
-channels, root, recipient, chunk index and parent retention (default seven days).
-Cleanup is shared, not per-file. Disabling recovery or removing a parent channel
-makes its records ineligible. Identity cleanup includes this database.
+Seeder authorizations live in
+`libp2r2p:private-messenger:<owner>:file-authorizations:idb-queue`, with `key`
+(unique control/data/recipient) and `channel` indexes. Records hold root, peer,
+optional size, recipient, `sharedAt`, and absolute `expiresAt`; no ciphertext,
+chunk bytes, signer or file-retention reference. The queue rejects capacity
+failures instead of silently evicting grants. Grants survive restart and expire
+at the original sharing time plus parent retention (default seven days), subject
+to a subsequently shorter parent policy. Only a newer explicit share renews them.
 
-Seed responses select the requester's encrypted recipient rows only and require
-the matching registered control/data channel pair. A channel holder can group
-traffic by its public channel author; no plaintext root/index tag is exposed.
-This does not hide timing or repeated transfers of the same pair/root.
+Direct validated, persisted deliveries may authorize their actual local receiver
+using the descriptor's `sharedAt`. Cache reads and recovery replies never renew
+or create grants. Applications must not infer authorization for a third-party
+announcer from its knowledge of a root. Group membership/revocation is not part
+of this DM implementation; future group requests also need current membership.
+
+Serving requires both live authorization and locally available chunks. The
+catalog never pins NostrDB roots or recreates missing bytes. Checks run before
+reads and again before each publication. Shared cleanup removes invalid grants
+at startup and every minute while running; expired grants are immediately
+unusable even before physical cleanup. Identity cleanup includes the catalog.
+
+Watchtower ciphertext remains in
+`libp2r2p:private-messenger:<owner>:file-seeds:idb-queue`, with its existing
+64 MiB FIFO budget and parent retention. The authorization catalog starts empty;
+there is no migration or compatibility path for unpublished seeder file seeds.
+
+Seed responses require the matching control/data channel pair and requester.
+A channel holder can group traffic by its public channel author; no plaintext
+root/index tag is exposed. This does not hide timing or repeated transfers of
+the same pair/root.
 
 Multi-device seed synchronization and group-channel derivation remain separate
 follow-ups. Applications own durable manual-download intent, metadata retention

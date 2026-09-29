@@ -903,5 +903,7 @@ NIP-94 supports `thumbnail` metadata with unordered `mark`/`size` root extension
 This release changes the encrypted router recipient tag from `r` to `p` without
 legacy fallback. Upgrade communicating consumers together. Inner ask/reply/tell
 `r` tags, file-reference `r` tags, and carrier 26400 are unchanged. Seeders now
-capture outgoing recipient ciphertext before publishing, even without relay echo.
+capture outgoing ordinary-message ciphertext before publishing, even without relay
+echo. For files, seeders instead keep expiring recipient authorizations and serve
+verified local chunks as `irfsChunk_v1`; watchtowers retain ciphertext seeds.
 No group derivation or multi-device seed replication is introduced.
