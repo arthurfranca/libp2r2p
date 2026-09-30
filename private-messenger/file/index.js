@@ -1,4 +1,7 @@
 import NMMR from 'nmmr'
+import { chunkStream } from './helpers/stream.js'
+import { createFileCache } from './helpers/cache.js'
+export { createFileCache, DEFAULT_FILE_CACHE_BYTES } from './helpers/cache.js'
 import { createFileCatalog } from './helpers/catalog.js'
 import { ValidationError } from '../../error/index.js'
 import { IRFS_CHUNK_BYTES, decodeIrfsChunk } from '../../irfs/index.js'
@@ -60,10 +63,13 @@ function waitForTransfer (promise, signal) {
   })
 }
 
-// One coordinator per account. Signer derivation and the local IRFS database
-// belong to the caller; recovery, validation and scheduling belong here.
-export function createPrivateFileTransfer ({ messenger, resolveChannel, storage, onError = () => {}, _transport = channelTransport, _messages = messages, _hedgeMs = 2000, _idleMs = 30000, _now = now }) {
-  if (!messenger?.extensions || typeof resolveChannel !== 'function' || !storage?.read || !storage?.save) throw new ValidationError('INVALID_FILE_TRANSFER_OPTIONS')
+// One coordinator per account. The caller resolves signers and may supply
+// storage; recovery, validation and scheduling belong here.
+export function createPrivateFileTransfer ({ messenger, resolveChannel, storage, authorizationStorage, seedStorage, cacheMaxBytes, onError = () => {}, _transport = channelTransport, _messages = messages, _hedgeMs = 2000, _idleMs = 30000, _now = now }) {
+  if (!messenger?.extensions || typeof resolveChannel !== 'function' || (storage && (!storage.read || !storage.save))) throw new ValidationError('INVALID_FILE_TRANSFER_OPTIONS')
+  const ownsStorage = !storage
+  storage ||= createFileCache({ prefix: messenger.prefix, indexedDB: messenger._indexedDB, maxBytes: cacheMaxBytes })
+  const uploadLeases = new Map()
   const registrations = new Map()
   const jobs = new Map()
   const listeners = new Set()
@@ -75,7 +81,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
   let closed = false
   let queuePromise
   const queue = () => (queuePromise ??= createQueue({ prefix: `${messenger.prefix}:file-seeds`, indexedDB: messenger._indexedDB, maxBytes: 64 * 1024 * 1024, evictionPolicy: 'fifo', indexes: { key: { keyPath: 'key', unique: true }, channel: 'fileChannelPubkey' } }))
-  const catalog = createFileCatalog({ messenger, now: _now })
+  const catalog = createFileCatalog({ messenger, now: _now, storage: authorizationStorage })
   catalog.ready.catch(onError)
   const keyFor = (control, root) => `${control}:${root}`
   const emit = job => { for (const listener of listeners) listener({ root: job.file.root, controlChannelPubkey: job.file.controlChannelPubkey, status: job.status, completed: job.completed, total: job.file.size, error: job.error }) }
@@ -116,6 +122,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
   }
   async function prune () {
     await catalog.prune()
+    if (seedStorage) { await seedStorage.prune({ now: _now() }); return }
     if (!queuePromise) return
     await (await queue()).removeWhere(row => {
       const parent = messenger.channels.get(row.controlChannelPubkey)
@@ -126,11 +133,13 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     if (messenger.channels.get(file.controlChannelPubkey)?.mode !== 'watchtower' || !seedEnabled(file)) return
     const index = readFileChunkIndex(seed.router)
     if (index === undefined) return
-    const db = await queue()
+    const db = seedStorage ? null : await queue()
     for (const row of compactSeedRouterRows(seed)) {
       if (![file.peerPubkey, messenger.userPubkey].includes(row.receiverPubkey)) continue
       const key = `${file.controlChannelPubkey}:${file.fileChannelPubkey}:${row.receiverPubkey}:${index}`
-      await db.putBy('key', { ...row, key, root: file.root, controlChannelPubkey: file.controlChannelPubkey, fileChannelPubkey: file.fileChannelPubkey, peerPubkey: file.peerPubkey, chunkIndex: index, receivedAt: _now(), expiresAt: _now() + messenger.offlineRecoverySecondsFor(file.controlChannelPubkey) })
+      const record = { ...row, key, root: file.root, controlChannelPubkey: file.controlChannelPubkey, fileChannelPubkey: file.fileChannelPubkey, peerPubkey: file.peerPubkey, chunkIndex: index, receivedAt: _now(), expiresAt: _now() + messenger.offlineRecoverySecondsFor(file.controlChannelPubkey) }
+      if (seedStorage) await seedStorage.put(record)
+      else await db.putBy('key', record)
     }
     await prune()
   }
@@ -151,9 +160,17 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     usable(file)
     const decoded = checked(file, event)
     await catalog.ready
-    const options = { ...sendOptions(file, await routing(file, file.peerPubkey)), receiverPubkeys: [file.peerPubkey], fileChunkIndex: decoded.index, ...(messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? { onPreparedSeed: seed => saveSeed(file, seed) } : {}) }
-    const result = event.sig ? await _messages.broadcastEvent({ ...options, event }) : await _messages.broadcastRumor({ ...options, rumor: event })
-    assertPublished(result)
+    if (ownsStorage) {
+      if (!uploadLeases.has(file.root)) uploadLeases.set(file.root, await storage.reserve(file.root, file.size))
+      try { await storage.save(event, file) } catch (error) { await uploadLeases.get(file.root)?.(); uploadLeases.delete(file.root); throw error }
+    }
+    let result
+    try {
+      const options = { ...sendOptions(file, await routing(file, file.peerPubkey)), receiverPubkeys: [file.peerPubkey], fileChunkIndex: decoded.index, ...(messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? { onPreparedSeed: seed => saveSeed(file, seed) } : {}) }
+      result = event.sig ? await _messages.broadcastEvent({ ...options, event }) : await _messages.broadcastRumor({ ...options, rumor: event })
+      assertPublished(result)
+    } catch (error) { await uploadLeases.get(file.root)?.(); uploadLeases.delete(file.root); throw error }
+    if (decoded.index === decoded.total - 1) { await uploadLeases.get(file.root)?.(); uploadLeases.delete(file.root) }
     // A scheduler turn between chunks lets queued text/control publications run.
     await new Promise(resolve => setTimeout(resolve, 0))
     return result
@@ -198,9 +215,11 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
       return true
     }
     if (messenger.channels.get(controlChannelPubkey)?.mode !== 'watchtower') return true
-    const db = await queue()
+    const db = seedStorage ? null : await queue()
     let packer
-    for await (const seed of db.storedItemsBy('channel', payload.fileChannelPubkey)) {
+    const candidates = seedStorage ? seedStorage.iterate({ controlChannelPubkey, fileChannelPubkey: payload.fileChannelPubkey, receiverPubkey: question.pubkey, indices: [...indices] }) : db.storedItemsBy('channel', payload.fileChannelPubkey)
+    for await (const seed of candidates) {
+      if (seed.expiresAt <= _now() || seed.receivedAt + messenger.offlineRecoverySecondsFor(controlChannelPubkey) <= _now() || (seedStorage && !await seedStorage.has(seed))) continue
       if (seed.controlChannelPubkey !== controlChannelPubkey || seed.receiverPubkey !== question.pubkey || !indices.has(seed.chunkIndex) || !seedEnabled(seed)) continue
       const file = await register(seed)
       usable(file)
@@ -218,7 +237,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
   async function run (job) {
     const file = job.file
     const signal = job.controller.signal
-    let sub
+    let sub, release
     const historyController = new AbortController()
     let ingest = Promise.resolve()
     let total = file.size === undefined ? undefined : Math.ceil(file.size / IRFS_CHUNK_BYTES)
@@ -286,6 +305,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
       return ingest
     }
     try {
+      release = await storage.reserve?.(file.root, file.size, { signal })
       job.status = 'downloading'; emit(job)
       // Resume from independently verified local chunks, never from an ACK.
       for (let index = 0; index < (total ?? 1); index++) {
@@ -329,7 +349,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
           await new Promise(resolve => { const timer = setTimeout(done, Math.min(100, _hedgeMs)); function done () { clearTimeout(timer); signal.removeEventListener('abort', done); resolve() } signal.addEventListener('abort', done, { once: true }) })
         }
       } finally { signal.removeEventListener('abort', stop) }
-    } finally { historyController.abort(); await sub?.close(); await ingest }
+    } finally { historyController.abort(); await sub?.close(); await ingest; await release?.() }
     if (job.completed !== file.size) throw new ValidationError('FILE_SIZE_MISMATCH')
   }
   function pump () {
@@ -366,7 +386,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     }
     const key = keyFor(file.controlChannelPubkey, file.root)
     let job = jobs.get(key)
-    if (!job || ['error', 'cancelled', 'paused'].includes(job.status)) {
+    if (!job || ['error', 'cancelled', 'paused', ...(ownsStorage ? ['complete'] : [])].includes(job.status)) {
       const controller = new AbortController()
       const { promise, resolve, reject } = Promise.withResolvers()
       job = { file, controller, resolve, reject, promise, completed: 0, manual, thumbnail, priority: thumbnail ? 2 : manual ? 1 : 0, status: 'queued' }
@@ -404,10 +424,10 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
       for (const job of jobs.values()) if (job.pauseRequested && job.status !== 'complete') download(job.file, { manual: job.manual, thumbnail: job.thumbnail }).catch(onError)
     },
     unwatch (channels) { for (const job of jobs.values()) if (channels.includes(job.file.controlChannelPubkey)) cancelJob(job) },
-    async close () { if (closed) return; closed = true; extension.pause(); clearInterval(timer); await Promise.allSettled([...work]); await catalog.close(); if (queuePromise) await (await queuePromise).close(); messenger.extensions.delete(extension); listeners.clear() }
+    async close () { if (closed) return; closed = true; extension.pause(); clearInterval(timer); await Promise.allSettled([...work]); await catalog.close(); for (const release of uploadLeases.values()) await release(); uploadLeases.clear(); if (ownsStorage) await storage.close(); if (queuePromise) await (await queuePromise).close(); messenger.extensions.delete(extension); listeners.clear() }
   }
   const timer = setInterval(() => { prune().catch(onError) }, 60000)
   timer.unref?.()
   messenger.extensions.add(extension)
-  return { register, authorizeSeeding, publishChunk, download, close: extension.close, cancel (control, root) { const job = jobs.get(keyFor(control, root)); if (job) { job.pauseRequested = false; cancelJob(job) } }, observe (listener) { listeners.add(listener); for (const job of jobs.values()) emit(job); return () => listeners.delete(listener) } }
+  return { register, authorizeSeeding, publishChunk, download, readChunk: (root, index) => storage.read(root, index), stream: (descriptor, options = {}) => storage.stream ? storage.stream(descriptor, options) : chunkStream({ read: storage.read.bind(storage), ...descriptor, ...options }), close: extension.close, cancel (control, root) { const job = jobs.get(keyFor(control, root)); if (job) { job.pauseRequested = false; cancelJob(job) } }, observe (listener) { listeners.add(listener); for (const job of jobs.values()) emit(job); return () => listeners.delete(listener) } }
 }

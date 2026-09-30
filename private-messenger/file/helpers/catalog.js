@@ -6,7 +6,29 @@ const keyFor = row => `${row.controlChannelPubkey}:${row.fileChannelPubkey}:${ro
 
 // A grant contains no payload, key material or retention reference in the file
 // store. Serialize read/merge/write with other coordinators for this identity.
-export function createFileCatalog ({ messenger, now }) {
+export function createFileCatalog ({ messenger, now, storage }) {
+  if (storage) {
+    const valid = row => {
+      const parent = messenger.channels.get(row.controlChannelPubkey)
+      return parent?.mode === 'seeder' && row.expiresAt > now() && row.sharedAt + messenger.offlineRecoverySecondsFor(parent) > now()
+    }
+    return {
+      ready: Promise.resolve(),
+      async authorize (file, receivers, sharedAt) {
+        const { controlChannelPubkey, fileChannelPubkey, peerPubkey, root, size } = file
+        for (const receiverPubkey of receivers) {
+          const row = { controlChannelPubkey, fileChannelPubkey, peerPubkey, root, size, receiverPubkey, sharedAt, expiresAt: sharedAt + messenger.offlineRecoverySecondsFor(controlChannelPubkey) }
+          if (valid(row)) await storage.put(row)
+        }
+      },
+      async find (controlChannelPubkey, fileChannelPubkey, receiverPubkey) {
+        const row = await storage.find({ controlChannelPubkey, fileChannelPubkey, receiverPubkey })
+        return row && valid(row) ? row : null
+      },
+      prune: () => storage.prune({ now: now() }),
+      async close () {}
+    }
+  }
   const prefix = `${messenger.prefix}:file-authorizations`
   let database
   const db = () => (database ??= createQueue({ prefix, indexedDB: messenger._indexedDB, evictionPolicy: 'reject', indexes: { key: { keyPath: 'key', unique: true }, channel: 'fileChannelPubkey' } }))

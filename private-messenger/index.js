@@ -201,6 +201,7 @@ export class PrivateMessenger {
     maxDynamicRecoverySeeders = DEFAULT_MAX_DYNAMIC_RECOVERY_SEEDERS,
     messageQueueMaxBytes = DEFAULT_MESSAGE_QUEUE_MAX_BYTES,
     seedQueueMaxBytes = DEFAULT_SEED_QUEUE_MAX_BYTES,
+    seedStorage,
     temporaryStorageArea = globalThis.sessionStorage,
     autoDeletionCapability = true,
     _indexedDB = globalThis.indexedDB,
@@ -232,6 +233,7 @@ export class PrivateMessenger {
     this.maxDynamicRecoverySeeders = maxDynamicRecoverySeeders
     this.messageQueueMaxBytes = messageQueueMaxBytes
     this.seedQueueMaxBytes = seedQueueMaxBytes
+    this.seedStorage = seedStorage
     this.temporaryStorageArea = temporaryStorageArea
     this.autoDeletionCapability = normalizeAutoDeletionCapability(autoDeletionCapability)
     this._indexedDB = _indexedDB
@@ -348,13 +350,15 @@ export class PrivateMessenger {
         indexedDB: this._indexedDB
       })
       this.assertOpen()
-      this.seedQueue = await createQueue({
-        prefix: `${this.prefix}:seeds`,
-        indexes: SEED_QUEUE_INDEXES,
-        maxBytes: this.seedQueueMaxBytes,
-        evictionPolicy: 'fifo',
-        indexedDB: this._indexedDB
-      })
+      this.seedQueue = this.seedStorage
+        ? null
+        : await createQueue({
+          prefix: `${this.prefix}:seeds`,
+          indexes: SEED_QUEUE_INDEXES,
+          maxBytes: this.seedQueueMaxBytes,
+          evictionPolicy: 'fifo',
+          indexedDB: this._indexedDB
+        })
       this.assertOpen()
       this.stateStore = await createChannelStateStore({
         prefix: this.prefix,
@@ -1342,6 +1346,16 @@ export class PrivateMessenger {
   async enqueueSeed (channelPubkey, seed) {
     if (!this.offlineRecoverySecondsFor(channelPubkey)) return
     const receivedAt = nowSeconds()
+    if (this.seedStorage) {
+      const rows = seed.recordType === NYM_CARRIER_SEED_RECORD_TYPE || seed.carriers?.length
+        ? [{ recordType: NYM_CARRIER_SEED_RECORD_TYPE, carriers: compactSeedNymCarriers(seed.carriers) }]
+        : compactSeedRouterRows(seed)
+      for (const row of rows) {
+        const time = seedRecordTime(row) || receivedAt
+        await this.seedStorage.put({ ...row, channelPubkey, receivedAt, expiresAt: time + this.offlineRecoverySecondsFor(channelPubkey) })
+      }
+      return
+    }
     if (seed.recordType === NYM_CARRIER_SEED_RECORD_TYPE || seed.carriers?.length) {
       const carriers = compactSeedNymCarriers(seed.carriers)
       const recordTime = nymCarrierRecordTime({ carriers }) || seed.outer?.created_at || receivedAt
@@ -1932,7 +1946,9 @@ export class PrivateMessenger {
     })
 
     if (this.offlineRecoverySecondsFor(channelPubkey)) {
-      for await (const seed of this.seedQueue.storedItemsBy('byChannel', channelPubkey)) {
+      for await (const seed of this.seedStorage ? this.seedStorage.iterate({ channelPubkey, receiverPubkey: message.event?.pubkey, since, until }) : this.seedQueue.storedItemsBy('byChannel', channelPubkey)) {
+        if (seedRecordTime(seed) < nowSeconds() - this.offlineRecoverySecondsFor(channelPubkey)) continue
+        if (this.seedStorage && !await this.seedStorage.has(seed)) continue
         await packer.update(seed)
       }
     }
@@ -2108,7 +2124,7 @@ export class PrivateMessenger {
       this.removeChannelState(pubkey)
       await this.flushStateWrites()
       await this.queue.removeBy('byChannel', pubkey)
-      await this.seedQueue.removeBy('byChannel', pubkey)
+      await (this.seedStorage ? this.seedStorage.removeLocal({ channelPubkey: pubkey }) : this.seedQueue.removeBy('byChannel', pubkey))
       await this.touchStorageActivity({ force: true })
       this.ensureRelayListWatcher()
     })
@@ -2134,7 +2150,7 @@ export class PrivateMessenger {
         delete state.channels[pubkey]
         stalePubkeys.push(pubkey)
         await this.queue?.removeBy('byChannel', pubkey)
-        await this.seedQueue?.removeBy('byChannel', pubkey)
+        await (this.seedStorage ? this.seedStorage.removeLocal({ channelPubkey: pubkey }) : this.seedQueue?.removeBy('byChannel', pubkey))
       }
       this.state = state
       if (stalePubkeys.length) await this.removeChannelStates(stalePubkeys)
@@ -2142,6 +2158,7 @@ export class PrivateMessenger {
   }
 
   async pruneStoredSeeds (channelPubkey) {
+    if (this.seedStorage) { await this.seedStorage.prune({ now: nowSeconds() }); return }
     if (!this.seedQueue) return
     const keyRange = globalThis.IDBKeyRange
     if (!channelPubkey) {

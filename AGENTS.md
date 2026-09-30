@@ -152,3 +152,21 @@ NIP-46 against the real pool with controlled transport and injected controls.
   Completion depends on validated persisted chunks, never reply terminal markers.
 - Parse NIP-94 root extensions by field name, not ordinal position. Only the root
   is fixed at tag[1]. Preserve ThumbHash Base64 and optional thumbnail SHA-256.
+
+## Pluggable recovery persistence
+
+- External seed/grant stores use semantic methods, never the IDB queue interface.
+  Keep local queue indices, byte accounting and atomic upserts intact. External
+  adapters are caller-owned; default stores are closed by their consumers.
+- Event-store recovery records are immutable 30078 inners in self personal copies
+  with empty content and unversioned d namespaces. Preserve ciphertext/tag order,
+  validate snapshot hashes and escape original CRDT-like values. Revocations use
+  private kind 5, not a custom state field. Never renew expiry on sync/retry.
+- Day candidates use D and literal '*', then exact snapshot overlap. Do not filter
+  wrapper created_at as if it were the recovery time. No cross-snapshot hull merge.
+- Keep sync transport seeds out of the event store being synchronized. Never
+  automatically migrate unpublished local file seeds or pin roots with grants.
+- The optional session coordinator is UI-independent; apps own presentation and
+  account-state interpretation. Keep pending work encrypted and existing-only
+  checkpoints cancellation-safe. File cache budgets count useful bytes, evict
+  inactive roots and preserve active reservations/stream backpressure.

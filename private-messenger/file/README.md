@@ -3,8 +3,9 @@
 `createPrivateFileTransfer({ messenger, resolveChannel, storage, onError })`
 creates one account coordinator attached to an initialized PrivateMessenger.
 It does not create permanent watched channels for files. The application resolves
-channel signers and supplies `storage.read(root, index, descriptor)` and
-`storage.save(event, descriptor)`. The latter must resolve only after persistence.
+channel signers. An optional adapter supplies `storage.read(root, index, descriptor)`
+and `storage.save(event, descriptor)`; otherwise the library uses its bounded local
+cache. `save` must resolve only after persistence.
 The descriptor is `{ controlChannelPubkey, peerPubkey, root, size?, sharedAt? }`.
 `sharedAt` is a stable sharing timestamp, never a read/retry timestamp.
 
@@ -125,3 +126,27 @@ the same pair/root.
 Multi-device seed synchronization and group-channel derivation remain separate
 follow-ups. Applications own durable manual-download intent, metadata retention
 and UI policy. Removing one message must not delete a root retained by another.
+
+## Optional persistence (0.11.1)
+
+`storage`, `authorizationStorage`, and `seedStorage` are optional. The latter two
+use the semantic contracts in `private-messenger/event-store`; omitted stores
+retain their existing indexed local implementation. External stores are owned by
+the caller. Synced grants are checked against the current channel mode/retention
+before serving, and are never deleted globally because a channel is not loaded.
+
+With no chunk adapter, `createFileCache` owns
+`<messenger prefix>:file-chunks:idb` (files and chunks stores). Its default
+`cacheMaxBytes` is 256 MiB of useful decoded bytes; physical IndexedDB overhead is
+additional. Deduplication uses root/index. FIFO root eviction discards inactive
+files to admit new data. Durable renewable reservations protect active transfers
+and readers across tabs; stale reservations expire after two minutes. A blocked
+transfer waits with cancellation. Unknown sizes reserve the budget exclusively;
+an individual oversized file raises `FILE_EXCEEDS_CACHE_CAPACITY`. Physical quota
+failures try discarding additional inactive roots before propagating.
+
+Outgoing chunks are saved before publication; this does not authorize recipients.
+`readChunk(root, index)` reads local data. `stream(descriptor, { signal })` uses
+bounded sequential reads and backpressure, not a whole-file Blob. Cancel streams
+when unused. Cache eviction can remove a previously completed file, so new
+requests recheck persisted indices. The cache is included in identity cleanup.

@@ -194,3 +194,26 @@ test('automatic consumers join an active manual transfer without rescanning stor
     }
   } finally { await f.close() }
 })
+
+test('default file storage retains published chunks across coordinator restart and serves an authorized peer', async () => {
+  const f = await fixture()
+  await f.manager.close()
+  const replies = []
+  const options = {
+    messenger: f.messenger, resolveChannel: async () => ({ getPublicKey: async () => data }),
+    _messages: { broadcastRumor: async () => ({ delivery: { reports: [{ success: true }] } }), reply: async value => { replies.push(value) } }
+  }
+  let manager = createPrivateFileTransfer(options)
+  try {
+    await manager.authorizeSeeding(f.descriptor, { receiverPubkeys: [peer], sharedAt: Math.floor(Date.now() / 1000) })
+    for (const chunk of f.chunks) await manager.publishChunk(f.descriptor, chunk)
+    await manager.close(); manager = createPrivateFileTransfer(options)
+    assert.ok(await manager.readChunk(f.descriptor.root, 1))
+    const question = { id: '77'.repeat(32), pubkey: peer, tags: [['r', owner]] }
+    const handler = [...f.messenger.extensions][0]
+    handler.handleAsk(control, { question, senderPubkey: peer, provenance: 'direct', payload: { code: FILE_CHUNKS_REQUEST_CODE, payload: { fileChannelPubkey: data, missingRanges: [[0, 1]] } } })
+    for (let attempt = 0; !replies.some(reply => reply.payload.isLast) && attempt < 100; attempt++) await new Promise(resolve => setTimeout(resolve, 2))
+    assert.equal(replies.flatMap(reply => reply.payload.jsonl.trim().split('\n')).filter(Boolean).length, 2)
+    assert.equal(JSON.parse(replies[0].payload.jsonl.trim()).recordType, 'irfsChunk_v1')
+  } finally { await manager.close(); await f.close() }
+})

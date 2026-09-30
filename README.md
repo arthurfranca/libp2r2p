@@ -907,3 +907,9 @@ capture outgoing ordinary-message ciphertext before publishing, even without rel
 echo. For files, seeders instead keep expiring recipient authorizations and serve
 verified local chunks as `irfsChunk_v1`; watchtowers retain ciphertext seeds.
 No group derivation or multi-device seed replication is introduced.
+
+Private-message consumers can now substitute recovery persistence through
+[`private-messenger/event-store`](private-messenger/event-store/README.md), or use
+local defaults, including a bounded streaming file cache. The optional
+[`private-messenger/session`](private-messenger/session/README.md) coordinator
+provides reusable DM inbox/outbox and attachment lifecycle without UI coupling.
