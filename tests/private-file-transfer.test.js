@@ -11,7 +11,7 @@ import { generateSecretKey, getPublicKey } from '../key/index.js'
 
 globalThis.IDBKeyRange = IDBKeyRange
 const owner = '11'.repeat(32), peer = '22'.repeat(32), control = '33'.repeat(32), data = '44'.repeat(32), second = '55'.repeat(32)
-async function fixture ({ bytes = 51001, local = [], ask = async () => {}, read, save, seeders = [peer], history = async () => { throw new Error('relay unavailable') } } = {}) {
+async function fixture ({ onError, bytes = 51001, local = [], ask = async () => {}, read, save, seeders = [peer], history = async () => { throw new Error('relay unavailable') } } = {}) {
   const prepared = await prepareIrfsFile(new Uint8Array(bytes).fill(7))
   const chunks = []
   for await (const chunk of prepared.chunks()) chunks.push(chunk)
@@ -19,7 +19,7 @@ async function fixture ({ bytes = 51001, local = [], ask = async () => {}, read,
   const parent = { pubkey: control, mode: 'seeder' }
   let feed, closes = 0
   const messenger = { extensions: new Set(), prefix: `test:${crypto.randomUUID()}`, _indexedDB: new IDBFactory(), userPubkey: owner, desiredChannels: new Set([control]), channels: new Map([[control, parent]]), requireWritableChannel: () => parent, recoverySeeders: () => seeders, resolveWatchRelays: async () => ['wss://test.invalid'], offlineRecoverySecondsFor: () => 604800, ask: options => ask(options, feed), resolveSendRouting: async () => ({ relays: ['wss://test.invalid'] }), eventExpirationSecondsFor: () => 604800, contentKeyLookup: () => undefined }
-  const manager = createPrivateFileTransfer({ messenger, resolveChannel: async () => ({ getPublicKey: async () => data }), storage: { read: async (root, index) => { read?.(index); return stored.get(index) }, save: async event => { await save?.(event); stored.set(Number(event.tags[1][1]), event) } }, _transport: { subscribe: options => { feed = options; return { ready: Promise.resolve(), close: async () => { closes++ } } }, fetch: history }, _hedgeMs: 5, _idleMs: 40 })
+  const manager = createPrivateFileTransfer({ onError, messenger, resolveChannel: async () => ({ getPublicKey: async () => data }), storage: { read: async (root, index) => { read?.(index); return stored.get(index) }, save: async event => { await save?.(event); stored.set(Number(event.tags[1][1]), event) } }, _transport: { subscribe: options => { feed = options; return { ready: Promise.resolve(), close: async () => { closes++ } } }, fetch: history }, _hedgeMs: 5, _idleMs: 40 })
   const descriptor = { controlChannelPubkey: control, peerPubkey: peer, root: prepared.root, size: prepared.size }
   const deliver = (feed, index) => feed.onEvent(chunks[index], {}, { senderPubkey: peer, router: { tags: [['i', String(index)]] } })
   return { manager, messenger, descriptor, stored, chunks, deliver, closes: () => closes, close: async () => { await manager.close(); prepared.close() } }
@@ -216,4 +216,36 @@ test('default file storage retains published chunks across coordinator restart a
     assert.equal(replies.flatMap(reply => reply.payload.jsonl.trim().split('\n')).filter(Boolean).length, 2)
     assert.equal(JSON.parse(replies[0].payload.jsonl.trim()).recordType, 'irfsChunk_v1')
   } finally { await manager.close(); await f.close() }
+})
+
+
+test('completing a file cancels unfinished history without reporting its own AbortError', async () => {
+  const errors = []
+  let aborted = false
+  const f = await fixture({
+    onError: error => errors.push(error),
+    history: ({ signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => { aborted = true; reject(signal.reason) }, { once: true })
+    }),
+    ask: async (_, feed) => { await f.deliver(feed, 0); await f.deliver(feed, 1) }
+  })
+  try {
+    await f.manager.download(f.descriptor)
+    assert.equal(aborted, true)
+    assert.deepEqual(errors, [])
+  } finally { await f.close() }
+})
+
+test('history failure remains visible when peers can finish the file', async () => {
+  const errors = []
+  const failure = new Error('Relay disconnected')
+  const f = await fixture({
+    onError: error => errors.push(error),
+    history: async () => { throw failure },
+    ask: async (_, feed) => { await f.deliver(feed, 0); await f.deliver(feed, 1) }
+  })
+  try {
+    await f.manager.download(f.descriptor)
+    assert.deepEqual(errors, [failure])
+  } finally { await f.close() }
 })

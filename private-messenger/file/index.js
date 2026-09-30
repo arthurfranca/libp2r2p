@@ -324,7 +324,11 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
         await sub.ready
         signal.throwIfAborted()
         // Partial/failed history still permits recovery from peers.
-        const history = _transport.fetch({ ...options, signal: AbortSignal.any([signal, historyController.signal]), since: 0 }).catch(error => { if (!signal.aborted) onError(error) })
+        const history = _transport.fetch({ ...options, signal: AbortSignal.any([signal, historyController.signal]), since: 0 }).catch(error => {
+          // Completion aborts the remaining history read in finally. Only its
+          // own cancellation is expected; genuine history failures stay visible.
+          if (!signal.aborted && !(historyController.signal.aborted && error === historyController.signal.reason)) onError(error)
+        })
         work.add(history); history.finally(() => work.delete(history))
         const seeders = [...validSeeders].sort((a, b) => (successes.get(b) || 0) - (successes.get(a) || 0) || Math.random() - 0.5)
         while (true) {
