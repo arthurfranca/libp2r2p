@@ -534,6 +534,42 @@ returned events; received messages may already have been queued. This is a
 history completeness failure, not evidence that an outgoing message failed.
 Existing rewatch/resume and relay-list refresh paths retry pending intervals;
 there is no dedicated periodic retry timer for a failed history fetch.
+`private-channel.fetchHistory(options)` (0.11.6) is the complete-interval API
+used by messenger recovery. It accepts the signers, processor/fragment options,
+callbacks and abort signal of `fetch`, plus inclusive `since`/`until` bounds
+(defaults: 0 and the start time of the call). It returns only
+`{ oldestCreatedAt, receivedEventCount, relays }`; an empty scan has a null oldest
+time. No complete-history event array is retained. `fetch` keeps its existing
+single-query array contract and optional limit.
+
+History queries each relay independently with limit 16. A response with 16 events
+or status `satisfied` is saturated, even if it already reports EOSE or contains
+fewer valid events. Saturated intervals split into nonoverlapping inclusive
+halves; completed pages process chronologically, oldest half first. Single-second
+intervals grow through 16, 32, 64, 128 and 256. Each response is also bounded to
+4 MiB of serialized UTF-8 event data. At the dense-second or volume ceiling,
+`PRIVATE_CHANNEL_FETCH_INCOMPLETE` retains the operational cause
+`PRIVATE_CHANNEL_HISTORY_PAGE_LIMIT`; the interval stays pending. There is no
+nonstandard cursor, disk spool, dropped excess or successful incomplete scan.
+
+A fragment processor and the existing scoped fragment storage span the entire
+call, including pages and relays. Callbacks are awaited before requesting the
+next page. Processing/persistence failures propagate; completed pages may already
+be ingested and retries remain subject to the existing idempotence contract.
+The summary count includes processed outer events per relay, including replicas,
+not unique decrypted messages or discarded saturated probes. It does not include
+all events observed in those probes.
+
+Recovery admits at most two pages per PrivateMessenger and one per normalized
+relay across the same library instance, including page processing time. Continuous
+live watches are outside those recovery gates. Waiters are abortable and FIFO,
+with at most 256 queued per gate (`PRIVATE_CHANNEL_HISTORY_QUEUE_FULL` on excess).
+The five-second network timeout begins after admission; reported read time also
+includes admission but excludes processing. Seeders still supplement the oldest
+relay result. Checkpoints advance only after the entire interval and existing
+seeder stages succeed; interruption preserves its original pending range. No
+persisted state format changes or migrations are needed.
+
 Subscription relay errors forwarded to `onError` include `relay` when known
 and `operation: 'private-channel.subscribe'`. A per-notification wrapper retains
 the native message, name, code, category and WebSocket close fields; `cause`

@@ -42,6 +42,7 @@
 // - Seeder replies stream compact routers with createMissingMessageReplyPacker({ messenger, question }).update(seed), then finalize(optionalLastSeed).
 // - For other event-list replies, use createEventReplyPacker({ messenger, question, code }).update(event).
 
+import { createAbortableSemaphore } from '../helpers/abortable-semaphore.js'
 import * as privateMessage from '../private-message/index.js'
 import { isOnline } from '../network/index.js'
 import { createSendRelayRouting, normalizeFallbackRelays } from './helpers/send-routing.js'
@@ -285,6 +286,7 @@ export class PrivateMessenger {
     this.deliveryReads = new Set()
     this.deliveryWaiters = new Set()
     this.recoveries = new Map()
+    this.recoveryAdmission = createAbortableSemaphore(2)
     this.recoveryControllers = new Set()
     this.resumeWork = null
     this.capacityTimer = null
@@ -1950,12 +1952,11 @@ export class PrivateMessenger {
   }
 
   async askSeedersForRelayLeftEdge (channelPubkey, range, fetchedEvents) {
-    const { asks } = await this.#askSeedersForRelayLeftEdgeAttempt(channelPubkey, range, fetchedEvents)
+    const { asks } = await this.#askSeedersForRelayLeftEdgeAttempt(channelPubkey, range, oldestCreatedAt(fetchedEvents))
     return asks
   }
 
-  async #askSeedersForRelayLeftEdgeAttempt (channelPubkey, range, fetchedEvents) {
-    const oldest = oldestCreatedAt(fetchedEvents)
+  async #askSeedersForRelayLeftEdgeAttempt (channelPubkey, range, oldest) {
     const until = oldest == null ? range.end : Math.min(range.end, oldest)
     if (until < range.start) return { asks: [], failures: [] }
     return this.#askSeedersForMissingRangeAttempt(channelPubkey, range.start, until)
@@ -2098,7 +2099,8 @@ export class PrivateMessenger {
           if (this.pauseReasons.size || this.closePromise || !this.desiredChannels.has(pubkey)) throw new Error('PRIVATE_MESSENGER_PAUSED')
           const fetchRelays = await this.resolveWatchRelays(channel)
           controller.signal.throwIfAborted()
-          const fetchedEvents = await this._privateChannel.fetch({
+          const history = await this._privateChannel.fetchHistory({
+            _acquirePage: signal => this.recoveryAdmission.acquire(signal),
             signal: controller.signal,
             receivedChunkScope: this.storageLeaseId,
             receiverSigner: this.userSigner,
@@ -2120,9 +2122,9 @@ export class PrivateMessenger {
             onSeedEvent: seed => this.receive(pubkey, () => this.enqueueSeed(pubkey, seed), seed),
             onContentKeyUsage: usage => this.handleContentKeyUsage(pubkey, usage),
             onError: err => { throw err }
-          }) || []
+          })
           controller.signal.throwIfAborted()
-          const attempt = await this.#askSeedersForRelayLeftEdgeAttempt(pubkey, range, fetchedEvents)
+          const attempt = await this.#askSeedersForRelayLeftEdgeAttempt(pubkey, range, history.oldestCreatedAt)
           const lifecycleChanged = this.closePromise || !this.channels.has(pubkey) || !this.stopByChannel.has(pubkey) ||
             (this.watchRevisionByChannel.get(pubkey) || 0) !== watchRevision
           if (lifecycleChanged || attempt.failures.length) remaining.push(range)

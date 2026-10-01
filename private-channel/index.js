@@ -7,6 +7,7 @@ import { getIykcProofs } from '../content-key/index.js'
 import { ValidationError } from '../error/index.js'
 import { normalizeRumor, deliveryInfo } from './helpers/rumor.js'
 import { incompleteFetchError } from './helpers/fetch-error.js'
+import { readHistory } from './helpers/history.js'
 import { subscriptionError } from './helpers/subscription-error.js'
 import * as nip44v3 from '../nip44-v3/index.js'
 import { relayPool } from '../relay/index.js'
@@ -953,6 +954,17 @@ export async function fetch ({ signal, receiverSigner, iykcSigner, privateChanne
   } finally {
     processOuterEvent.close()
   }
+}
+
+// Complete interval recovery with bounded pages and one fragment processor.
+// Existing fetch() retains its one-query/event-array contract.
+export async function fetchHistory ({ receiverSigner, privateChannelSigner = receiverSigner, _getEvents = getEvents, _acquirePage, ...options }) {
+  const authors = privateChannelPubkeyList(options)
+  const filter = { kinds: [PRIVATE_BROADCAST_KIND], ...(authors.length ? { authors } : {}), since: options.since, until: options.until }
+  const processOuterEvent = createProcessor({ ...options, receiverSigner, privateChannelSigner, onError: error => { options.onError?.(error); throw error } })
+  try {
+    return await readHistory({ filter, relays: options.relays, receiverPubkey: options.receiverPubkey, signal: options.signal, getEvents: _getEvents, processEvent: processOuterEvent, acquirePage: _acquirePage })
+  } finally { processOuterEvent.close() }
 }
 
 export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = receiverSigner, privateChannelSignersByPubkey, privateChannelReaderSigner = privateChannelSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, privateChannelPubkey, privateChannelPubkeys, receiverPubkey, relays, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onError, since = nowSeconds() - 5, limit, liveOnly = false, mode = 'leecher', modeByPubkey, receivedChunkScope = '', receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS, receivedChunkTtlMsByPubkey, receivedChunkMaxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES, receivedChunkIndexedDB = globalThis.indexedDB, ignoredGroupTtlMs = DEFAULT_IGNORED_GROUP_TTL_MS, ignoredGroupMaxEntries = DEFAULT_IGNORED_GROUP_MAX_ENTRIES, _liveEventsGenerator = getLiveEventsGenerator, _eventsFeedGenerator = getEventsFeedGenerator }) {

@@ -9,6 +9,7 @@ import {
   EXPIRATION_SECONDS,
   eventFromNymCarriers,
   fetch,
+  fetchHistory,
   getJsonlChunkByteSize,
   getNymCarrierChunkSize,
   MAX_EVENT_BYTES,
@@ -2334,4 +2335,36 @@ test('subscription context preserves aggregates and does not guess a missing rel
   assert.equal(errors[0].relay, undefined)
   assert.equal(errors[1].relay, 'wss://one.example')
   assert.equal(errors[1].message, 'non-Error failure')
+})
+
+test('history pages share fragment assembly and preserve rejection/retry behavior', async () => {
+  const sender = signer()
+  const receiver = signer()
+  const receiverPubkey = await receiver.getPublicKey()
+  const original = eventFixture('fragmented history '.repeat(18000))
+  const wrapped = await wrapEvent({ senderSigner: sender, receivers: [receiverPubkey], event: original, _getIykcProofs: noContentKeys })
+  assert.ok(wrapped.length > 16)
+  // Spread fragment timestamps so recovery must traverse several leaves.
+  const events = wrapped.map((event, index) => ({ ...event, created_at: index }))
+  const calls = []
+  let fail = true
+  const received = []
+  const options = {
+    receiverSigner: receiver, privateChannelSigner: sender, receiverPubkey,
+    receivedChunkScope: 'paged-fragments', relays: ['wss://history.example'], since: 0, until: events.length,
+    _getEvents: async (filter, [relay], options) => {
+      calls.push(filter)
+      const result = events.filter(event => event.created_at >= filter.since && event.created_at <= filter.until).sort((a, b) => b.created_at - a.created_at).slice(0, filter.limit).map(event => ({ event, relay }))
+      result.forEach(({ event }) => options.callback({ type: 'event', event }))
+      return { result, relays: [{ relay, status: result.length >= filter.limit ? 'satisfied' : 'eose' }] }
+    },
+    onEvent: event => { if (fail) throw new Error('SAVE_FAILED'); received.push(event) }
+  }
+  await assert.rejects(fetchHistory(options), /SAVE_FAILED/)
+  fail = false
+  const result = await fetchHistory(options)
+  assert.deepEqual(received, [unwrappedFixture(original, await sender.getPublicKey())])
+  assert.equal(result.receivedEventCount, events.length)
+  assert.equal(result.oldestCreatedAt, 0)
+  assert.ok(calls.length > 2)
 })

@@ -208,3 +208,12 @@ NIP-46 against the real pool with controlled transport and injected controls.
   Aggregate native diagnostics from all attempts and retain the first-ACK path.
 - Outbox cancellation and close abort fallback work for messages and file chunks.
   Shared publication diagnostics live in private-messenger/helpers/publication.js.
+
+- Complete private-channel recovery uses `fetchHistory`: 16-event temporal pages,
+  oldest leaves first, 16..256 for a dense second, at most 4 MiB per response.
+  `satisfied` is saturation, never exhaustion. A dense/oversized response leaves
+  the interval pending with `PRIVATE_CHANNEL_HISTORY_PAGE_LIMIT` inside
+  `PRIVATE_CHANNEL_FETCH_INCOMPLETE`; never checkpoint an incomplete scan.
+  Preserve one fragment processor per call and summary-only results. Recovery
+  gates cover reads plus processing (two per messenger, one per relay per library
+  instance) without blocking live watches. Keep the original `fetch` contract.

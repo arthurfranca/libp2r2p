@@ -4,6 +4,7 @@ import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { ValidationError } from '../error/index.js'
 import { ASK_KIND, REPLY_KIND, TELL_KIND } from '../private-message/index.js'
 import { EXPIRATION_SECONDS } from '../private-channel/index.js'
+import { readHistory } from '../private-channel/helpers/history.js'
 import {
   createEventReplyPacker,
   createMissingMessageReplyPacker,
@@ -21,7 +22,18 @@ import { createChannelStateStore } from '../private-messenger/services/channel-s
 const instances = new Set()
 class PrivateMessenger extends RealPrivateMessenger {
   constructor (options = {}) {
-    super({ _privateChannel: { fetch: async () => [] }, ...options })
+    // Existing fixtures describe outer-event arrays; production history now
+    // returns a bounded summary instead of retaining all those outer events.
+    const channel = options._privateChannel ?? { fetchHistory: async () => [] }
+    super({
+      ...options, _privateChannel: {
+        ...channel, fetchHistory: async args => {
+          const result = await channel.fetchHistory?.(args) ?? []
+          if (!Array.isArray(result)) return result
+          return { oldestCreatedAt: result.length ? Math.min(...result.map(event => event.created_at)) : null, receivedEventCount: result.length, relays: [] }
+        }
+      }
+    })
     instances.add(this)
   }
 }
@@ -653,7 +665,7 @@ test('offline recovery zero disables durable recovery while preserving live tech
   const fetches = []
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
-    _privateChannel: { fetch: async options => { fetches.push(options); return [] } },
+    _privateChannel: { fetchHistory: async options => { fetches.push(options); return [] } },
     _setInterval: (fn, ms) => { const timer = { fn, ms }; intervals.push(timer); return timer },
     _setTimeout: fn => { scheduled.push(fn); return fn },
     onContentKeyChange: event => contentKeyChanges.push(event)
@@ -733,7 +745,7 @@ test('private messenger pauses live watches offline, restarts them before durabl
     messenger = await new PrivateMessenger({
       _privateMessage: pm,
       _privateChannel: {
-        fetch: async () => {
+        fetchHistory: async () => {
           order.push('recover')
           return []
         }
@@ -1082,7 +1094,7 @@ test('private messenger reload-gap fetch uses all local read relays when channel
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
     _privateChannel: {
-      fetch: async options => {
+      fetchHistory: async options => {
         fetches.push(options)
         return []
       }
@@ -1115,7 +1127,7 @@ test('private messenger refreshes NIP-65-derived watch relays from relay-list up
     fallbackRelays: ['wss://fallback.example/', 'wss://user.old-two.example', 'wss://fallback.example'],
     _privateMessage: pm,
     _privateChannel: {
-      fetch: async options => {
+      fetchHistory: async options => {
         fetches.push(options)
         options.onEvent({
           id: 'missed-id',
@@ -1463,7 +1475,7 @@ test('watch schedules reload-gap recovery and fetches missing channel window', a
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
     _privateChannel: {
-      fetch: async options => {
+      fetchHistory: async options => {
         fetches.push(options)
         options.onEvent({
           id: 'ask-id',
@@ -1500,7 +1512,7 @@ test('stale reload-gap timers do not run after rewatch, unwatch, or close', asyn
   await seedMessengerState({ channel: { lastSeenAt: now - 10, lastWatchedAt: now - 10 } })
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
-    _privateChannel: { fetch: async options => { fetches.push(options); return [] } },
+    _privateChannel: { fetchHistory: async options => { fetches.push(options); return [] } },
     _setTimeout: fn => {
       const timer = { fn, cleared: false }
       timers.push(timer)
@@ -1544,7 +1556,7 @@ test('reader-only channels fetch reload gaps with the reader signer', async () =
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
     _privateChannel: {
-      fetch: async options => {
+      fetchHistory: async options => {
         fetches.push(options)
         options.onEvent({
           id: 'missed-id',
@@ -1811,7 +1823,7 @@ test('recovery asks online seeders for the relay-uncovered left edge', async () 
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
     _privateChannel: {
-      fetch: async options => {
+      fetchHistory: async options => {
         fetches.push(options)
         options.onEvent({
           id: 'relay-id',
@@ -1921,7 +1933,7 @@ test('recovery retains the full range until every seeder ask is delivered', asyn
       pm.ask = scenario.ask
       const messenger = await new PrivateMessenger({
         _privateMessage: pm,
-        _privateChannel: { fetch: async () => [] }
+        _privateChannel: { fetchHistory: async () => [] }
       }).init({
         userSigner: signer(userPubkey),
         channels: [{
@@ -2291,7 +2303,7 @@ test('unacknowledged deliveries survive close, nack and iterator cancellation', 
 test('unwatch intent survives online, update and independent pause reasons', async () => {
   const pm = fakePrivateMessage()
   const channel = { signer: signer('channel'), relays: ['wss://relay.example'] }
-  const messenger = await new PrivateMessenger({ _privateMessage: pm, _privateChannel: { fetch: async () => [] } }).init({ userSigner: signer('owner'), channels: [channel] })
+  const messenger = await new PrivateMessenger({ _privateMessage: pm, _privateChannel: { fetchHistory: async () => [] } }).init({ userSigner: signer('owner'), channels: [channel] })
   try {
     await messenger.unwatch('channel')
     await messenger.pause('network')
@@ -2316,7 +2328,7 @@ test('capacity pauses ingestion without eviction and ack resumes durable recover
   const errors = []
   const messenger = await new PrivateMessenger({
     _privateMessage: pm, messageQueueMaxBytes: 850, onError: err => errors.push(err),
-    _privateChannel: { fetch: async () => { recovered++; return [] } }
+    _privateChannel: { fetchHistory: async () => { recovered++; return [] } }
   }).init({
     userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
   })
@@ -2345,7 +2357,7 @@ test('failed recovery ingestion retains its range and does not advance lastSeenA
   const messenger = await new PrivateMessenger({
     _privateMessage: pm, messageQueueMaxBytes: 100, onError: () => {},
     _privateChannel: {
-      fetch: async options => {
+      fetchHistory: async options => {
         await options.onEvent({ kind: 9, id: 'large', pubkey: 'peer', tags: [], created_at: now, content: 'x'.repeat(300) }, { created_at: now }, { senderPubkey: 'peer' })
         return []
       }
@@ -2363,7 +2375,7 @@ test('failed recovery ingestion retains its range and does not advance lastSeenA
 
 test('failed resume remains paused and can be retried', async () => {
   const pm = fakePrivateMessage()
-  const messenger = await new PrivateMessenger({ _privateMessage: pm, _privateChannel: { fetch: async () => [] } }).init({ userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+  const messenger = await new PrivateMessenger({ _privateMessage: pm, _privateChannel: { fetchHistory: async () => [] } }).init({ userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
   try {
     await messenger.pause('vault')
     const watch = pm.watch
@@ -2450,7 +2462,7 @@ test('first watch commits the bounded initial window before live delivery', asyn
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
     _setTimeout: fn => { scheduled = fn },
-    _privateChannel: { fetch: async options => { fetches.push(options); return [] } }
+    _privateChannel: { fetchHistory: async options => { fetches.push(options); return [] } }
   }).init({ userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
   await scheduled()
   assert.equal(fetches[0].since, now - 7 * 86400)
@@ -2485,7 +2497,7 @@ test('abrupt restart of an empty channel uses its completed scan, not its heartb
   const second = await new PrivateMessenger({
     _indexedDB: restartedDb, _privateMessage: fakePrivateMessage(),
     _setTimeout: fn => { scheduled = fn },
-    _privateChannel: { fetch: async options => { fetches.push(options); return [] } }
+    _privateChannel: { fetchHistory: async options => { fetches.push(options); return [] } }
   }).init(init)
   await scheduled()
   assert.equal(fetches[0].since, now - 7200 - second.offlineSkewSeconds)
@@ -2501,7 +2513,7 @@ test('failed initial recovery survives restart despite newer live progress', asy
   const init = { userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] }
   const first = await new PrivateMessenger({
     _privateMessage: pm, _setTimeout: fn => { scheduled = fn }, onError: () => {},
-    _privateChannel: { fetch: async () => { throw new Error('offline') } }
+    _privateChannel: { fetchHistory: async () => { throw new Error('offline') } }
   }).init(init)
   await scheduled()
   await pm.watchCalls[0].onMessage({
@@ -2521,7 +2533,7 @@ test('failed initial recovery survives restart despite newer live progress', asy
   await new PrivateMessenger({
     _indexedDB: restartedDb, _privateMessage: fakePrivateMessage(),
     _setTimeout: fn => { scheduled = fn },
-    _privateChannel: { fetch: async options => { fetches.push(options); return [] } }
+    _privateChannel: { fetchHistory: async options => { fetches.push(options); return [] } }
   }).init(init)
   await scheduled()
   assert.equal(fetches[0].since, now - 7 * 86400)
@@ -2538,7 +2550,7 @@ test('ack by A does not prevent first-open historical delivery to B on the same 
     _privateMessage: fakePrivateMessage(), _setTimeout: fn => { timers.push(fn) },
     offlineRecoverySeconds: 600,
     _privateChannel: {
-      fetch: async options => {
+      fetchHistory: async options => {
         assert.equal(options.since, now - 600)
         seenReceivers.push(options.receiverPubkey)
         await options.onEvent(event, { created_at: event.created_at }, { channelPubkey: 'channel', senderPubkey: 'peer' })
@@ -2572,7 +2584,7 @@ test('incomplete fetch reaches onError unchanged and remains pending until a suc
   const messenger = await new PrivateMessenger({
     _privateMessage: fakePrivateMessage(), _setTimeout: fn => { scheduled = fn },
     onError: error => errors.push(error),
-    _privateChannel: { fetch: async () => { if (fail) throw failure; return [] } }
+    _privateChannel: { fetchHistory: async () => { if (fail) throw failure; return [] } }
   }).init({ userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
   await scheduled()
   assert.equal(errors[0], failure)
@@ -2677,4 +2689,51 @@ test('nym recipient maps derive fallback coverage without a separate receiverPub
   assert.equal(pm.sent[0].options.relayToReceivers, relayToReceivers)
   assert.equal(typeof pm.sent[0].options._publish, 'function')
   assert.ok(messenger.sendRelayExclusions.has('channel:alice,bob'))
+})
+
+test('paged recovery persists partial deliveries but retains the whole interval across restart', async t => {
+  const now = 1800000000
+  t.mock.method(Date, 'now', () => now * 1000)
+  let scheduled
+  let rejectPage = true
+  const rows = Array.from({ length: 35 }, (_, index) => ({ id: `page-${index}`, kind: 9, pubkey: 'peer', created_at: now - 40 + index, tags: [], content: String(index) }))
+  const init = { userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] }
+  const reads = []
+  const channel = {
+    fetchHistory: options => readHistory({
+      filter: { since: options.since, until: options.until }, relays: options.relays, signal: options.signal,
+      acquirePage: options._acquirePage,
+      getEvents: async (filter, [relay]) => {
+        reads.push(filter)
+        const result = rows.filter(event => event.created_at >= filter.since && event.created_at <= filter.until).reverse().slice(0, filter.limit).map(event => ({ event, relay }))
+        return { result, relays: [{ relay, status: result.length === filter.limit ? 'satisfied' : 'eose' }] }
+      },
+      processEvent: async event => {
+        if (rejectPage && event.id === 'page-20') throw new Error('PERSISTENCE_FAILED')
+        await options.onEvent(event, { created_at: event.created_at }, { channelPubkey: 'channel', senderPubkey: 'peer' })
+      }
+    })
+  }
+  const make = indexedDB => new PrivateMessenger({ _indexedDB: indexedDB, _privateMessage: fakePrivateMessage(), _privateChannel: channel, offlineRecoverySeconds: 60, _setTimeout: fn => { scheduled = fn }, onError: () => {} }).init(init)
+  const first = await make(globalThis.indexedDB)
+  await scheduled()
+  const delivery = await first.nextMessage()
+  assert.equal(delivery.message.event.id, 'page-0')
+  await delivery.ack()
+  const snapshot = await first.stateStore.load()
+  assert.equal(snapshot.channel.recoveredThrough, 0)
+  assert.deepEqual(snapshot.channel.offlineRanges, [{ start: now - 60, end: now }])
+  assert.ok(reads.length > 1)
+  const database = new IDBFactory()
+  const state = await createChannelStateStore({ prefix: first.prefix, indexedDB: database })
+  await state.update(snapshot)
+  await state.close()
+  rejectPage = false
+  reads.length = 0
+  const second = await make(database)
+  await scheduled()
+  assert.equal(reads[0].since, now - 60)
+  const recovered = await second.stateStore.load()
+  assert.equal(recovered.channel.recoveredThrough, now)
+  assert.deepEqual(recovered.channel.offlineRanges, [])
 })
