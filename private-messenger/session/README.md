@@ -48,21 +48,53 @@ This is a DM profile; group membership/key derivation is not implemented.
 
 ## Relay fallback
 
-Automatic single-recipient routing uses the recipient's NIP-65 read relays, at
-most two per attempt. On `blocked`, `restricted`, `auth-required`, `pow`,
-`rate-limited`, or `error` rejections, or connection/transport/timeout failures,
-it can try remaining read relays after `isOnline` confirms connectivity. Invalid
-messages, local signer/authentication failures and unknown error text retain their
-original diagnosis. Explicit per-call `relays`/`relayToReceivers`, channel
-`sendRelays`/`relays`, and multi-recipient sends do not enable automatic fallback.
+Both `createPrivateMessenger` and `createPrivateMessageSession` accept an optional
+`fallbackRelays` array (default `[]`) at construction. URLs are normalized,
+deduplicated and copied; invalid values throw `ValidationError`. For example:
+
+```js
+const session = createPrivateMessageSession({
+  owner, signer, eventStore,
+  fallbackRelays: ['wss://relay.44billion.net']
+})
+```
+
+Automatic sends try each recipient's NIP-65 read relays first, at most two per
+recipient per attempt, then the configured fallbacks in pairs. Explicit
+per-call `relays`, channel `sendRelays`/`relays` and global `relays` remain primary
+and also support configured fallbacks, including fixed multi-recipient sends.
+Explicit lists retain their requested initial fanout; no recipient relay lookup
+is added. A relay present in both lists is attempted only once per outer event.
+Automatic multi-recipient sends and explicit `relayToReceivers` maps also support
+fallbacks. Explicit maps retain their precedence over fixed lists, initial fanout
+and encrypted recipient subsets, without consulting recipient NIP-65 lists.
+The session coordinator remains a DM API; multi-recipient channels use
+`createPrivateMessenger` directly.
+
+On `blocked`, `restricted`, `auth-required`, `pow`, `rate-limited`, or `error`
+rejections, or connection/transport/timeout failures, replacement requires
+`isOnline` to confirm connectivity. Invalid messages, local signer/authentication
+failures and unknown error text retain their original diagnosis.
+
+Receive routing always adds the configured fallback relays to the effective
+primary list (explicit `relays` or the owner's NIP-65 read relays). Listen there
+from the start, even when primary relays are healthy: a sender may have used a
+fallback after publication was refused elsewhere. Live watches, historical
+recovery and file-channel reads share this policy. NIP-65 refreshes retain the
+fallbacks; outgoing exclusions never remove them from receive subscriptions.
+No public recipient tags or changes to a user's NIP-65 event are introduced.
 
 Each signed outer event is reused verbatim, including router/carrier fragments
 and deletion capabilities. Native errors from exhausted attempts remain in its
-publication report. One successful relay acknowledgement completes that outer
-event immediately; other acknowledgements may update future routing preferences
-without delaying the send. Preferences are channel/recipient-scoped, in-memory,
+publication report. A shared relay's first ACK covers all members assigned to
+that publication batch. If replacements use different relays for different
+members, every pending member must be covered before the outer event succeeds;
+a partial ACK cannot hide another member's failure. Remaining primary routes are
+exhausted before configured fallbacks. Redundant acknowledgements may update
+future routing preferences without delaying a successfully covered send. Preferences are channel/recipient-scoped, in-memory,
 expire after five minutes, and never alter receive subscriptions. A fresh attempt
-can recheck an exhausted list. No additional public fallback relays are invented.
+can recheck an exhausted list. Additional fallback relays come only from the
+caller configuration; absent NIP-65 lists retain the existing discovery defaults.
 
 When offline/interrupted with alternatives remaining, reports carry
 `retryWhenAvailable: true`. The outbox remains pending and emits no `onSendError`.

@@ -8,6 +8,7 @@ import { decodeFileMetadata } from '../../nip94/index.js'
 import { createChatOutbox } from './helpers/work-storage.js'
 import { messengerSigner } from './helpers/signer.js'
 import { assertMessagePublished } from '../helpers/publication.js'
+import { normalizeFallbackRelays } from '../helpers/send-routing.js'
 
 export function wireEvent (value, owner) {
   const event = { kind: value.kind, created_at: value.created_at, tags: structuredClone(value.tags), content: value.content, pubkey: value.pubkey || owner }
@@ -17,7 +18,8 @@ export function wireEvent (value, owner) {
 // Relay rejection text must not be interpreted as a local signer denial.
 const retryable = error => error?.code === 'MESSAGE_NOT_PUBLISHED' || !/DENIED|PERMISSION|REVOKED|READ_ONLY|INVALID|BLOCKED|EXPIRED|NOT_IN_PERSONA/i.test(`${error?.code || ''} ${error?.message || ''}`)
 
-export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
+export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
+  fallbackRelays = normalizeFallbackRelays(fallbackRelays)
   const userSigner = messengerSigner(signer)
   messageStorage ||= createEventStoreMessageStorage({ eventStore })
   chunkStorage ||= eventStore ? createEventStoreChunkStorage({ eventStore }) : undefined
@@ -74,7 +76,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       if (closed || !available || version !== lifecycle) return
       values.push(channel)
     }
-    if (!messenger) messenger = await Messenger({ seedStorage: recoveryStorage?.seeds, userSigner, channels: [], useContentKeys: false, onMessageQueued: () => drain(), onError })
+    if (!messenger) messenger = await Messenger({ fallbackRelays, seedStorage: recoveryStorage?.seeds, userSigner, channels: [], useContentKeys: false, onMessageQueued: () => drain(), onError })
     if (closed || !available || version !== lifecycle) { await messenger.pause('signer'); return }
     await messenger.update({ channels: values })
     await messenger.resume('signer')

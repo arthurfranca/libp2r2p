@@ -1,7 +1,8 @@
 import { getEventHash } from '../../event/index.js'
 
 // A report describes one outer event, not one relay. Each outer event needs
-// at least one relay acknowledgement. Keep the successful fast path immediate.
+// accepted publication covering its routed recipients. Keep the successful fast
+// path immediate; a partially covered multi-recipient report remains a failure.
 export async function assertMessagePublished (result, event) {
   const reports = result?.delivery?.reports
   const present = Array.isArray(reports) && reports.length > 0

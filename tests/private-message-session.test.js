@@ -10,20 +10,21 @@ const until = async predicate => {
   for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 2)) }
   assert.fail('condition not reached')
 }
-async function fixture (t, { publish, save = async () => ({ result: { ok: true } }) } = {}) {
+async function fixture (t, { publish, fallbackRelays, save = async () => ({ result: { ok: true } }) } = {}) {
   const errors = []; const sendErrors = []; const records = new Map(); const onlineListeners = new Set()
   const store = () => ({ list: async () => [], put: async entry => records.set(entry.id, structuredClone(entry)), remove: async id => records.delete(id), close () {} })
+  let messengerOptions
   const session = createPrivateMessageSession({
-    owner, signer: { withSharedKey: () => ({ getPublicKey: async () => peer }) },
+    owner, fallbackRelays, signer: { withSharedKey: () => ({ getPublicKey: async () => peer }) },
     messageStorage: { save }, openOutbox: store, openDownloads: store,
-    Messenger: async () => ({ update () {}, resume () {}, pause () {}, close () {}, nextMessage: async () => null, broadcastRumor: publish }),
+    Messenger: async options => { messengerOptions = options; return { update () {}, resume () {}, pause () {}, close () {}, nextMessage: async () => null, broadcastRumor: publish } },
     FileTransfer: () => ({ observe () {} }),
     _onOnline: listener => { onlineListeners.add(listener); return () => onlineListeners.delete(listener) },
     onError: error => errors.push(error), onSendError: (error, context) => sendErrors.push({ error, context })
   })
   t.after(() => session.close())
   await session.setPeers([peer]); await session.setAvailable(true)
-  return { session, errors, sendErrors, records, onlineListeners, reconnect: () => Promise.all([...onlineListeners].map(listener => listener())) }
+  return { session, messengerOptions: () => messengerOptions, errors, sendErrors, records, onlineListeners, reconnect: () => Promise.all([...onlineListeners].map(listener => listener())) }
 }
 
 test('send errors identify the owning message when a quoted event is rejected', async t => {
@@ -120,4 +121,10 @@ test('cancel, signer unavailability and close release pending online listeners',
     assert.equal(publications, 1)
     assert.equal(f.sendErrors.length, 0)
   }
+})
+
+test('session forwards normalized fallback relays and rejects invalid public configuration', async t => {
+  const f = await fixture(t, { fallbackRelays: ['wss://FALLBACK.example/', 'wss://fallback.example'] })
+  assert.deepEqual(f.messengerOptions().fallbackRelays, ['wss://fallback.example'])
+  assert.throws(() => createPrivateMessageSession({ fallbackRelays: 'wss://fallback.example' }), { code: 'INVALID_FALLBACK_RELAYS' })
 })

@@ -1105,13 +1105,14 @@ test('private messenger reload-gap fetch uses all local read relays when channel
   assert.equal((await takeMessage(messenger)), null)
 })
 
-test('private messenger refreshes NIP-65-derived watch relays from relay-list updates', async () => {
+test('private messenger refreshes NIP-65-derived watch relays from relay-list updates while retaining configured fallbacks', async () => {
   const pm = fakePrivateMessage()
   const relayUpdates = fakeRelayListUpdates()
   const fetches = []
   const now = Math.floor(Date.now() / 1000)
   let userReadRelays = ['wss://user.old-one.example', 'wss://user.old-two.example']
   const messenger = await new PrivateMessenger({
+    fallbackRelays: ['wss://fallback.example/', 'wss://user.old-two.example', 'wss://fallback.example'],
     _privateMessage: pm,
     _privateChannel: {
       fetch: async options => {
@@ -1146,25 +1147,25 @@ test('private messenger refreshes NIP-65-derived watch relays from relay-list up
   assert.deepEqual(relayUpdates.subscriptions[0].pubkeys, ['user'])
   assert.equal(relayUpdates.subscriptions[0].options.relayType, 'read')
   assert.deepEqual(pm.watchCalls[0].channels, ['derived'])
-  assert.deepEqual(pm.watchCalls[0].relays, ['wss://user.old-one.example', 'wss://user.old-two.example'])
+  assert.deepEqual(pm.watchCalls[0].relays, ['wss://user.old-one.example', 'wss://user.old-two.example', 'wss://fallback.example'])
   assert.deepEqual(pm.watchCalls[1].channels, ['explicit'])
-  assert.deepEqual(pm.watchCalls[1].relays, ['wss://explicit.example'])
+  assert.deepEqual(pm.watchCalls[1].relays, ['wss://explicit.example', 'wss://fallback.example', 'wss://user.old-two.example'])
 
   userReadRelays = ['wss://user.old-two.example', 'wss://user.new.example']
   await relayUpdates.subscriptions[0].emit({ pubkey: 'user' })
 
   assert.equal(pm.watchCalls.length, 3)
   assert.deepEqual(pm.watchCalls[2].channels, ['derived'])
-  assert.deepEqual(pm.watchCalls[2].relays, ['wss://user.old-two.example', 'wss://user.new.example'])
+  assert.deepEqual(pm.watchCalls[2].relays, ['wss://user.old-two.example', 'wss://user.new.example', 'wss://fallback.example'])
   assert.deepEqual(pm.stopped, [])
   assert.equal(fetches.length, 1)
   assert.deepEqual(fetches[0].privateChannelPubkeys, ['derived'])
-  assert.deepEqual(fetches[0].relays, ['wss://user.old-two.example', 'wss://user.new.example'])
+  assert.deepEqual(fetches[0].relays, ['wss://user.old-two.example', 'wss://user.new.example', 'wss://fallback.example'])
   assert.ok(fetches[0].since <= now - 20)
   assert.ok(fetches[0].until >= now)
   assert.equal((await takeMessage(messenger)).event.id, 'missed-id')
-  assert.deepEqual(messenger.readState().channels.derived.relays, ['wss://user.old-two.example', 'wss://user.new.example'])
-  assert.deepEqual(messenger.readState().channels.explicit.relays, ['wss://explicit.example'])
+  assert.deepEqual(messenger.readState().channels.derived.relays, ['wss://user.old-two.example', 'wss://user.new.example', 'wss://fallback.example'])
+  assert.deepEqual(messenger.readState().channels.explicit.relays, ['wss://explicit.example', 'wss://fallback.example', 'wss://user.old-two.example'])
 })
 
 test('private messenger does not subscribe to relay-list updates for explicit-only channels', async () => {
@@ -1205,7 +1206,7 @@ test('private messenger prefers explicit relay receiver maps over channel relays
 
 test('private messenger uses channel sendRelays after per-call routing overrides', async () => {
   const pm = fakePrivateMessage()
-  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
+  const messenger = await new PrivateMessenger({ _privateMessage: pm, fallbackRelays: ['wss://fallback.example'] }).init({
     userSigner: signer('user'),
     channels: [{
       pubkey: 'channel',
@@ -1220,11 +1221,14 @@ test('private messenger uses channel sendRelays after per-call routing overrides
   await messenger.tell({ receiverPubkey: 'alice', relays: ['wss://per-call.example'], payload: 'per call relays' })
   await messenger.tell({ receiverPubkey: 'alice', relayToReceivers, payload: 'mapped relays' })
 
-  assert.deepEqual(pm.watchCalls[0].relays, ['wss://watch-one.example', 'wss://watch-two.example', 'wss://watch-three.example'])
+  assert.deepEqual(pm.watchCalls[0].relays, ['wss://watch-one.example', 'wss://watch-two.example', 'wss://watch-three.example', 'wss://fallback.example'])
+  assert.equal(typeof pm.sent[0].options._publish, 'function')
+  assert.equal(typeof pm.sent[1].options._publish, 'function')
   assert.deepEqual(pm.sent[0].options.relays, ['wss://send-one.example', 'wss://send-two.example'])
   assert.deepEqual(pm.sent[1].options.relays, ['wss://per-call.example'])
   assert.equal(pm.sent[2].options.relays, undefined)
   assert.equal(pm.sent[2].options.relayToReceivers, relayToReceivers)
+  assert.equal(typeof pm.sent[2].options._publish, 'function')
 })
 
 test('private messenger mirrors routed and nym sends to recovery seeder relays', async () => {
@@ -2598,4 +2602,79 @@ test('outgoing seeder capture precedes publication and does not require a networ
   await messenger.enqueueSeed('channel', seed)
   assert.equal((await Array.fromAsync(messenger.seedQueue.storedItems())).length, 1, 'echo deduplicates against the local ciphertext')
   await messenger.close()
+})
+
+test('fallback relay configuration validates and snapshots normalized URLs without fixing channels', async () => {
+  for (const value of [null, 'wss://fallback.example', {}]) assert.throws(() => new PrivateMessenger({ fallbackRelays: value }), { code: 'INVALID_FALLBACK_RELAYS' })
+  assert.throws(() => new PrivateMessenger({ fallbackRelays: Array(1) }), { code: 'INVALID_RELAY_URL' })
+  assert.throws(() => new PrivateMessenger({ fallbackRelays: ['ftp://fallback.example'] }), { code: 'INVALID_RELAY_PROTOCOL' })
+  const fallbackRelays = ['wss://FALLBACK.example/', 'wss://fallback.example']
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({
+    fallbackRelays, _privateMessage: pm,
+    _getRelaysByPubkey: async pubkeys => Object.fromEntries(pubkeys.map(pubkey => [pubkey, { read: [`wss://${pubkey}.example`], write: [] }]))
+  }).init({ userSigner: signer('user'), channels: [{ signer: signer('channel') }] })
+  fallbackRelays.push('wss://changed.example')
+  assert.deepEqual(messenger.fallbackRelays, ['wss://fallback.example'])
+  assert.equal(messenger.channels.get('channel').usesNip65WatchRelays, true)
+  assert.deepEqual(pm.watchCalls[0].relays, ['wss://user.example', 'wss://fallback.example'])
+  await messenger.tell({ receiverPubkey: 'peer', relays: ['wss://explicit.example'], payload: 'explicit' })
+  assert.deepEqual(pm.sent[0].options.relays, ['wss://explicit.example'])
+  assert.equal(typeof pm.sent[0].options._publish, 'function', 'explicit per-call relays retain the fallback publisher')
+})
+
+test('fixed relay fallbacks preserve the receiver set and do not consult recipient NIP-65 lists', async () => {
+  for (const source of ['global', 'channel', 'send', 'call']) {
+    const pm = fakePrivateMessage()
+    const primary = ['wss://fixed-one.example', 'wss://fixed-two.example', 'wss://fixed-three.example']
+    const messenger = await new PrivateMessenger({
+      fallbackRelays: ['wss://fallback.example'], _privateMessage: pm,
+      _getRelaysByPubkey: async pubkeys => {
+        assert.deepEqual(pubkeys, ['user'], 'only automatic receive routing discovers the owner relays')
+        return { user: { read: ['wss://read.example'], write: [] } }
+      }
+    }).init({
+      userSigner: signer('user'),
+      ...(source === 'global' ? { relays: primary } : {}),
+      channels: [{ signer: signer(`channel-${source}`), ...(source === 'channel' ? { relays: primary } : {}), ...(source === 'send' ? { sendRelays: primary } : {}) }]
+    })
+    await messenger.broadcastRumor({ receiverPubkeys: ['alice', 'bob'], ...(source === 'call' ? { relays: primary } : {}), rumor: { kind: 9, created_at: 1, tags: [], content: 'fixed destinations' } })
+    assert.deepEqual(pm.sent[0].options.receiverPubkeys, ['alice', 'bob'])
+    assert.deepEqual(pm.sent[0].options.relays, primary)
+    assert.equal(pm.sent[0].options.relayToReceivers, undefined)
+    assert.equal(typeof pm.sent[0].options._publish, 'function')
+    assert.deepEqual(pm.watchCalls[0].relays, [...(['global', 'channel'].includes(source) ? primary : ['wss://read.example']), 'wss://fallback.example'])
+  }
+})
+
+test('automatic group routing installs a fallback publisher without changing the initial recipient pairs', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({
+    fallbackRelays: ['wss://fallback.example'], _privateMessage: pm,
+    _getRelaysByPubkey: async () => ({
+      user: { read: ['wss://owner.example'] },
+      alice: { read: ['wss://shared.example', 'wss://alice.example', 'wss://alice-other.example'] },
+      bob: { read: ['wss://shared.example', 'wss://bob.example', 'wss://bob-other.example'] }
+    })
+  }).init({ userSigner: signer('user'), channels: [{ pubkey: 'channel', signer: signer('channel') }] })
+  await messenger.broadcastRumor({ receiverPubkeys: ['alice', 'bob'], rumor: { kind: 9, created_at: 1, tags: [], content: 'group' } })
+  assert.equal(typeof pm.sent[0].options._publish, 'function')
+  assert.deepEqual([...pm.sent[0].options.relayToReceivers], [
+    ['wss://shared.example', ['alice', 'bob']],
+    ['wss://alice.example', ['alice']],
+    ['wss://bob.example', ['bob']]
+  ])
+})
+
+test('nym recipient maps derive fallback coverage without a separate receiverPubkeys option', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm, fallbackRelays: ['wss://fallback.example'] }).init({
+    userSigner: signer('user'), nymSigner: signer('nym'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://channel.example'] }]
+  })
+  const relayToReceivers = new Map([['wss://bob.example', ['bob']], ['wss://alice.example', ['alice']]])
+  await messenger.broadcastNymRumor({ relayToReceivers, rumor: { kind: 9, created_at: 1, tags: [], content: 'nym group' } })
+  assert.equal(pm.sent[0].options.relayToReceivers, relayToReceivers)
+  assert.equal(typeof pm.sent[0].options._publish, 'function')
+  assert.ok(messenger.sendRelayExclusions.has('channel:alice,bob'))
 })

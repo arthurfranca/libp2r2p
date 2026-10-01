@@ -44,7 +44,8 @@
 
 import * as privateMessage from '../private-message/index.js'
 import { isOnline } from '../network/index.js'
-import { createSendRelayRouting } from './helpers/send-routing.js'
+import { createSendRelayRouting, normalizeFallbackRelays } from './helpers/send-routing.js'
+import { normalizeRelayUrl } from '../url/index.js'
 import { deliveryInfo } from '../private-channel/helpers/rumor.js'
 import { bytesToBase64 } from '../base64/index.js'
 import { ValidationError } from '../error/index.js'
@@ -193,6 +194,7 @@ export class PrivateMessenger {
   }
 
   constructor ({
+    fallbackRelays = [],
     offlineRecoverySeconds = DEFAULT_OFFLINE_RECOVERY_SECONDS,
     staleChannelSeconds = DEFAULT_STALE_CHANNEL_SECONDS,
     identityStorageRetentionSeconds = DEFAULT_IDENTITY_STORAGE_RETENTION_SECONDS,
@@ -226,6 +228,7 @@ export class PrivateMessenger {
     _storageClearInterval = globalThis.clearInterval.bind(globalThis),
     _BroadcastChannel = _indexedDB === globalThis.indexedDB ? globalThis.BroadcastChannel : undefined
   } = {}) {
+    this.fallbackRelays = normalizeFallbackRelays(fallbackRelays)
     this.offlineRecoverySeconds = normalizeOfflineRecoverySeconds(offlineRecoverySeconds)
     this.staleChannelSeconds = normalizeStaleChannelSeconds(staleChannelSeconds)
     this.identityStorageRetentionSeconds = normalizeIdentityStorageRetentionSeconds(identityStorageRetentionSeconds)
@@ -756,42 +759,38 @@ export class PrivateMessenger {
   }
 
   async resolveWatchRelays (channel) {
-    if (!channel.usesNip65WatchRelays && channel.relays.length) return channel.relays
-    return this.readRelaysForPubkey(this.userPubkey)
+    const primary = !channel.usesNip65WatchRelays && channel.relays.length ? channel.relays : await this.readRelaysForPubkey(this.userPubkey)
+    return uniq([...primary, ...this.fallbackRelays].map(normalizeRelayUrl))
   }
 
   async resolveSendRouting ({ channel, receiverPubkeys, relays, relayToReceivers, signal }) {
     const recoveryRelays = await this.recoveryMirrorRelays(channel.pubkey)
-    if (relayToReceivers) return { relayToReceivers, recoveryRelays }
-    if (relays?.length) return { relays: uniq(relays), recoveryRelays }
-    if (channel.sendRelays.length) return { relays: channel.sendRelays, recoveryRelays }
-    if (channel.relays.length) return { relays: channel.relays, recoveryRelays }
-    const recipients = uniq(receiverPubkeys)
-    if (recipients.length === 1) {
-      const peer = recipients[0]
-      const relaysByPubkey = await this._getRelaysByPubkey(recipients)
-      const key = `${channel.pubkey}:${peer}`
-      if (!this.sendRelayExclusions.has(key)) {
-        if (this.sendRelayExclusions.size >= 256) this.sendRelayExclusions.delete(this.sendRelayExclusions.keys().next().value)
-        this.sendRelayExclusions.set(key, { channelPubkey: channel.pubkey, exclusions: new Map() })
-      }
-      const routing = createSendRelayRouting({
-        peer, relaysByPubkey, recoveryRelays,
-        signal: signal ? AbortSignal.any([this.sendRoutingLifetime.signal, signal]) : this.sendRoutingLifetime.signal,
-        exclusions: this.sendRelayExclusions.get(key).exclusions,
-        pickRelays: this._pickRelaysForPubkeys,
-        publish: this._privateChannel.publish || privateChannel.publish,
-        publishNymEvent: this._privateChannel.publishNymEvent || privateChannel.publishNymEvent,
-        sendEvent: (...args) => relayPool.sendEvent(...args),
-        isOnline: this._isOnline,
-        isCurrent: () => !this.closePromise && !this.pauseReasons.size && this.channels.has(channel.pubkey)
-      })
-      if (!relayMapRelays(routing.relayToReceivers).length) throw new ValidationError('NO_RELAYS')
-      return routing
+    if (relayToReceivers && !this.fallbackRelays.length) return { relayToReceivers, recoveryRelays }
+    const fixed = relayToReceivers ? null : relays?.length ? uniq(relays) : channel.sendRelays.length ? channel.sendRelays : channel.relays.length ? channel.relays : null
+    if (fixed && !this.fallbackRelays.length) return { relays: fixed, recoveryRelays }
+    const recipients = uniq(receiverPubkeys?.length ? receiverPubkeys : relayMapReceivers(relayToReceivers))
+    const relaysByPubkey = fixed || relayToReceivers ? undefined : await this._getRelaysByPubkey(recipients)
+    const key = `${channel.pubkey}:${[...recipients].sort().join(',')}`
+    if (!this.sendRelayExclusions.has(key)) {
+      if (this.sendRelayExclusions.size >= 256) this.sendRelayExclusions.delete(this.sendRelayExclusions.keys().next().value)
+      this.sendRelayExclusions.set(key, { channelPubkey: channel.pubkey, exclusions: new Map() })
     }
-    const derived = await this.readRelayToReceivers(recipients)
-    if (!relayMapRelays(derived).length) throw new ValidationError('NO_RELAYS')
-    return { relayToReceivers: derived, recoveryRelays }
+    const routing = createSendRelayRouting({
+      peers: fixed && !recipients.length ? [this.userPubkey] : recipients, relaysByPubkey, recoveryRelays, primaryRelays: fixed?.map(normalizeRelayUrl), primaryRelayToReceivers: relayToReceivers, fallbackRelays: this.fallbackRelays,
+      signal: signal ? AbortSignal.any([this.sendRoutingLifetime.signal, signal]) : this.sendRoutingLifetime.signal,
+      exclusions: this.sendRelayExclusions.get(key).exclusions,
+      pickRelays: this._pickRelaysForPubkeys,
+      publish: this._privateChannel.publish || privateChannel.publish,
+      publishNymEvent: this._privateChannel.publishNymEvent || privateChannel.publishNymEvent,
+      sendEvent: (...args) => relayPool.sendEvent(...args),
+      isOnline: this._isOnline,
+      isCurrent: () => !this.closePromise && !this.pauseReasons.size && this.channels.has(channel.pubkey)
+    })
+    if (!relayMapRelays(routing.relayToReceivers).length) throw new ValidationError('NO_RELAYS')
+    // Fixed lists address the original receiver set as a whole, preserving the
+    // existing encryption grouping instead of inventing per-recipient routes.
+    if (fixed) return { relays: fixed, recoveryRelays: routing.recoveryRelays, _publish: routing._publish }
+    return routing
   }
 
   readState () {
@@ -2328,6 +2327,12 @@ function oldestCreatedAt (events) {
     oldest = oldest == null ? event.created_at : Math.min(oldest, event.created_at)
   }
   return oldest
+}
+
+function relayMapReceivers (relayToReceivers) {
+  if (!relayToReceivers) return []
+  const values = relayToReceivers instanceof Map ? [...relayToReceivers.values()] : Object.values(relayToReceivers)
+  return uniq(values.flat())
 }
 
 function relayMapRelays (relayToReceivers) {

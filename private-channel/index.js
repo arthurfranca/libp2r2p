@@ -37,7 +37,7 @@ const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 const NIP44_V3_SCOPE = ''
 
-const sendToRelays = (...args) => relayPool.sendEvent(...args)
+const sendToRelays = (event, relays) => relayPool.sendEvent(event, relays)
 const getEvents = (...args) => relayPool.getEvents(...args)
 const getLiveEventsGenerator = (...args) => relayPool.getLiveEventsGenerator(...args)
 const getEventsFeedGenerator = (...args) => relayPool.getEventsFeedGenerator(...args)
@@ -540,7 +540,7 @@ export async function publish ({ senderSigner, imkcSigner, privateChannelSigner 
     try {
       for (const group of groups) {
         for await (const wrappedEvent of wrapPreparedEvents({ privateChannelSigner, receivers: group.receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey: normalizedDeletionPubkey, expirationSeconds, context })) {
-          results.push(await _publish(wrappedEvent, withRecoveryRelays(group.relays, recoveryRelays)))
+          results.push(await _publish(wrappedEvent, withRecoveryRelays(group.relays, recoveryRelays), { receiverPubkeys: receiverPubkeys(group.receivers), primaryRelays: group.relays }))
         }
       }
     } finally {
@@ -550,7 +550,7 @@ export async function publish ({ senderSigner, imkcSigner, privateChannelSigner 
   }
 
   for await (const wrappedEvent of wrapEvents({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey: normalizedDeletionPubkey, event, expirationSeconds, temporaryStorageArea, _getIykcProofs })) {
-    results.push(await _publish(wrappedEvent, withRecoveryRelays(relays, recoveryRelays)))
+    results.push(await _publish(wrappedEvent, withRecoveryRelays(relays, recoveryRelays), { receiverPubkeys: receiverPubkeys(receivers), primaryRelays: relays }))
   }
   return results
 }

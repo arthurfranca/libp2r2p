@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
+import { PrivateMessenger } from '../private-messenger/index.js'
 import { createPrivateFileTransfer, decodeMissingRanges, fileChannelInfo, FILE_CHUNKS_REQUEST_CODE } from '../private-messenger/file/index.js'
 import { prepareIrfsFile } from '../irfs/index.js'
 import { wrapEvent, unwrapRouterEvent } from '../private-channel/index.js'
@@ -22,7 +23,7 @@ async function fixture ({ onError, bytes = 51001, local = [], ask = async () => 
   const manager = createPrivateFileTransfer({ onError, messenger, resolveChannel: async () => ({ getPublicKey: async () => data }), storage: { read: async (root, index) => { read?.(index); return stored.get(index) }, save: async event => { await save?.(event); stored.set(Number(event.tags[1][1]), event) } }, _transport: { subscribe: options => { feed = options; return { ready: Promise.resolve(), close: async () => { closes++ } } }, fetch: history }, _hedgeMs: 5, _idleMs: 40 })
   const descriptor = { controlChannelPubkey: control, peerPubkey: peer, root: prepared.root, size: prepared.size }
   const deliver = (feed, index) => feed.onEvent(chunks[index], {}, { senderPubkey: peer, router: { tags: [['i', String(index)]] } })
-  return { manager, messenger, descriptor, stored, chunks, deliver, closes: () => closes, close: async () => { await manager.close(); prepared.close() } }
+  return { manager, messenger, watch: () => feed, descriptor, stored, chunks, deliver, closes: () => closes, close: async () => { await manager.close(); prepared.close() } }
 }
 
 test('file convention and bounded disjoint request ranges', () => {
@@ -274,4 +275,29 @@ test('chunk publication preserves final relay diagnostics, deferred status and c
       return true
     })
   } finally { await manager.close() }
+})
+
+test('file live watches and historical chunk reads include the parent fallback relays', async () => {
+  for (const explicit of [false, true]) {
+    const primary = 'wss://primary.example', fallback = 'wss://fallback.example'
+    let historyRelays
+    const f = await fixture({
+      history: async options => {
+        historyRelays = options.relays
+        await f.deliver(options, 0); await f.deliver(options, 1)
+      }
+    })
+    const parent = f.messenger.channels.get(control)
+    parent.relays = explicit ? [primary] : []
+    parent.usesNip65WatchRelays = !explicit
+    f.messenger.fallbackRelays = [fallback]
+    f.messenger.readRelaysForPubkey = async () => [primary]
+    f.messenger.resolveWatchRelays = PrivateMessenger.prototype.resolveWatchRelays.bind(f.messenger)
+    try {
+      await f.manager.download(f.descriptor)
+      assert.deepEqual(f.watch().relays, [primary, fallback])
+      assert.deepEqual(historyRelays, [primary, fallback])
+      assert.equal(f.stored.size, 2)
+    } finally { await f.close() }
+  }
 })

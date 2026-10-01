@@ -176,10 +176,24 @@ NIP-46 against the real pool with controlled transport and injected controls.
   do not persist errors or report inbox/download/deletion/cancelled work through
   this callback. Apps decide which user attempts and routes warrant feedback.
 
-- Automatic single-recipient NIP-65 sends retry a finite candidate snapshot in
-  pairs, preserving the exact signed outer event. Keep explicit per-call/channel
-  relays and multi-recipient routing unchanged. Do not reintroduce excluded
-  recipient relays through recovery mirrors or change receive subscriptions.
+- Automatic NIP-65 sends retry a finite candidate snapshot in pairs per recipient,
+  preserving the exact signed outer event. Configured `fallbackRelays`
+  follow primary exhaustion and also support explicit per-call `relays`, channel
+  `sendRelays` and channel/global `relays`, preserving explicit initial fanout and
+  receiver sets. Automatic multi-recipient routing and explicit `relayToReceivers`
+  maps use the same fallback policy. Maps keep precedence over fixed lists and
+  do not trigger recipient discovery. Do not promote fallbacks through recovery mirrors.
+- Private-channel publication passes local recipient/primary-route context to its
+  injected sender. Retry each encrypted subset unchanged; never recreate wrappers
+  or widen their recipients. Split replacement batches by the members they serve
+  and require coverage of every member, even when some batches have ACKs. Exhaust
+  remaining primary routes before configured fallbacks. Preserve first-ACK latency
+  within each batch and native errors in partially successful final reports.
+- `fallbackRelays` defaults to `[]` on the messenger/session constructors. Validate,
+  normalize, deduplicate and snapshot URLs. Receive routing unions fallbacks with
+  both explicit and NIP-65-derived primaries from the start, including history and
+  files; keep NIP-65 subscriptions active for automatic channels. Never add public
+  recipient tags or rewrite relay-list metadata for this policy.
 - Classify failures by native category and leading NIP prefix, never arbitrary
   prose. Invalid events, local signer/auth failures and unknown errors do not
   rotate relays. Confirm connectivity through `isOnline` before replacement;
