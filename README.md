@@ -914,3 +914,12 @@ local defaults, including a bounded streaming file cache. The optional
 [`private-messenger/session`](private-messenger/session/README.md) coordinator
 provides reusable DM inbox/outbox and attachment lifecycle without UI coupling,
 including an optional `onSendError` callback identifying the failed outbox message.
+
+Single-recipient private messages now retry NIP-65 read relays in pairs when
+selected relays reject publication or become unreachable while connectivity is
+confirmed. The exact encrypted outer events are reused; explicit per-call and
+channel relay overrides remain authoritative. Successful sends keep first-ACK
+latency, and short-lived channel/recipient preferences avoid recently refused
+relays without changing receive subscriptions. See the
+[session coordinator](private-messenger/session/README.md) for deferred offline
+attempts and final failure notifications.

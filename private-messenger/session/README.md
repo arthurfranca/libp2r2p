@@ -45,3 +45,34 @@ passing their established factories, as Zillion does.
 External recovery factories are owned by their caller and must be closed after
 the session. Work storage opened by the session is closed by the session.
 This is a DM profile; group membership/key derivation is not implemented.
+
+## Relay fallback
+
+Automatic single-recipient routing uses the recipient's NIP-65 read relays, at
+most two per attempt. On `blocked`, `restricted`, `auth-required`, `pow`,
+`rate-limited`, or `error` rejections, or connection/transport/timeout failures,
+it can try remaining read relays after `isOnline` confirms connectivity. Invalid
+messages, local signer/authentication failures and unknown error text retain their
+original diagnosis. Explicit per-call `relays`/`relayToReceivers`, channel
+`sendRelays`/`relays`, and multi-recipient sends do not enable automatic fallback.
+
+Each signed outer event is reused verbatim, including router/carrier fragments
+and deletion capabilities. Native errors from exhausted attempts remain in its
+publication report. One successful relay acknowledgement completes that outer
+event immediately; other acknowledgements may update future routing preferences
+without delaying the send. Preferences are channel/recipient-scoped, in-memory,
+expire after five minutes, and never alter receive subscriptions. A fresh attempt
+can recheck an exhausted list. No additional public fallback relays are invented.
+
+When offline/interrupted with alternatives remaining, reports carry
+`retryWhenAvailable: true`. The outbox remains pending and emits no `onSendError`.
+Offline reports also carry `retryWhenOnline: true`: the session owns a temporary
+`onOnline` subscription to retry those entries after confirmed connectivity,
+including brief outages the app's existing monitor might have missed. Cancel,
+close and signer unavailability release the subscription. Account recovery still
+uses `setAvailable(true)`; network recovery never overrides signer availability.
+`onSendError` is emitted only after final failure, including exhausted eligible
+relays. Validation/authorization failures are terminal without relay rotation.
+`broadcastRumor`/`broadcastEvent` accept a `signal` to stop further replacement
+publications; the session supplies it and aborts it on cancel/close. An already
+published event cannot be recalled by cancellation.

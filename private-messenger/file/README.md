@@ -21,8 +21,10 @@ append it to the thumbnail URL. This is not a group-key derivation scheme.
   The application calls it for an explicit share, using its persisted message
   timestamp (standalone 1063 uses its own timestamp). Registration, cache hits
   and incoming requests never grant access. Missing router `p` is not a wildcard.
-- `publishChunk(descriptor, event)` checks a 34601 proof and the descriptor,
+- `publishChunk(descriptor, event, { signal } = {})` checks a 34601 proof and the descriptor,
   captures ciphertext only in watchtower mode, and publishes to the recipient's relays.
+  It shares the parent channel's automatic relay fallback and full publication
+  diagnostics; `signal` stops further replacement attempts.
   Every wrapper must receive at least one relay acceptance. Yield between calls
   so text/control sends can run. Publish all file chunks before announcing 1063/9.
 - `download(descriptor, { manual, thumbnail, signal })` returns the verified,

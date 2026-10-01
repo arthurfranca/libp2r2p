@@ -1,4 +1,4 @@
-import { getEventHash } from '../../../event/index.js'
+import { getEventHash } from '../../event/index.js'
 
 // A report describes one outer event, not one relay. Each outer event needs
 // at least one relay acknowledgement. Keep the successful fast path immediate.
@@ -17,6 +17,8 @@ export async function assertMessagePublished (result, event) {
       return {
         index,
         total: settled?.total ?? report?.total,
+        ...(report?.retryWhenAvailable ? { retryWhenAvailable: true } : {}),
+        ...(report?.retryWhenOnline ? { retryWhenOnline: true } : {}),
         fulfilled: settled?.fulfilled,
         errors: (settled?.errors || []).map(({ relay, reason }) => ({ relay, reason }))
       }
@@ -32,6 +34,7 @@ export async function assertMessagePublished (result, event) {
   })
   throw Object.assign(new Error(`MESSAGE_NOT_PUBLISHED: ${details.join(' | ') || reason}`), {
     code: 'MESSAGE_NOT_PUBLISHED',
+    ...(failures.length && failures.every(report => report.retryWhenAvailable) ? { retryWhenAvailable: true, ...(failures.some(report => report.retryWhenOnline) ? { retryWhenOnline: true } : {}) } : {}),
     reason,
     eventId: getEventHash(event),
     eventKind: event.kind,

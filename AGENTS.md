@@ -175,3 +175,22 @@ NIP-46 against the real pool with controlled transport and injected controls.
   including failures of its context/file events. Preserve native diagnostics;
   do not persist errors or report inbox/download/deletion/cancelled work through
   this callback. Apps decide which user attempts and routes warrant feedback.
+
+- Automatic single-recipient NIP-65 sends retry a finite candidate snapshot in
+  pairs, preserving the exact signed outer event. Keep explicit per-call/channel
+  relays and multi-recipient routing unchanged. Do not reintroduce excluded
+  recipient relays through recovery mirrors or change receive subscriptions.
+- Classify failures by native category and leading NIP prefix, never arbitrary
+  prose. Invalid events, local signer/auth failures and unknown errors do not
+  rotate relays. Confirm connectivity through `isOnline` before replacement;
+  session failures with `retryWhenAvailable` stay pending and do not invoke
+  `onSendError`. `retryWhenOnline` also owns a temporary shared `onOnline`
+  subscription, released on cancel/close/unavailability. Retry only those waiting
+  entries and never override signer availability; account recovery still uses
+  `setAvailable(true)`.
+- Relay exclusions live only in memory, expire after five minutes, and are scoped
+  by channel/recipient (at most 256 scopes). Removing channels or closing clears
+  them. Track attempted relays per outer event independently of this shared state.
+  Aggregate native diagnostics from all attempts and retain the first-ACK path.
+- Outbox cancellation and close abort fallback work for messages and file chunks.
+  Shared publication diagnostics live in private-messenger/helpers/publication.js.

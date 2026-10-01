@@ -3,10 +3,11 @@ import { createPrivateFileTransfer } from '../file/index.js'
 import { createPrivateMessenger } from '../index.js'
 import { getEventHash, isValidEvent, isSerializableEvent } from '../../event/index.js'
 import { decodeIrfsChunk, IRFS_CHUNK_BYTES } from '../../irfs/index.js'
+import { onOnline } from '../../network/index.js'
 import { decodeFileMetadata } from '../../nip94/index.js'
 import { createChatOutbox } from './helpers/work-storage.js'
 import { messengerSigner } from './helpers/signer.js'
-import { assertMessagePublished } from './helpers/publication.js'
+import { assertMessagePublished } from '../helpers/publication.js'
 
 export function wireEvent (value, owner) {
   const event = { kind: value.kind, created_at: value.created_at, tags: structuredClone(value.tags), content: value.content, pubkey: value.pubkey || owner }
@@ -16,7 +17,7 @@ export function wireEvent (value, owner) {
 // Relay rejection text must not be interpreted as a local signer denial.
 const retryable = error => error?.code === 'MESSAGE_NOT_PUBLISHED' || !/DENIED|PERMISSION|REVOKED|READ_ONLY|INVALID|BLOCKED|EXPIRED|NOT_IN_PERSONA/i.test(`${error?.code || ''} ${error?.message || ''}`)
 
-export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
+export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
   const userSigner = messengerSigner(signer)
   messageStorage ||= createEventStoreMessageStorage({ eventStore })
   chunkStorage ||= eventStore ? createEventStoreChunkStorage({ eventStore }) : undefined
@@ -25,6 +26,9 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const deniedPeers = new Set()
   const entries = new Map()
   const cancelled = new Set()
+  const sendControllers = new Map()
+  const offlineSends = new Set()
+  let stopOnline
   let messenger
   let fileTransfers
   let downloads
@@ -140,16 +144,18 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       }
     } finally { await Promise.all(deferred.map(nack => nack())); draining = false; settled() }
   }
-  async function publish (peer, event) {
+  async function publish (peer, event, signal) {
     if (deniedPeers.has(peer)) throw new Error('PERMISSION_DENIED')
     if (!available || !peers.has(peer) || !channels.has(peer)) throw new Error('CHAT_UNAVAILABLE')
-    const options = { channelPubkey: channels.get(peer)?.pubkey, receiverPubkeys: [peer] }
+    const options = { channelPubkey: channels.get(peer)?.pubkey, receiverPubkeys: [peer], signal }
     const report = event.sig ? await messenger.broadcastEvent({ ...options, event }) : await messenger.broadcastRumor({ ...options, rumor: event })
     // Published is relay acceptance, never a peer receipt.
     await assertMessagePublished(report, event)
   }
   async function sendEntry (entry) {
     entry.status = 'pending'; emit()
+    const controller = new AbortController()
+    sendControllers.set(entry.id, controller)
     try {
       const active = async () => {
         if (storage.has && !await storage.has(entry.id)) cancelled.add(entry.id)
@@ -180,7 +186,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
           const chunk = chunkStorage ? await chunkStorage.read(file.root, entry.chunkIndex, file) : await fileTransfers.readChunk(file.root, entry.chunkIndex)
           if (!chunk || decodeIrfsChunk(chunk).root !== file.root) { if (file.optional) break; throw new Error('FILE_UNAVAILABLE') }
           if (!fileTransfers) throw new Error('FILE_TRANSFER_UNAVAILABLE')
-          await fileTransfers.publishChunk({ controlChannelPubkey: channels.get(entry.peer).pubkey, peerPubkey: entry.peer, root: file.root, size: file.size }, wireEvent(chunk, owner))
+          await fileTransfers.publishChunk({ controlChannelPubkey: channels.get(entry.peer).pubkey, peerPubkey: entry.peer, root: file.root, size: file.size }, wireEvent(chunk, owner), { signal: controller.signal })
           const completed = entry.files.slice(0, entry.fileIndex).reduce((sum, value) => sum + value.size, 0) + Math.min(file.size, (entry.chunkIndex + 1) * IRFS_CHUNK_BYTES)
           entry.uploadProgress = { completed, total: entry.files.reduce((sum, value) => sum + value.size, 0) }
           emit()
@@ -199,7 +205,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       for (; entry.index < entry.events.length; entry.index++) {
         await active()
         const event = entry.events[entry.index]
-        if (entry.peer !== owner) await publish(entry.peer, event)
+        if (entry.peer !== owner) await publish(entry.peer, event, controller.signal)
         await active()
         await storage.put({ ...entry, index: entry.index + 1 }, { existing: true })
       }
@@ -208,15 +214,33 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       emit()
     } catch (error) {
       if (cancelled.has(entry.id)) { await storage.remove(entry.id); entries.delete(entry.id) } else {
-        entry.status = 'error'; entry.failed = true; entry.retryable = retryable(error)
+        entry.status = error.retryWhenAvailable ? 'pending' : 'error'; entry.failed = true; entry.retryable = retryable(error)
         await storage.put(entry, { existing: true }).catch(onError)
         onError(error)
         // The failed wire event may be a quote or file chunk. Report the
         // owning outbox item separately, without mutating the native error.
-        if (!closed && !entry.deletion && !cancelled.has(entry.id)) onSendError(error, { id: entry.id, peer: entry.peer })
+        if (error.retryWhenOnline) offlineSends.add(entry.id)
+        if (!closed && !entry.deletion && !cancelled.has(entry.id) && !error.retryWhenAvailable) onSendError(error, { id: entry.id, peer: entry.peer })
       }
       emit()
-    }
+    } finally { sendControllers.delete(entry.id) }
+  }
+  function stopOnlineRetry () { stopOnline?.(); stopOnline = undefined }
+  function watchOfflineSends () {
+    if (closed || !available || !offlineSends.size) { stopOnlineRetry(); return }
+    if (stopOnline) return
+    // A fresh listener receives confirmed connectivity even when a brief outage
+    // occurred between the app's long-lived monitor checks.
+    stopOnline = _onOnline(() => {
+      stopOnlineRetry()
+      if (closed || !available) return
+      for (const id of offlineSends) {
+        const entry = entries.get(id)
+        if (entry?.retryable) entry.failed = false
+      }
+      offlineSends.clear()
+      return schedule()
+    })
   }
   async function pump () {
     if (sending || !available || closed || !messenger || !storage) return
@@ -227,7 +251,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         if ((entry.peer !== owner && !peers.has(entry.peer)) || entry.failed || cancelled.has(entry.id)) continue
         await sendEntry(entry)
       }
-    } finally { sending = false; settled() }
+    } finally { sending = false; watchOfflineSends(); settled() }
   }
   const intentId = file => getEventHash({ kind: 0, pubkey: owner, created_at: 0, tags: [], content: `${file.peer}:${file.root}` })
   async function download (file, options = {}) {
@@ -266,6 +290,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     },
     async setAvailable (value) {
       available = value === true
+      stopOnlineRetry(); offlineSends.clear()
       lifecycle++
       if (!available) { await messenger?.pause('signer'); return }
       await ready()
@@ -286,12 +311,15 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       return id
     },
     async retry (id) {
+      offlineSends.delete(id); watchOfflineSends()
       await ready()
       const entry = entries.get(id)
       if (entry) { entry.failed = false; if (deniedPeers.delete(entry.peer)) await schedule(); return pump() }
     },
     async cancel (id) {
       cancelled.add(id)
+      sendControllers.get(id)?.abort()
+      offlineSends.delete(id); watchOfflineSends()
       await ready()
       entries.delete(id)
       await storage.remove(id)
@@ -299,6 +327,8 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     },
     async close () {
       closed = true; available = false; lifecycle++
+      stopOnlineRetry(); offlineSends.clear()
+      for (const controller of sendControllers.values()) controller.abort()
       await Promise.allSettled([configuring, initialized])
       await messenger?.pause('closed')
       if (sending || draining) await new Promise(resolve => idleWaiters.add(resolve))

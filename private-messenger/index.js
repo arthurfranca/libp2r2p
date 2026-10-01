@@ -43,10 +43,12 @@
 // - For other event-list replies, use createEventReplyPacker({ messenger, question, code }).update(event).
 
 import * as privateMessage from '../private-message/index.js'
+import { isOnline } from '../network/index.js'
+import { createSendRelayRouting } from './helpers/send-routing.js'
 import { deliveryInfo } from '../private-channel/helpers/rumor.js'
 import { bytesToBase64 } from '../base64/index.js'
 import { ValidationError } from '../error/index.js'
-import { getRelaysByPubkey, pickRelaysForPubkeys, subscribeRelayListUpdates } from '../relay/index.js'
+import { getRelaysByPubkey, pickRelaysForPubkeys, subscribeRelayListUpdates, relayPool } from '../relay/index.js'
 import * as privateChannel from '../private-channel/index.js'
 import { DEFAULT_RECEIVED_CHUNK_TTL_MS } from '../private-channel/services/received-chunks.js'
 import { createQueue } from '../idb-queue/index.js'
@@ -215,6 +217,7 @@ export class PrivateMessenger {
     _getRelaysByPubkey = getRelaysByPubkey,
     _pickRelaysForPubkeys = pickRelaysForPubkeys,
     _subscribeRelayListUpdates = subscribeRelayListUpdates,
+    _isOnline = isOnline,
     _setTimeout = globalThis.setTimeout.bind(globalThis),
     _clearTimeout = globalThis.clearTimeout.bind(globalThis),
     _setInterval = globalThis.setInterval.bind(globalThis),
@@ -247,6 +250,9 @@ export class PrivateMessenger {
     this._getRelaysByPubkey = _getRelaysByPubkey
     this._pickRelaysForPubkeys = _pickRelaysForPubkeys
     this._subscribeRelayListUpdates = _subscribeRelayListUpdates
+    this._isOnline = _isOnline
+    this.sendRelayExclusions = new Map()
+    this.sendRoutingLifetime = new AbortController()
     this._setTimeout = _setTimeout
     this._clearTimeout = _clearTimeout
     this._setInterval = _setInterval
@@ -670,6 +676,7 @@ export class PrivateMessenger {
 
     await this.unwatch(removedPubkeys)
     for (const pubkey of removedPubkeys) this.channels.delete(pubkey)
+    for (const [key, value] of this.sendRelayExclusions) if (removedPubkeys.includes(value.channelPubkey)) this.sendRelayExclusions.delete(key)
     for (const channel of nextChannels) this.channels.set(channel.pubkey, channel)
 
     await this.cleanupStaleChannels({ storageSnapshot })
@@ -753,13 +760,36 @@ export class PrivateMessenger {
     return this.readRelaysForPubkey(this.userPubkey)
   }
 
-  async resolveSendRouting ({ channel, receiverPubkeys, relays, relayToReceivers }) {
+  async resolveSendRouting ({ channel, receiverPubkeys, relays, relayToReceivers, signal }) {
     const recoveryRelays = await this.recoveryMirrorRelays(channel.pubkey)
     if (relayToReceivers) return { relayToReceivers, recoveryRelays }
     if (relays?.length) return { relays: uniq(relays), recoveryRelays }
     if (channel.sendRelays.length) return { relays: channel.sendRelays, recoveryRelays }
     if (channel.relays.length) return { relays: channel.relays, recoveryRelays }
-    const derived = await this.readRelayToReceivers(receiverPubkeys)
+    const recipients = uniq(receiverPubkeys)
+    if (recipients.length === 1) {
+      const peer = recipients[0]
+      const relaysByPubkey = await this._getRelaysByPubkey(recipients)
+      const key = `${channel.pubkey}:${peer}`
+      if (!this.sendRelayExclusions.has(key)) {
+        if (this.sendRelayExclusions.size >= 256) this.sendRelayExclusions.delete(this.sendRelayExclusions.keys().next().value)
+        this.sendRelayExclusions.set(key, { channelPubkey: channel.pubkey, exclusions: new Map() })
+      }
+      const routing = createSendRelayRouting({
+        peer, relaysByPubkey, recoveryRelays,
+        signal: signal ? AbortSignal.any([this.sendRoutingLifetime.signal, signal]) : this.sendRoutingLifetime.signal,
+        exclusions: this.sendRelayExclusions.get(key).exclusions,
+        pickRelays: this._pickRelaysForPubkeys,
+        publish: this._privateChannel.publish || privateChannel.publish,
+        publishNymEvent: this._privateChannel.publishNymEvent || privateChannel.publishNymEvent,
+        sendEvent: (...args) => relayPool.sendEvent(...args),
+        isOnline: this._isOnline,
+        isCurrent: () => !this.closePromise && !this.pauseReasons.size && this.channels.has(channel.pubkey)
+      })
+      if (!relayMapRelays(routing.relayToReceivers).length) throw new ValidationError('NO_RELAYS')
+      return routing
+    }
+    const derived = await this.readRelayToReceivers(recipients)
     if (!relayMapRelays(derived).length) throw new ValidationError('NO_RELAYS')
     return { relayToReceivers: derived, recoveryRelays }
   }
@@ -1600,9 +1630,9 @@ export class PrivateMessenger {
     })
   }
 
-  async broadcastRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, deletionPubkey }) {
+  async broadcastRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, deletionPubkey, signal }) {
     const channel = this.requireWritableChannel(channelPubkey)
-    const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
+    const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers, signal })
     this.debugSend('broadcastRumor', channelPubkey, { receiverPubkeys })
     return this._privateMessage.broadcastRumor({
       senderSigner: this.userSigner,
@@ -1621,9 +1651,9 @@ export class PrivateMessenger {
     })
   }
 
-  async broadcastEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, deletionPubkey }) {
+  async broadcastEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, deletionPubkey, signal }) {
     const channel = this.requireWritableChannel(channelPubkey)
-    const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
+    const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers, signal })
     this.debugSend('broadcastEvent', channelPubkey, { receiverPubkeys })
     return this._privateMessage.broadcastEvent({
       senderSigner: this.userSigner,
@@ -2187,6 +2217,8 @@ export class PrivateMessenger {
   close () {
     if (this.closePromise) return this.closePromise
     const initSettledPromise = this.initSettledPromise
+    this.sendRoutingLifetime.abort()
+    this.sendRelayExclusions.clear()
     let unwatchPromise
     try {
       unwatchPromise = Promise.resolve(this.unwatch())

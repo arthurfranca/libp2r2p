@@ -3,6 +3,7 @@ import { chunkStream } from './helpers/stream.js'
 import { createFileCache } from './helpers/cache.js'
 export { createFileCache, DEFAULT_FILE_CACHE_BYTES } from './helpers/cache.js'
 import { createFileCatalog } from './helpers/catalog.js'
+import { assertMessagePublished } from '../helpers/publication.js'
 import { ValidationError } from '../../error/index.js'
 import { IRFS_CHUNK_BYTES, decodeIrfsChunk } from '../../irfs/index.js'
 import { createQueue } from '../../idb-queue/index.js'
@@ -46,11 +47,6 @@ function rangesFor (indices) {
     else ranges.push([index, index])
   }
   return ranges
-}
-
-function assertPublished (result) {
-  const reports = result?.delivery?.reports
-  if (!Array.isArray(reports) || !reports.length || !reports.every(report => report?.success === true)) throw Object.assign(new Error('FILE_NOT_PUBLISHED'), { code: 'MESSAGE_NOT_PUBLISHED' })
 }
 
 function waitForTransfer (promise, signal) {
@@ -148,14 +144,14 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     if (decoded.root !== file.root || (index !== undefined && decoded.index !== index) || (file.size !== undefined && (decoded.total !== Math.ceil(file.size / IRFS_CHUNK_BYTES) || (decoded.index === decoded.total - 1 && decoded.contentBytes.length !== file.size - decoded.index * IRFS_CHUNK_BYTES)))) throw new ValidationError('FILE_CHUNK_DESCRIPTOR_MISMATCH')
     return decoded
   }
-  async function routing (file, receiverPubkey) {
+  async function routing (file, receiverPubkey, signal) {
     const parent = messenger.requireWritableChannel(file.controlChannelPubkey)
-    return messenger.resolveSendRouting({ channel: parent, receiverPubkeys: [receiverPubkey] })
+    return messenger.resolveSendRouting({ channel: parent, receiverPubkeys: [receiverPubkey], signal })
   }
   function sendOptions (file, routes) {
     return { senderSigner: messenger.userSigner, imkcSigner: messenger.contentKeySigner, privateChannelSigner: file.signer, ...routes, temporaryStorageArea: messenger.temporaryStorageArea, expirationSeconds: messenger.eventExpirationSecondsFor(file.controlChannelPubkey), _getIykcProofs: messenger.contentKeyLookup() }
   }
-  async function publishChunk (descriptor, event) {
+  async function publishChunk (descriptor, event, { signal } = {}) {
     const file = await register(descriptor)
     usable(file)
     const decoded = checked(file, event)
@@ -166,9 +162,9 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     }
     let result
     try {
-      const options = { ...sendOptions(file, await routing(file, file.peerPubkey)), receiverPubkeys: [file.peerPubkey], fileChunkIndex: decoded.index, ...(messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? { onPreparedSeed: seed => saveSeed(file, seed) } : {}) }
+      const options = { ...sendOptions(file, await routing(file, file.peerPubkey, signal)), receiverPubkeys: [file.peerPubkey], fileChunkIndex: decoded.index, ...(messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? { onPreparedSeed: seed => saveSeed(file, seed) } : {}) }
       result = event.sig ? await _messages.broadcastEvent({ ...options, event }) : await _messages.broadcastRumor({ ...options, rumor: event })
-      assertPublished(result)
+      await assertMessagePublished(result, result?.rumor || result?.event || { ...event, pubkey: event.pubkey || messenger.userPubkey })
     } catch (error) { await uploadLeases.get(file.root)?.(); uploadLeases.delete(file.root); throw error }
     if (decoded.index === decoded.total - 1) { await uploadLeases.get(file.root)?.(); uploadLeases.delete(file.root) }
     // A scheduler turn between chunks lets queued text/control publications run.

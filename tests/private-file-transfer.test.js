@@ -218,7 +218,6 @@ test('default file storage retains published chunks across coordinator restart a
   } finally { await manager.close(); await f.close() }
 })
 
-
 test('completing a file cancels unfinished history without reporting its own AbortError', async () => {
   const errors = []
   let aborted = false
@@ -248,4 +247,31 @@ test('history failure remains visible when peers can finish the file', async () 
     await f.manager.download(f.descriptor)
     assert.deepEqual(errors, [failure])
   } finally { await f.close() }
+})
+
+test('chunk publication preserves final relay diagnostics, deferred status and cancellation signal', async () => {
+  const f = await fixture()
+  await f.close()
+  const reason = Object.assign(new Error('blocked: policy'), { category: 'relay' })
+  const controller = new AbortController()
+  f.messenger.resolveSendRouting = async options => {
+    assert.equal(options.signal, controller.signal)
+    return { relays: ['wss://test.invalid'] }
+  }
+  const manager = createPrivateFileTransfer({
+    messenger: f.messenger,
+    resolveChannel: async () => ({ getPublicKey: async () => data }),
+    storage: { read: async () => null, save: async () => {} },
+    _messages: { broadcastRumor: async () => ({ delivery: { reports: [{ success: false, retryWhenAvailable: true, retryWhenOnline: true, promise: Promise.resolve({ total: 2, fulfilled: 0, errors: [{ relay: 'wss://test.invalid', reason }] }) }] } }) }
+  })
+  try {
+    await assert.rejects(manager.publishChunk(f.descriptor, f.chunks[0], { signal: controller.signal }), error => {
+      assert.equal(error.code, 'MESSAGE_NOT_PUBLISHED')
+      assert.equal(error.eventKind, 34601)
+      assert.equal(error.retryWhenAvailable, true)
+      assert.equal(error.retryWhenOnline, true)
+      assert.equal(error.reports[0].errors[0].reason, reason)
+      return true
+    })
+  } finally { await manager.close() }
 })

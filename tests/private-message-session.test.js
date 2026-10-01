@@ -11,18 +11,19 @@ const until = async predicate => {
   assert.fail('condition not reached')
 }
 async function fixture (t, { publish, save = async () => ({ result: { ok: true } }) } = {}) {
-  const errors = []; const sendErrors = []; const records = new Map()
+  const errors = []; const sendErrors = []; const records = new Map(); const onlineListeners = new Set()
   const store = () => ({ list: async () => [], put: async entry => records.set(entry.id, structuredClone(entry)), remove: async id => records.delete(id), close () {} })
   const session = createPrivateMessageSession({
     owner, signer: { withSharedKey: () => ({ getPublicKey: async () => peer }) },
     messageStorage: { save }, openOutbox: store, openDownloads: store,
     Messenger: async () => ({ update () {}, resume () {}, pause () {}, close () {}, nextMessage: async () => null, broadcastRumor: publish }),
     FileTransfer: () => ({ observe () {} }),
+    _onOnline: listener => { onlineListeners.add(listener); return () => onlineListeners.delete(listener) },
     onError: error => errors.push(error), onSendError: (error, context) => sendErrors.push({ error, context })
   })
   t.after(() => session.close())
   await session.setPeers([peer]); await session.setAvailable(true)
-  return { session, errors, sendErrors, records }
+  return { session, errors, sendErrors, records, onlineListeners, reconnect: () => Promise.all([...onlineListeners].map(listener => listener())) }
 }
 
 test('send errors identify the owning message when a quoted event is rejected', async t => {
@@ -62,4 +63,61 @@ test('cancelled sends and deletions do not report send failures', async t => {
   await g.session.enqueue({ peer, event: { ...event, kind: 5 }, deletion: true })
   await until(() => g.errors.length === 1)
   assert.equal(g.sendErrors.length, 0)
+})
+
+test('offline fallback stays pending without send-error feedback until availability returns', async t => {
+  let online = false
+  const f = await fixture(t, {
+    publish: async () => ({
+      delivery: {
+        reports: online
+          ? [{ success: true }]
+          : [{ success: false, retryWhenAvailable: true, total: 2, promise: Promise.resolve({ total: 2, fulfilled: 0, errors: [{ relay: 'wss://test.invalid', reason: Object.assign(new Error('PUBLISH_TIMEOUT'), { category: 'timeout' }) }] }) }]
+      }
+    })
+  })
+  const id = await f.session.enqueue({ peer, event })
+  await until(() => f.errors.length === 1)
+  assert.equal(f.records.get(id).status, 'pending')
+  assert.equal(f.records.get(id).failed, true)
+  assert.equal(f.sendErrors.length, 0)
+  online = true
+  await f.session.setAvailable(true)
+  await until(() => !f.records.has(id))
+  assert.equal(f.sendErrors.length, 0)
+})
+
+test('a transient outage owns a fresh online listener and resumes without an account-state change', async t => {
+  let online = false
+  const f = await fixture(t, {
+    publish: async () => ({ delivery: { reports: online ? [{ success: true }] : [{ success: false, retryWhenAvailable: true, retryWhenOnline: true, promise: Promise.resolve({ errors: [] }) }] } })
+  })
+  const id = await f.session.enqueue({ peer, event })
+  await until(() => f.onlineListeners.size === 1)
+  assert.equal(f.records.get(id).status, 'pending')
+  assert.equal(f.sendErrors.length, 0)
+  online = true
+  await f.reconnect()
+  await until(() => !f.records.has(id))
+  assert.equal(f.onlineListeners.size, 0)
+  assert.equal(f.sendErrors.length, 0)
+})
+
+test('cancel, signer unavailability and close release pending online listeners', async t => {
+  for (const operation of ['cancel', 'unavailable', 'close']) {
+    let publications = 0
+    const f = await fixture(t, {
+      publish: async () => { publications++; return { delivery: { reports: [{ success: false, retryWhenAvailable: true, retryWhenOnline: true, promise: Promise.resolve({ errors: [] }) }] } } }
+    })
+    const id = await f.session.enqueue({ peer, event })
+    await until(() => f.onlineListeners.size === 1)
+    const staleCallback = [...f.onlineListeners][0]
+    if (operation === 'cancel') await f.session.cancel(id)
+    else if (operation === 'unavailable') await f.session.setAvailable(false)
+    else await f.session.close()
+    assert.equal(f.onlineListeners.size, 0)
+    await staleCallback()
+    assert.equal(publications, 1)
+    assert.equal(f.sendErrors.length, 0)
+  }
 })
