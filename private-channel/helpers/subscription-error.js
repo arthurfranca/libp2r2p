@@ -5,7 +5,7 @@ export function subscriptionError (reason, relay) {
   const error = reason instanceof AggregateError
     ? new AggregateError(reason.errors, message, { cause: reason })
     : new Error(message, { cause: reason })
-  for (const key of ['name', 'code', 'category', 'retryAfterMs', 'retryAt', 'closeCode', 'closeReason', 'wasClean']) {
+  for (const key of ['name', 'code', 'category', 'retryAfterMs', 'retryAt', 'closeCode', 'closeReason', 'wasClean', 'phase', 'buffer', 'recoverySince']) {
     if (reason?.[key] !== undefined) error[key] = reason[key]
   }
   error.operation = 'private-channel.subscribe'

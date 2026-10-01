@@ -1,3 +1,4 @@
+import { liveBufferError } from '../helpers/live-buffer-error.js'
 import { ValidationError } from '../../error/index.js'
 import { decodeHll, encodeHll, estimateHllCount, mergeHll } from '../helpers/hll.js'
 import { createPublishSettlements, firstFulfillment, publishSummary } from '../helpers/publish.js'
@@ -651,18 +652,23 @@ export class RelayPool {
     const seenIds = new Set()
 
     let untilTimer = null
-    const overflow = relay => {
-      failure = Object.assign(new Error('RELAY_LIVE_BUFFER_FULL'), { code: 'RELAY_LIVE_BUFFER_FULL', relay, phase: 'live-buffer' })
+    const overflow = (item, bytes, stage = 'delivery', entries = queue, volume = queuedBytes) => {
+      if (isDone) return
+      failure = liveBufferError({
+        relay: item.relay, stage, queue: entries, queuedBytes: volume, incoming: item, incomingBytes: bytes,
+        maxEvents: maxBufferedLiveEvents, maxBytes: maxBufferedLiveBytes,
+        since: Math.min(sinceFloor, ...pendingGaps.values(), ...queue.map(entry => entry.item?.event?.created_at).filter(Number.isFinite))
+      })
       teardown()
     }
     const enqueue = item => {
       const bytes = encoder.encode(JSON.stringify(item)).byteLength
       if (queue.length >= maxBufferedLiveEvents || queuedBytes + bytes > maxBufferedLiveBytes) {
-        overflow(item.relay)
+        overflow(item, bytes)
         return
       }
       queuedBytes += bytes
-      queue.push({ item, bytes })
+      queue.push({ item, bytes, receivedAt: Date.now() })
       p.resolve()
       p = Promise.withResolvers()
     }
@@ -863,11 +869,11 @@ export class RelayPool {
             if (liveBuffer) {
               const bytes = encoder.encode(JSON.stringify(event)).byteLength
               if (liveBuffer.length >= maxBufferedLiveEvents || bufferedBytes + bytes > maxBufferedLiveBytes) {
-                overflow(url)
+                overflow({ event, relay: url }, bytes, 'reconnect', liveBuffer, bufferedBytes)
                 return
               }
               bufferedBytes += bytes
-              liveBuffer.push(event)
+              liveBuffer.push({ item: { event, relay: url }, receivedAt: Date.now() })
             } else pushEvent(event, url)
           },
           onclose: error => {
@@ -906,7 +912,7 @@ export class RelayPool {
           }).finally(() => {
             const buf = liveBuffer
             liveBuffer = null
-            for (const event of buf) pushEvent(event, url, true)
+            for (const entry of buf) pushEvent(entry.item.event, url, true)
             gapTasks.delete(task)
             scheduleProgress(attempt)
             p.resolve()
@@ -1052,9 +1058,9 @@ export class RelayPool {
           else {
             const bytes = encoder.encode(JSON.stringify(item)).byteLength
             if (liveBuffer.length >= maxBufferedLiveEvents || bufferedBytes + bytes > maxBufferedLiveBytes) {
-              throw Object.assign(new Error('RELAY_LIVE_BUFFER_FULL'), { code: 'RELAY_LIVE_BUFFER_FULL', relay: item.relay, phase: 'live-buffer' })
+              throw liveBufferError({ relay: item.relay, stage: 'history-wait', queue: liveBuffer, queuedBytes: bufferedBytes, incoming: item, incomingBytes: bytes, maxEvents: maxBufferedLiveEvents, maxBytes: maxBufferedLiveBytes, since: filter.since ?? 0 })
             }
-            liveBuffer.push({ item, bytes })
+            liveBuffer.push({ item, bytes, receivedAt: Date.now() })
             bufferedBytes += bytes
           }
           liveWake.resolve()

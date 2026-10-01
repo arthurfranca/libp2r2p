@@ -1,3 +1,4 @@
+import { normalizeRelayUrl } from '../url/index.js'
 import { isValidEvent } from '../event/index.js'
 import { ValidationError } from '../error/index.js'
 import { generateKeypair } from '../key/index.js'
@@ -144,9 +145,10 @@ async function ownPrivateChannelPubkey (signer) {
 
 // A session owns its callbacks and relay reads. Other consumers, including
 // the other side of the same shared channel, cannot overwrite or stop them.
-export function createPrivateMessageSession () {
+export function createPrivateMessageSession ({ _setTimeout = setTimeout, _clearTimeout = clearTimeout, _now = Date.now, _random = Math.random } = {}) {
   const watchesByChannel = new Map()
   const subsByRelay = new Map()
+  const relayRecoveries = new Map()
   let nextWatchRevision = 1
   let requestSequence = 0
   const watchRequests = new Map()
@@ -301,11 +303,113 @@ export function createPrivateMessageSession () {
     }
   }
 
-  function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, gracefulClose = true } = {}) {
+  function reportSubscriptionError (channels, error) {
+    try { watchCallbacks([...channels][0]).onError?.(error) } catch {}
+  }
+
+  function cancelRelayRecovery (relay) {
+    const recovery = relayRecoveries.get(relay)
+    if (recovery?.timer != null) _clearTimeout(recovery.timer)
+    relayRecoveries.delete(relay)
+  }
+
+  async function notifyInterruption (relay, recovery) {
+    const channels = desiredRelayState().get(relay) || []
+    // Each consumer must persist its gap before this shared subscription restarts.
+    // Keep acknowledgments on partial failure; new/replaced watches participate too.
+    const outcomes = await Promise.allSettled([...channels].map(async channel => {
+      const watch = watchesByChannel.get(channel)
+      if (recovery.notified.get(channel) === watch) return
+      await watch.callbacks.onSubscriptionState?.({ state: 'interrupted', relay, error: recovery.error, since: recovery.since })
+      recovery.notified.set(channel, watch)
+    }))
+    const failed = outcomes.find(result => result.status === 'rejected')
+    if (failed) throw failed.reason
+    if (relayRecoveries.get(relay) === recovery && [...(desiredRelayState().get(relay) || [])].some(channel => recovery.notified.get(channel) !== watchesByChannel.get(channel))) {
+      await notifyInterruption(relay, recovery)
+    }
+  }
+
+  function scheduleRelayRecovery (relay, recovery) {
+    if (relayRecoveries.get(relay) !== recovery || recovery.timer || !desiredRelayState().has(relay)) return
+    const delay = Math.min(30000, recovery.delay * (0.8 + _random() * 0.4))
+    recovery.delay = Math.min(30000, recovery.delay * 2)
+    recovery.timer = _setTimeout(async () => {
+      recovery.timer = null
+      try {
+        await notifyInterruption(relay, recovery)
+        if (relayRecoveries.get(relay) !== recovery || !desiredRelayState().has(relay)) return
+        await rebuildSubscriptions({ retryRelay: relay })
+      } catch (error) {
+        reportSubscriptionError(desiredRelayState().get(relay) || [], error)
+        scheduleRelayRecovery(relay, recovery)
+      }
+    }, delay)
+    recovery.timer?.unref?.()
+  }
+
+  function subscriptionEnded (relay, entry, result) {
+    if (subsByRelay.get(relay) !== entry) return
+    subsByRelay.delete(relay)
+    if (result.status === 'closed' || !desiredRelayState().has(relay)) return
+    const error = result.error || Object.assign(new Error('PRIVATE_CHANNEL_SUBSCRIPTION_ENDED'), { code: 'PRIVATE_CHANNEL_SUBSCRIPTION_ENDED', relay })
+    const previous = relayRecoveries.get(relay)
+    const recovery = {
+      error,
+      since: Math.min(entry.since, error.recoverySince ?? entry.since, previous?.since ?? Infinity),
+      delay: entry.readyAt !== undefined && _now() - entry.readyAt >= 60000 ? 1000 : (previous?.delay || entry.retryDelay || 1000),
+      notified: new Map(), timer: null
+    }
+    if (/^(auth-required:|restricted:|blocked:|invalid:|pow:)/.test(error.message || '') || error.name === 'ValidationError' ||
+        (error.code !== 'RELAY_LIVE_BUFFER_FULL' && !previous)) {
+      cancelRelayRecovery(relay)
+      notifyInterruption(relay, recovery).catch(error => reportSubscriptionError(entry.channels, error))
+      return
+    }
+    cancelRelayRecovery(relay)
+    relayRecoveries.set(relay, recovery)
+    // Start persistence immediately, without overlapping a later retry callback.
+    recovery.preparing = notifyInterruption(relay, recovery).catch(error => reportSubscriptionError(entry.channels, error))
+    recovery.preparing.finally(() => scheduleRelayRecovery(relay, recovery))
+  }
+
+  async function subscriptionReady (relay, entry, ready) {
+    if (subsByRelay.get(relay) !== entry) return
+    const recovery = relayRecoveries.get(relay)
+    if (!ready?.relays?.includes(relay)) {
+      if (recovery) {
+        const error = ready?.errors?.[0]?.reason || Object.assign(new Error('RELAY_LIVE_NOT_READY'), { code: 'RELAY_LIVE_NOT_READY', relay })
+        subscriptionEnded(relay, entry, { status: 'failed', error })
+        await entry.sub.close()
+      }
+      return
+    }
+    entry.readyAt = _now()
+    if (!recovery) return
+    try {
+      const until = Math.floor(_now() / 1000)
+      await Promise.all([...entry.channels].map(async channel => {
+        if (subsByRelay.get(relay) !== entry || !watchesByChannel.has(channel)) return
+        await watchCallbacks(channel).onSubscriptionState?.({ state: 'ready', relay, since: recovery.since, until })
+      }))
+      if (subsByRelay.get(relay) === entry && relayRecoveries.get(relay) === recovery) {
+        entry.retryDelay = recovery.delay
+        cancelRelayRecovery(relay)
+        await rebuildSubscriptions()
+      }
+    } catch (error) {
+      reportSubscriptionError(entry.channels, error)
+      subscriptionEnded(relay, entry, { status: 'failed', error })
+      await entry.sub.close()
+    }
+  }
+
+  function rebuildSubscriptions ({ _subscribe = privateChannel.subscribe, gracefulClose = true, retryRelay } = {}) {
     subscribe = _subscribe === privateChannel.subscribe ? subscribe : _subscribe
     _subscribe = subscribe
     const desired = desiredRelayState()
     const closing = []
+    for (const relay of relayRecoveries.keys()) if (!desired.has(relay)) cancelRelayRecovery(relay)
 
     for (const [relay, current] of subsByRelay) {
       const nextChannels = desired.get(relay)
@@ -321,6 +425,8 @@ export function createPrivateMessageSession () {
       const current = subsByRelay.get(relay)
       if (doesSubscriptionMatch(current, channels)) continue
 
+      if (relayRecoveries.has(relay) && retryRelay !== relay) continue
+      const since = nowSeconds()
       const channelList = [...channels]
       const firstWatch = watchesByChannel.get(channelList[0])
       const sub = _subscribe({
@@ -345,7 +451,7 @@ export function createPrivateMessageSession () {
         ignoredGroupTtlMs: maxWatchNumber(channelList, 'ignoredGroupTtlMs'),
         ignoredGroupMaxEntries: maxWatchNumber(channelList, 'ignoredGroupMaxEntries'),
         limit: 0,
-        since: nowSeconds(),
+        since,
         liveOnly: true,
         onChunk: handleChunk,
         onEvent: (event, outer, meta) => {
@@ -358,14 +464,24 @@ export function createPrivateMessageSession () {
           return dispatchSeedEvent(seed)
         },
         onContentKeyUsage: dispatchContentKeyUsage,
-        onError: err => firstWatch.callbacks.onError?.(err)
+        onError: err => reportSubscriptionError(channels, err)
       })
 
-      subsByRelay.set(relay, {
+      const entry = {
+        since,
         channels: new Set(channels),
         revisions: watchRevisionsForChannels(channelList),
         sub
-      })
+      }
+      subsByRelay.set(relay, entry)
+      if (sub.done) sub.done.then(result => subscriptionEnded(relay, entry, result)).catch(error => reportSubscriptionError(channels, error))
+      if (sub.ready) {
+        sub.ready.then(ready => subscriptionReady(relay, entry, ready)).catch(error => {
+          reportSubscriptionError(channels, error)
+          subscriptionEnded(relay, entry, { status: 'failed', error })
+          Promise.resolve(sub.close()).catch(() => {})
+        })
+      }
       if (current) {
         const close = closeSubscription(current.sub, gracefulClose)
         if (close) closing.push(close)
@@ -393,6 +509,7 @@ export function createPrivateMessageSession () {
     onSeed,
     onChunk,
     onContentKeyUsage,
+    onSubscriptionState,
     onError,
     receivedChunkTtlMs,
     receivedChunkMaxBytes,
@@ -403,6 +520,7 @@ export function createPrivateMessageSession () {
     _subscribe = privateChannel.subscribe
   }) {
     if (!relays?.length) throw new ValidationError('NO_RELAYS')
+    relays = uniq(relays.map(normalizeRelayUrl))
     const request = ++requestSequence
     const channelList = uniq(channels?.length ? channels : [await ownPrivateChannelPubkey(privateChannelSigner)])
     for (const channel of channelList) {
@@ -411,9 +529,8 @@ export function createPrivateMessageSession () {
     const ownPubkey = receiverPubkey || await receiverSigner?.getPublicKey?.()
     if (identity !== undefined && identity !== ownPubkey) throw new ValidationError('PRIVATE_MESSAGE_IDENTITY_MISMATCH')
     identity = ownPubkey
-    const callbacks = { onAsk, onReply, onTell, onYell, onNym, onMessage, onSeed, onChunk, onContentKeyUsage, onError }
+    const callbacks = { onAsk, onReply, onTell, onYell, onNym, onMessage, onSeed, onChunk, onContentKeyUsage, onSubscriptionState, onError }
 
-    let changed = false
     for (const channel of channelList) {
       if (watchRequests.get(channel) !== request) continue
       const next = {
@@ -457,10 +574,9 @@ export function createPrivateMessageSession () {
         continue
       }
       watchesByChannel.set(channel, next)
-      changed = true
     }
 
-    if (changed) await rebuildSubscriptions({ _subscribe })
+    await rebuildSubscriptions({ _subscribe })
     return () => {
       const owned = channelList.filter(channel => watchRequests.get(channel) === request)
       return unwatch(owned)

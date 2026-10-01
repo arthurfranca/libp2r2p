@@ -2407,3 +2407,59 @@ test('large outgoing messages stream without duplicating prepared payload in ses
     assert.equal(data.size, 0)
   }
 })
+
+test('subscription done reports explicit close, unexpected completion and native failures without rejecting', async () => {
+  const failure = Object.assign(new Error('RELAY_LIVE_BUFFER_FULL'), { code: 'RELAY_LIVE_BUFFER_FULL', relay: 'wss://relay.example', recoverySince: 0, buffer: { stage: 'delivery' } })
+  for (const throws of [false, true]) {
+    const sub = subscribe({
+      privateChannelSigner: signer(), relays: ['wss://relay.example'],
+      onError: () => { throw new Error('callback failed') },
+      _eventsFeedGenerator: () => (async function * () { if (throws) throw failure })()
+    })
+    const result = await sub.done
+    assert.equal(result.status, throws ? 'failed' : 'ended')
+    if (throws) {
+      assert.equal(result.error.cause, failure)
+      assert.equal(result.error.recoverySince, 0)
+      assert.equal(result.error.buffer.stage, 'delivery')
+    }
+  }
+  const started = Promise.withResolvers()
+  const sub = subscribe({
+    privateChannelSigner: signer(), relays: ['wss://relay.example'],
+    _eventsFeedGenerator: (_filter, _relays, { signal }) => (async function * () {
+      started.resolve()
+      await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))
+    })()
+  })
+  await started.promise
+  assert.deepEqual(await sub.close(), { status: 'closed' })
+  assert.equal(await sub.close(), await sub.done)
+})
+
+test('fragment assembly survives a failed subscription and its replacement', async () => {
+  const sender = signer()
+  const receiver = signer()
+  const original = eventFixture('fragment after overflow '.repeat(6000))
+  const receiverPubkey = await receiver.getPublicKey()
+  const wrapped = await wrapEvent({ senderSigner: sender, receivers: [receiverPubkey], event: original, _getIykcProofs: noContentKeys })
+  assert.ok(wrapped.length > 1)
+  const events = []
+  const base = { receiverSigner: receiver, receiverPubkey, privateChannelSigner: sender, relays: ['wss://relay.example'], receivedChunkScope: 'overflow-fragments', onEvent: event => events.push(event) }
+  const first = subscribe({
+    ...base, onError: () => {}, _eventsFeedGenerator: () => (async function * () {
+      yield { type: 'event', event: wrapped[0] }
+      throw Object.assign(new Error('RELAY_LIVE_BUFFER_FULL'), { code: 'RELAY_LIVE_BUFFER_FULL' })
+    })()
+  })
+  assert.equal((await first.done).status, 'failed')
+  assert.equal(events.length, 0)
+  const second = subscribe({
+    ...base, _eventsFeedGenerator: () => (async function * () {
+      for (const event of wrapped.slice(1)) yield { type: 'event', event }
+    })()
+  })
+  assert.equal((await second.done).status, 'ended')
+  assert.equal(events.length, 1)
+  assert.equal(events[0].content, original.content)
+})

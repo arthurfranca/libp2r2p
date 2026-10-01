@@ -2775,3 +2775,121 @@ test('reply packer keeps failed final payload and index for retry', async () => 
   await packer.finalize()
   assert.equal(replies.length, 2)
 })
+
+test('overflow persists the lost interval before readiness, then retries transient history without losing live progress', async t => {
+  let now = 1800000000
+  t.mock.method(Date, 'now', () => now * 1000)
+  const pm = fakePrivateMessage()
+  const timers = []
+  const fetches = []
+  let fail = false
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm, onError: () => {},
+    _setTimeout: (fn, delay) => { const timer = { fn, delay }; timers.push(timer); return timer },
+    _clearTimeout: timer => { timer.cancelled = true },
+    _privateChannel: {
+      fetchHistory: async options => {
+        fetches.push(options)
+        if (fail) throw Object.assign(new Error('temporary failure'), { category: 'transport' })
+        return []
+      }
+    }
+  }).init({ userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+  await timers[0].fn()
+  now += 60
+  const callback = pm.watchCalls[0].onSubscriptionState
+  await callback({ state: 'interrupted', relay: 'wss://relay.example', since: now - 30 })
+  const before = await messenger.stateStore.load()
+  assert.ok(before.channel.offlineRanges[0].start <= now - 30)
+  assert.ok(before.channel.openOfflineStart <= now - 30)
+  await pm.watchCalls[0].onMessage({ event: { id: 'live', kind: 9, pubkey: 'peer', created_at: now, tags: [], content: '' }, outer: { created_at: now }, senderPubkey: 'peer' })
+  fail = true
+  await callback({ state: 'ready', relay: 'wss://relay.example', until: now })
+  await timers.at(-1).fn()
+  assert.ok(messenger.readState().channels.channel.offlineRanges.length)
+  assert.equal(messenger.readState().channels.channel.recoveredThrough, now - 60)
+  assert.ok(timers.at(-1).delay >= 800)
+  fail = false
+  await timers.at(-1).fn()
+  assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [])
+  assert.equal(messenger.readState().channels.channel.recoveredThrough, now)
+  assert.ok(fetches.at(-1).since <= now - 30)
+})
+
+test('overflow gap persistence rejection blocks readiness until storage recovers', async t => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm, onError: () => {}, _setTimeout: () => null }).init({ userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+  const update = messenger.stateStore.update.bind(messenger.stateStore)
+  t.mock.method(messenger.stateStore, 'update', async () => { throw new Error('storage unavailable') })
+  const interrupted = { state: 'interrupted', relay: 'wss://relay.example', since: Math.floor(Date.now() / 1000) - 20 }
+  await assert.rejects(pm.watchCalls[0].onSubscriptionState(interrupted), /storage unavailable/)
+  messenger.stateStore.update = update
+  await pm.watchCalls[0].onSubscriptionState(interrupted)
+  assert.ok((await messenger.stateStore.load()).channel.offlineRanges.length)
+})
+
+test('dense-page limits remain pending without an automatic recovery loop; unwatch cancels retries', async () => {
+  const pm = fakePrivateMessage()
+  const timers = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm, onError: () => {},
+    _setTimeout: (fn, delay) => { const timer = { fn, delay }; timers.push(timer); return timer }, _clearTimeout: timer => { timer.cancelled = true },
+    _privateChannel: { fetchHistory: async () => { throw Object.assign(new Error('dense page'), { code: 'PRIVATE_CHANNEL_HISTORY_PAGE_LIMIT' }) } }
+  }).init({ userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+  const callback = pm.watchCalls[0].onSubscriptionState
+  const now = Math.floor(Date.now() / 1000)
+  await callback({ state: 'interrupted', relay: 'wss://relay.example', since: now - 10 })
+  await callback({ state: 'ready', relay: 'wss://relay.example', until: now })
+  const timer = timers.at(-1)
+  await timer.fn()
+  assert.equal(timers.at(-1), timer)
+  assert.ok(messenger.readState().channels.channel.offlineRanges.length)
+  await callback({ state: 'interrupted', relay: 'wss://relay.example', since: now - 10 })
+  await callback({ state: 'ready', relay: 'wss://relay.example', until: now })
+  const cancelled = timers.at(-1)
+  await messenger.unwatch()
+  assert.equal(cancelled.cancelled, true)
+  await cancelled.fn()
+  assert.equal(messenger.liveRecoveryTimers.size, 0)
+})
+
+test('disabled historical recovery ignores subscription gaps and leaves live recovery to the session', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm, offlineRecoverySeconds: 0 }).init({ userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+  await pm.watchCalls[0].onSubscriptionState({ state: 'interrupted', relay: 'wss://relay.example', since: 0 })
+  await pm.watchCalls[0].onSubscriptionState({ state: 'ready', relay: 'wss://relay.example', until: Math.floor(Date.now() / 1000) })
+  assert.equal(messenger.liveInterruptions.size, 0)
+  assert.equal(messenger.liveRecoveryTimers.size, 0)
+})
+
+test('overflow fences an in-flight history checkpoint and readiness starts a fresh scan after cancellation', async () => {
+  const pm = fakePrivateMessage()
+  const timers = []
+  const entered = Promise.withResolvers()
+  const release = Promise.withResolvers()
+  let calls = 0
+  let cancelledSignal
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm, onError: () => {},
+    _setTimeout: fn => { const timer = { fn }; timers.push(timer); return timer }, _clearTimeout: timer => { timer.cancelled = true },
+    _privateChannel: {
+      fetchHistory: async options => {
+        if (++calls === 1) { cancelledSignal = options.signal; entered.resolve(); await release.promise }
+        return []
+      }
+    }
+  }).init({ userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+  const initial = timers[0].fn()
+  await entered.promise
+  const now = Math.floor(Date.now() / 1000)
+  await pm.watchCalls[0].onSubscriptionState({ state: 'interrupted', relay: 'wss://relay.example', since: now - 10 })
+  assert.equal(cancelledSignal.aborted, true)
+  await pm.watchCalls[0].onSubscriptionState({ state: 'ready', relay: 'wss://relay.example', until: now })
+  const retry = timers.at(-1).fn()
+  assert.equal(calls, 1)
+  release.resolve()
+  await initial
+  await retry
+  assert.equal(calls, 2)
+  assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [])
+})

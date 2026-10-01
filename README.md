@@ -985,3 +985,39 @@ publication failures retain the payload/index for retry. Outbound channel
 fragmentation streams from prepared encrypted rows, cleans partial writes and
 removes failed new keys from the temporary-storage registry. It does not raise
 the browser's Web Storage quota or delete unrelated application data.
+
+
+### Private subscription recovery (0.11.8)
+
+`privateChannel.subscribe()` returns `{ ready, done, close }`. `done` always
+resolves to `{ status: 'closed' | 'ended' | 'failed', error? }` after processing
+stops. Explicit cancellation is `closed`; a naturally exhausted stream is
+`ended`; a terminal error is `failed` and still reaches `onError`.
+
+`private-message.watch()` accepts an optional asynchronous
+`onSubscriptionState({ state, relay, since, until?, error? })` callback.
+`interrupted` identifies the conservative lower recovery boundary; after a
+buffer overflow, every affected channel must finish this callback before its
+shared relay subscription reopens. `ready` follows successful initial relay
+readiness on the replacement. Callbacks and completions are generation-fenced.
+Equal watch settings cannot keep a dead subscription registered as active.
+
+Overflow recovery keeps one timer per relay with exponential 1–30 second
+backoff and 20% jitter, reset after a stable minute. Other relays remain live.
+Removal, pause and close cancel pending work. Fragment storage stays scoped to
+the same session across replacement subscriptions. Permanent refusals remain
+reported and do not trigger this automatic retry loop.
+
+PrivateMessenger persists each interrupted interval before reopening, then
+uses paged `fetchHistory` to repair the gap while listening for new messages.
+Transient history failures retry with bounded backoff and honor `retryAt`;
+dense-page limits, permanent refusals and unknown failures stay pending without
+an automatic loop. Disabled historical recovery restores only live input.
+Existing persisted ranges, checkpoints, recovery windows and ack/nack semantics
+are unchanged; newer live arrivals cannot erase a pending interval.
+
+`RELAY_LIVE_BUFFER_FULL` retains `relay`, `phase`, `recoverySince` and a bounded
+`buffer` diagnostic: stage (`delivery`, `reconnect`, `history-wait`), queued
+count/bytes, incoming bytes, limits and oldest queued age. Queue bytes are UTF-8
+serialized volume, not heap use. Diagnostics never retain event contents or
+filters. Existing 1,000-item / 8-MiB live limits are unchanged.

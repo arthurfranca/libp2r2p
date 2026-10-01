@@ -984,6 +984,7 @@ export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = 
     })
 
   async function consumeEvents () {
+    let result = { status: 'ended' }
     try {
       for await (const item of events) {
         if (controller.signal.aborted) continue
@@ -991,19 +992,26 @@ export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = 
         else if (item.type === 'event') await processOuterEvent(item.event)
       }
     } catch (error) {
-      if (!controller.signal.aborted && error?.message !== 'Aborted') onError?.(error)
+      if (!controller.signal.aborted) {
+        const diagnostic = subscriptionError(error, error?.relay)
+        result = { status: 'failed', error: diagnostic }
+        // Consumer error callbacks must not turn `done` into an unhandled rejection.
+        try { onError?.(diagnostic) } catch {}
+      }
     } finally {
       processOuterEvent.close()
     }
+    return controller.signal.aborted ? { status: 'closed' } : result
   }
 
-  const consumePromise = consumeEvents()
+  const done = consumeEvents()
 
   return {
     ready: events.ready || Promise.resolve(),
+    done,
     close () {
       controller.abort()
-      return consumePromise
+      return done
     }
   }
 }

@@ -1,3 +1,4 @@
+import { recoveryRetryDelay } from './helpers/recovery-retry.js'
 // Expected use:
 // const messenger = await createPrivateMessenger({
 //   userSigner,
@@ -293,6 +294,8 @@ export class PrivateMessenger {
     this.capacityCheck = null
     this.capacityRequiredBytes = 0
     this.reloadGapTimers = new Map()
+    this.liveInterruptions = new Map()
+    this.liveRecoveryTimers = new Map()
     this.watchRevisionByChannel = new Map()
     this.presenceTimers = new Map()
     this.stopRelayListWatcher = null
@@ -1103,6 +1106,7 @@ export class PrivateMessenger {
         onContentKeyUsage: usage => this.handleContentKeyUsage(pubkey, usage),
         receivedChunkTtlMs: this.receivedChunkTtlMsFor(channel),
         receivedChunkIndexedDB: this._indexedDB,
+        onSubscriptionState: state => this.handleSubscriptionState(pubkey, state),
         onError: err => this.onError?.(err)
       })
       if (this.closePromise || this.pauseReasons.size || !this.desiredChannels.has(pubkey) || revision !== (this.watchRevisionByChannel.get(pubkey) || 0)) {
@@ -1136,6 +1140,76 @@ export class PrivateMessenger {
     return this
   }
 
+  async handleSubscriptionState (pubkey, { state, relay, since, until }) {
+    if (this.closePromise || this.pauseReasons.size || !this.desiredChannels.has(pubkey)) return
+    if (!this.offlineRecoverySecondsFor(pubkey)) return
+    let interrupted = this.liveInterruptions.get(pubkey)
+    if (state === 'interrupted') {
+      if (!interrupted) { interrupted = new Map(); this.liveInterruptions.set(pubkey, interrupted) }
+      const start = Math.min(interrupted.get(relay) ?? Infinity, since)
+      interrupted.set(relay, start)
+      this.cancelReloadGap(pubkey)
+      for (const controller of this.recoveryControllers) {
+        if (controller.channelPubkey === pubkey) { controller.liveInterrupted = true; controller.abort() }
+      }
+      this.recordInterruption([pubkey], start)
+      this.addOfflineRange(pubkey, Math.max(0, start - this.offlineSkewSeconds), nowSeconds())
+      // This rejection prevents the session from reopening the shared relay.
+      await this.flushStateWrites()
+    } else if (state === 'ready' && interrupted?.has(relay)) {
+      const start = interrupted.get(relay)
+      this.addOfflineRange(pubkey, Math.max(0, start - this.offlineSkewSeconds), until)
+      if (interrupted.size === 1) this.closeOpenOfflineRanges([pubkey])
+      await this.flushStateWrites()
+      if (this.closePromise || this.pauseReasons.size || !this.desiredChannels.has(pubkey) || this.liveInterruptions.get(pubkey) !== interrupted) return
+      interrupted.delete(relay)
+      if (!interrupted.size) this.liveInterruptions.delete(pubkey)
+      this.scheduleLiveRecovery(pubkey)
+    }
+  }
+
+  cancelLiveRecovery (pubkey) {
+    const work = this.liveRecoveryTimers.get(pubkey)
+    if (work?.timer != null) this._clearTimeout(work.timer)
+    this.liveRecoveryTimers.delete(pubkey)
+  }
+
+  scheduleLiveRecovery (pubkey) {
+    const current = this.liveRecoveryTimers.get(pubkey)
+    if (current) { current.again = true; return }
+    const work = { delay: 1000, timer: null, again: false }
+    this.liveRecoveryTimers.set(pubkey, work)
+    const isCurrent = () => this.liveRecoveryTimers.get(pubkey) === work && !this.closePromise &&
+      !this.pauseReasons.size && this.desiredChannels.has(pubkey)
+    const schedule = delay => {
+      work.timer = this._setTimeout(async () => {
+        work.timer = null
+        if (!isCurrent()) return
+        work.again = false
+        let errors
+        try {
+          // A ready notification may overtake cancellation of the previous scan.
+          // Let that scan retain its range, then start a fresh recovery attempt.
+          await this.recoveries.get(pubkey)
+          if (!isCurrent()) return
+          errors = await this.recoverOfflineRanges([pubkey])
+        } catch (error) {
+          this.onError?.(error)
+          errors = [error]
+        }
+        if (!isCurrent()) return
+        const pending = this.readState().channels[pubkey]?.offlineRanges?.length
+        const retry = pending ? recoveryRetryDelay(errors, Math.min(30000, work.delay * (0.8 + Math.random() * 0.4))) : null
+        if (work.again || retry !== null) {
+          schedule(work.again ? 0 : retry)
+          work.delay = Math.min(30000, work.delay * 2)
+        } else this.liveRecoveryTimers.delete(pubkey)
+      }, delay)
+      work.timer?.unref?.()
+    }
+    schedule(0)
+  }
+
   recordInterruption (channels, at = nowSeconds()) {
     const state = this.readState()
     for (const pubkey of channels) {
@@ -1152,6 +1226,8 @@ export class PrivateMessenger {
     const closing = []
     for (const pubkey of channels) {
       this.cancelReloadGap(pubkey)
+      this.cancelLiveRecovery(pubkey)
+      this.liveInterruptions.delete(pubkey)
       this.watchRevisionByChannel.set(pubkey, (this.watchRevisionByChannel.get(pubkey) || 0) + 1)
       const close = this.stopByChannel.get(pubkey)?.()
       if (close?.then) closing.push(close)
@@ -2063,6 +2139,7 @@ export class PrivateMessenger {
   }
 
   async recoverOfflineRanges (channels = [...this.stopByChannel.keys()]) {
+    const failures = []
     for (const pubkey of uniq(channels)) {
       if (this.pauseReasons.size || this.closePromise || !this.desiredChannels.has(pubkey)) continue
       let work = this.recoveries.get(pubkey)
@@ -2070,11 +2147,13 @@ export class PrivateMessenger {
         work = this.recoverChannelRanges([pubkey])
         this.recoveries.set(pubkey, work)
       }
-      try { await work } finally { if (this.recoveries.get(pubkey) === work) this.recoveries.delete(pubkey) }
+      try { failures.push(...await work) } finally { if (this.recoveries.get(pubkey) === work) this.recoveries.delete(pubkey) }
     }
+    return failures
   }
 
   async recoverChannelRanges (channels) {
+    const failures = []
     const state = this.readState()
     const now = nowSeconds()
 
@@ -2125,12 +2204,14 @@ export class PrivateMessenger {
           })
           controller.signal.throwIfAborted()
           const attempt = await this.#askSeedersForRelayLeftEdgeAttempt(pubkey, range, history.oldestCreatedAt)
-          const lifecycleChanged = this.closePromise || !this.channels.has(pubkey) || !this.stopByChannel.has(pubkey) ||
+          const lifecycleChanged = controller.signal.aborted || this.closePromise || !this.channels.has(pubkey) || !this.stopByChannel.has(pubkey) ||
             (this.watchRevisionByChannel.get(pubkey) || 0) !== watchRevision
+          failures.push(...attempt.failures.map(failure => failure.error))
           if (lifecycleChanged || attempt.failures.length) remaining.push(range)
           else recoveredThrough = Math.max(recoveredThrough, range.end)
         } catch (err) {
-          this.onError?.(err)
+          if (!(controller.liveInterrupted && err === controller.signal.reason)) this.onError?.(err)
+          failures.push(err)
           remaining.push(range)
         } finally { this.recoveryControllers.delete(controller) }
       }
@@ -2145,6 +2226,7 @@ export class PrivateMessenger {
       this.writeState(fresh)
       await this.flushStateWrites()
     }
+    return failures
   }
 
   async clearChannel (pubkey) {

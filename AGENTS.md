@@ -225,3 +225,10 @@ NIP-46 against the real pool with controlled transport and injected controls.
 - Reply packers cap UTF-8 JSONL at 128 KiB and 100 records, except one indivisible
   oversized record. Stream outgoing fragments from prepared rows without a
   second Web Storage copy. Cleanup partial writes and failed tracking entries.
+
+- Private-channel subscriptions expose a non-rejecting `done` result; private-message
+  retires only the matching generation. Overflow retries await every affected
+  channel's durable interruption callback before reopening one relay, preserving
+  healthy subscriptions, fragment scope and cancellation. Readiness triggers paged
+  gap recovery; live progress must never erase that interval. Keep bounded backoff,
+  permanent-refusal handling and content-free buffer diagnostics.
