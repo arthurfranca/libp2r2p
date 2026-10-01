@@ -339,7 +339,7 @@ must not delete a kind `3560` event, whether or not that event has an `s` tag.
 ### Storage Maintenance
 
 While an outgoing private message is being assembled, the messenger keeps
-encrypted envelope rows and router chunks in `sessionStorage`. They are
+encrypted envelope rows in `sessionStorage` (router fragments are encoded on demand, without a second stored copy). They are
 removed when the send finishes, but an interrupted browser operation can leave
 them behind until cleanup runs.
 
@@ -965,3 +965,23 @@ latency, and short-lived channel/recipient preferences avoid recently refused
 relays without changing receive subscriptions. See the
 [session coordinator](private-messenger/session/README.md) for deferred offline
 attempts and final failure notifications.
+
+
+### Relay backpressure and bounded synchronization (0.11.7)
+
+Optional numeric `retry_after` seconds on relay `CLOSED` and rejected `OK`
+responses are preserved as `retryAfterMs` and `retryAt` on native relay errors.
+Only `rate-limited:` responses apply this advice; invalid values are ignored
+and delays are capped at five minutes. New operations on that connection wait
+within their existing deadlines; active subscriptions remain live and `CLOSE`
+never waits. Cancelled or timed-out operations cannot be sent later. A rejection
+is still reported to the caller; this does not silently republish failed events.
+
+`createEventReplyPacker` and `createMissingMessageReplyPacker` accept
+`bytesPerChunk` (default 128 KiB of UTF-8 JSONL), in addition to the existing
+100-record maximum. One indivisible oversized record is sent alone. Consumers
+must keep failed requests pending; no record is truncated or discarded. Final
+publication failures retain the payload/index for retry. Outbound channel
+fragmentation streams from prepared encrypted rows, cleans partial writes and
+removes failed new keys from the temporary-storage registry. It does not raise
+the browser's Web Storage quota or delete unrelated application data.

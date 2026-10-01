@@ -78,23 +78,6 @@ function encryptedPayload ({ messageSecretKey, event }) {
   return nip44v3.encrypt(messageSecretKey, messagePubkey, ROUTER_KIND, '', JSON.stringify(event))
 }
 
-function appendLine (chunk, line, id, chunkIndex, temporaryStorage) {
-  while (line.length) {
-    const available = JSONL_CHUNK_BYTES - chunk.length
-    chunk = appendBytes(chunk, line.slice(0, available))
-    line = line.slice(available)
-    if (chunk.length === JSONL_CHUNK_BYTES) {
-      temporaryStorage.setItem(tempKey(id, chunkIndex++), bytesToBase64(chunk))
-      chunk = new Uint8Array()
-    }
-  }
-  return { chunk, chunkIndex }
-}
-
-function appendRow (chunk, row, id, chunkIndex, temporaryStorage) {
-  return appendLine(chunk, encoder.encode(`${row}\n`), id, chunkIndex, temporaryStorage)
-}
-
 function joinByteChunks (parts) {
   let length = 0
   const decoded = parts.map(part => {
@@ -249,20 +232,42 @@ export function preparedRowIndexesForReceivers (preparedRows, receivers) {
   return indexes
 }
 
+// Keep only one encoded row and one fragment in memory; do not stage a
+// second, Base64-expanded copy of the entire message in Web Storage.
+export function preparedChunkCount (preparedRows, rowIndexes = preparedRows.rowIndexes) {
+  let bytes = 0
+  for (const index of [0, ...rowIndexes]) bytes += encoder.encode(readPreparedRow(preparedRows, index)).length + 1
+  return Math.max(1, Math.ceil(bytes / JSONL_CHUNK_BYTES))
+}
+
+export function * preparedChunks (preparedRows, rowIndexes = preparedRows.rowIndexes) {
+  let chunk = new Uint8Array()
+  for (const index of [0, ...rowIndexes]) {
+    const row = encoder.encode(`${readPreparedRow(preparedRows, index)}\n`)
+    for (let offset = 0; offset < row.length;) {
+      const size = Math.min(JSONL_CHUNK_BYTES - chunk.length, row.length - offset)
+      chunk = appendBytes(chunk, row.subarray(offset, offset + size))
+      offset += size
+      if (chunk.length === JSONL_CHUNK_BYTES) {
+        yield bytesToBase64(chunk)
+        chunk = new Uint8Array()
+      }
+    }
+  }
+  if (chunk.length) yield bytesToBase64(chunk)
+}
+
 export function writeChunksFromPreparedRows (preparedRows, rowIndexes = preparedRows?.rowIndexes || []) {
   const temporaryStorage = storageFor(preparedRows?.temporaryStorage)
   const id = temporaryId()
-  let chunk = new Uint8Array()
   let chunkIndex = 0
   try {
-    ;({ chunk, chunkIndex } = appendRow(chunk, readPreparedRow(preparedRows, 0), id, chunkIndex, temporaryStorage))
-    for (const rowIndex of rowIndexes) {
-      ;({ chunk, chunkIndex } = appendRow(chunk, readPreparedRow(preparedRows, rowIndex), id, chunkIndex, temporaryStorage))
+    for (const content of preparedChunks(preparedRows, rowIndexes)) {
+      temporaryStorage.setItem(tempKey(id, chunkIndex++), content)
     }
-    if (chunk.length || chunkIndex === 0) temporaryStorage.setItem(tempKey(id, chunkIndex++), bytesToBase64(chunk))
     return { id, total: chunkIndex, ownContentPubkey: preparedRows.ownContentPubkey || '' }
   } catch (err) {
-    cleanupChunks(id, chunkIndex + 1, temporaryStorage)
+    cleanupChunks(id, chunkIndex, temporaryStorage)
     throw err
   }
 }

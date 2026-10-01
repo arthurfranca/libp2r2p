@@ -36,8 +36,9 @@ export function createTemporaryStorage ({ storageArea = globalThis.sessionStorag
 
   function trackTemporaryKey (key) {
     const tracked = readTrackedKeys()
-    if (tracked.includes(key)) return
+    if (tracked.includes(key)) return false
     writeTrackedKeys(tracked.concat(key))
+    return true
   }
 
   function untrackTemporaryKeys (keys) {
@@ -57,8 +58,14 @@ export function createTemporaryStorage ({ storageArea = globalThis.sessionStorag
 
   function setItem (key, value) {
     if (typeof key !== 'string' || !key || key === TEMPORARY_STORAGE_KEYS_KEY) throw new ValidationError('INVALID_TEMPORARY_STORAGE_KEY')
-    trackTemporaryKey(key)
-    storage().setItem(key, value)
+    const newlyTracked = trackTemporaryKey(key)
+    try {
+      storage().setItem(key, value)
+    } catch (error) {
+      // A failed write is atomic; keep tracking any previous value.
+      if (newlyTracked && storage().getItem(key) === null) untrackTemporaryKeys([key])
+      throw error
+    }
   }
 
   function removeItems (keys) {

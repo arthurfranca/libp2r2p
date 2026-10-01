@@ -26,6 +26,7 @@ import {
 } from '../private-channel/index.js'
 import { createReceivedChunkStore, DEFAULT_RECEIVED_CHUNK_MAX_BYTES } from '../private-channel/services/received-chunks.js'
 import { isValidContentKeyProof, makeContentKeyEvent, parseContentKeyEvent } from '../content-key/event/index.js'
+import { writeChunksFromPreparedRows } from '../private-channel/helpers/chunks.js'
 import { TEMPORARY_STORAGE_KEYS_KEY } from '../temporary-storage/index.js'
 import { bytesToBase64, base64ToBytes } from '../base64/index.js'
 import { bytesToHex, hexToBytes } from '../base16/index.js'
@@ -2367,4 +2368,42 @@ test('history pages share fragment assembly and preserve rejection/retry behavio
   assert.equal(result.receivedEventCount, events.length)
   assert.equal(result.oldestCreatedAt, 0)
   assert.ok(calls.length > 2)
+})
+
+test('chunk write failure mid-row removes every written fragment without deleting prepared rows', () => {
+  const data = new Map([['libp2r2p:private-channel:prepared:row:0', 'x'.repeat(getJsonlChunkByteSize() * 10)]])
+  const temporaryStorage = {
+    getItem: key => data.get(key) ?? null,
+    setItem: (key, value) => {
+      if (data.size >= 6) throw new DOMException('full', 'QuotaExceededError')
+      data.set(key, value)
+    },
+    removeItems: keys => keys.forEach(key => data.delete(key))
+  }
+  assert.throws(() => writeChunksFromPreparedRows({ id: 'prepared', rowIndexes: [], temporaryStorage }), { name: 'QuotaExceededError' })
+  assert.equal(data.size, 1)
+  assert.ok(data.has('libp2r2p:private-channel:prepared:row:0'))
+})
+
+test('large outgoing messages stream without duplicating prepared payload in session storage', async () => {
+  const data = new Map()
+  const storage = {
+    getItem: key => data.get(key) ?? null,
+    removeItem: key => data.delete(key),
+    setItem: (key, value) => {
+      const usage = [...data].reduce((sum, [k, v]) => sum + k.length + v.length, 0)
+      if (usage + key.length + value.length > 5 * 1024 * 1024) throw new DOMException('full', 'QuotaExceededError')
+      assert.ok(key === TEMPORARY_STORAGE_KEYS_KEY || key.includes(':row:'), 'no second fragment staging copy')
+      data.set(key, value)
+    }
+  }
+  const alice = signer()
+  const bob = signer()
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const stream = wrapEvents({ senderSigner: alice, receivers: [await bob.getPublicKey()], event: eventFixture('x'.repeat(2_000_000)), temporaryStorageArea: storage, _getIykcProofs: noContentKeys })
+    const first = await stream.next()
+    assert.equal(first.done, false)
+    await stream.return()
+    assert.equal(data.size, 0)
+  }
 })

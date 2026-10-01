@@ -1,7 +1,7 @@
 import { isValidEvent } from '../../event/index.js'
 import { ValidationError } from '../../error/index.js'
 import { maybeUnref } from '../helpers/timer.js'
-import { categorizeRelayError, relayCloseError, relayTimeoutError } from '../helpers/error.js'
+import { categorizeRelayError, relayCloseError, relayTimeoutError, relayRejectionError } from '../helpers/error.js'
 
 const DEFAULT_CONNECT_TIMEOUT = 3000
 const DEFAULT_OPERATION_TIMEOUT = 30000
@@ -50,6 +50,7 @@ export class RelayConnection {
   #publishes = new Map()
   #authentications = new Map()
   #counts = new Map()
+  #retryAt = 0
 
   constructor (url, { WebSocket: WebSocketImpl = globalThis.WebSocket } = {}) {
     this.url = url
@@ -121,47 +122,87 @@ export class RelayConnection {
     }
   }
 
+  // New work respects relay cooldowns; cleanup uses send() directly. These
+  // waits stay within the caller's existing deadline and are cancellable.
+  #dispatchWork (send, fail) {
+    let timer = null
+    let cancelled = false
+    const dispatch = () => {
+      if (cancelled) return
+      const remaining = this.#retryAt - Date.now()
+      if (remaining > 0) {
+        timer = maybeUnref(setTimeout(dispatch, remaining))
+        return
+      }
+      try { send() } catch (error) { fail(error) }
+    }
+    dispatch()
+    return () => { cancelled = true; clearTimeout(timer) }
+  }
+
+  #rejection (reason, extra, fallback) {
+    const error = relayRejectionError(reason, extra, fallback)
+    this.#retryAt = Math.max(this.#retryAt, error.retryAt || 0)
+    return error
+  }
+
   subscribe (filters, handlers = {}) {
     if (!Array.isArray(filters) || !filters.length) throw new ValidationError('SUBSCRIPTION_FILTERS_REQUIRED')
     const id = `p2r2p-sub:${++this.#serial}`
     let closed = false
+    let sent = false
     const close = () => {
       if (closed) return
       closed = true
       const subscription = this.#subscriptions.get(id)
       if (!subscription) return
       this.#subscriptions.delete(id)
-      try { this.send(JSON.stringify(['CLOSE', id])) } catch {}
+      subscription.cancelSend?.()
+      if (sent) { try { this.send(JSON.stringify(['CLOSE', id])) } catch {} }
       handlers.onclose?.()
     }
-    this.#subscriptions.set(id, { filters, handlers, close })
-    try { this.send(JSON.stringify(['REQ', id, ...filters])) } catch (error) {
+    const subscription = { filters, handlers, close, cancelSend: null }
+    this.#subscriptions.set(id, subscription)
+    subscription.cancelSend = this.#dispatchWork(() => {
+      this.send(JSON.stringify(['REQ', id, ...filters]))
+      sent = true
+    }, error => {
       this.#subscriptions.delete(id)
-      throw error
-    }
+      handlers.onclose?.(error)
+    })
     return { id, close }
   }
 
-  publish (event) {
+  publish (event, { signal } = {}) {
     if (!isValidEvent(event)) return Promise.reject(new Error('INVALID_EVENT'))
-    return this.#sendEventOperation('EVENT', event, this.#publishes, 'PUBLISH_TIMEOUT')
+    return this.#sendEventOperation('EVENT', event, this.#publishes, 'PUBLISH_TIMEOUT', signal)
   }
 
-  async authenticate (getAuthEvent) {
+  async authenticate (getAuthEvent, { signal } = {}) {
     if (!this.#challenge) throw new Error('AUTH_CHALLENGE_MISSING')
     const event = await getAuthEvent({ relay: this.url, challenge: this.#challenge })
     if (!isValidEvent(event)) throw new ValidationError('INVALID_AUTH_EVENT')
-    return await this.#sendEventOperation('AUTH', event, this.#authentications, 'AUTH_TIMEOUT')
+    return await this.#sendEventOperation('AUTH', event, this.#authentications, 'AUTH_TIMEOUT', signal)
   }
 
-  #sendEventOperation (type, event, map, timeoutCode) {
+  #sendEventOperation (type, event, map, timeoutCode, signal) {
+    if (signal?.aborted) return Promise.reject(signal.reason || relayTimeoutError(timeoutCode))
     if (map.has(event.id)) return map.get(event.id).promise
     const deferred = Promise.withResolvers()
     const timer = maybeUnref(setTimeout(() => this.#settleEvent(map, event.id, relayTimeoutError(timeoutCode, this.#lastTransportError)), this.publishTimeout))
-    map.set(event.id, { ...deferred, timer, promise: deferred.promise })
-    try { this.send(JSON.stringify([type, event])) } catch (error) {
+    const onAbort = () => this.#settleEvent(map, event.id, signal.reason || relayTimeoutError(timeoutCode))
+    const stopAbort = () => signal?.removeEventListener('abort', onAbort)
+    const pending = { ...deferred, timer, promise: deferred.promise, cancelSend: null, stopAbort }
+    map.set(event.id, pending)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    pending.cancelSend = this.#dispatchWork(() => {
+      // Once transmitted, keep the existing ACK/report semantics. Before that,
+      // an operation-wide deadline must cancel the deferred publication.
+      stopAbort()
+      this.send(JSON.stringify([type, event]))
+    }, error => {
       this.#settleEvent(map, event.id, error)
-    }
+    })
     return deferred.promise
   }
 
@@ -170,11 +211,12 @@ export class RelayConnection {
     const id = `p2r2p-count:${++this.#serial}`
     const deferred = Promise.withResolvers()
     const onAbort = () => this.#settleCount(id, null, new Error('COUNT_ABORTED'))
-    this.#counts.set(id, { ...deferred, signal, onAbort })
+    const pending = { ...deferred, signal, onAbort, cancelSend: null }
+    this.#counts.set(id, pending)
     signal?.addEventListener('abort', onAbort, { once: true })
-    try { this.send(JSON.stringify(['COUNT', id, ...filters])) } catch (error) {
+    pending.cancelSend = this.#dispatchWork(() => this.send(JSON.stringify(['COUNT', id, ...filters])), error => {
       this.#settleCount(id, null, error)
-    }
+    })
     return deferred.promise
   }
 
@@ -182,6 +224,8 @@ export class RelayConnection {
     const pending = map.get(id)
     if (!pending) return
     map.delete(id)
+    pending.cancelSend?.()
+    pending.stopAbort?.()
     clearTimeout(pending.timer)
     if (reason) pending.reject(errorFrom(reason, 'OPERATION_REJECTED'))
     else pending.resolve(value)
@@ -191,6 +235,7 @@ export class RelayConnection {
     const pending = this.#counts.get(id)
     if (!pending) return
     this.#counts.delete(id)
+    pending.cancelSend?.()
     pending.signal?.removeEventListener('abort', pending.onAbort)
     if (reason) pending.reject(errorFrom(reason, 'COUNT_REJECTED'))
     else pending.resolve(payload)
@@ -219,14 +264,16 @@ export class RelayConnection {
     if (data[0] === 'CLOSED') {
       const id = data[1]
       const subscription = this.#subscriptions.get(id)
+      const reason = this.#rejection(data[2], data[3], subscription ? 'SUBSCRIPTION_CLOSED' : 'COUNT_CLOSED')
       if (subscription) {
         this.#subscriptions.delete(id)
-        subscription.handlers.onclose?.(errorFrom(data[2], 'SUBSCRIPTION_CLOSED'))
-      } else this.#settleCount(id, null, errorFrom(data[2], 'COUNT_CLOSED'))
+        subscription.cancelSend?.()
+        subscription.handlers.onclose?.(reason)
+      } else this.#settleCount(id, null, reason)
       return
     }
     if (data[0] === 'OK') {
-      const reason = data[2] === true ? null : categorizeRelayError(data[3], 'relay', 'EVENT_REJECTED')
+      const reason = data[2] === true ? null : this.#rejection(data[3], data[4], 'EVENT_REJECTED')
       this.#settleEvent(this.#publishes, data[1], reason, data[3])
       this.#settleEvent(this.#authentications, data[1], reason, data[3])
       return
@@ -248,6 +295,7 @@ export class RelayConnection {
     const reason = relayCloseError(event, 'transport', this.#lastTransportError)
     for (const [id, subscription] of this.#subscriptions) {
       this.#subscriptions.delete(id)
+      subscription.cancelSend?.()
       subscription.handlers.onclose?.(reason)
     }
     for (const id of [...this.#publishes.keys()]) this.#settleEvent(this.#publishes, id, reason)
@@ -263,6 +311,7 @@ export class RelayConnection {
     const reason = relayCloseError(null, 'transport', this.#lastTransportError)
     for (const [id, subscription] of this.#subscriptions) {
       this.#subscriptions.delete(id)
+      subscription.cancelSend?.()
       subscription.handlers.onclose?.()
     }
     for (const id of [...this.#publishes.keys()]) this.#settleEvent(this.#publishes, id, reason)

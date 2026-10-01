@@ -39,12 +39,12 @@ function trackedKeys () {
   return raw ? JSON.parse(raw) : []
 }
 
-test('setTemporaryItem tracks a key before storing the value', () => {
+test('setTemporaryItem rolls back tracking after a failed new value', () => {
   failOnSetKey = 'tmp.fail'
 
   assert.throws(() => setTemporaryItem('tmp.fail', 'secret'), /set failed/)
 
-  assert.deepEqual(trackedKeys(), ['tmp.fail'])
+  assert.deepEqual(trackedKeys(), [])
   assert.equal(globalThis.sessionStorage.getItem('tmp.fail'), null)
   assert.equal(globalThis.localStorage.getItem('tmp.fail'), null)
 })
@@ -86,4 +86,16 @@ test('createTemporaryStorage isolates a caller-supplied area', () => {
 
   assert.equal(globalThis.localStorage.getItem('tmp.local'), null)
   assert.equal(globalThis.localStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+})
+
+test('failed overwrite retains the old value and tracking; registry failures create no payload', () => {
+  setTemporaryItem('tmp.existing', 'old')
+  failOnSetKey = 'tmp.existing'
+  assert.throws(() => setTemporaryItem('tmp.existing', 'new'), /set failed/)
+  assert.equal(getTemporaryItem('tmp.existing'), 'old')
+  assert.deepEqual(trackedKeys(), ['tmp.existing'])
+  failOnSetKey = TEMPORARY_STORAGE_KEYS_KEY
+  assert.throws(() => setTemporaryItem('tmp.new', 'new'), /set failed/)
+  assert.equal(getTemporaryItem('tmp.new'), null)
+  assert.deepEqual(trackedKeys(), ['tmp.existing'])
 })

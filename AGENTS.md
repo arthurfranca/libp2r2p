@@ -217,3 +217,11 @@ NIP-46 against the real pool with controlled transport and injected controls.
   Preserve one fragment processor per call and summary-only results. Recovery
   gates cover reads plus processing (two per messenger, one per relay per library
   instance) without blocking live watches. Keep the original `fetch` contract.
+
+- Honor optional numeric relay `retry_after` on rate-limited CLOSED/OK, bounded
+  to five minutes, without blocking CLOSE or sending cancelled work later.
+  Preserve retryAfterMs/retryAt through subscription diagnostics. Existing
+  operation deadlines remain authoritative; do not silently republish failures.
+- Reply packers cap UTF-8 JSONL at 128 KiB and 100 records, except one indivisible
+  oversized record. Stream outgoing fragments from prepared rows without a
+  second Web Storage copy. Cleanup partial writes and failed tracking entries.

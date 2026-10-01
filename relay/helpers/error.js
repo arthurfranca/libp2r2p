@@ -28,3 +28,15 @@ export function relayCloseError (event, category, cause) {
   if (event?.wasClean !== undefined) error.wasClean = event.wasClean
   return categorizeRelayError(error, category)
 }
+
+// retry_after is an optional relay extension, in seconds. Bound remote advice
+// to five minutes; invalid metadata must not stall unrelated operations.
+export function relayRejectionError (reason, extra, fallback) {
+  const error = categorizeRelayError(reason, 'relay', fallback)
+  const seconds = extra?.retry_after
+  if (error.message.startsWith('rate-limited:') && typeof seconds === 'number' && Number.isFinite(seconds) && seconds > 0) {
+    error.retryAfterMs = Math.min(seconds, 300) * 1000
+    error.retryAt = Date.now() + error.retryAfterMs
+  }
+  return error
+}

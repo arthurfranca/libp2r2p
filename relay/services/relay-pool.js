@@ -233,21 +233,21 @@ export class RelayPool {
 
   // NIP-42 retries happen inside one relay attempt, so sendEvent still reports
   // exactly one terminal outcome for each relay URL.
-  async #publishEvent (relay, event, getAuthEvent) {
+  async #publishEvent (relay, event, getAuthEvent, signal) {
     try {
-      await relay.publish(event)
+      await relay.publish(event, { signal })
       return 'published'
     } catch (error) {
       const reason = error instanceof Error ? error : new Error(String(error))
       if (!getAuthEvent || !requiresNip42Auth(reason)) throw reason
 
       try {
-        await relay.authenticate(getAuthEvent)
+        await relay.authenticate(getAuthEvent, { signal })
       } catch (error) {
         const authReason = error instanceof Error ? error : new Error(String(error))
         throw new Nip42AuthenticationError(authReason)
       }
-      await relay.publish(event)
+      await relay.publish(event, { signal })
       return 'published'
     }
   }
@@ -1144,12 +1144,14 @@ export class RelayPool {
     const eventToSend = event.meta ? { ...event } : event
     if (eventToSend.meta) delete eventToSend.meta
 
+    const sendControllers = urls.map(() => new AbortController())
     const sendDeferreds = urls.map(() => Promise.withResolvers())
     const sendPromises = sendDeferreds.map(({ promise }) => promise)
 
     // Starts before connection work so every relay shares one real deadline.
     const settlement = createPublishSettlements(sendPromises, timeout, {
       onSettled: (settlement, index) => {
+        sendControllers[index].abort(settlement.reason)
         if (settlement.reason?.category === 'timeout' && !settlement.reason.cause) {
           const relay = this.#relays.get(normalizeRelayUrl(urls[index]))
           if (relay?.lastTransportError) settlement.reason.cause = relay.lastTransportError
@@ -1171,7 +1173,9 @@ export class RelayPool {
       ;(async () => {
         try {
           const relay = await this.#getRelay(url)
-          return await this.#publishEvent(relay, eventToSend, getAuthEvent)
+          const signal = sendControllers[index].signal
+          if (signal.aborted) throw signal.reason
+          return await this.#publishEvent(relay, eventToSend, getAuthEvent, signal)
         } catch (err) {
           const reason = err instanceof Error ? err : new Error(String(err))
           if (reason instanceof Nip42AuthenticationError) throw reason

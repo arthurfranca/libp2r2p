@@ -9,6 +9,7 @@ export const MISSING_MESSAGES_REPLY_CODE = 'missingMessages_reply_8mj8'
 export const ROUTER_SEED_RECORD_TYPE = 'routerEnvelopeRow_v1'
 export const NYM_CARRIER_SEED_RECORD_TYPE = 'nymCarrier_v1'
 
+export const DEFAULT_REPLY_BYTES_PER_CHUNK = 128 * 1024
 const DEFAULT_EVENTS_PER_CHUNK = 100
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
@@ -224,6 +225,7 @@ export function createEventReplyPacker ({
   code,
   payload = {},
   eventsPerChunk = DEFAULT_EVENTS_PER_CHUNK,
+  bytesPerChunk = DEFAULT_REPLY_BYTES_PER_CHUNK,
   recordsFromInput = eventRecordFromInput,
   sendEmptyReply = false
 }) {
@@ -231,18 +233,17 @@ export function createEventReplyPacker ({
   if (!question?.id) throw new ValidationError('QUESTION_REQUIRED')
   if (!receiverPubkey) throw new ValidationError('RECEIVER_PUBKEY_REQUIRED')
   if (!Number.isSafeInteger(eventsPerChunk) || eventsPerChunk < 1) throw new ValidationError('INVALID_EVENTS_PER_CHUNK')
+  if (!Number.isSafeInteger(bytesPerChunk) || bytesPerChunk < 1) throw new ValidationError('INVALID_BYTES_PER_CHUNK')
 
   let chunk = ''
   let chunkEvents = 0
+  let chunkBytes = 0
   let index = 0
   let finalized = false
   let published = false
 
   async function publish (isLast) {
     const jsonl = chunk
-    chunk = ''
-    chunkEvents = 0
-    published = true
     await messenger.reply({
       channelPubkey,
       question,
@@ -250,17 +251,27 @@ export function createEventReplyPacker ({
       code,
       payload: {
         ...payload,
-        index: index++,
+        index,
         isLast,
         jsonl
       }
     })
+    index++
+    chunk = ''
+    chunkEvents = 0
+    chunkBytes = 0
+    published = true
   }
 
   async function appendRecord (record, { flush = true } = {}) {
-    chunk += `${JSON.stringify(record)}\n`
+    const line = `${JSON.stringify(record)}\n`
+    const bytes = encoder.encode(line).length
+    if (chunk && (chunkBytes + bytes > bytesPerChunk || chunkEvents >= eventsPerChunk)) await publish(false)
+    chunk += line
+    chunkBytes += bytes
     chunkEvents++
-    if (flush && chunkEvents >= eventsPerChunk) await publish(false)
+    // A record is indivisible: an oversized one travels alone, never truncated.
+    if (flush && (chunkEvents >= eventsPerChunk || chunkBytes >= bytesPerChunk)) await publish(false)
   }
 
   async function appendRecords (records, { final = false } = {}) {
@@ -278,9 +289,8 @@ export function createEventReplyPacker ({
   async function finalize (input) {
     if (finalized) return
     if (input != null) await appendRecords(await recordsFromInput(input), { final: true })
+    if (chunk || sendEmptyReply || published) await publish(true)
     finalized = true
-    if (!chunk && !sendEmptyReply && !published) return
-    await publish(true)
   }
 
   return {
@@ -297,12 +307,14 @@ export function createMissingMessageReplyPacker ({
   since,
   until,
   eventsPerChunk = DEFAULT_EVENTS_PER_CHUNK,
+  bytesPerChunk = DEFAULT_REPLY_BYTES_PER_CHUNK,
   sendEmptyReply = false
 }) {
   if (!messenger?.reply) throw new ValidationError('MESSENGER_REQUIRED')
   if (!question?.id) throw new ValidationError('QUESTION_REQUIRED')
   if (!receiverPubkey) throw new ValidationError('RECEIVER_PUBKEY_REQUIRED')
   if (!Number.isSafeInteger(eventsPerChunk) || eventsPerChunk < 1) throw new ValidationError('INVALID_EVENTS_PER_CHUNK')
+  if (!Number.isSafeInteger(bytesPerChunk) || bytesPerChunk < 1) throw new ValidationError('INVALID_BYTES_PER_CHUNK')
 
   const range = backfillRequestRange(question, since, until)
   return createEventReplyPacker({
@@ -313,6 +325,7 @@ export function createMissingMessageReplyPacker ({
     code: MISSING_MESSAGES_REPLY_CODE,
     payload: { since: range.since, until: range.until },
     eventsPerChunk,
+    bytesPerChunk,
     sendEmptyReply,
     recordsFromInput: seed => compactRecordsFromSeed(seed, { receiverPubkey, since: range.since, until: range.until })
   })

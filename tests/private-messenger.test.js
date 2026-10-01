@@ -2737,3 +2737,41 @@ test('paged recovery persists partial deliveries but retains the whole interval 
   assert.equal(recovered.channel.recoveredThrough, now)
   assert.deepEqual(recovered.channel.offlineRanges, [])
 })
+
+test('event reply packer bounds UTF-8 bytes, sends oversized records alone and preserves order', async () => {
+  const replies = []
+  const events = Array.from({ length: 10 }, (_, index) => ({ id: String(index), content: 'á'.repeat(index === 4 ? 200 : 20) }))
+  const packer = createEventReplyPacker({
+    messenger: { reply: async ({ payload }) => replies.push(payload) },
+    question: { id: 'question', pubkey: 'peer' }, code: 'test', bytesPerChunk: 160,
+    recordsFromInput: event => [event]
+  })
+  for (const event of events) await packer.update(event)
+  await packer.finalize()
+  const actual = []
+  for (const reply of replies) {
+    const records = reply.jsonl.trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+    assert.ok(Buffer.byteLength(reply.jsonl) <= 160 || records.length === 1)
+    actual.push(...records)
+  }
+  assert.deepEqual(actual, events)
+  assert.equal(replies.at(-1).isLast, true)
+  assert.deepEqual(replies.map(reply => reply.index), replies.map((_, index) => index))
+})
+
+test('reply packer keeps failed final payload and index for retry', async () => {
+  const failure = new Error('quota')
+  let failing = true
+  const replies = []
+  const packer = createEventReplyPacker({
+    messenger: { reply: async ({ payload }) => { replies.push(payload); if (failing) throw failure } },
+    question: { id: 'question', pubkey: 'peer' }, code: 'test', recordsFromInput: event => [event]
+  })
+  await packer.update({ id: 'one' })
+  await assert.rejects(packer.finalize(), error => error === failure)
+  failing = false
+  await packer.finalize()
+  assert.deepEqual(replies[1], replies[0])
+  await packer.finalize()
+  assert.equal(replies.length, 2)
+})
