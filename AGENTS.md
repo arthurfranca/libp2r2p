@@ -170,3 +170,8 @@ NIP-46 against the real pool with controlled transport and injected controls.
   account-state interpretation. Keep pending work encrypted and existing-only
   checkpoints cancellation-safe. File cache budgets count useful bytes, evict
   inactive roots and preserve active reservations/stream backpressure.
+
+- Session `onSendError(error, { id, peer })` reports the owning outbox item,
+  including failures of its context/file events. Preserve native diagnostics;
+  do not persist errors or report inbox/download/deletion/cancelled work through
+  this callback. Apps decide which user attempts and routes warrant feedback.

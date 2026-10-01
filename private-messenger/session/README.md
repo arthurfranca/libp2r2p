@@ -14,8 +14,16 @@ persistence; absent file storage uses the library cache. `mode` defaults to
 
 Methods: `setPeers`, `setAvailable(boolean)`, `enqueue`, `retry`, `cancel`,
 `download`, `cancelDownload`, and `close`. Callbacks are `onOutbox`, `onMedia`,
-and `onError`. The caller maps its account permissions/connectivity/lock state
-to availability and owns view subscriptions. There are no DOM or UI imports.
+`onError`, and optional `onSendError(error, { id, peer })`. The caller maps its
+account permissions/connectivity/lock state to availability and owns view subscriptions. There are no DOM or UI imports.
+
+`onSendError` identifies the main outbox message even when its quote, metadata,
+file chunks, or local persistence failed. The original error is also reported to
+`onError` unchanged. It fires once per failed send attempt (including retries),
+not when persisted failures are read, nor for inbox/download/deletion operations
+or cancelled/closed sends. Apps own route visibility and user-intent filtering;
+automatic retries may also fail. Callbacks must not throw. Errors are not copied
+into persisted outbox records.
 
 `enqueue({ peer, event, context, requiredFiles, deletion })` preserves prepared
 identities. Local message commits and remote stages have independent checkpoints.

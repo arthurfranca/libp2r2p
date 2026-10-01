@@ -912,4 +912,5 @@ Private-message consumers can now substitute recovery persistence through
 [`private-messenger/event-store`](private-messenger/event-store/README.md), or use
 local defaults, including a bounded streaming file cache. The optional
 [`private-messenger/session`](private-messenger/session/README.md) coordinator
-provides reusable DM inbox/outbox and attachment lifecycle without UI coupling.
+provides reusable DM inbox/outbox and attachment lifecycle without UI coupling,
+including an optional `onSendError` callback identifying the failed outbox message.

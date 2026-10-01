@@ -16,7 +16,7 @@ export function wireEvent (value, owner) {
 // Relay rejection text must not be interpreted as a local signer denial.
 const retryable = error => error?.code === 'MESSAGE_NOT_PUBLISHED' || !/DENIED|PERMISSION|REVOKED|READ_ONLY|INVALID|BLOCKED|EXPIRED|NOT_IN_PERSONA/i.test(`${error?.code || ''} ${error?.message || ''}`)
 
-export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], onMedia = () => {}, onOutbox = () => {}, onError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
+export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
   const userSigner = messengerSigner(signer)
   messageStorage ||= createEventStoreMessageStorage({ eventStore })
   chunkStorage ||= eventStore ? createEventStoreChunkStorage({ eventStore }) : undefined
@@ -207,7 +207,14 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       entries.delete(entry.id)
       emit()
     } catch (error) {
-      if (cancelled.has(entry.id)) { await storage.remove(entry.id); entries.delete(entry.id) } else { entry.status = 'error'; entry.failed = true; entry.retryable = retryable(error); await storage.put(entry, { existing: true }).catch(onError); onError(error) }
+      if (cancelled.has(entry.id)) { await storage.remove(entry.id); entries.delete(entry.id) } else {
+        entry.status = 'error'; entry.failed = true; entry.retryable = retryable(error)
+        await storage.put(entry, { existing: true }).catch(onError)
+        onError(error)
+        // The failed wire event may be a quote or file chunk. Report the
+        // owning outbox item separately, without mutating the native error.
+        if (!closed && !entry.deletion && !cancelled.has(entry.id)) onSendError(error, { id: entry.id, peer: entry.peer })
+      }
       emit()
     }
   }
