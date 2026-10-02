@@ -1126,6 +1126,37 @@ test('wrapEvent can add imkc from senderSigner Double-DH without direct content 
   )
 })
 
+test('unwrapEvent resolves the self receiver content key from imkc when no iykc row is stored', async () => {
+  const alice = signer()
+  const aliceContent = signer()
+  const aliceProxy = await signerWithInternalContentKey(alice, aliceContent)
+  const alicePubkey = await alice.getPublicKey()
+  const contentPubkey = await aliceContent.getPublicKey()
+  const original = eventFixture('note to self')
+  const [wrapped] = await wrapEvent({
+    senderSigner: aliceProxy,
+    privateChannelSigner: alice,
+    receivers: [alicePubkey],
+    event: original,
+    _getIykcProofs: noContentKeys
+  })
+  const router = await decryptPrivateBroadcast(alice, alicePubkey, wrapped.content)
+  const rows = routerJsonlRows(router)
+
+  assert.equal(router.tags.find(t => t[0] === 'imkc')?.[1], contentPubkey)
+  assert.deepEqual(rows[1].slice(0, 1), [alicePubkey])
+  assert.equal(rows[1].length, 2)
+  assert.deepEqual(
+    await unwrapEvent({
+      receiverSigner: aliceProxy,
+      privateChannelSigner: alice,
+      event: wrapped,
+      receiverPubkey: alicePubkey
+    }),
+    unwrappedFixture(original, alicePubkey)
+  )
+})
+
 test('wrapEvent uses Double-DH returned own content pubkey for imkc tag', async () => {
   const alice = signer()
   const oldContent = signer()

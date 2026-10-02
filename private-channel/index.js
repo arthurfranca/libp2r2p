@@ -390,13 +390,18 @@ async function unwrapRecipientEnvelope ({ payloadCiphertext, envelope, receiverS
     if (envelope.iykcPubkey) {
       assertValidEnvelopeIykcProof(envelope)
     }
+    // In self-encryption the advertised sender content key is also our own.
+    // Rows written without a content-key lookup (useContentKeys: false) carry
+    // no iykc pubkey, so hand imkc to the signer as the receiver's own key.
+    const ownContentPubkey = envelope.iykcPubkey ||
+      (senderPubkey && receiverPubkey && senderPubkey === receiverPubkey ? imkcPubkey : '')
     messageSeckey = base64ToText(await receiverSigner.nip44DecryptDoubleDH(
       senderPubkey,
       ROUTER_KIND,
       rowScope,
       envelope.ciphertext,
       imkcPubkey,
-      envelope.iykcPubkey || ''
+      ownContentPubkey
     ))
   } else {
     if (!receiverSigner?.nip44v3Decrypt) throw new ValidationError('RECEIVER_SIGNER_NIP44V3_DECRYPT_UNSUPPORTED')
