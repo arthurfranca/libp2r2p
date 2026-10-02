@@ -243,6 +243,16 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     const requestedSeeders = new Set()
     const validSeeders = new Set([file.peerPubkey, ...messenger.recoverySeeders(file.controlChannelPubkey)])
     let terminalError
+    let lastError = null
+    const reportError = error => {
+      lastError = {
+        name: error?.name || 'Error',
+        message: error?.message ?? String(error),
+        code: error?.code || '',
+        at: Date.now()
+      }
+      onError(error)
+    }
     const fail = error => { terminalError ||= error }
     async function accept (event, index, { save = true } = {}) {
       signal.throwIfAborted()
@@ -297,7 +307,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
       })
       // Malformed remote records do not poison the ingestion chain. Operational
       // persistence failures stop the job so completion cannot outrun storage.
-      ingest = task.catch(error => { if (error instanceof ValidationError) onError(error); else if (!signal.aborted) fail(error) })
+      ingest = task.catch(error => { if (error instanceof ValidationError) reportError(error); else if (!signal.aborted) fail(error) })
       return ingest
     }
     try {
@@ -312,7 +322,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
       if (total !== undefined && persisted.size === total) return
       const parent = messenger.requireWritableChannel(file.controlChannelPubkey)
       const relays = await messenger.resolveWatchRelays(parent)
-      const options = { receiverSigner: messenger.userSigner, privateChannelSigner: file.signer, privateChannelPubkey: file.fileChannelPubkey, receiverPubkey: messenger.userPubkey, relays, receivedChunkIndexedDB: messenger._indexedDB, receivedChunkScope: `${messenger.userPubkey}:file:${file.fileChannelPubkey}`, onEvent: consume, onSeedEvent: seed => saveSeed(file, seed), mode: messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? 'watchtower' : 'leecher', onError }
+      const options = { receiverSigner: messenger.userSigner, privateChannelSigner: file.signer, privateChannelPubkey: file.fileChannelPubkey, receiverPubkey: messenger.userPubkey, relays, receivedChunkIndexedDB: messenger._indexedDB, receivedChunkScope: `${messenger.userPubkey}:file:${file.fileChannelPubkey}`, onEvent: consume, onSeedEvent: seed => saveSeed(file, seed), mode: messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? 'watchtower' : 'leecher', onError: reportError }
       sub = _transport.subscribe({ ...options, liveOnly: true })
       const stop = () => { sub?.close() }
       signal.addEventListener('abort', stop, { once: true })
@@ -323,7 +333,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
         const history = _transport.fetch({ ...options, signal: AbortSignal.any([signal, historyController.signal]), since: 0 }).catch(error => {
           // Completion aborts the remaining history read in finally. Only its
           // own cancellation is expected; genuine history failures stay visible.
-          if (!signal.aborted && !(historyController.signal.aborted && error === historyController.signal.reason)) onError(error)
+          if (!signal.aborted && !(historyController.signal.aborted && error === historyController.signal.reason)) reportError(error)
         })
         work.add(history); history.finally(() => work.delete(history))
         const seeders = [...validSeeders].sort((a, b) => (successes.get(b) || 0) - (successes.get(a) || 0) || Math.random() - 0.5)
@@ -340,9 +350,33 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
             requestedSeeders.add(peer)
             requestRoundAt = Date.now() + _hedgeMs
             // The request is on dm; its compact reply is on the file channel.
-            await messenger.ask({ channelPubkey: file.controlChannelPubkey, receiverPubkey: peer, code: FILE_CHUNKS_REQUEST_CODE, payload: { fileChannelPubkey: file.fileChannelPubkey, missingRanges: rangesFor(missing) } }).catch(onError)
+            await messenger.ask({ channelPubkey: file.controlChannelPubkey, receiverPubkey: peer, code: FILE_CHUNKS_REQUEST_CODE, payload: { fileChannelPubkey: file.fileChannelPubkey, missingRanges: rangesFor(missing) } }).catch(reportError)
           }
-          if (!remaining.length && Date.now() - Math.max(lastProgress, requestRoundAt - _hedgeMs) >= _idleMs) throw new Error('FILE_DOWNLOAD_STALLED')
+          if (!remaining.length && Date.now() - Math.max(lastProgress, requestRoundAt - _hedgeMs) >= _idleMs) {
+            const details = {
+              operation: 'file-download-stall',
+              ownerPubkey: messenger.userPubkey,
+              root: file.root,
+              peerPubkey: file.peerPubkey,
+              total,
+              persisted: persisted.size,
+              missingRanges: rangesFor(missing),
+              missingCount: total === undefined ? null : total - persisted.size,
+              seeders: [...validSeeders],
+              requestedSeeders: [...requestedSeeders],
+              lastProgressAt: new Date(lastProgress).toISOString(),
+              lastProgressAgoMs: Date.now() - lastProgress,
+              elapsedMs: Date.now() - Math.max(lastProgress, requestRoundAt - _hedgeMs),
+              lastError
+            }
+            const error = new Error('FILE_DOWNLOAD_STALLED')
+            error.code = 'FILE_DOWNLOAD_STALLED'
+            error.operation = details.operation
+            error.elapsedMs = details.elapsedMs
+            error.details = details
+            console.warn('private-messenger file download stalled', details)
+            throw error
+          }
           // Start a fresh batch when all positions of the previous batch arrived.
           if (job.batch?.every(index => persisted.has(index))) { requestedSeeders.clear(); requestRoundAt = Date.now(); job.batch = null }
           job.batch ||= missing

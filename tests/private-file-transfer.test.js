@@ -46,6 +46,38 @@ test('failed relay history still requests dm seeds and completes only after pers
   try { await fixtureValue.manager.download(fixtureValue.descriptor); assert.equal(asks, 1); assert.equal(fixtureValue.stored.size, 2); assert.ok(fixtureValue.closes()) } finally { await fixtureValue.close() }
 })
 
+test('stalled downloads keep the failure code and log bounded diagnostics', async () => {
+  const warnings = []
+  const errors = []
+  const originalWarn = console.warn
+  console.warn = (...args) => warnings.push(args)
+  const f = await fixture({ onError: error => errors.push(error) })
+  try {
+    const failure = await f.manager.download(f.descriptor).then(() => null, error => error)
+
+    assert.ok(failure, 'download should stall')
+    assert.equal(failure.message, 'FILE_DOWNLOAD_STALLED')
+    assert.equal(failure.code, 'FILE_DOWNLOAD_STALLED')
+    assert.equal(failure.operation, 'file-download-stall')
+    assert.ok(Number.isSafeInteger(failure.elapsedMs) && failure.elapsedMs >= 40)
+    assert.equal(failure.details.root, f.descriptor.root)
+    assert.equal(failure.details.peerPubkey, peer)
+    assert.equal(failure.details.total, 2)
+    assert.equal(failure.details.persisted, 0)
+    assert.deepEqual(failure.details.missingRanges, [[0, 1]])
+    assert.deepEqual(failure.details.seeders, [peer])
+    assert.deepEqual(failure.details.requestedSeeders, [peer])
+    assert.equal(failure.details.lastError.message, 'relay unavailable')
+    assert.deepEqual(errors.map(error => error.message), ['relay unavailable'])
+    assert.equal(warnings.length, 1)
+    assert.equal(warnings[0][0], 'private-messenger file download stalled')
+    assert.equal(warnings[0][1].root, f.descriptor.root)
+  } finally {
+    console.warn = originalWarn
+    await f.close()
+  }
+})
+
 test('hedges recompute missing indices and preserve useful late responses', async () => {
   const asks = []
   const f = await fixture({
