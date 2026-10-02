@@ -1157,6 +1157,48 @@ test('unwrapEvent resolves the self receiver content key from imkc when no iykc 
   )
 })
 
+test('wrapEvent falls back to sender-content when the content-key lookup fails', async () => {
+  const alice = signer()
+  const aliceContent = signer()
+  const bob = signer()
+  const aliceProxy = await signerWithInternalContentKey(alice, aliceContent)
+  const alicePubkey = await alice.getPublicKey()
+  const bobPubkey = await bob.getPublicKey()
+  const original = eventFixture('lookup fallback')
+  const warnings = []
+  const originalWarn = console.warn
+  console.warn = (...args) => warnings.push(args)
+  try {
+    const [wrapped] = await wrapEvent({
+      senderSigner: aliceProxy,
+      privateChannelSigner: alice,
+      receivers: [bobPubkey],
+      event: original,
+      _getIykcProofs: async () => { throw new Error('content key lookup failed') }
+    })
+    const router = await decryptPrivateBroadcast(alice, alicePubkey, wrapped.content)
+    const rows = routerJsonlRows(router)
+
+    assert.ok(router.tags.find(t => t[0] === 'imkc')?.[1])
+    assert.equal(rows[1].length, 2)
+    assert.deepEqual(
+      await unwrapEvent({
+        receiverSigner: bob,
+        privateChannelSigner: alice,
+        event: wrapped,
+        receiverPubkey: bobPubkey
+      }),
+      unwrappedFixture(original, alicePubkey)
+    )
+    assert.deepEqual(warnings[0], [
+      'private-messenger content-key lookup failed (recipients: 1)',
+      'content key lookup failed'
+    ])
+  } finally {
+    console.warn = originalWarn
+  }
+})
+
 test('wrapEvent uses Double-DH returned own content pubkey for imkc tag', async () => {
   const alice = signer()
   const oldContent = signer()

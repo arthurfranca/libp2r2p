@@ -9,11 +9,18 @@ Provide `owner`, a byte-based NIP-44 v3 `signer` with `withSharedKey`, and eithe
 Optional `chunkStorage` and `recoveryStorage` (`seeds`, `authorizations`) select
 persistence; absent file storage uses the library cache. `mode` defaults to
 `seeder`, `seedersForPeer(peer)` to `[peer]`, and `allowedKinds` to
-`[5, 9, 1063, 34601]`. The DM context is `dm`; file contexts are `dm:media:<root>`.
+`[5, 9, 1063, 34601]`. `useContentKeys` defaults to `true`: the coordinator looks
+up recipients' published content-key proofs (kind 18716) while sending and falls
+back to sender-content whenever a proof is missing or the lookup fails. Misses
+are cached for 5 minutes (found proofs for 40), so a later prefetch picks up a
+key published after an earlier miss. Set it to `false` when the signer owns that discovery. The DM context is `dm`; file contexts are `dm:media:<root>`.
 `createMessengerSigner` adapts this byte signer to the transport's Base64 API.
 
-Methods: `setPeers`, `setAvailable(boolean)`, `enqueue`, `retry`, `cancel`,
-`download`, `cancelDownload`, and `close`. Callbacks are `onOutbox`, `onMedia`,
+Methods: `setPeers`, `setAvailable(boolean)`, `prefetchContentKeys(peers?)`,
+`enqueue`, `retry`, `cancel`, `download`, `cancelDownload`, and `close`.
+`prefetchContentKeys` warms the content-key lookup cache for the owner and the
+given peers (default: current peers); it is best-effort and never rejects.
+Callbacks are `onOutbox`, `onMedia`,
 `onError`, and optional `onSendError(error, { id, peer })`. The caller maps its
 account permissions/connectivity/lock state to availability and owns view subscriptions. There are no DOM or UI imports.
 

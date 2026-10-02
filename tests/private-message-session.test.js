@@ -10,7 +10,7 @@ const until = async predicate => {
   for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 2)) }
   assert.fail('condition not reached')
 }
-async function fixture (t, { publish, fallbackRelays, save = async () => ({ result: { ok: true } }) } = {}) {
+async function fixture (t, { publish, fallbackRelays, save = async () => ({ result: { ok: true } }), ...sessionOptions } = {}) {
   const errors = []; const sendErrors = []; const records = new Map(); const onlineListeners = new Set()
   const store = () => ({ list: async () => [], put: async entry => records.set(entry.id, structuredClone(entry)), remove: async id => records.delete(id), close () {} })
   let messengerOptions
@@ -20,12 +20,48 @@ async function fixture (t, { publish, fallbackRelays, save = async () => ({ resu
     Messenger: async options => { messengerOptions = options; return { update () {}, resume () {}, pause () {}, close () {}, nextMessage: async () => null, broadcastRumor: publish } },
     FileTransfer: () => ({ observe () {} }),
     _onOnline: listener => { onlineListeners.add(listener); return () => onlineListeners.delete(listener) },
-    onError: error => errors.push(error), onSendError: (error, context) => sendErrors.push({ error, context })
+    onError: error => errors.push(error), onSendError: (error, context) => sendErrors.push({ error, context }),
+    ...sessionOptions
   })
   t.after(() => session.close())
   await session.setPeers([peer]); await session.setAvailable(true)
   return { session, messengerOptions: () => messengerOptions, errors, sendErrors, records, onlineListeners, reconnect: () => Promise.all([...onlineListeners].map(listener => listener())) }
 }
+
+test('session enables content-key lookup by default and forwards it to the messenger', async t => {
+  const f = await fixture(t)
+  assert.equal(f.messengerOptions().useContentKeys, true)
+})
+
+test('session can disable content-key lookup', async t => {
+  const f = await fixture(t, { useContentKeys: false })
+  assert.equal(f.messengerOptions().useContentKeys, false)
+})
+
+test('session prefetches content keys for the owner and current peers', async t => {
+  const calls = []
+  const proof = { iykcPubkey: 'c'.repeat(64), iykcProof: `${1}:${'a'.repeat(128)}` }
+  const f = await fixture(t, {
+    _getIykcProofs: async pubkeys => {
+      calls.push(pubkeys)
+      return { [peer]: proof }
+    }
+  })
+
+  assert.deepEqual(await f.session.prefetchContentKeys(), { [peer]: proof })
+  assert.deepEqual(calls, [[owner, peer]])
+})
+
+test('session prefetch is best-effort when the lookup fails or is disabled', async t => {
+  const failing = await fixture(t, { _getIykcProofs: async () => { throw new Error('offline') } })
+  assert.deepEqual(await failing.session.prefetchContentKeys([peer]), {})
+
+  const disabled = await fixture(t, {
+    useContentKeys: false,
+    _getIykcProofs: async () => { throw new Error('must not run') }
+  })
+  assert.deepEqual(await disabled.session.prefetchContentKeys(), {})
+})
 
 test('send errors identify the owning message when a quoted event is rejected', async t => {
   const f = await fixture(t, { publish: async () => ({ delivery: { reports: [{ success: false, total: 1, errors: [{ relay: 'wss://test.invalid', reason: new Error('blocked: policy') }] }] } }) })

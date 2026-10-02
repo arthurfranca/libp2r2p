@@ -3,6 +3,7 @@ import { createPrivateFileTransfer } from '../file/index.js'
 import { createPrivateMessenger } from '../index.js'
 import { getEventHash, isValidEvent, isSerializableEvent } from '../../event/index.js'
 import { decodeIrfsChunk, IRFS_CHUNK_BYTES } from '../../irfs/index.js'
+import { getIykcProofs } from '../../content-key/index.js'
 import { onOnline } from '../../network/index.js'
 import { decodeFileMetadata } from '../../nip94/index.js'
 import { createChatOutbox } from './helpers/work-storage.js'
@@ -18,7 +19,7 @@ export function wireEvent (value, owner) {
 // Relay rejection text must not be interpreted as a local signer denial.
 const retryable = error => error?.code === 'MESSAGE_NOT_PUBLISHED' || !/DENIED|PERMISSION|REVOKED|READ_ONLY|INVALID|BLOCKED|EXPIRED|NOT_IN_PERSONA/i.test(`${error?.code || ''} ${error?.message || ''}`)
 
-export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
+export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], useContentKeys = true, onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, _getIykcProofs = getIykcProofs, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
   fallbackRelays = normalizeFallbackRelays(fallbackRelays)
   const userSigner = messengerSigner(signer)
   messageStorage ||= createEventStoreMessageStorage({ eventStore })
@@ -76,7 +77,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       if (closed || !available || version !== lifecycle) return
       values.push(channel)
     }
-    if (!messenger) messenger = await Messenger({ fallbackRelays, seedStorage: recoveryStorage?.seeds, userSigner, channels: [], useContentKeys: false, onMessageQueued: () => drain(), onError })
+    if (!messenger) messenger = await Messenger({ fallbackRelays, seedStorage: recoveryStorage?.seeds, userSigner, channels: [], useContentKeys, onMessageQueued: () => drain(), onError })
     if (closed || !available || version !== lifecycle) { await messenger.pause('signer'); return }
     await messenger.update({ channels: values })
     await messenger.resume('signer')
@@ -284,6 +285,24 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   }
   return {
     download, cancelDownload,
+    // Peers-based so callers can prefetch as soon as a chat route opens, before
+    // the shared-key channel exists. When group chats get real membership, add
+    // a thin prefetchChannelContentKeys(channelPubkey) wrapper that resolves
+    // the channel's receivers and delegates here.
+    async prefetchContentKeys (values = [...peers]) {
+      if (closed || !useContentKeys) return {}
+      const requested = [...new Set([owner, ...(Array.isArray(values) ? values : [values])])]
+        .filter(value => typeof value === 'string' && value)
+      if (!requested.length) return {}
+      try {
+        return await _getIykcProofs(requested)
+      } catch (error) {
+        // Prefetch only warms the lookup cache; callers must keep working with
+        // sender-content until a proof is available. Keep the failure visible.
+        console.warn('private-messenger content-key prefetch failed', error?.message ?? error)
+        return {}
+      }
+    },
     async setPeers (values) {
       peers.clear(); for (const peer of values) if (peer !== owner) peers.add(peer)
       for (const peer of deniedPeers) if (!peers.has(peer)) deniedPeers.delete(peer)

@@ -297,6 +297,70 @@ test('getIykcProofs finds latest content-key events through relay routing', asyn
   assert.equal(found[userPubkey].iykcPubkey, await newer.getPublicKey())
 })
 
+test('getIykcProofs tolerates failing relay groups', async () => {
+  const user = signer()
+  const userPubkey = await user.getPublicKey()
+
+  const found = await getIykcProofs([userPubkey], {
+    _getRelaysByPubkey: async () => ({ [userPubkey]: { write: ['wss://one.example'] } }),
+    _getEvents: async () => { throw new Error('relay unavailable') }
+  })
+
+  assert.deepEqual(found, {})
+})
+
+test('getIykcProofs shares one in-flight lookup per pubkey', async () => {
+  const user = signer()
+  const content = signer()
+  const userPubkey = await user.getPublicKey()
+  const contentPubkey = await content.getPublicKey()
+  const event = await makeContentKeyEvent({ userSigner: user, contentKeySigner: content, createdAt: 7 })
+  const gate = Promise.withResolvers()
+  let calls = 0
+  const options = {
+    _getRelaysByPubkey: async () => ({ [userPubkey]: { write: ['wss://one.example'] } }),
+    _getEvents: async () => {
+      calls++
+      await gate.promise
+      return { result: [{ event, relay: 'wss://fixture.example' }] }
+    }
+  }
+
+  const first = getIykcProofs([userPubkey], options)
+  const second = getIykcProofs([userPubkey], options)
+  gate.resolve()
+  const [a, b] = await Promise.all([first, second])
+
+  assert.equal(calls, 1)
+  assert.equal(a[userPubkey].iykcPubkey, contentPubkey)
+  assert.equal(b[userPubkey].iykcPubkey, contentPubkey)
+})
+
+test('getIykcProofs expires misses without evicting cached proofs', async () => {
+  const user = signer()
+  const content = signer()
+  const userPubkey = await user.getPublicKey()
+  const contentPubkey = await content.getPublicKey()
+  const event = await makeContentKeyEvent({ userSigner: user, contentKeySigner: content, createdAt: 7 })
+  let calls = 0
+  const options = {
+    negativeCacheMs: 0,
+    _getRelaysByPubkey: async () => ({ [userPubkey]: { write: ['wss://one.example'] } }),
+    _getEvents: async () => {
+      calls++
+      return { result: calls === 1 ? [] : [{ event, relay: 'wss://fixture.example' }] }
+    }
+  }
+
+  assert.deepEqual(await getIykcProofs([userPubkey], options), {})
+  const found = await getIykcProofs([userPubkey], options)
+  assert.equal(calls, 2)
+  assert.equal(found[userPubkey].iykcPubkey, contentPubkey)
+
+  assert.deepEqual(await getIykcProofs([userPubkey], options), { [userPubkey]: found[userPubkey] })
+  assert.equal(calls, 2)
+})
+
 test('subscribeRelayListUpdates only reports watched relay-type changes', async () => {
   const changes = []
   let aborted = false

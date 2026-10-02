@@ -9,6 +9,7 @@ import { normalizeRumor, deliveryInfo } from './helpers/rumor.js'
 import { incompleteFetchError } from './helpers/fetch-error.js'
 import { readHistory } from './helpers/history.js'
 import { subscriptionError } from './helpers/subscription-error.js'
+import { createLookupWarningLogger } from './helpers/lookup-warning.js'
 import * as nip44v3 from '../nip44-v3/index.js'
 import { relayPool } from '../relay/index.js'
 import { JSONL_CHUNK_BYTES, NYM_CARRIER_CHUNK_CHARS } from './helpers/chunk-size.js'
@@ -35,6 +36,7 @@ const HEX_SECKEY = /^[0-9a-f]{64}$/i
 const HEX_PUBKEY = /^[0-9a-f]{64}$/i
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
+const warnLookupFailure = createLookupWarningLogger()
 const NIP44_V3_SCOPE = ''
 
 const sendToRelays = (event, relays) => relayPool.sendEvent(event, relays)
@@ -110,7 +112,19 @@ async function prepareRoutedMessage ({ senderSigner, imkcSigner, privateChannelS
   const useDoubleDh = typeof senderSigner.nip44EncryptDoubleDH === 'function'
   const channelPubkey = await privateChannelSigner.getPublicKey()
   const channelReaderPubkey = privateChannelReaderPubkey || channelPubkey
-  const receiverContentKeys = useDoubleDh ? await _getIykcProofs(receiverPubkeysWithoutContentKeys(receivers)) : {}
+  let receiverContentKeys = {}
+  if (useDoubleDh) {
+    const receiversWithoutContentKeys = receiverPubkeysWithoutContentKeys(receivers)
+    try {
+      receiverContentKeys = await _getIykcProofs(receiversWithoutContentKeys) || {}
+    } catch (error) {
+      // Content-key discovery is best-effort; without a proof the row still
+      // works in sender-content mode instead of failing the send. Keep
+      // failures visible without logging on every message during an outage.
+      warnLookupFailure(error, `recipients: ${receiversWithoutContentKeys.length}`)
+      receiverContentKeys = {}
+    }
+  }
   const preparedRows = await prepareEnvelopeRows({
     senderSigner,
     imkcSigner: useDoubleDh ? imkcSigner : null,
