@@ -43,7 +43,7 @@
 // - For other event-list replies, use createEventReplyPacker({ messenger, question, code }).update(event).
 
 import { createAbortableSemaphore } from '../helpers/abortable-semaphore.js'
-import { mergeRanges, subtractRanges } from '../helpers/ranges.js'
+import { mergeRanges, subtractRanges, intersectRanges } from '../helpers/ranges.js'
 import * as privateMessage from '../private-message/index.js'
 import { isOnline } from '../network/index.js'
 import { createSendRelayRouting, normalizeFallbackRelays } from './helpers/send-routing.js'
@@ -130,6 +130,10 @@ export const RECOVERY_RELAY_RETRY_LIMITS = Object.freeze({
   allFailed: 10
 })
 const RECOVERY_ONLINE_CACHE_MS = 5000
+const DEFAULT_PRIORITY_TAIL_SECONDS = 6 * 3600
+const DEFAULT_PRIORITY_TTL_MS = 10 * 60 * 1000
+const DEFAULT_PRIORITY_HEDGE_DELAY_MS = 500
+const DEFAULT_PRIORITY_HEDGE_RELAYS = 2
 
 function textToBase64 (text) {
   return bytesToBase64(encoder.encode(text))
@@ -213,6 +217,10 @@ export class PrivateMessenger {
     reloadGapDelayMs = DEFAULT_RELOAD_GAP_DELAY_MS,
     seederPresenceIntervalMs = DEFAULT_SEEDER_PRESENCE_INTERVAL_MS,
     seederOnlineSeconds = DEFAULT_SEEDER_ONLINE_SECONDS,
+    priorityTailSeconds = DEFAULT_PRIORITY_TAIL_SECONDS,
+    priorityTtlMs = DEFAULT_PRIORITY_TTL_MS,
+    priorityHedgeDelayMs = DEFAULT_PRIORITY_HEDGE_DELAY_MS,
+    priorityHedgeRelays = DEFAULT_PRIORITY_HEDGE_RELAYS,
     maxDynamicRecoverySeeders = DEFAULT_MAX_DYNAMIC_RECOVERY_SEEDERS,
     messageQueueMaxBytes = DEFAULT_MESSAGE_QUEUE_MAX_BYTES,
     seedQueueMaxBytes = DEFAULT_SEED_QUEUE_MAX_BYTES,
@@ -247,6 +255,19 @@ export class PrivateMessenger {
     this.reloadGapDelayMs = reloadGapDelayMs
     this.seederPresenceIntervalMs = seederPresenceIntervalMs
     this.seederOnlineSeconds = seederOnlineSeconds
+    this.priorityTailSeconds = Number.isFinite(priorityTailSeconds) && priorityTailSeconds >= 0
+      ? Math.floor(priorityTailSeconds)
+      : DEFAULT_PRIORITY_TAIL_SECONDS
+    this.priorityTtlMs = Number.isFinite(priorityTtlMs) && priorityTtlMs > 0
+      ? Math.floor(priorityTtlMs)
+      : DEFAULT_PRIORITY_TTL_MS
+    this.priorityHedgeDelayMs = Number.isFinite(priorityHedgeDelayMs) && priorityHedgeDelayMs >= 0
+      ? Math.floor(priorityHedgeDelayMs)
+      : DEFAULT_PRIORITY_HEDGE_DELAY_MS
+    const hedgeRelays = Math.floor(Number(priorityHedgeRelays))
+    this.priorityHedgeRelays = Number.isSafeInteger(hedgeRelays) && hedgeRelays >= 1
+      ? Math.min(hedgeRelays, 3)
+      : DEFAULT_PRIORITY_HEDGE_RELAYS
     this.maxDynamicRecoverySeeders = maxDynamicRecoverySeeders
     this.messageQueueMaxBytes = messageQueueMaxBytes
     this.seedQueueMaxBytes = seedQueueMaxBytes
@@ -299,6 +320,7 @@ export class PrivateMessenger {
     this.recoveryAdmission = createAbortableSemaphore(2)
     this.recoveryControllers = new Set()
     this.recoveryRanges = new Map()
+    this.recoveryPriority = new Map()
     this.recoveryOnline = { at: 0, value: true }
     this.resumeWork = null
     this.capacityTimer = null
@@ -675,7 +697,7 @@ export class PrivateMessenger {
 
     if (removedPubkeys.length) {
       await this.stampChannelActivity(removedPubkeys)
-      for (const pubkey of removedPubkeys) this.dropRecoveryRanges(pubkey)
+      for (const pubkey of removedPubkeys) this.dropRecoveryState(pubkey)
     }
 
     const storageSnapshot = await activatePrivateMessengerStorage({
@@ -1214,6 +1236,7 @@ export class PrivateMessenger {
         start: range.start,
         end: range.end,
         covered: [],
+        claimed: [],
         oldestCreatedAt: null,
         relays: new Map(),
         tier: '',
@@ -1241,20 +1264,34 @@ export class PrivateMessenger {
         dead: false,
         eose: false,
         events: 0,
-        error: null
+        error: null,
+        consecutiveFailures: 0,
+        latencyMs: null,
+        lastEoseAt: 0,
+        lastErrorAt: 0
       })
     }
   }
 
+  orderedRecoveryRelays (record) {
+    return [...record.relays.entries()]
+      .filter(([, state]) => !state.dead && !state.eose && state.pending?.length)
+      .sort((a, b) => {
+        const failures = (a[1].consecutiveFailures || 0) - (b[1].consecutiveFailures || 0)
+        if (failures) return failures
+        const latency = (a[1].latencyMs ?? Infinity) - (b[1].latencyMs ?? Infinity)
+        if (latency) return latency
+        return (b[1].lastEoseAt || 0) - (a[1].lastEoseAt || 0)
+      })
+  }
+
   recoveryRelayPlan (record) {
     const plan = {}
-    let hasWork = false
-    for (const [relay, state] of record.relays) {
-      if (state.dead || state.eose || !state.pending?.length) continue
+    const ordered = this.orderedRecoveryRelays(record)
+    for (const [relay, state] of ordered) {
       plan[relay] = state.pending
-      hasWork = true
     }
-    return hasWork ? plan : null
+    return ordered.length ? plan : null
   }
 
   hasActiveRecoveryRelays (channelPubkey) {
@@ -1289,7 +1326,65 @@ export class PrivateMessenger {
     }
   }
 
-  updateRecoveryRecord (record, history) {
+  dropRecoveryState (channelPubkey) {
+    this.dropRecoveryRanges(channelPubkey)
+    this.recoveryPriority.delete(channelPubkey)
+  }
+
+  recoveryPriorities (channelPubkey) {
+    const entries = this.recoveryPriority.get(channelPubkey) || []
+    if (!entries.length) return []
+    const now = Date.now()
+    const active = entries.filter(entry => entry.expiresAt > now)
+    if (active.length !== entries.length) {
+      if (active.length) this.recoveryPriority.set(channelPubkey, active)
+      else this.recoveryPriority.delete(channelPubkey)
+    }
+    return active
+  }
+
+  async prioritizeRange (channelPubkey, { since, until, type = 'unread-page', ttlMs } = {}) {
+    if (typeof channelPubkey !== 'string' || !/^[0-9a-f]{64}$/i.test(channelPubkey)) throw new ValidationError('INVALID_CHANNEL_PUBKEY')
+    if (type !== 'unread-page' && type !== 'tail') throw new ValidationError('INVALID_PRIORITY_TYPE')
+    if (since !== undefined && !Number.isSafeInteger(since)) throw new ValidationError('INVALID_PRIORITY_RANGE')
+    if (until !== undefined && !Number.isSafeInteger(until)) throw new ValidationError('INVALID_PRIORITY_RANGE')
+    if (type === 'unread-page' && since === undefined) throw new ValidationError('PRIORITY_SINCE_REQUIRED')
+
+    const now = nowSeconds()
+    const ranges = (this.readState().channels[channelPubkey]?.offlineRanges || []).slice()
+    if (!ranges.length) return false
+
+    let start = since
+    let end = until
+    if (type === 'unread-page') {
+      const range = ranges.filter(candidate => candidate.end >= start).sort((a, b) => a.start - b.start)[0]
+      if (!range) return false
+      start = Math.max(start, range.start)
+      if (end === undefined) end = Math.min(range.end, now)
+    } else {
+      const range = ranges.sort((a, b) => b.end - a.end)[0]
+      if (end === undefined) end = Math.min(range.end, now)
+      if (start === undefined) start = Math.max(range.start, end - this.priorityTailSeconds)
+    }
+
+    const recoverySeconds = this.offlineRecoverySecondsFor(channelPubkey)
+    if (recoverySeconds) {
+      start = Math.max(start, now - recoverySeconds)
+      end = Math.min(end, now)
+    }
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end < start) return false
+
+    const ttl = Number.isSafeInteger(ttlMs) && ttlMs > 0 ? ttlMs : this.priorityTtlMs
+    const entries = this.recoveryPriority.get(channelPubkey) || []
+    const createdAt = Date.now()
+    if (!entries.some(entry => entry.start === start && entry.end === end && entry.type === type)) {
+      entries.push({ start, end, type, createdAt, expiresAt: createdAt + ttl })
+      this.recoveryPriority.set(channelPubkey, entries)
+    }
+    return true
+  }
+
+  updateRecoveryRecord (record, history, { completeRelays = new Set((history.relays || []).map(entry => entry.relay)) } = {}) {
     record.covered = mergeRanges([
       ...record.covered,
       ...(history.relays || []).flatMap(entry => entry.covered || [])
@@ -1306,19 +1401,82 @@ export class PrivateMessenger {
       const relayErrors = [...(entry.errors || [])]
       if (entry.error) relayErrors.push(entry.error)
       state.error = relayErrors[0] || null
-      const done = entry.status === 'eose' && !(entry.pending?.length)
+      const done = entry.status === 'eose' && !(entry.pending?.length) && completeRelays.has(relay)
       state.covered = mergeRanges([...(state.covered || []), ...(entry.covered || [])])
       state.eose = done
-      state.pending = done ? [] : subtractRanges({ start: record.start, end: record.end }, state.covered)
+      state.pending = done
+        ? []
+        : subtractRanges({ start: record.start, end: record.end }, mergeRanges([...state.covered, ...record.claimed]))
       state.events += entry.events || 0
+      if (Number.isFinite(entry.elapsedMs)) {
+        state.latencyMs = state.latencyMs == null
+          ? entry.elapsedMs
+          : Math.round(state.latencyMs * 0.7 + entry.elapsedMs * 0.3)
+      }
       if (done) {
         state.attempts = 0
+        state.consecutiveFailures = 0
+        state.lastEoseAt = nowSeconds()
+      } else if (entry.status === 'eose') {
+        state.consecutiveFailures = 0
+        state.lastEoseAt = nowSeconds()
+      } else {
+        state.consecutiveFailures = (state.consecutiveFailures || 0) + 1
+        state.lastErrorAt = nowSeconds()
+      }
+      if (entry.status === 'eose') {
         record.everEose = true
         if (state.events > 0) record.everEoseWithEvents = true
       }
     }
     record.tier = record.everEoseWithEvents ? 'partial' : record.everEose ? 'emptyEose' : 'allFailed'
     record.lastErrors = (history.relays || []).flatMap(entry => [...(entry.errors || []), ...(entry.error ? [entry.error] : [])])
+  }
+
+  applyRecoveryCoverage (record, ranges) {
+    if (!ranges?.length) return
+    record.claimed = mergeRanges([...record.claimed, ...ranges])
+    record.covered = mergeRanges([...record.covered, ...ranges])
+    for (const state of record.relays.values()) {
+      if (state.eose) continue
+      state.pending = subtractRanges({ start: record.start, end: record.end }, mergeRanges([...state.covered, ...record.claimed]))
+    }
+  }
+
+  activeRecoverySeeders (channelPubkey) {
+    if (!this.offlineRecoverySecondsFor(channelPubkey)) return []
+    const channel = this.channels.get(channelPubkey)
+    if (!channel?.signer) return []
+    const activity = this.readState().channels[channelPubkey]?.seederActivity || {}
+    const cutoff = nowSeconds() - this.seederOnlineSeconds
+    const candidates = new Set([...(channel.seeders || []), ...Object.keys(activity)])
+    return [...candidates].filter(seeder => {
+      if (!seeder || seeder === this.userPubkey) return false
+      const entry = activity[seeder]
+      const recent = Math.max(entry?.announcedAt || 0, entry?.lastActiveAt || 0)
+      return recent >= cutoff
+    })
+  }
+
+  prunePriorityEntries (channelPubkey) {
+    const entries = this.recoveryPriorities(channelPubkey)
+    if (!entries.length) return
+    const records = [...this.recoveryRanges.values()].filter(record => record.channelPubkey === channelPubkey)
+    const next = entries.filter(entry => {
+      let intersects = false
+      for (const record of records) {
+        const parts = intersectRanges(
+          [{ start: entry.start, end: entry.end }],
+          [{ start: record.start, end: record.end }]
+        )
+        if (!parts.length) continue
+        intersects = true
+        if (subtractRanges(parts[0], record.covered).length) return true
+      }
+      return !intersects
+    })
+    if (next.length) this.recoveryPriority.set(channelPubkey, next)
+    else this.recoveryPriority.delete(channelPubkey)
   }
 
   applyRecoveryRetryBudget (record) {
@@ -1462,7 +1620,7 @@ export class PrivateMessenger {
     const pubkeys = channels ? uniq(Array.isArray(channels) ? channels : [channels]) : [...this.desiredChannels]
     for (const extension of this.extensions) extension.unwatch?.(pubkeys)
     for (const pubkey of pubkeys) this.desiredChannels.delete(pubkey)
-    for (const pubkey of pubkeys) this.dropRecoveryRanges(pubkey)
+    for (const pubkey of pubkeys) this.dropRecoveryState(pubkey)
     this.recordInterruption(pubkeys)
     for (const controller of this.recoveryControllers) {
       if (pubkeys.includes(controller.channelPubkey)) controller.abort()
@@ -2156,7 +2314,7 @@ export class PrivateMessenger {
       this.writeState(state)
       await this.flushStateWrites()
       for (const channel of channels) {
-        if (!this.offlineRecoverySecondsFor(channel)) this.dropRecoveryRanges(channel.pubkey)
+        if (!this.offlineRecoverySecondsFor(channel)) this.dropRecoveryState(channel.pubkey)
       }
       for (const channel of channels) await this.pruneStoredSeeds(channel.pubkey)
     })
@@ -2231,15 +2389,15 @@ export class PrivateMessenger {
     return asks
   }
 
-  async #askSeedersForMissingRangeAttempt (channelPubkey, since, until) {
+  async #askSeedersForMissingRangeAttempt (channelPubkey, since, until, { seeders } = {}) {
     if (!this.offlineRecoverySecondsFor(channelPubkey)) return { asks: [], failures: [] }
     if (!this.channels.get(channelPubkey)?.signer) return { asks: [], failures: [] }
-    const seeders = this.recoverySeeders(channelPubkey)
-    if (!seeders.length || until < since) return { asks: [], failures: [] }
+    const candidates = seeders ?? this.recoverySeeders(channelPubkey)
+    if (!candidates.length || until < since) return { asks: [], failures: [] }
 
     const asks = []
     const failures = []
-    for (const seeder of seeders) {
+    for (const seeder of candidates) {
       try {
         const ask = await this.ask({
           channelPubkey,
@@ -2385,6 +2543,146 @@ export class PrivateMessenger {
     return failures
   }
 
+  recoveryFetchOptions ({ channelPubkey, channel, relays, since, until, signal, partial = false, resume = null }) {
+    return {
+      _acquirePage: pageSignal => this.recoveryAdmission.acquire(pageSignal),
+      signal,
+      receivedChunkScope: this.storageLeaseId,
+      receiverSigner: this.userSigner,
+      iykcSigner: this.contentKeySigner,
+      privateChannelSigner: channel.signer,
+      privateChannelReaderSigner: channel.readerSigner,
+      privateChannelReaderPubkey: channel.readerPubkey,
+      privateChannelPubkeys: [channelPubkey],
+      receiverPubkey: this.userPubkey,
+      relays,
+      since: Math.max(0, since),
+      until,
+      partial,
+      resume,
+      mode: channel.mode,
+      modeByPubkey: { [channelPubkey]: channel.mode },
+      receivedChunkTtlMs: this.receivedChunkTtlMsFor(channel),
+      receivedChunkIndexedDB: this._indexedDB,
+      onEvent: (event, outer, meta) => this.receive(channelPubkey, () => this.enqueueRumor(eventType(event), channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }),
+      onNymEvent: (event, outer, meta) => this.receive(channelPubkey, () => this.enqueueRumor('nym', channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }),
+      onSeedEvent: seed => this.receive(channelPubkey, () => this.enqueueSeed(channelPubkey, seed), seed),
+      onContentKeyUsage: usage => this.handleContentKeyUsage(channelPubkey, usage),
+      onError: err => { throw err }
+    }
+  }
+
+  async hedgedPriorityFetch ({ channelPubkey, channel, candidates, since, until }) {
+    const launched = []
+    let hedgeTimer = null
+    let secondStarted = false
+    const launch = candidate => {
+      const controller = new AbortController()
+      const promise = this._privateChannel
+        .fetchHistory(this.recoveryFetchOptions({
+          channelPubkey,
+          channel,
+          relays: [candidate.relay],
+          since,
+          until,
+          signal: controller.signal,
+          partial: true,
+          resume: { [candidate.relay]: candidate.pending }
+        }))
+        .then(
+          history => ({ ok: true, relay: candidate.relay, controller, history }),
+          error => ({ ok: false, relay: candidate.relay, controller, error })
+        )
+      promise.catch(() => {})
+      launched.push({ promise, controller })
+      return promise
+    }
+    try {
+      const first = launch(candidates[0])
+      const hedge = candidates.length > 1
+        ? new Promise(resolve => {
+          hedgeTimer = this._setTimeout(() => {
+            secondStarted = true
+            resolve(launch(candidates[1]))
+          }, this.priorityHedgeDelayMs)
+        })
+        : null
+      let settled = hedge ? await Promise.race([first, hedge]) : await first
+      if (!settled.ok) {
+        if (secondStarted && launched.length > 1) settled = await launched[launched.length - 1].promise
+        else if (candidates.length > 1) settled = await launch(candidates[1])
+      }
+      if (!settled.ok) return null
+      for (const entry of launched) {
+        if (entry.controller === settled.controller) continue
+        try { entry.controller.abort() } catch { /* aborted */ }
+      }
+      return settled
+    } finally {
+      if (hedgeTimer) this._clearTimeout(hedgeTimer)
+    }
+  }
+
+  async askPrioritySeeders (channelPubkey, intervals) {
+    if (!intervals.length) return []
+    if (!await this.checkRecoveryOnline()) return []
+    const seeders = this.activeRecoverySeeders(channelPubkey)
+    if (!seeders.length) return []
+    const failures = []
+    const claimed = []
+    for (const interval of mergeRanges(intervals)) {
+      const attempt = await this.#askSeedersForMissingRangeAttempt(channelPubkey, interval.start, interval.end, { seeders })
+      failures.push(...attempt.failures.map(failure => failure.error))
+      if (!attempt.failures.length) claimed.push(interval)
+    }
+    if (claimed.length) {
+      for (const record of this.recoveryRanges.values()) {
+        if (record.channelPubkey !== channelPubkey) continue
+        const applied = intersectRanges(claimed, [{ start: record.start, end: record.end }])
+        if (applied.length) this.applyRecoveryCoverage(record, applied)
+      }
+    }
+    return failures
+  }
+
+  async runPriorityLane (channelPubkey, channel, ranges) {
+    const priorities = this.recoveryPriorities(channelPubkey)
+    if (!priorities.length) return
+    const fetchRelays = await this.resolveWatchRelays(channel)
+    for (const range of ranges) {
+      const record = this.recoveryRangeRecord(channelPubkey, range)
+      this.reconcileRecoveryRelays(record, fetchRelays)
+      const priorityIntervals = intersectRanges(
+        priorities.map(entry => ({ start: entry.start, end: entry.end })),
+        [{ start: range.start, end: range.end }]
+      )
+      if (!priorityIntervals.length) continue
+      const pending = subtractRanges({ start: range.start, end: range.end }, record.covered)
+      const wanted = intersectRanges(priorityIntervals, pending)
+      if (!wanted.length) continue
+      const candidates = this.orderedRecoveryRelays(record)
+        .map(([relay, state]) => ({ relay, pending: intersectRanges(state.pending, wanted) }))
+        .filter(candidate => candidate.pending.length)
+        .slice(0, this.priorityHedgeRelays)
+      if (candidates.length) {
+        const winner = await this.hedgedPriorityFetch({
+          channelPubkey,
+          channel,
+          candidates,
+          since: wanted[0].start,
+          until: wanted[wanted.length - 1].end
+        })
+        if (winner?.history) {
+          if (this.isPartialRecoveryHistory(winner.history)) this.updateRecoveryRecord(record, winner.history, { completeRelays: new Set() })
+          else this.applyRecoveryCoverage(record, wanted)
+        }
+      }
+      const uncovered = intersectRanges(wanted, subtractRanges({ start: range.start, end: range.end }, record.covered))
+      if (uncovered.length) await this.askPrioritySeeders(channelPubkey, uncovered)
+    }
+    this.prunePriorityEntries(channelPubkey)
+  }
+
   async recoverChannelRanges (channels) {
     const failures = []
     const state = this.readState()
@@ -2395,16 +2693,20 @@ export class PrivateMessenger {
       const channel = this.channels.get(pubkey)
       const current = state.channels[pubkey]
       if (!channel || !current?.offlineRanges?.length) {
-        this.dropRecoveryRanges(pubkey)
+        this.dropRecoveryState(pubkey)
         continue
       }
       const recoverySeconds = this.offlineRecoverySecondsFor(channel)
       if (!recoverySeconds) {
-        this.dropRecoveryRanges(pubkey)
+        this.dropRecoveryState(pubkey)
         continue
       }
       const minStart = now - recoverySeconds
       const processedRanges = new Set(current.offlineRanges.map(range => `${range.start}:${range.end}`))
+
+      if (online) {
+        try { await this.runPriorityLane(pubkey, channel, current.offlineRanges) } catch (error) { this.onError?.(error) }
+      }
 
       const remaining = []
       let recoveredThrough = current.recoveredThrough || 0
@@ -2423,32 +2725,16 @@ export class PrivateMessenger {
           this.reconcileRecoveryRelays(record, fetchRelays)
           const plan = this.recoveryRelayPlan(record)
           if (plan) {
-            const history = await this._privateChannel.fetchHistory({
-              _acquirePage: signal => this.recoveryAdmission.acquire(signal),
-              signal: controller.signal,
-              receivedChunkScope: this.storageLeaseId,
-              receiverSigner: this.userSigner,
-              iykcSigner: this.contentKeySigner,
-              privateChannelSigner: channel.signer,
-              privateChannelReaderSigner: channel.readerSigner,
-              privateChannelReaderPubkey: channel.readerPubkey,
-              privateChannelPubkeys: [pubkey],
-              receiverPubkey: this.userPubkey,
+            const history = await this._privateChannel.fetchHistory(this.recoveryFetchOptions({
+              channelPubkey: pubkey,
+              channel,
               relays: Object.keys(plan),
-              since: Math.max(0, range.start),
+              since: range.start,
               until: range.end,
+              signal: controller.signal,
               partial: true,
-              resume: plan,
-              mode: channel.mode,
-              modeByPubkey: { [pubkey]: channel.mode },
-              receivedChunkTtlMs: this.receivedChunkTtlMsFor(channel),
-              receivedChunkIndexedDB: this._indexedDB,
-              onEvent: (event, outer, meta) => this.receive(pubkey, () => this.enqueueRumor(eventType(event), pubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }),
-              onNymEvent: (event, outer, meta) => this.receive(pubkey, () => this.enqueueRumor('nym', pubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }),
-              onSeedEvent: seed => this.receive(pubkey, () => this.enqueueSeed(pubkey, seed), seed),
-              onContentKeyUsage: usage => this.handleContentKeyUsage(pubkey, usage),
-              onError: err => { throw err }
-            })
+              resume: plan
+            }))
             controller.signal.throwIfAborted()
             if (this.isPartialRecoveryHistory(history)) {
               this.updateRecoveryRecord(record, history)
@@ -2517,7 +2803,7 @@ export class PrivateMessenger {
   async clearChannel (pubkey) {
     await this.unwatch(pubkey)
     await this._privateMessage.clearChannelState?.(pubkey)
-    this.dropRecoveryRanges(pubkey)
+    this.dropRecoveryState(pubkey)
     return this.runQueueOperation(async () => {
       this.channels.delete(pubkey)
       this.removeChannelState(pubkey)
@@ -2551,7 +2837,7 @@ export class PrivateMessenger {
         await this.queue?.removeBy('byChannel', pubkey)
         await (this.seedStorage ? this.seedStorage.removeLocal({ channelPubkey: pubkey }) : this.seedQueue?.removeBy('byChannel', pubkey))
       }
-      for (const pubkey of stalePubkeys) this.dropRecoveryRanges(pubkey)
+      for (const pubkey of stalePubkeys) this.dropRecoveryState(pubkey)
       this.state = state
       if (stalePubkeys.length) await this.removeChannelStates(stalePubkeys)
     })
@@ -2643,6 +2929,7 @@ export class PrivateMessenger {
         })
       }
       this.recoveryRanges.clear()
+      this.recoveryPriority.clear()
       if (unwatchError) throw unwatchError
     })()
     return this.closePromise

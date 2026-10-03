@@ -98,6 +98,7 @@ test('partial history reports per-relay coverage instead of failing', async () =
   assert.equal(summary.anyEose, true)
   assert.equal(summary.anyEoseWithEvents, true)
   assert.equal(summary.allFailed, false)
+  assert.ok(Number.isInteger(summary.relays[0].elapsedMs))
   assert.deepEqual(byRelay[relay].covered, [{ start: 0, end: 100 }])
   assert.deepEqual(byRelay[relay].pending, [])
   assert.deepEqual(byRelay['wss://failed.example'].pending, [{ start: 0, end: 100 }])

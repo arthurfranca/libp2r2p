@@ -46,6 +46,7 @@ export async function readHistory ({ filter, relays, receiverPubkey, signal, get
   }
   for (const relay of urls) {
     const relayStartCount = receivedEventCount
+    let relayElapsedMs = 0
     const intervals = resumeIntervalsFor({ resume, relay, since, until })
       .map(interval => ({ since: interval.start, until: interval.end, limit: PAGE_SIZE }))
     const covered = []
@@ -83,7 +84,11 @@ export async function readHistory ({ filter, relays, receiverPubkey, signal, get
           outcome = { relay, status: 'error', error }
           intervals.push(interval)
           break
-        } finally { elapsedMs += performance.now() - started }
+        } finally {
+          const took = performance.now() - started
+          elapsedMs += took
+          relayElapsedMs += took
+        }
         signal?.throwIfAborted()
         const status = page.relays?.find(item => item.relay === relay)
         if (page.errors?.length || !status || !['eose', 'satisfied'].includes(status.status)) {
@@ -123,7 +128,8 @@ export async function readHistory ({ filter, relays, receiverPubkey, signal, get
         ? {
             covered: mergeRanges(covered),
             pending: mergeRanges(intervals.map(interval => ({ start: interval.since, end: interval.until }))),
-            events: receivedEventCount - relayStartCount
+            events: receivedEventCount - relayStartCount,
+            elapsedMs: Math.round(relayElapsedMs)
           }
         : {})
     })

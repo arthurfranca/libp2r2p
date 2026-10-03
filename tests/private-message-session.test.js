@@ -11,13 +11,19 @@ const until = async predicate => {
   assert.fail('condition not reached')
 }
 async function fixture (t, { publish, fallbackRelays, save = async () => ({ result: { ok: true } }), ...sessionOptions } = {}) {
-  const errors = []; const sendErrors = []; const records = new Map(); const onlineListeners = new Set()
+  const errors = []; const sendErrors = []; const records = new Map(); const onlineListeners = new Set(); const priorities = []
   const store = () => ({ list: async () => [], put: async entry => records.set(entry.id, structuredClone(entry)), remove: async id => records.delete(id), close () {} })
   let messengerOptions
   const session = createPrivateMessageSession({
     owner, fallbackRelays, signer: { withSharedKey: () => ({ getPublicKey: async () => peer }) },
     messageStorage: { save }, openOutbox: store, openDownloads: store,
-    Messenger: async options => { messengerOptions = options; return { update () {}, resume () {}, pause () {}, close () {}, nextMessage: async () => null, broadcastRumor: publish } },
+    Messenger: async options => {
+      messengerOptions = options
+      return {
+        update () {}, resume () {}, pause () {}, close () {}, nextMessage: async () => null, broadcastRumor: publish,
+        prioritizeRange: async (channelPubkey, request) => { priorities.push({ channelPubkey, request }); return true }
+      }
+    },
     FileTransfer: () => ({ observe () {} }),
     _onOnline: listener => { onlineListeners.add(listener); return () => onlineListeners.delete(listener) },
     onError: error => errors.push(error), onSendError: (error, context) => sendErrors.push({ error, context }),
@@ -25,7 +31,7 @@ async function fixture (t, { publish, fallbackRelays, save = async () => ({ resu
   })
   t.after(() => session.close())
   await session.setPeers([peer]); await session.setAvailable(true)
-  return { session, messengerOptions: () => messengerOptions, errors, sendErrors, records, onlineListeners, reconnect: () => Promise.all([...onlineListeners].map(listener => listener())) }
+  return { session, messengerOptions: () => messengerOptions, errors, sendErrors, records, onlineListeners, priorities, reconnect: () => Promise.all([...onlineListeners].map(listener => listener())) }
 }
 
 test('session enables content-key lookup by default and forwards it to the messenger', async t => {
@@ -61,6 +67,55 @@ test('session prefetch is best-effort when the lookup fails or is disabled', asy
     _getIykcProofs: async () => { throw new Error('must not run') }
   })
   assert.deepEqual(await disabled.session.prefetchContentKeys(), {})
+})
+
+test('session forwards prioritized ranges to the messenger channel', async t => {
+  const f = await fixture(t)
+
+  assert.equal(await f.session.prioritizeRange(peer, { since: 1000 }), true)
+  assert.equal(await f.session.prioritizeRange(peer, { type: 'tail' }), true)
+  await until(() => f.priorities.length === 2)
+
+  assert.ok(f.priorities.every(entry => entry.channelPubkey === peer))
+  assert.deepEqual(f.priorities.map(entry => entry.request.type), ['unread-page', 'tail'])
+  assert.equal(f.priorities[0].request.since, 1000)
+})
+
+test('session validates prioritized range input', async t => {
+  const f = await fixture(t)
+  await assert.rejects(() => f.session.prioritizeRange('nope', { since: 1 }), /INVALID_PRIORITY_PEER/)
+  await assert.rejects(() => f.session.prioritizeRange(peer, { since: 1, type: 'kind' }), /INVALID_PRIORITY_TYPE/)
+  await assert.rejects(() => f.session.prioritizeRange(peer, { type: 'unread-page' }), /PRIORITY_SINCE_REQUIRED/)
+  await assert.rejects(() => f.session.prioritizeRange(peer, { since: 1.5 }), /INVALID_PRIORITY_RANGE/)
+})
+
+test('session queues prioritized ranges until the channel exists', async t => {
+  const priorities = []
+  const session = createPrivateMessageSession({
+    owner,
+    recoveryStorage: null,
+    signer: { withSharedKey: () => ({ getPublicKey: async () => peer }) },
+    messageStorage: { save: async () => ({ result: { ok: true } }) },
+    Messenger: async () => ({
+      update: async () => {}, resume: async () => {}, pause: async () => {}, close: async () => {}, nextMessage: async () => null,
+      prioritizeRange: async (channelPubkey, request) => { priorities.push({ channelPubkey, request }); return true }
+    }),
+    FileTransfer: () => ({ observe () {} }),
+    openOutbox: async () => ({ list: async () => [], put: async () => {}, remove: async () => {}, close: async () => {} }),
+    openDownloads: async () => ({ list: async () => [], put: async () => {}, remove: async () => {}, close: async () => {} }),
+    onError: () => {}
+  })
+  t.after(() => session.close())
+
+  assert.equal(await session.prioritizeRange(peer, { since: 1000 }), true)
+  assert.equal(priorities.length, 0)
+  await session.setPeers([peer])
+  await session.setAvailable(true)
+  await until(() => priorities.length === 1)
+  assert.deepEqual(priorities[0], {
+    channelPubkey: peer,
+    request: { since: 1000, until: undefined, type: 'unread-page' }
+  })
 })
 
 test('a failing download intent is reported once across reconfigures', async t => {

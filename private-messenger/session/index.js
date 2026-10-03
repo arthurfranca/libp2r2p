@@ -46,6 +46,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const downloadIntents = new Map()
   const downloadEpochs = new Map()
   const activeDownloads = new Map()
+  const pendingPriorityRanges = new Map()
   let downloadWriteTail = Promise.resolve()
   const writeDownloadIntent = operation => {
     const work = downloadWriteTail.catch(() => {}).then(operation)
@@ -89,6 +90,16 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     if (!messenger) messenger = await Messenger({ fallbackRelays, seedStorage: recoveryStorage?.seeds, userSigner, channels: [], useContentKeys, onMessageQueued: () => drain(), onError: reportError })
     if (closed || !available || version !== lifecycle) { await messenger.pause('signer'); return }
     await messenger.update({ channels: values })
+    if (pendingPriorityRanges.size && typeof messenger.prioritizeRange === 'function') {
+      for (const [peer, list] of [...pendingPriorityRanges]) {
+        const channel = channels.get(peer)
+        if (!channel) continue
+        for (const request of list) {
+          try { await messenger.prioritizeRange(channel.pubkey, request) } catch (error) { reportError(error) }
+        }
+        pendingPriorityRanges.delete(peer)
+      }
+    }
     await messenger.resume('signer')
     if (!fileTransfers) {
       fileTransfers = FileTransfer({
@@ -322,6 +333,23 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         return {}
       }
     },
+    async prioritizeRange (peer, options = {}) {
+      if (!/^[0-9a-f]{64}$/.test(peer || '')) throw new TypeError('INVALID_PRIORITY_PEER')
+      const { since, until, type = 'unread-page' } = options || {}
+      if (type !== 'unread-page' && type !== 'tail') throw new TypeError('INVALID_PRIORITY_TYPE')
+      if (since !== undefined && !Number.isSafeInteger(since)) throw new TypeError('INVALID_PRIORITY_RANGE')
+      if (until !== undefined && !Number.isSafeInteger(until)) throw new TypeError('INVALID_PRIORITY_RANGE')
+      if (type === 'unread-page' && since === undefined) throw new TypeError('PRIORITY_SINCE_REQUIRED')
+      const request = { since, until, type }
+      const channel = channels.get(peer)
+      if (channel && typeof messenger?.prioritizeRange === 'function') {
+        try { return await messenger.prioritizeRange(channel.pubkey, request) } catch (error) { reportError(error); return false }
+      }
+      const list = pendingPriorityRanges.get(peer) || []
+      list.push(request)
+      pendingPriorityRanges.set(peer, list)
+      return true
+    },
     async setPeers (values) {
       peers.clear(); for (const peer of values) if (peer !== owner) peers.add(peer)
       for (const peer of deniedPeers) if (!peers.has(peer)) deniedPeers.delete(peer)
@@ -367,7 +395,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     },
     async close () {
       closed = true; available = false; lifecycle++
-      stopOnlineRetry(); offlineSends.clear(); activeDownloads.clear()
+      stopOnlineRetry(); offlineSends.clear(); activeDownloads.clear(); pendingPriorityRanges.clear()
       for (const controller of sendControllers.values()) controller.abort()
       await Promise.allSettled([configuring, initialized])
       await messenger?.pause('closed')

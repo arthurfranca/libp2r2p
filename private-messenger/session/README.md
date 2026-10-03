@@ -17,9 +17,17 @@ key published after an earlier miss. Set it to `false` when the signer owns that
 `createMessengerSigner` adapts this byte signer to the transport's Base64 API.
 
 Methods: `setPeers`, `setAvailable(boolean)`, `prefetchContentKeys(peers?)`,
-`enqueue`, `retry`, `cancel`, `download`, `cancelDownload`, and `close`.
+`prioritizeRange(peer, options)`, `enqueue`, `retry`, `cancel`, `download`,
+`cancelDownload`, and `close`.
 `prefetchContentKeys` warms the content-key lookup cache for the owner and the
 given peers (default: current peers); it is best-effort and never rejects.
+`prioritizeRange` registers an in-memory priority window for a conversation:
+`type: 'unread-page'` requires `since` (the read anchor), while `type: 'tail'`
+defaults to the newest persisted range minus `priorityTailSeconds` (6 hours).
+The coordinator resolves the peer's channel and queues the request until the
+channel exists. Priorities expire after `priorityTtlMs` (10 minutes) or once
+covered, and are dropped with recovery state. They are process-local and reset
+on reload.
 Callbacks are `onOutbox`, `onMedia`,
 `onError`, and optional `onSendError(error, { id, peer })`. The caller maps its
 account permissions/connectivity/lock state to availability and owns view subscriptions. There are no DOM or UI imports.

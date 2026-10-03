@@ -2623,6 +2623,258 @@ test('failed reload-gap recovery schedules an automatic retry', async () => {
   assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [])
 })
 
+test('prioritized ranges resolve defaults from persisted recovery ranges', async () => {
+  const channel = '11'.repeat(32)
+  const now = Math.floor(Date.now() / 1000)
+  await seedMessengerState({ [channel]: { offlineRanges: [{ start: now - 1000, end: now - 100 }] } })
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _privateChannel: { fetchHistory: async () => [] }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: channel, signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  assert.equal(await messenger.prioritizeRange(channel, { since: now - 500 }), true)
+  const [unread] = messenger.recoveryPriorities(channel)
+  assert.equal(unread.type, 'unread-page')
+  assert.equal(unread.start, now - 500)
+  assert.ok(unread.end >= now - 500 && unread.end <= Math.floor(Date.now() / 1000) + 1)
+
+  assert.equal(await messenger.prioritizeRange(channel, { type: 'tail' }), true)
+  const tail = messenger.recoveryPriorities(channel).find(entry => entry.type === 'tail')
+  assert.equal(tail.start, tail.end - 6 * 3600)
+})
+
+test('prioritized range input is validated and requires persisted ranges', async () => {
+  const channel = '11'.repeat(32)
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _privateChannel: { fetchHistory: async () => [] }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: channel, signer: signer('channel'), relays: ['wss://relay.example'], offlineRecoverySeconds: 0 }]
+  })
+
+  await assert.rejects(() => messenger.prioritizeRange('nope', { since: 1 }), /INVALID_CHANNEL_PUBKEY/)
+  await assert.rejects(() => messenger.prioritizeRange(channel, { since: 1, type: 'kind' }), /INVALID_PRIORITY_TYPE/)
+  await assert.rejects(() => messenger.prioritizeRange(channel, { type: 'unread-page' }), /PRIORITY_SINCE_REQUIRED/)
+  await assert.rejects(() => messenger.prioritizeRange(channel, { since: 1.5 }), /INVALID_PRIORITY_RANGE/)
+  assert.equal(await messenger.prioritizeRange(channel, { since: 1 }), false)
+})
+
+test('prioritized ranges expire by ttl and clear with recovery state', async t => {
+  const channel = '11'.repeat(32)
+  const now = Math.floor(Date.now() / 1000)
+  let nowMs = now * 1000
+  t.mock.method(Date, 'now', () => nowMs)
+  await seedMessengerState({ [channel]: { offlineRanges: [{ start: now - 100, end: now - 50 }] } })
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _privateChannel: { fetchHistory: async () => [] }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: channel, signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  assert.equal(await messenger.prioritizeRange(channel, { since: now - 60, ttlMs: 1000 }), true)
+  assert.equal(messenger.recoveryPriorities(channel).length, 1)
+  nowMs += 2000
+  assert.deepEqual(messenger.recoveryPriorities(channel), [])
+
+  assert.equal(await messenger.prioritizeRange(channel, { since: now - 60, ttlMs: 60000 }), true)
+  await messenger.unwatch([channel])
+  assert.deepEqual(messenger.recoveryPriorities(channel), [])
+})
+
+test('priority lane fetches the requested window before older history', async () => {
+  const channel = '11'.repeat(32)
+  const relay = 'wss://relay.example'
+  const now = Math.floor(Date.now() / 1000)
+  await seedMessengerState({ [channel]: { offlineRanges: [{ start: now - 1000, end: now - 100 }] } })
+  const fetches = []
+  const partial = args => {
+    const url = args.relays[0]
+    const intervals = args.resume?.[url] || [{ start: args.since, end: args.until }]
+    return {
+      oldestCreatedAt: intervals[0]?.start ?? args.since,
+      receivedEventCount: 1,
+      elapsedMs: 5,
+      relays: [{ relay: url, status: 'eose', covered: intervals, pending: [], events: 1 }],
+      pendingByRelay: {},
+      anyEose: true,
+      anyEoseWithEvents: true,
+      allFailed: false
+    }
+  }
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _privateChannel: { fetchHistory: async args => { fetches.push(args); return partial(args) } }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: channel, signer: signer('channel'), relays: [relay] }]
+  })
+
+  const range = messenger.readState().channels[channel].offlineRanges[0]
+  const since = range.end - 100
+  assert.equal(await messenger.prioritizeRange(channel, { since, ttlMs: 60000 }), true)
+  await messenger.runPriorityLane(channel, messenger.channels.get(channel), [range])
+
+  const record = [...messenger.recoveryRanges.values()].find(entry => entry.channelPubkey === channel)
+  assert.ok(record.covered.length)
+  assert.ok([...record.relays.values()].every(state => state.attempts === 0))
+  assert.equal(fetches[0].since, since)
+  const priorityCoverage = record.covered[0]
+
+  fetches.length = 0
+  await messenger.recoverOfflineRanges([channel])
+  assert.ok(fetches.length > 0)
+  const overlapsPriority = fetches.some(args => {
+    const url = args.relays[0]
+    const intervals = args.resume?.[url] || [{ start: args.since, end: args.until }]
+    return intervals.some(interval => interval.start <= priorityCoverage.end && interval.end >= priorityCoverage.start)
+  })
+  assert.equal(overlapsPriority, false)
+  assert.deepEqual(messenger.readState().channels[channel].offlineRanges, [])
+})
+
+test('priority hedge starts the next relay after the delay and aborts the loser', async () => {
+  const channel = '11'.repeat(32)
+  const [first, second] = ['wss://a.example', 'wss://b.example']
+  const now = Math.floor(Date.now() / 1000)
+  await seedMessengerState({ [channel]: { offlineRanges: [{ start: now - 1000, end: now - 100 }] } })
+  const calls = []
+  let aborted = false
+  const partial = (url, intervals) => ({
+    oldestCreatedAt: intervals[0]?.start ?? 0,
+    receivedEventCount: 1,
+    elapsedMs: 5,
+    relays: [{ relay: url, status: 'eose', covered: intervals, pending: [], events: 1 }],
+    pendingByRelay: {},
+    anyEose: true,
+    anyEoseWithEvents: true,
+    allFailed: false
+  })
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    priorityHedgeDelayMs: 5,
+    _privateChannel: {
+      fetchHistory: async args => {
+        const url = args.relays[0]
+        calls.push(url)
+        const intervals = args.resume?.[url] || [{ start: args.since, end: args.until }]
+        if (url === first && calls.filter(value => value === first).length === 1) {
+          return await new Promise((resolve, reject) => {
+            args.signal.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')) }, { once: true })
+          })
+        }
+        return partial(url, intervals)
+      }
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: channel, signer: signer('channel'), relays: [first, second] }]
+  })
+
+  const range = messenger.readState().channels[channel].offlineRanges[0]
+  assert.equal(await messenger.prioritizeRange(channel, { since: range.end - 100, ttlMs: 60000 }), true)
+  await messenger.runPriorityLane(channel, messenger.channels.get(channel), [range])
+
+  assert.deepEqual(calls.slice(0, 2), [first, second])
+  assert.equal(aborted, true)
+})
+
+test('priority seeder fallback requires recent presence', async () => {
+  const channel = '11'.repeat(32)
+  const seeder = '22'.repeat(32)
+  const now = Math.floor(Date.now() / 1000)
+  const failingFetch = async args => {
+    const url = args.relays[0]
+    const pending = args.resume?.[url] || [{ start: args.since, end: args.until }]
+    return {
+      oldestCreatedAt: null,
+      receivedEventCount: 0,
+      elapsedMs: 5,
+      relays: [{ relay: url, status: 'timeout', covered: [], pending, events: 0 }],
+      pendingByRelay: { [url]: pending },
+      anyEose: false,
+      anyEoseWithEvents: false,
+      allFailed: true
+    }
+  }
+  const run = async lastActiveAt => {
+    await seedMessengerState({
+      [channel]: {
+        offlineRanges: [{ start: now - 1000, end: now - 100 }],
+        seederActivity: { [seeder]: { lastActiveAt, announcedAt: lastActiveAt } }
+      }
+    })
+    const pm = fakePrivateMessage()
+    const messenger = await new PrivateMessenger({
+      _privateMessage: pm,
+      _privateChannel: { fetchHistory: failingFetch }
+    }).init({
+      userSigner: signer('user'),
+      channels: [{ pubkey: channel, signer: signer('channel'), relays: ['wss://relay.example'], seeders: [seeder] }]
+    })
+    const range = messenger.readState().channels[channel].offlineRanges[0]
+    await messenger.prioritizeRange(channel, { since: range.end - 100, ttlMs: 60000 })
+    await messenger.runPriorityLane(channel, messenger.channels.get(channel), [range])
+    return {
+      asks: pm.sent.filter(entry => entry.method === 'ask'),
+      record: [...messenger.recoveryRanges.values()].find(entry => entry.channelPubkey === channel)
+    }
+  }
+
+  assert.equal((await run(now - 3600)).asks.length, 0)
+  const recent = await run(now)
+  assert.equal(recent.asks.length, 1)
+  assert.ok(recent.asks[0].options.payload.since <= now && recent.asks[0].options.payload.until >= recent.asks[0].options.payload.since)
+  assert.ok(recent.record.claimed.length)
+})
+
+test('recovery relay ordering prefers the most reliable relay', async () => {
+  const channel = '11'.repeat(32)
+  const [slow, fast] = ['wss://slow.example', 'wss://fast.example']
+  const now = Math.floor(Date.now() / 1000)
+  await seedMessengerState({ [channel]: { offlineRanges: [{ start: now - 1000, end: now - 100 }] } })
+  const calls = []
+  const partial = args => {
+    const results = args.relays.map(relay => {
+      const pending = args.resume?.[relay] || [{ start: args.since, end: args.until }]
+      return { relay, status: 'timeout', covered: [], pending, events: 0, elapsedMs: relay === slow ? 5000 : 20 }
+    })
+    return {
+      oldestCreatedAt: null,
+      receivedEventCount: 0,
+      elapsedMs: results.reduce((sum, entry) => sum + entry.elapsedMs, 0),
+      relays: results,
+      pendingByRelay: Object.fromEntries(results.map(entry => [entry.relay, entry.pending])),
+      anyEose: false,
+      anyEoseWithEvents: false,
+      allFailed: true
+    }
+  }
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _privateChannel: {
+      fetchHistory: async args => {
+        calls.push(args.relays[0])
+        return partial(args)
+      }
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: channel, signer: signer('channel'), relays: [slow, fast] }]
+  })
+
+  await messenger.recoverOfflineRanges([channel])
+  assert.equal(calls[0], slow)
+  calls.length = 0
+  await messenger.recoverOfflineRanges([channel])
+  assert.equal(calls[0], fast)
+})
+
 test('partial recovery retries the failing relay then hands the left edge to seeders', async () => {
   const pm = fakePrivateMessage()
   const timers = []

@@ -541,6 +541,22 @@ and the uncovered subranges plus the pre-oldest left edge are requested from
 seeders. Offline attempts never consume the budget, mark coverage or contact
 seeders; they wait for connectivity. The per-relay tracker is process-local, so a
 restart falls back to the persisted whole interval.
+
+`prioritizeRange(channelPubkey, { since, until, type })` registers an
+application-directed priority window for the next recovery pass. `unread-page`
+requires `since` (a read anchor); `tail` derives a bounded window from the
+newest persisted range using `priorityTailSeconds` (six hours by default).
+Priority subranges are fetched before older history; relays are ordered by
+recent EOSE, consecutive failures and latency; and the first priority page may
+hedge up to `priorityHedgeRelays` (two) relays with `priorityHedgeDelayMs`
+(500 ms), aborting the loser. When relays do not cover the window, seeders with
+recent presence (`announcedAt`/`lastActiveAt` within `seederOnlineSeconds`) are
+asked only for that subrange; a successful ask counts as coverage. Priority
+probes never consume the relay tier budget, and priorities/statistics are
+process-local: they expire after `priorityTtlMs` (ten minutes) or once covered,
+and clear with channel/recovery state. Presence payloads and persisted ranges
+are unchanged.
+
 `private-channel.fetchHistory(options)` (0.11.6) is the complete-interval API
 used by messenger recovery. It accepts the signers, processor/fragment options,
 callbacks and abort signal of `fetch`, plus inclusive `since`/`until` bounds

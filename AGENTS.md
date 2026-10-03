@@ -225,6 +225,12 @@ NIP-46 against the real pool with controlled transport and injected controls.
   are process-local and pruned on range completion, relay-set change, channel
   clear/stale cleanup and close. Permanent per-relay errors stop that relay
   without spending the range budget.
+- Priority recovery is an in-memory, app-directed window: `unread-page` requires
+  `since`, `tail` derives a bounded window. Fetch priority subranges before older
+  history, order relays by recent EOSE/latency, hedge only the first priority page,
+  and use seeders only as fallback with recent presence; a successful ask counts as
+  coverage and probes never consume tier budgets. Keep presence payloads and
+  persisted ranges unchanged.
 
 - Honor optional numeric relay `retry_after` on rate-limited CLOSED/OK, bounded
   to five minutes, without blocking CLOSE or sending cancelled work later.
