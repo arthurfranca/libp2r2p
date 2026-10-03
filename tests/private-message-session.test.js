@@ -63,6 +63,30 @@ test('session prefetch is best-effort when the lookup fails or is disabled', asy
   assert.deepEqual(await disabled.session.prefetchContentKeys(), {})
 })
 
+test('a failing download intent is reported once across reconfigures', async t => {
+  const gate = Promise.withResolvers()
+  const root = 'a'.repeat(64)
+  const id = getEventHash({ kind: 0, pubkey: owner, created_at: 0, tags: [], content: `${peer}:${root}` })
+  const entry = { id, file: { peer, root, size: 1 } }
+  let downloads = 0
+  const f = await fixture(t, {
+    FileTransfer: () => ({
+      observe () {},
+      download: async () => { downloads++; return gate.promise },
+      cancel () {}
+    }),
+    openDownloads: async () => ({ list: async () => [entry], put: async () => {}, remove: async () => {}, close: async () => {} })
+  })
+
+  await f.session.setPeers([peer])
+  gate.reject(Object.assign(new Error('FILE_DOWNLOAD_STALLED'), { code: 'FILE_DOWNLOAD_STALLED' }))
+  await until(() => f.errors.length >= 1)
+  await new Promise(resolve => setTimeout(resolve, 20))
+
+  assert.equal(downloads, 1)
+  assert.equal(f.errors.filter(error => error.code === 'FILE_DOWNLOAD_STALLED').length, 1)
+})
+
 test('send errors identify the owning message when a quoted event is rejected', async t => {
   const f = await fixture(t, { publish: async () => ({ delivery: { reports: [{ success: false, total: 1, errors: [{ relay: 'wss://test.invalid', reason: new Error('blocked: policy') }] }] } }) })
   const quote = { ...event, content: 'quote' }

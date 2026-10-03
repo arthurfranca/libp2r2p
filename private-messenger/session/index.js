@@ -21,6 +21,14 @@ const retryable = error => error?.code === 'MESSAGE_NOT_PUBLISHED' || !/DENIED|P
 
 export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], useContentKeys = true, onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, _getIykcProofs = getIykcProofs, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
   fallbackRelays = normalizeFallbackRelays(fallbackRelays)
+  const reportedErrors = new WeakSet()
+  const reportError = error => {
+    if (error && (typeof error === 'object' || typeof error === 'function')) {
+      if (reportedErrors.has(error)) return
+      reportedErrors.add(error)
+    }
+    onError(error)
+  }
   const userSigner = messengerSigner(signer)
   messageStorage ||= createEventStoreMessageStorage({ eventStore })
   chunkStorage ||= eventStore ? createEventStoreChunkStorage({ eventStore }) : undefined
@@ -37,6 +45,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   let downloads
   const downloadIntents = new Map()
   const downloadEpochs = new Map()
+  const activeDownloads = new Map()
   let downloadWriteTail = Promise.resolve()
   const writeDownloadIntent = operation => {
     const work = downloadWriteTail.catch(() => {}).then(operation)
@@ -72,18 +81,18 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
           const scoped = messengerSigner(signer.withSharedKey(peer, 'dm'))
           channel = { signer: scoped, pubkey: await scoped.getPublicKey(), mode, seeders: seedersForPeer(peer) }
           channels.set(peer, channel)
-        } catch (error) { if (!retryable(error)) deniedPeers.add(peer); onError(error); continue }
+        } catch (error) { if (!retryable(error)) deniedPeers.add(peer); reportError(error); continue }
       }
       if (closed || !available || version !== lifecycle) return
       values.push(channel)
     }
-    if (!messenger) messenger = await Messenger({ fallbackRelays, seedStorage: recoveryStorage?.seeds, userSigner, channels: [], useContentKeys, onMessageQueued: () => drain(), onError })
+    if (!messenger) messenger = await Messenger({ fallbackRelays, seedStorage: recoveryStorage?.seeds, userSigner, channels: [], useContentKeys, onMessageQueued: () => drain(), onError: reportError })
     if (closed || !available || version !== lifecycle) { await messenger.pause('signer'); return }
     await messenger.update({ channels: values })
     await messenger.resume('signer')
     if (!fileTransfers) {
       fileTransfers = FileTransfer({
-        messenger, onError,
+        messenger, onError: reportError,
         resolveChannel: ({ peerPubkey, info }) => messengerSigner(signer.withSharedKey(peerPubkey, info)),
         storage: chunkStorage,
         seedStorage: recoveryStorage?.seeds,
@@ -95,20 +104,30 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
           onMedia({ ...state, peer })
           if (state.status === 'complete') {
             const id = intentId({ peer, root: state.root })
-            if (downloadIntents.delete(id)) writeDownloadIntent(() => downloads?.remove(id)).catch(onError)
+            if (downloadIntents.delete(id)) writeDownloadIntent(() => downloads?.remove(id)).catch(reportError)
           }
         }
       })
       downloads = await openDownloads({ owner, signer })
       for (const entry of await downloads.list()) downloadIntents.set(entry.id, entry)
     }
-    for (const entry of downloadIntents.values()) if (peers.has(entry.file.peer)) download(entry.file, { manual: true }).catch(onError)
+    for (const entry of downloadIntents.values()) {
+      if (!peers.has(entry.file.peer) || activeDownloads.has(entry.id)) continue
+      const work = download(entry.file, { manual: true })
+        .catch(error => {
+          // A failed intent stays queued for the next configure; report each
+          // real attempt once even if configure runs while it is in flight.
+          if (downloadIntents.has(entry.id)) reportError(error)
+        })
+        .finally(() => { if (activeDownloads.get(entry.id) === work) activeDownloads.delete(entry.id) })
+      activeDownloads.set(entry.id, work)
+    }
     drain(); pump()
   }
   function schedule () {
     const work = configuring.catch(() => {}).then(configure)
     configuring = work
-    work.catch(onError)
+    work.catch(reportError)
     return work
   }
   async function drain () {
@@ -130,7 +149,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
           const valid = event.pubkey === peer || message.provenance === 'hearsay' || message.provenance === 'signed'
           if (!valid || !isSerializableEvent(event) || !allowedKinds.includes(event.kind) || (event.sig && !isValidEvent(event)) || getEventHash(event) !== message.event.id) { await ack(); continue }
           if (event.kind === 34601) {
-            try { decodeIrfsChunk(event) } catch (error) { onError(error); await ack(); continue }
+            try { decodeIrfsChunk(event) } catch (error) { reportError(error); await ack(); continue }
           }
           if (event.kind === 5 && (message.provenance === 'hearsay' || event.pubkey !== peer)) { await ack(); continue }
           if (!available || closed) { await nack(); break }
@@ -139,7 +158,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
           await ack()
         } catch (error) {
           await nack()
-          onError(error)
+          reportError(error)
           // Retain the failed record and suspend network ingestion until recovery.
           await messenger.pause('storage')
           break
@@ -218,8 +237,8 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     } catch (error) {
       if (cancelled.has(entry.id)) { await storage.remove(entry.id); entries.delete(entry.id) } else {
         entry.status = error.retryWhenAvailable ? 'pending' : 'error'; entry.failed = true; entry.retryable = retryable(error)
-        await storage.put(entry, { existing: true }).catch(onError)
-        onError(error)
+        await storage.put(entry, { existing: true }).catch(reportError)
+        reportError(error)
         // The failed wire event may be a quote or file chunk. Report the
         // owning outbox item separately, without mutating the native error.
         if (error.retryWhenOnline) offlineSends.add(entry.id)
@@ -348,14 +367,14 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     },
     async close () {
       closed = true; available = false; lifecycle++
-      stopOnlineRetry(); offlineSends.clear()
+      stopOnlineRetry(); offlineSends.clear(); activeDownloads.clear()
       for (const controller of sendControllers.values()) controller.abort()
       await Promise.allSettled([configuring, initialized])
       await messenger?.pause('closed')
       if (sending || draining) await new Promise(resolve => idleWaiters.add(resolve))
       await messenger?.close()
       await storage?.close()
-      await downloadWriteTail.catch(onError)
+      await downloadWriteTail.catch(reportError)
       await downloads?.close()
     }
   }
