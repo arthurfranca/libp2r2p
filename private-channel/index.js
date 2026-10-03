@@ -972,12 +972,12 @@ export async function fetch ({ signal, receiverSigner, iykcSigner, privateChanne
 
 // Complete interval recovery with bounded pages and one fragment processor.
 // Existing fetch() retains its one-query/event-array contract.
-export async function fetchHistory ({ receiverSigner, privateChannelSigner = receiverSigner, _getEvents = getEvents, _acquirePage, ...options }) {
+export async function fetchHistory ({ receiverSigner, privateChannelSigner = receiverSigner, _getEvents = getEvents, _acquirePage, partial = false, resume = null, ...options }) {
   const authors = privateChannelPubkeyList(options)
   const filter = { kinds: [PRIVATE_BROADCAST_KIND], ...(authors.length ? { authors } : {}), since: options.since, until: options.until }
   const processOuterEvent = createProcessor({ ...options, receiverSigner, privateChannelSigner, onError: error => { options.onError?.(error); throw error } })
   try {
-    return await readHistory({ filter, relays: options.relays, receiverPubkey: options.receiverPubkey, signal: options.signal, getEvents: _getEvents, processEvent: processOuterEvent, acquirePage: _acquirePage })
+    return await readHistory({ filter, relays: options.relays, receiverPubkey: options.receiverPubkey, signal: options.signal, getEvents: _getEvents, processEvent: processOuterEvent, acquirePage: _acquirePage, partial, resume })
   } finally { processOuterEvent.close() }
 }
 

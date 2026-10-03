@@ -217,6 +217,14 @@ NIP-46 against the real pool with controlled transport and injected controls.
   Preserve one fragment processor per call and summary-only results. Recovery
   gates cover reads plus processing (two per messenger, one per relay per library
   instance) without blocking live watches. Keep the original `fetch` contract.
+- Messenger recovery uses `fetchHistory`'s opt-in partial mode with an in-memory
+  per-range/per-relay tracker: retry only pending subranges (3 partial, 6
+  empty-EOSE, 10 all-failed attempts per relay), then accept coverage from EOSE
+  relays and ask seeders for uncovered subranges plus the pre-oldest left edge.
+  Never advance ranges, consume budgets or contact seeders while offline. Trackers
+  are process-local and pruned on range completion, relay-set change, channel
+  clear/stale cleanup and close. Permanent per-relay errors stop that relay
+  without spending the range budget.
 
 - Honor optional numeric relay `retry_after` on rate-limited CLOSED/OK, bounded
   to five minutes, without blocking CLOSE or sending cancelled work later.

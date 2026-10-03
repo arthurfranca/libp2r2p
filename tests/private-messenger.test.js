@@ -12,6 +12,7 @@ import {
   MISSING_MESSAGES_REPLY_CODE,
   NYM_CARRIER_SEED_RECORD_TYPE,
   PrivateMessenger as RealPrivateMessenger,
+  RECOVERY_RELAY_RETRY_LIMITS,
   ROUTER_SEED_RECORD_TYPE,
   SEEDER_PRESENCE_CODE
 } from '../private-messenger/index.js'
@@ -2596,6 +2597,160 @@ test('incomplete fetch reaches onError unchanged and remains pending until a suc
   state = (await messenger.stateStore.load()).channel
   assert.equal(state.recoveredThrough, now)
   assert.deepEqual(state.offlineRanges, [])
+})
+
+test('failed reload-gap recovery schedules an automatic retry', async () => {
+  const pm = fakePrivateMessage()
+  const timers = []
+  let fail = true
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    onError: () => {},
+    _setTimeout: (fn, delay) => { const timer = { fn, delay }; timers.push(timer); return timer },
+    _clearTimeout: timer => { timer.cancelled = true },
+    _privateChannel: { fetchHistory: async () => { if (fail) throw Object.assign(new Error('relay down'), { category: 'transport' }); return [] } }
+  }).init({ userSigner: signer('user'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
+
+  const first = timers.at(-1)
+  await first.fn()
+  assert.ok(messenger.readState().channels.channel.offlineRanges.length)
+  const retry = timers.at(-1)
+  assert.notEqual(retry, first)
+  assert.ok(retry.delay > 0)
+
+  fail = false
+  await retry.fn()
+  assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [])
+})
+
+test('partial recovery retries the failing relay then hands the left edge to seeders', async () => {
+  const pm = fakePrivateMessage()
+  const timers = []
+  const fetches = []
+  const now = Math.floor(Date.now() / 1000)
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    onError: () => {},
+    _setTimeout: (fn, delay) => { const timer = { fn, delay }; timers.push(timer); return timer },
+    _clearTimeout: timer => { timer.cancelled = true },
+    _privateChannel: {
+      fetchHistory: async args => {
+        fetches.push(args)
+        const results = []
+        const healthy = args.relays.find(relay => relay.includes('a.example'))
+        const failing = args.relays.find(relay => relay.includes('b.example'))
+        if (healthy) results.push({ relay: healthy, status: 'eose', covered: [{ start: args.since, end: args.until }], pending: [], events: 1 })
+        if (failing) results.push({ relay: failing, status: 'timeout', covered: [], pending: [{ start: args.since, end: args.until }], events: 0 })
+        const anyEose = results.some(entry => entry.status === 'eose')
+        return {
+          oldestCreatedAt: now - 5,
+          receivedEventCount: results.reduce((sum, entry) => sum + entry.events, 0),
+          elapsedMs: 1,
+          relays: results,
+          pendingByRelay: Object.fromEntries(results.filter(entry => entry.pending.length).map(entry => [entry.relay, entry.pending])),
+          anyEose,
+          anyEoseWithEvents: results.some(entry => entry.status === 'eose' && entry.events > 0),
+          allFailed: !anyEose
+        }
+      }
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://a.example', 'wss://b.example'], seeders: ['seeder'] }]
+  })
+
+  const callback = pm.watchCalls[0].onSubscriptionState
+  await callback({ state: 'interrupted', relay: 'wss://a.example', since: now - 10 })
+  await callback({ state: 'ready', relay: 'wss://a.example', until: now })
+
+  const limit = RECOVERY_RELAY_RETRY_LIMITS.partial
+  let timer = timers.at(-1)
+  for (let attempt = 0; attempt < limit; attempt++) {
+    await timer.fn()
+    if (attempt < limit - 1) timer = timers.at(-1)
+  }
+
+  assert.equal(fetches.length, limit)
+  assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [])
+  assert.equal(messenger.recoveryRanges.size, 0)
+  const asks = pm.sent.filter(entry => entry.method === 'ask')
+  assert.equal(asks.length, 1)
+  assert.equal(asks[0].options.payload.until, now - 5)
+  assert.ok(asks[0].options.payload.since < now - 5)
+})
+
+test('all-failed relay attempts exhaust the larger budget before the seeder handoff', async () => {
+  const pm = fakePrivateMessage()
+  const timers = []
+  const fetches = []
+  const now = Math.floor(Date.now() / 1000)
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    onError: () => {},
+    _setTimeout: (fn, delay) => { const timer = { fn, delay }; timers.push(timer); return timer },
+    _clearTimeout: timer => { timer.cancelled = true },
+    _privateChannel: {
+      fetchHistory: async args => {
+        fetches.push(args)
+        const relay = args.relays[0]
+        const pending = [{ start: args.since, end: args.until }]
+        return {
+          oldestCreatedAt: null,
+          receivedEventCount: 0,
+          elapsedMs: 1,
+          relays: [{ relay, status: 'timeout', covered: [], pending, events: 0 }],
+          pendingByRelay: { [relay]: pending },
+          anyEose: false,
+          anyEoseWithEvents: false,
+          allFailed: true
+        }
+      }
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'], seeders: ['seeder'] }]
+  })
+
+  const callback = pm.watchCalls[0].onSubscriptionState
+  await callback({ state: 'interrupted', relay: 'wss://relay.example', since: now - 10 })
+  await callback({ state: 'ready', relay: 'wss://relay.example', until: now })
+  const range = messenger.readState().channels.channel.offlineRanges[0]
+
+  const limit = RECOVERY_RELAY_RETRY_LIMITS.allFailed
+  let timer = timers.at(-1)
+  for (let attempt = 0; attempt < limit; attempt++) {
+    await timer.fn()
+    if (attempt < limit - 1) timer = timers.at(-1)
+  }
+
+  assert.equal(fetches.length, limit)
+  assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [])
+  const asks = pm.sent.filter(entry => entry.method === 'ask')
+  assert.equal(asks.length, 1)
+  assert.deepEqual(asks[0].options.payload, { since: range.start, until: range.end })
+})
+
+test('offline recovery leaves ranges and budgets untouched', async () => {
+  const now = Math.floor(Date.now() / 1000)
+  const range = { start: now - 100, end: now - 50 }
+  await seedMessengerState({ channel: { offlineRanges: [range] } })
+  const pm = fakePrivateMessage()
+  const fetches = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    onError: () => {},
+    _isOnline: async () => false,
+    _privateChannel: { fetchHistory: async args => { fetches.push(args); return [] } }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'], seeders: ['seeder'] }]
+  })
+
+  const pending = messenger.readState().channels.channel.offlineRanges
+  await messenger.recoverOfflineRanges(['channel'])
+  assert.equal(fetches.length, 0)
+  assert.deepEqual(messenger.readState().channels.channel.offlineRanges, pending)
+  assert.equal(pm.sent.filter(entry => entry.method === 'ask').length, 0)
 })
 
 test('outgoing seeder capture precedes publication and does not require a network echo', async () => {

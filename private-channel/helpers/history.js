@@ -1,6 +1,7 @@
 import { ValidationError } from '../../error/index.js'
 import { normalizeRelayUrl } from '../../url/index.js'
 import { createAbortableSemaphore } from '../../helpers/abortable-semaphore.js'
+import { mergeRanges } from '../../helpers/ranges.js'
 import { incompleteFetchError } from './fetch-error.js'
 
 const PAGE_SIZE = 16
@@ -23,7 +24,7 @@ function acquireRelay (relay, signal) {
 
 // Queries bounded temporal leaves, oldest first. A saturated one-second leaf
 // cannot be split using standard NIP-01; expand it only up to the safe ceiling.
-export async function readHistory ({ filter, relays, receiverPubkey, signal, getEvents, processEvent, acquirePage }) {
+export async function readHistory ({ filter, relays, receiverPubkey, signal, getEvents, processEvent, acquirePage, partial = false, resume = null }) {
   const since = filter.since ?? 0
   const until = filter.until ?? Math.floor(Date.now() / 1000)
   if (![since, until].every(value => Number.isSafeInteger(value) && value >= 0) || since > until) throw new ValidationError('INVALID_PRIVATE_CHANNEL_HISTORY_RANGE')
@@ -44,7 +45,10 @@ export async function readHistory ({ filter, relays, receiverPubkey, signal, get
     }
   }
   for (const relay of urls) {
-    const intervals = [{ since, until, limit: PAGE_SIZE }]
+    const relayStartCount = receivedEventCount
+    const intervals = resumeIntervalsFor({ resume, relay, since, until })
+      .map(interval => ({ since: interval.start, until: interval.end, limit: PAGE_SIZE }))
+    const covered = []
     let outcome = { relay, status: 'eose' }
     while (intervals.length) {
       signal?.throwIfAborted()
@@ -77,6 +81,7 @@ export async function readHistory ({ filter, relays, receiverPubkey, signal, get
           signal?.throwIfAborted()
           errors.push({ relay, reason: error })
           outcome = { relay, status: 'error', error }
+          intervals.push(interval)
           break
         } finally { elapsedMs += performance.now() - started }
         signal?.throwIfAborted()
@@ -85,6 +90,7 @@ export async function readHistory ({ filter, relays, receiverPubkey, signal, get
           await process(page.result)
           errors.push(...(page.errors ?? []))
           outcome = status ?? { relay, status: 'error' }
+          intervals.push(interval)
           break
         }
         if (status.status === 'satisfied' || page.result.length >= interval.limit) {
@@ -98,10 +104,12 @@ export async function readHistory ({ filter, relays, receiverPubkey, signal, get
             const error = pageLimitError()
             errors.push({ relay, reason: error })
             outcome = { relay, status: 'error', error }
+            intervals.push(interval)
             break
           }
         } else {
           await process(page.result)
+          covered.push({ start: interval.since, end: interval.until })
         }
         signal?.throwIfAborted()
       } finally {
@@ -109,13 +117,49 @@ export async function readHistory ({ filter, relays, receiverPubkey, signal, get
         releaseRelay?.()
       }
     }
-    report.push(outcome)
+    report.push({
+      ...outcome,
+      ...(partial
+        ? {
+            covered: mergeRanges(covered),
+            pending: mergeRanges(intervals.map(interval => ({ start: interval.since, end: interval.until }))),
+            events: receivedEventCount - relayStartCount
+          }
+        : {})
+    })
   }
   signal?.throwIfAborted()
+  if (partial) {
+    const pendingByRelay = {}
+    for (const entry of report) {
+      if (entry.pending?.length) pendingByRelay[entry.relay] = entry.pending
+    }
+    return {
+      oldestCreatedAt,
+      receivedEventCount,
+      elapsedMs: Math.round(elapsedMs),
+      relays: report,
+      pendingByRelay,
+      anyEose: report.some(entry => entry.status === 'eose'),
+      anyEoseWithEvents: report.some(entry => entry.status === 'eose' && (entry.events ?? 0) > 0),
+      allFailed: report.every(entry => entry.status !== 'eose')
+    }
+  }
   if (errors.length || report.some(item => item.status !== 'eose')) {
     const error = incompleteFetchError({ errors, report, receivedEventCount, elapsedMs: Math.round(elapsedMs), request: { relays: urls, channelPubkeys: filter.authors ?? [], receiverPubkey, since, until, limit: PAGE_SIZE, timeoutMs: TIMEOUT_MS } })
     error.operation = 'private-channel.fetchHistory'
     throw error
   }
   return { oldestCreatedAt, receivedEventCount, relays: report }
+}
+
+function resumeIntervalsFor ({ resume, relay, since, until }) {
+  const pending = resume && Object.prototype.hasOwnProperty.call(resume, relay) ? resume[relay] : null
+  const intervals = Array.isArray(pending) ? pending : [{ start: since, end: until }]
+  return mergeRanges(intervals
+    .map(interval => ({
+      start: Math.max(since, Math.floor(Number(interval?.start))),
+      end: Math.min(until, Math.floor(Number(interval?.end)))
+    }))
+    .filter(interval => Number.isSafeInteger(interval.start) && Number.isSafeInteger(interval.end) && interval.end >= interval.start))
 }

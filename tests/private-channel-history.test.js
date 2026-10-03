@@ -84,6 +84,58 @@ test('preserves partial deliveries and per-relay status-only failures', async ()
   assert.deepEqual(processed, [1, 2])
 })
 
+test('partial history reports per-relay coverage instead of failing', async () => {
+  const summary = await run({
+    relays: [relay, 'wss://failed.example'],
+    partial: true,
+    getEvents: async (filter, [url]) => ({
+      result: url === relay ? [{ event: event(1), relay: url }] : [],
+      relays: [{ relay: url, status: url === relay ? 'eose' : 'timeout' }]
+    })
+  })
+  const byRelay = Object.fromEntries(summary.relays.map(entry => [entry.relay, entry]))
+
+  assert.equal(summary.anyEose, true)
+  assert.equal(summary.anyEoseWithEvents, true)
+  assert.equal(summary.allFailed, false)
+  assert.deepEqual(byRelay[relay].covered, [{ start: 0, end: 100 }])
+  assert.deepEqual(byRelay[relay].pending, [])
+  assert.deepEqual(byRelay['wss://failed.example'].pending, [{ start: 0, end: 100 }])
+  assert.deepEqual(summary.pendingByRelay, { 'wss://failed.example': [{ start: 0, end: 100 }] })
+})
+
+test('partial history retries only resumed subranges and merges coverage', async () => {
+  const requests = []
+  const summary = await run({
+    partial: true,
+    resume: { [relay]: [{ start: 40, end: 60 }] },
+    getEvents: async filter => {
+      requests.push({ since: filter.since, until: filter.until })
+      return { result: [{ event: event(50), relay }], relays: [{ relay, status: 'eose' }] }
+    }
+  })
+
+  assert.deepEqual(requests, [{ since: 40, until: 60 }])
+  assert.deepEqual(summary.relays[0].covered, [{ start: 40, end: 60 }])
+  assert.deepEqual(summary.relays[0].pending, [])
+})
+
+test('partial history marks all-failed attempts for the seeder handoff', async () => {
+  const summary = await run({
+    relays: [relay, 'wss://other.example'],
+    partial: true,
+    getEvents: async (filter, [url]) => ({ result: [], relays: [{ relay: url, status: 'timeout' }] })
+  })
+
+  assert.equal(summary.anyEose, false)
+  assert.equal(summary.anyEoseWithEvents, false)
+  assert.equal(summary.allFailed, true)
+  assert.deepEqual(summary.pendingByRelay, {
+    [relay]: [{ start: 0, end: 100 }],
+    'wss://other.example': [{ start: 0, end: 100 }]
+  })
+})
+
 test('one relay gate spans processing and queued cancellation releases the waiter', async () => {
   const entered = Promise.withResolvers()
   const finish = Promise.withResolvers()

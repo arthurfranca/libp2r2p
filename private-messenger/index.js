@@ -1,4 +1,3 @@
-import { recoveryRetryDelay } from './helpers/recovery-retry.js'
 // Expected use:
 // const messenger = await createPrivateMessenger({
 //   userSigner,
@@ -44,9 +43,12 @@ import { recoveryRetryDelay } from './helpers/recovery-retry.js'
 // - For other event-list replies, use createEventReplyPacker({ messenger, question, code }).update(event).
 
 import { createAbortableSemaphore } from '../helpers/abortable-semaphore.js'
+import { mergeRanges, subtractRanges } from '../helpers/ranges.js'
 import * as privateMessage from '../private-message/index.js'
 import { isOnline } from '../network/index.js'
 import { createSendRelayRouting, normalizeFallbackRelays } from './helpers/send-routing.js'
+import { incompleteFetchError } from '../private-channel/helpers/fetch-error.js'
+import { recoveryRetryDelay, isPermanentRecoveryError } from './helpers/recovery-retry.js'
 import { normalizeRelayUrl } from '../url/index.js'
 import { deliveryInfo } from '../private-channel/helpers/rumor.js'
 import { bytesToBase64 } from '../base64/index.js'
@@ -121,6 +123,13 @@ const SEED_QUEUE_INDEXES = {
 }
 const encoder = new TextEncoder()
 const noContentKeys = async () => ({})
+
+export const RECOVERY_RELAY_RETRY_LIMITS = Object.freeze({
+  partial: 3,
+  emptyEose: 6,
+  allFailed: 10
+})
+const RECOVERY_ONLINE_CACHE_MS = 5000
 
 function textToBase64 (text) {
   return bytesToBase64(encoder.encode(text))
@@ -289,6 +298,8 @@ export class PrivateMessenger {
     this.recoveries = new Map()
     this.recoveryAdmission = createAbortableSemaphore(2)
     this.recoveryControllers = new Set()
+    this.recoveryRanges = new Map()
+    this.recoveryOnline = { at: 0, value: true }
     this.resumeWork = null
     this.capacityTimer = null
     this.capacityCheck = null
@@ -664,6 +675,7 @@ export class PrivateMessenger {
 
     if (removedPubkeys.length) {
       await this.stampChannelActivity(removedPubkeys)
+      for (const pubkey of removedPubkeys) this.dropRecoveryRanges(pubkey)
     }
 
     const storageSnapshot = await activatePrivateMessengerStorage({
@@ -1174,7 +1186,211 @@ export class PrivateMessenger {
     this.liveRecoveryTimers.delete(pubkey)
   }
 
+  async checkRecoveryOnline () {
+    const now = Date.now()
+    if (now - this.recoveryOnline.at < RECOVERY_ONLINE_CACHE_MS) return this.recoveryOnline.value
+    let value = true
+    try {
+      if (globalThis.navigator?.onLine === false) value = false
+      else if (this._isOnline !== isOnline || typeof globalThis.document !== 'undefined') {
+        value = (await this._isOnline()) !== false
+      }
+    } catch { value = false }
+    this.recoveryOnline = { at: Date.now(), value }
+    return value
+  }
+
+  recoveryRangeKey (channelPubkey, range) {
+    return `${channelPubkey}:${range.start}:${range.end}`
+  }
+
+  recoveryRangeRecord (channelPubkey, range) {
+    const key = this.recoveryRangeKey(channelPubkey, range)
+    let record = this.recoveryRanges.get(key)
+    if (!record) {
+      record = {
+        key,
+        channelPubkey,
+        start: range.start,
+        end: range.end,
+        covered: [],
+        oldestCreatedAt: null,
+        relays: new Map(),
+        tier: '',
+        everEose: false,
+        everEoseWithEvents: false,
+        attempts: 0,
+        lastErrors: []
+      }
+      this.recoveryRanges.set(key, record)
+    }
+    return record
+  }
+
+  reconcileRecoveryRelays (record, relays) {
+    const current = new Set(relays)
+    for (const relay of [...record.relays.keys()]) {
+      if (!current.has(relay)) record.relays.delete(relay)
+    }
+    for (const relay of current) {
+      if (record.relays.has(relay)) continue
+      record.relays.set(relay, {
+        pending: [{ start: record.start, end: record.end }],
+        covered: [],
+        attempts: 0,
+        dead: false,
+        eose: false,
+        events: 0,
+        error: null
+      })
+    }
+  }
+
+  recoveryRelayPlan (record) {
+    const plan = {}
+    let hasWork = false
+    for (const [relay, state] of record.relays) {
+      if (state.dead || state.eose || !state.pending?.length) continue
+      plan[relay] = state.pending
+      hasWork = true
+    }
+    return hasWork ? plan : null
+  }
+
+  hasActiveRecoveryRelays (channelPubkey) {
+    for (const record of this.recoveryRanges.values()) {
+      if (record.channelPubkey !== channelPubkey) continue
+      if (this.recoveryRecordActive(record)) return true
+    }
+    return false
+  }
+
+  recoveryRecordActive (record) {
+    for (const state of record.relays.values()) {
+      if (!state.dead && !state.eose && state.pending?.length) return true
+    }
+    return false
+  }
+
+  hasPendingRecovery (channelPubkey) {
+    return (this.readState().channels[channelPubkey]?.offlineRanges || []).length > 0
+  }
+
+  dropRecoveryRanges (channelPubkey) {
+    for (const [key, record] of this.recoveryRanges) {
+      if (record.channelPubkey === channelPubkey) this.recoveryRanges.delete(key)
+    }
+  }
+
+  pruneRecoveryRanges (channelPubkey, ranges) {
+    const keep = new Set((ranges || []).map(range => this.recoveryRangeKey(channelPubkey, range)))
+    for (const [key, record] of this.recoveryRanges) {
+      if (record.channelPubkey === channelPubkey && !keep.has(key)) this.recoveryRanges.delete(key)
+    }
+  }
+
+  updateRecoveryRecord (record, history) {
+    record.covered = mergeRanges([
+      ...record.covered,
+      ...(history.relays || []).flatMap(entry => entry.covered || [])
+    ])
+    if (history.oldestCreatedAt != null) {
+      record.oldestCreatedAt = record.oldestCreatedAt == null
+        ? history.oldestCreatedAt
+        : Math.min(record.oldestCreatedAt, history.oldestCreatedAt)
+    }
+    const byRelay = new Map((history.relays || []).map(entry => [entry.relay, entry]))
+    for (const [relay, state] of record.relays) {
+      const entry = byRelay.get(relay)
+      if (!entry) continue
+      const relayErrors = [...(entry.errors || [])]
+      if (entry.error) relayErrors.push(entry.error)
+      state.error = relayErrors[0] || null
+      const done = entry.status === 'eose' && !(entry.pending?.length)
+      state.covered = mergeRanges([...(state.covered || []), ...(entry.covered || [])])
+      state.eose = done
+      state.pending = done ? [] : subtractRanges({ start: record.start, end: record.end }, state.covered)
+      state.events += entry.events || 0
+      if (done) {
+        state.attempts = 0
+        record.everEose = true
+        if (state.events > 0) record.everEoseWithEvents = true
+      }
+    }
+    record.tier = record.everEoseWithEvents ? 'partial' : record.everEose ? 'emptyEose' : 'allFailed'
+    record.lastErrors = (history.relays || []).flatMap(entry => [...(entry.errors || []), ...(entry.error ? [entry.error] : [])])
+  }
+
+  applyRecoveryRetryBudget (record) {
+    const limit = RECOVERY_RELAY_RETRY_LIMITS[record.tier] ?? RECOVERY_RELAY_RETRY_LIMITS.allFailed
+    for (const state of record.relays.values()) {
+      if (state.eose || state.dead || !state.pending?.length) continue
+      state.attempts++
+      if (state.attempts >= limit || isPermanentRecoveryError(state.error)) state.dead = true
+    }
+    record.attempts++
+  }
+
+  recoveryIncompleteError (record, history, range) {
+    const errors = []
+    for (const entry of history.relays || []) {
+      for (const reason of entry.errors || []) errors.push({ relay: entry.relay, reason })
+      if (entry.error) errors.push({ relay: entry.relay, reason: entry.error })
+    }
+    const error = incompleteFetchError({
+      errors,
+      report: (history.relays || []).map(entry => ({
+        relay: entry.relay,
+        status: entry.status,
+        ...(entry.error ? { error: entry.error } : {})
+      })),
+      receivedEventCount: history.receivedEventCount || 0,
+      elapsedMs: history.elapsedMs || 0,
+      request: {
+        relays: [...record.relays.keys()],
+        channelPubkeys: [record.channelPubkey],
+        receiverPubkey: this.userPubkey,
+        since: range.start,
+        until: range.end,
+        limit: 16,
+        timeoutMs: 5000
+      }
+    })
+    error.operation = 'private-channel.fetchHistory'
+    return error
+  }
+
+  isPartialRecoveryHistory (history) {
+    return Boolean(history) && !Array.isArray(history) &&
+      Array.isArray(history.relays) &&
+      history.pendingByRelay !== undefined &&
+      typeof history.anyEose === 'boolean'
+  }
+
+  async finalizeRecoveryRange ({ channelPubkey, range, record }) {
+    if (!await this.checkRecoveryOnline()) return { complete: false, failures: [], offline: true }
+    const uncovered = subtractRanges({ start: range.start, end: range.end }, record.covered)
+    const oldest = record.oldestCreatedAt
+    const leftEdge = oldest == null
+      ? [{ start: range.start, end: range.end }]
+      : oldest > range.start
+        ? [{ start: range.start, end: Math.min(oldest, range.end) }]
+        : []
+    const seedRanges = mergeRanges([...uncovered, ...leftEdge])
+    const failures = []
+    for (const seedRange of seedRanges) {
+      const attempt = await this.#askSeedersForMissingRangeAttempt(channelPubkey, seedRange.start, seedRange.end)
+      failures.push(...attempt.failures.map(failure => failure.error))
+    }
+    record.lastErrors = failures
+    return { complete: failures.length === 0, failures }
+  }
+
   scheduleLiveRecovery (pubkey) {
+    return this.scheduleOfflineRecovery(pubkey)
+  }
+
+  scheduleOfflineRecovery (pubkey, { startDelayMs = 0 } = {}) {
     const current = this.liveRecoveryTimers.get(pubkey)
     if (current) { current.again = true; return }
     const work = { delay: 1000, timer: null, again: false }
@@ -1199,7 +1415,11 @@ export class PrivateMessenger {
         }
         if (!isCurrent()) return
         const pending = this.readState().channels[pubkey]?.offlineRanges?.length
-        const retry = pending ? recoveryRetryDelay(errors, Math.min(30000, work.delay * (0.8 + Math.random() * 0.4))) : null
+        let retry = null
+        if (pending) {
+          retry = recoveryRetryDelay(errors, Math.min(30000, work.delay * (0.8 + Math.random() * 0.4)))
+          if (retry === null && this.hasActiveRecoveryRelays(pubkey)) retry = Math.min(30000, work.delay)
+        }
         if (work.again || retry !== null) {
           schedule(work.again ? 0 : retry)
           work.delay = Math.min(30000, work.delay * 2)
@@ -1207,7 +1427,7 @@ export class PrivateMessenger {
       }, delay)
       work.timer?.unref?.()
     }
-    schedule(0)
+    schedule(startDelayMs)
   }
 
   recordInterruption (channels, at = nowSeconds()) {
@@ -1242,6 +1462,7 @@ export class PrivateMessenger {
     const pubkeys = channels ? uniq(Array.isArray(channels) ? channels : [channels]) : [...this.desiredChannels]
     for (const extension of this.extensions) extension.unwatch?.(pubkeys)
     for (const pubkey of pubkeys) this.desiredChannels.delete(pubkey)
+    for (const pubkey of pubkeys) this.dropRecoveryRanges(pubkey)
     this.recordInterruption(pubkeys)
     for (const controller of this.recoveryControllers) {
       if (pubkeys.includes(controller.channelPubkey)) controller.abort()
@@ -1278,6 +1499,9 @@ export class PrivateMessenger {
       if (this.pauseReasons.size || this.closePromise) return
       await this.reconcilePresencePublishers()
       await this.recoverOfflineRanges(channels)
+      for (const pubkey of channels) {
+        if (this.hasPendingRecovery(pubkey)) this.scheduleOfflineRecovery(pubkey, { startDelayMs: 1000 })
+      }
       for (const extension of this.extensions) await extension.resume?.()
     })()
     this.resumeWork = work
@@ -1348,6 +1572,9 @@ export class PrivateMessenger {
     }
     await this.watch(channelPubkeys, { scheduleReloadGap: false })
     await this.recoverOfflineRanges(channelPubkeys)
+    for (const pubkey of channelPubkeys) {
+      if (this.hasPendingRecovery(pubkey)) this.scheduleOfflineRecovery(pubkey, { startDelayMs: 1000 })
+    }
   }
 
   async handleAsk (channelPubkey, message) {
@@ -1928,6 +2155,9 @@ export class PrivateMessenger {
       }
       this.writeState(state)
       await this.flushStateWrites()
+      for (const channel of channels) {
+        if (!this.offlineRecoverySecondsFor(channel)) this.dropRecoveryRanges(channel.pubkey)
+      }
       for (const channel of channels) await this.pruneStoredSeeds(channel.pubkey)
     })
   }
@@ -1968,6 +2198,9 @@ export class PrivateMessenger {
       if ((this.watchRevisionByChannel.get(pubkey) || 0) !== revision) return
       if (start != null) this.addOfflineRange(pubkey, Math.max(0, start - this.offlineSkewSeconds), nowSeconds())
       try { await this.recoverOfflineRanges([pubkey]) } catch (err) { this.onError?.(err) }
+      if (!this.closePromise && !this.pauseReasons.size && this.desiredChannels.has(pubkey) && this.hasPendingRecovery(pubkey)) {
+        this.scheduleOfflineRecovery(pubkey, { startDelayMs: 1000 })
+      }
     }, this.reloadGapDelayMs)
     this.reloadGapTimers.set(pubkey, { timer, token, revision })
   }
@@ -2156,13 +2389,20 @@ export class PrivateMessenger {
     const failures = []
     const state = this.readState()
     const now = nowSeconds()
+    const online = await this.checkRecoveryOnline()
 
     for (const pubkey of uniq(channels)) {
       const channel = this.channels.get(pubkey)
       const current = state.channels[pubkey]
-      if (!channel || !current?.offlineRanges?.length) continue
+      if (!channel || !current?.offlineRanges?.length) {
+        this.dropRecoveryRanges(pubkey)
+        continue
+      }
       const recoverySeconds = this.offlineRecoverySecondsFor(channel)
-      if (!recoverySeconds) continue
+      if (!recoverySeconds) {
+        this.dropRecoveryRanges(pubkey)
+        continue
+      }
       const minStart = now - recoverySeconds
       const processedRanges = new Set(current.offlineRanges.map(range => `${range.start}:${range.end}`))
 
@@ -2170,6 +2410,7 @@ export class PrivateMessenger {
       let recoveredThrough = current.recoveredThrough || 0
       for (const range of current.offlineRanges) {
         if (range.end < minStart) continue
+        if (!online) { remaining.push(range); continue }
         const watchRevision = this.watchRevisionByChannel.get(pubkey) || 0
         const controller = new AbortController()
         controller.channelPubkey = pubkey
@@ -2178,38 +2419,81 @@ export class PrivateMessenger {
           if (this.pauseReasons.size || this.closePromise || !this.desiredChannels.has(pubkey)) throw new Error('PRIVATE_MESSENGER_PAUSED')
           const fetchRelays = await this.resolveWatchRelays(channel)
           controller.signal.throwIfAborted()
-          const history = await this._privateChannel.fetchHistory({
-            _acquirePage: signal => this.recoveryAdmission.acquire(signal),
-            signal: controller.signal,
-            receivedChunkScope: this.storageLeaseId,
-            receiverSigner: this.userSigner,
-            iykcSigner: this.contentKeySigner,
-            privateChannelSigner: channel.signer,
-            privateChannelReaderSigner: channel.readerSigner,
-            privateChannelReaderPubkey: channel.readerPubkey,
-            privateChannelPubkeys: [pubkey],
-            receiverPubkey: this.userPubkey,
-            relays: fetchRelays,
-            since: Math.max(0, range.start),
-            until: range.end,
-            mode: channel.mode,
-            modeByPubkey: { [pubkey]: channel.mode },
-            receivedChunkTtlMs: this.receivedChunkTtlMsFor(channel),
-            receivedChunkIndexedDB: this._indexedDB,
-            onEvent: (event, outer, meta) => this.receive(pubkey, () => this.enqueueRumor(eventType(event), pubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }),
-            onNymEvent: (event, outer, meta) => this.receive(pubkey, () => this.enqueueRumor('nym', pubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }),
-            onSeedEvent: seed => this.receive(pubkey, () => this.enqueueSeed(pubkey, seed), seed),
-            onContentKeyUsage: usage => this.handleContentKeyUsage(pubkey, usage),
-            onError: err => { throw err }
-          })
-          controller.signal.throwIfAborted()
-          const attempt = await this.#askSeedersForRelayLeftEdgeAttempt(pubkey, range, history.oldestCreatedAt)
+          const record = this.recoveryRangeRecord(pubkey, range)
+          this.reconcileRecoveryRelays(record, fetchRelays)
+          const plan = this.recoveryRelayPlan(record)
+          if (plan) {
+            const history = await this._privateChannel.fetchHistory({
+              _acquirePage: signal => this.recoveryAdmission.acquire(signal),
+              signal: controller.signal,
+              receivedChunkScope: this.storageLeaseId,
+              receiverSigner: this.userSigner,
+              iykcSigner: this.contentKeySigner,
+              privateChannelSigner: channel.signer,
+              privateChannelReaderSigner: channel.readerSigner,
+              privateChannelReaderPubkey: channel.readerPubkey,
+              privateChannelPubkeys: [pubkey],
+              receiverPubkey: this.userPubkey,
+              relays: Object.keys(plan),
+              since: Math.max(0, range.start),
+              until: range.end,
+              partial: true,
+              resume: plan,
+              mode: channel.mode,
+              modeByPubkey: { [pubkey]: channel.mode },
+              receivedChunkTtlMs: this.receivedChunkTtlMsFor(channel),
+              receivedChunkIndexedDB: this._indexedDB,
+              onEvent: (event, outer, meta) => this.receive(pubkey, () => this.enqueueRumor(eventType(event), pubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }),
+              onNymEvent: (event, outer, meta) => this.receive(pubkey, () => this.enqueueRumor('nym', pubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }),
+              onSeedEvent: seed => this.receive(pubkey, () => this.enqueueSeed(pubkey, seed), seed),
+              onContentKeyUsage: usage => this.handleContentKeyUsage(pubkey, usage),
+              onError: err => { throw err }
+            })
+            controller.signal.throwIfAborted()
+            if (this.isPartialRecoveryHistory(history)) {
+              this.updateRecoveryRecord(record, history)
+              this.applyRecoveryRetryBudget(record)
+              if ((history.relays || []).some(entry => entry.status !== 'eose' || entry.pending?.length)) {
+                const error = this.recoveryIncompleteError(record, history, range)
+                this.onError?.(error)
+                failures.push(error)
+              }
+            } else {
+              // Legacy fetch seam (tests/custom channels): resolves only when
+              // the whole range was read, so treat it as fully relay-covered.
+              record.covered = mergeRanges([...record.covered, { start: range.start, end: range.end }])
+              if (history?.oldestCreatedAt != null) {
+                record.oldestCreatedAt = record.oldestCreatedAt == null
+                  ? history.oldestCreatedAt
+                  : Math.min(record.oldestCreatedAt, history.oldestCreatedAt)
+              }
+              for (const state of record.relays.values()) {
+                state.eose = true
+                state.pending = []
+              }
+              record.tier = 'partial'
+              record.lastErrors = []
+            }
+          }
           const lifecycleChanged = controller.signal.aborted || this.closePromise || !this.channels.has(pubkey) || !this.stopByChannel.has(pubkey) ||
             (this.watchRevisionByChannel.get(pubkey) || 0) !== watchRevision
-          failures.push(...attempt.failures.map(failure => failure.error))
-          if (lifecycleChanged || attempt.failures.length) remaining.push(range)
-          else recoveredThrough = Math.max(recoveredThrough, range.end)
+          if (lifecycleChanged) {
+            remaining.push(range)
+            continue
+          }
+          if (this.recoveryRecordActive(record)) {
+            remaining.push(range)
+            continue
+          }
+          const result = await this.finalizeRecoveryRange({ channelPubkey: pubkey, range, record })
+          failures.push(...result.failures)
+          if (result.complete) recoveredThrough = Math.max(recoveredThrough, range.end)
+          else remaining.push(range)
         } catch (err) {
+          const record = this.recoveryRanges.get(this.recoveryRangeKey(pubkey, range))
+          if (record && isPermanentRecoveryError(err)) {
+            for (const state of record.relays.values()) state.dead = true
+          }
           if (!(controller.liveInterrupted && err === controller.signal.reason)) this.onError?.(err)
           failures.push(err)
           remaining.push(range)
@@ -2223,6 +2507,7 @@ export class PrivateMessenger {
         recoveredThrough: Math.max(fresh.channels[pubkey]?.recoveredThrough || 0, recoveredThrough),
         offlineRanges: mergeRanges(concurrentRanges.concat(remaining))
       }
+      this.pruneRecoveryRanges(pubkey, remaining)
       this.writeState(fresh)
       await this.flushStateWrites()
     }
@@ -2232,6 +2517,7 @@ export class PrivateMessenger {
   async clearChannel (pubkey) {
     await this.unwatch(pubkey)
     await this._privateMessage.clearChannelState?.(pubkey)
+    this.dropRecoveryRanges(pubkey)
     return this.runQueueOperation(async () => {
       this.channels.delete(pubkey)
       this.removeChannelState(pubkey)
@@ -2265,6 +2551,7 @@ export class PrivateMessenger {
         await this.queue?.removeBy('byChannel', pubkey)
         await (this.seedStorage ? this.seedStorage.removeLocal({ channelPubkey: pubkey }) : this.seedQueue?.removeBy('byChannel', pubkey))
       }
+      for (const pubkey of stalePubkeys) this.dropRecoveryRanges(pubkey)
       this.state = state
       if (stalePubkeys.length) await this.removeChannelStates(stalePubkeys)
     })
@@ -2355,20 +2642,11 @@ export class PrivateMessenger {
           temporaryStorageArea: this.temporaryStorageArea
         })
       }
+      this.recoveryRanges.clear()
       if (unwatchError) throw unwatchError
     })()
     return this.closePromise
   }
-}
-
-function mergeRanges (ranges) {
-  const out = []
-  for (const range of ranges) {
-    const last = out[out.length - 1]
-    if (!last || range.start > last.end + 1) out.push({ ...range })
-    else last.end = Math.max(last.end, range.end)
-  }
-  return out
 }
 
 function eventType (event) {

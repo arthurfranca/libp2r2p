@@ -532,15 +532,26 @@ are attached. These diagnostics reach the messenger's `onError` unchanged.
 A single incomplete relay keeps the interval pending even if another relay
 returned events; received messages may already have been queued. This is a
 history completeness failure, not evidence that an outgoing message failed.
-Existing rewatch/resume and relay-list refresh paths retry pending intervals;
-there is no dedicated periodic retry timer for a failed history fetch.
+Rewatch/resume, relay-list refresh and reload-gap paths schedule bounded retries
+for pending intervals (1s doubling to 30s). Recovery tracks per-relay coverage in
+memory: a tier where some relay returned events and EOSE retries the remaining
+relays a few times (3), an empty-EOSE tier gets more attempts (6), and an
+all-failed tier gets the most (10) before coverage from EOSE relays is accepted
+and the uncovered subranges plus the pre-oldest left edge are requested from
+seeders. Offline attempts never consume the budget, mark coverage or contact
+seeders; they wait for connectivity. The per-relay tracker is process-local, so a
+restart falls back to the persisted whole interval.
 `private-channel.fetchHistory(options)` (0.11.6) is the complete-interval API
 used by messenger recovery. It accepts the signers, processor/fragment options,
 callbacks and abort signal of `fetch`, plus inclusive `since`/`until` bounds
 (defaults: 0 and the start time of the call). It returns only
 `{ oldestCreatedAt, receivedEventCount, relays }`; an empty scan has a null oldest
-time. No complete-history event array is retained. `fetch` keeps its existing
-single-query array contract and optional limit.
+time. Passing `partial: true` (used by messenger recovery) returns per-relay
+`covered`/`pending`/`events` plus `pendingByRelay`, `anyEose`, `anyEoseWithEvents`
+and `allFailed` instead of throwing on partial failure, and `resume` restricts
+each relay to the given pending subranges. No complete-history event array is
+retained. `fetch` keeps its existing single-query array contract and optional
+limit.
 
 History queries each relay independently with limit 16. A response with 16 events
 or status `satisfied` is saturated, even if it already reports EOSE or contains
