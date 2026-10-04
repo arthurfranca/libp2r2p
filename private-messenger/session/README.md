@@ -40,6 +40,14 @@ or cancelled/closed sends. Apps own route visibility and user-intent filtering;
 automatic retries may also fail. Callbacks must not throw. Errors are not copied
 into persisted outbox records.
 
+Sends that only failed because the messenger was paused or otherwise
+unavailable (`PRIVATE_MESSENGER_PAUSED`, `CHAT_UNAVAILABLE`) stay pending
+without `onSendError`. The session re-pumps them on a bounded backoff
+(1–30 seconds with 20% jitter) in addition to availability/connectivity
+changes, so a paused messenger recovers without a manual retry. The backoff
+resets on a user `retry`, on `setAvailable(true)`, and once no retryable entry
+remains.
+
 `enqueue({ peer, event, context, requiredFiles, deletion })` preserves prepared
 identities. Local message commits and remote stages have independent checkpoints.
 It sends original/thumbnail chunks before announcements, yields for small messages,

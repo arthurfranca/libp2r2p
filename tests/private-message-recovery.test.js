@@ -102,6 +102,28 @@ test('retry delay survives short attempts and resets only after a stable minute'
   assert.equal(await f.retry(), 1000)
 })
 
+test('relay pool capacity closes keep the shared subscription retrying with relay backoff', async t => {
+  const f = fixture(t)
+  await f.watch('a')
+  const capacity = Object.assign(new Error('relay pool capacity'), { closeCode: 1013, category: 'transport', relay: 'wss://a.example' })
+  f.calls[0].done.resolve({ status: 'failed', error: capacity })
+  await until(() => f.timers.length === 1)
+  assert.equal(await f.retry(), 1000)
+  assert.equal(f.calls.length, 2, 'the capacity close reopens the shared subscription')
+  f.calls[1].ready.resolve({ relays: ['wss://a.example'] })
+  await tick()
+  assert.equal(f.calls[1].closed, false)
+})
+
+test('an unknown first-time subscription error still stops until an explicit rebuild', async t => {
+  const f = fixture(t)
+  await f.watch('a')
+  f.calls[0].done.resolve({ status: 'failed', error: new Error('UNEXPECTED_RELAY_FAILURE') })
+  await tick()
+  assert.equal(f.timers.length, 0)
+  assert.equal(f.calls.length, 1)
+})
+
 for (const limits of [{ maxBufferedLiveEvents: 2 }, { maxBufferedLiveBytes: 500 }]) {
   test(`real pool overflow restarts private subscription (${Object.keys(limits)[0]})`, async t => {
     const connections = []; const subscriptions = []; const errors = []; const states = []; const timers = []

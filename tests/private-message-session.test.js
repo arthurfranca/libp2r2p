@@ -203,6 +203,30 @@ test('offline fallback stays pending without send-error feedback until availabil
   assert.equal(f.sendErrors.length, 0)
 })
 
+test('a paused messenger keeps the send pending and retries it on a bounded backoff', async t => {
+  const timers = []
+  let paused = true
+  const f = await fixture(t, {
+    _setTimeout: (fn, delay) => { const timer = { fn, delay, cancelled: false }; timers.push(timer); return timer },
+    _clearTimeout: timer => { timer.cancelled = true },
+    _random: () => 0.5,
+    publish: async () => {
+      if (paused) throw new Error('PRIVATE_MESSENGER_PAUSED')
+      return { delivery: { reports: [{ success: true }] } }
+    }
+  })
+  const id = await f.session.enqueue({ peer, event })
+  await until(() => f.records.get(id)?.status === 'pending' && f.records.get(id)?.failed === true)
+  assert.equal(f.sendErrors.length, 0, 'a paused messenger is not a user-facing send failure')
+  assert.equal(timers.filter(timer => !timer.cancelled).length, 1)
+  assert.equal(timers[0].delay, 1000)
+  paused = false
+  await timers[0].fn()
+  await until(() => !f.records.has(id))
+  assert.equal(f.sendErrors.length, 0)
+  assert.equal(timers.filter(timer => !timer.cancelled).length, 1, 'a successful retry clears the backoff')
+})
+
 test('a transient outage owns a fresh online listener and resumes without an account-state change', async t => {
   let online = false
   const f = await fixture(t, {

@@ -991,7 +991,10 @@ messages, history and files while preserving automatic NIP-65 updates. Successfu
 latency, and short-lived channel/recipient preferences avoid recently refused
 relays without changing receive subscriptions. See the
 [session coordinator](private-messenger/session/README.md) for deferred offline
-attempts and final failure notifications.
+attempts and final failure notifications. Sends attempted while the messenger is
+paused or otherwise unavailable now stay pending in the outbox and retry on a
+bounded session backoff (1–30 seconds, 20% jitter) instead of surfacing a
+user-facing send error.
 
 
 ### Relay backpressure and bounded synchronization (0.11.7)
@@ -1030,10 +1033,12 @@ readiness on the replacement. Callbacks and completions are generation-fenced.
 Equal watch settings cannot keep a dead subscription registered as active.
 
 Overflow recovery keeps one timer per relay with exponential 1–30 second
-backoff and 20% jitter, reset after a stable minute. Other relays remain live.
-Removal, pause and close cancel pending work. Fragment storage stays scoped to
-the same session across replacement subscriptions. Permanent refusals remain
-reported and do not trigger this automatic retry loop.
+backoff and 20% jitter, reset after a stable minute. Relay-pool capacity closes
+(1013, "relay pool capacity") use the same relay backoff instead of stopping
+until an explicit rebuild, because the launcher pool bucket budget is transient.
+Other relays remain live. Removal, pause and close cancel pending work. Fragment
+storage stays scoped to the same session across replacement subscriptions.
+Permanent refusals remain reported and do not trigger this automatic retry loop.
 
 PrivateMessenger persists each interrupted interval before reopening, then
 uses paged `fetchHistory` to repair the gap while listening for new messages.

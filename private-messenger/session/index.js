@@ -18,8 +18,20 @@ export function wireEvent (value, owner) {
 }
 // Relay rejection text must not be interpreted as a local signer denial.
 const retryable = error => error?.code === 'MESSAGE_NOT_PUBLISHED' || !/DENIED|PERMISSION|REVOKED|READ_ONLY|INVALID|BLOCKED|EXPIRED|NOT_IN_PERSONA/i.test(`${error?.code || ''} ${error?.message || ''}`)
+const unavailableSend = /PRIVATE_MESSENGER_PAUSED|CHAT_UNAVAILABLE|MESSENGER_UNAVAILABLE/i
+const isUnavailableSend = error => unavailableSend.test(`${error?.code || ''} ${error?.message || ''}`)
+const SEND_RETRY_MIN_MS = 1000
+const SEND_RETRY_MAX_MS = 30000
+// A paused or unavailable messenger must keep the outbox entry retryable
+// instead of surfacing a send failure the user has to retry by hand.
+const unavailableError = (error, signal) => Object.assign(new Error(error?.message || 'CHAT_UNAVAILABLE'), {
+  code: error?.code,
+  cause: error,
+  retryWhenAvailable: !signal?.aborted,
+  retryWhenOnline: false
+})
 
-export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], useContentKeys = true, onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, _getIykcProofs = getIykcProofs, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
+export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], useContentKeys = true, onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, _getIykcProofs = getIykcProofs, _setTimeout = setTimeout, _clearTimeout = clearTimeout, _random = Math.random, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
   fallbackRelays = normalizeFallbackRelays(fallbackRelays)
   const reportedErrors = new WeakSet()
   const reportError = error => {
@@ -40,6 +52,8 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const sendControllers = new Map()
   const offlineSends = new Set()
   let stopOnline
+  let sendRetryTimer
+  let sendRetryDelay = SEND_RETRY_MIN_MS
   let messenger
   let fileTransfers
   let downloads
@@ -60,6 +74,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   let lifecycle = 0
   let configuring = Promise.resolve()
   let sending
+  let repump
   let draining
   const idleWaiters = new Set()
   const settled = () => { if (!sending && !draining) { for (const resolve of idleWaiters) resolve(); idleWaiters.clear() } }
@@ -179,9 +194,15 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   }
   async function publish (peer, event, signal) {
     if (deniedPeers.has(peer)) throw new Error('PERMISSION_DENIED')
-    if (!available || !peers.has(peer) || !channels.has(peer)) throw new Error('CHAT_UNAVAILABLE')
+    if (!available || !peers.has(peer) || !channels.has(peer)) throw unavailableError(new Error('CHAT_UNAVAILABLE'), signal)
     const options = { channelPubkey: channels.get(peer)?.pubkey, receiverPubkeys: [peer], signal }
-    const report = event.sig ? await messenger.broadcastEvent({ ...options, event }) : await messenger.broadcastRumor({ ...options, rumor: event })
+    let report
+    try {
+      report = event.sig ? await messenger.broadcastEvent({ ...options, event }) : await messenger.broadcastRumor({ ...options, rumor: event })
+    } catch (error) {
+      if (isUnavailableSend(error)) throw unavailableError(error, signal)
+      throw error
+    }
     // Published is relay acceptance, never a peer receipt.
     await assertMessagePublished(report, event)
   }
@@ -245,7 +266,10 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       await storage.remove(entry.id)
       entries.delete(entry.id)
       emit()
-    } catch (error) {
+    } catch (cause) {
+      // Pauses can surface at any stage (text publication, file authorization
+      // or chunk delivery). Normalize all of them into the retryable path.
+      const error = cause?.retryWhenAvailable ? cause : (isUnavailableSend(cause) ? unavailableError(cause, controller.signal) : cause)
       if (cancelled.has(entry.id)) { await storage.remove(entry.id); entries.delete(entry.id) } else {
         entry.status = error.retryWhenAvailable ? 'pending' : 'error'; entry.failed = true; entry.retryable = retryable(error)
         await storage.put(entry, { existing: true }).catch(reportError)
@@ -253,12 +277,42 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         // The failed wire event may be a quote or file chunk. Report the
         // owning outbox item separately, without mutating the native error.
         if (error.retryWhenOnline) offlineSends.add(entry.id)
+        if (error.retryWhenAvailable) scheduleSendRetry()
         if (!closed && !entry.deletion && !cancelled.has(entry.id) && !error.retryWhenAvailable) onSendError(error, { id: entry.id, peer: entry.peer })
       }
       emit()
     } finally { sendControllers.delete(entry.id) }
   }
   function stopOnlineRetry () { stopOnline?.(); stopOnline = undefined }
+  // Entries that failed only because the messenger was paused/unavailable do
+  // not receive a connectivity transition, so they own a bounded backoff timer
+  // instead of waiting for the next account-state change.
+  function clearSendRetry () {
+    if (sendRetryTimer) _clearTimeout(sendRetryTimer)
+    sendRetryTimer = undefined
+  }
+  function resetSendRetry () {
+    clearSendRetry()
+    sendRetryDelay = SEND_RETRY_MIN_MS
+  }
+  const pendingRetryable = entry => Boolean(entry.failed && !cancelled.has(entry.id) && (entry.retryable || entry.status === 'pending'))
+  function scheduleSendRetry () {
+    if (closed || !available || sendRetryTimer) return
+    const delay = Math.min(SEND_RETRY_MAX_MS, sendRetryDelay * (0.8 + _random() * 0.4))
+    sendRetryDelay = Math.min(SEND_RETRY_MAX_MS, sendRetryDelay * 2)
+    sendRetryTimer = _setTimeout(() => {
+      sendRetryTimer = undefined
+      if (closed || !available) return
+      let retried = false
+      for (const entry of entries.values()) {
+        if (!pendingRetryable(entry)) continue
+        entry.failed = false
+        retried = true
+      }
+      if (retried) pump()
+    }, delay)
+    sendRetryTimer.unref?.()
+  }
   function watchOfflineSends () {
     if (closed || !available || !offlineSends.size) { stopOnlineRetry(); return }
     if (stopOnline) return
@@ -276,15 +330,26 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     })
   }
   async function pump () {
-    if (sending || !available || closed || !messenger || !storage) return
+    if (!available || closed || !messenger || !storage) return
+    // A retry that lands while a pump is already running must not be skipped
+    // just because that pass already walked past the entry.
+    if (sending) { repump = true; return }
     sending = true
     try {
-      for (const entry of entries.values()) {
-        if (closed || !available) break
-        if ((entry.peer !== owner && !peers.has(entry.peer)) || entry.failed || cancelled.has(entry.id)) continue
-        await sendEntry(entry)
-      }
-    } finally { sending = false; watchOfflineSends(); settled() }
+      do {
+        repump = false
+        for (const entry of entries.values()) {
+          if (closed || !available) break
+          if ((entry.peer !== owner && !peers.has(entry.peer)) || entry.failed || cancelled.has(entry.id)) continue
+          await sendEntry(entry)
+        }
+      } while (repump && !closed && available)
+    } finally {
+      sending = false
+      watchOfflineSends()
+      if (![...entries.values()].some(pendingRetryable)) resetSendRetry()
+      settled()
+    }
   }
   const intentId = file => getEventHash({ kind: 0, pubkey: owner, created_at: 0, tags: [], content: `${file.peer}:${file.root}` })
   async function download (file, options = {}) {
@@ -359,10 +424,12 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     async setAvailable (value) {
       available = value === true
       stopOnlineRetry(); offlineSends.clear()
+      if (available) resetSendRetry()
+      else clearSendRetry()
       lifecycle++
       if (!available) { await messenger?.pause('signer'); return }
       await ready()
-      for (const entry of entries.values()) if (entry.retryable) entry.failed = false
+      for (const entry of entries.values()) if (pendingRetryable(entry)) entry.failed = false
       await messenger?.resume('storage')
       return schedule()
     },
@@ -382,7 +449,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       offlineSends.delete(id); watchOfflineSends()
       await ready()
       const entry = entries.get(id)
-      if (entry) { entry.failed = false; if (deniedPeers.delete(entry.peer)) await schedule(); return pump() }
+      if (entry) { entry.failed = false; resetSendRetry(); if (deniedPeers.delete(entry.peer)) await schedule(); return pump() }
     },
     async cancel (id) {
       cancelled.add(id)
@@ -396,6 +463,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     async close () {
       closed = true; available = false; lifecycle++
       stopOnlineRetry(); offlineSends.clear(); activeDownloads.clear(); pendingPriorityRanges.clear()
+      clearSendRetry()
       for (const controller of sendControllers.values()) controller.abort()
       await Promise.allSettled([configuring, initialized])
       await messenger?.pause('closed')

@@ -107,7 +107,7 @@ test('offline, invalid messages, local authorization and unknown errors never ro
   assert.equal(isReplaceableRelayFailure(Object.assign(new Error('PUBLISH_TIMEOUT'), { category: 'timeout' })), true)
 })
 
-test('cancellation and session pause prevent a replacement publication', async t => {
+test('cancellation stops retries while a session pause keeps the send retryable', async t => {
   for (const abort of [true, false]) {
     const f = fixture(t, { fallbackRelays: ['wss://fallback.example'], reasons: Object.fromEntries(urls.map(url => [url, 'blocked: policy'])) })
     f.state.held = new Set(urls.slice(0, 2))
@@ -118,7 +118,8 @@ test('cancellation and session pause prevent a replacement publication', async t
     f.state.pending.splice(0).forEach(settle => settle())
     const result = await work
     assert.equal(result.success, false)
-    assert.equal(result.retryWhenOnline, false)
+    assert.equal(result.retryWhenAvailable, !abort)
+    assert.equal(result.retryWhenOnline, !abort)
     assert.equal(f.batches.length, 1)
     assert.equal(f.exclusions.size, 0)
   }

@@ -21,6 +21,18 @@ function uniq (values) {
   return [...new Set((values || []).filter(Boolean))]
 }
 
+// The launcher's shared relay pool closes anonymous members with 1013 when its
+// per-relay buckets are all busy. That is a transient pool condition, not a
+// permanent relay rejection, so the shared subscription must keep the normal
+// relay backoff instead of stopping until something else re-opens it.
+function isRelayPoolCapacity (error) {
+  for (let current = error, depth = 0; current && depth < 3; current = current.cause, depth++) {
+    if (current.closeCode === 1013 || current.code === 'RELAY_POOL_CAPACITY') return true
+    if (/relay pool capacity/i.test(current.message || '')) return true
+  }
+  return false
+}
+
 function normalizeDeletionPubkey (deletionPubkey) {
   if (deletionPubkey === undefined) return undefined
   if (typeof deletionPubkey !== 'string' || !HEX_PUBKEY.test(deletionPubkey)) {
@@ -360,8 +372,9 @@ export function createPrivateMessageSession ({ _setTimeout = setTimeout, _clearT
       delay: entry.readyAt !== undefined && _now() - entry.readyAt >= 60000 ? 1000 : (previous?.delay || entry.retryDelay || 1000),
       notified: new Map(), timer: null
     }
-    if (/^(auth-required:|restricted:|blocked:|invalid:|pow:)/.test(error.message || '') || error.name === 'ValidationError' ||
-        (error.code !== 'RELAY_LIVE_BUFFER_FULL' && !previous)) {
+    const permanent = /^(auth-required:|restricted:|blocked:|invalid:|pow:)/.test(error.message || '') || error.name === 'ValidationError'
+    const retryable = error.code === 'RELAY_LIVE_BUFFER_FULL' || isRelayPoolCapacity(error) || Boolean(previous)
+    if (permanent || !retryable) {
       cancelRelayRecovery(relay)
       notifyInterruption(relay, recovery).catch(error => reportSubscriptionError(entry.channels, error))
       return

@@ -102,6 +102,11 @@ export function createSendRelayRouting ({ peer, peers = [peer], relaysByPubkey, 
         errors: reports.flatMap(report => report.errors || [])
       }))
     })
+    // A lifecycle change (signer/pause) during a batch is not a user abort:
+    // every failure summary stays retryable so the session can re-attempt it.
+    const finished = result => current()
+      ? finish(result)
+      : { ...finish(result), retryWhenAvailable: !signal?.aborted, retryWhenOnline: !signal?.aborted }
     let result = { success: false }
     while ((batch ||= next())) {
       signal?.throwIfAborted()
@@ -124,15 +129,15 @@ export function createSendRelayRouting ({ peer, peers = [peer], relaysByPubkey, 
         const report = await settled
         const failed = rejected(report)
         errors.push(...(report?.errors || []))
-        if (!failed.length || errors.some(item => !isReplaceableRelayFailure(item.reason))) return finish(result)
-        if (!next()) { exclusions.clear(); return finish(result) }
-        if (!await online()) return { ...finish(result), retryWhenAvailable: !signal?.aborted, retryWhenOnline: current() }
+        if (!failed.length || errors.some(item => !isReplaceableRelayFailure(item.reason))) return finished(result)
+        if (!next()) { exclusions.clear(); return finished(result) }
+        if (!await online()) return { ...finish(result), retryWhenAvailable: !signal?.aborted, retryWhenOnline: !signal?.aborted }
         remember(failed)
       }
-      if (!current()) return { ...finish(result), retryWhenAvailable: !signal?.aborted, retryWhenOnline: false }
+      if (!current()) return finished(result)
       batch = null
     }
-    return finish(result)
+    return finished(result)
   }
 
   return {
