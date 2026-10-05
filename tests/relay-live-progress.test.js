@@ -12,6 +12,7 @@ function fixture (t) {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: NOW * 1000 })
   const relays = new Map()
   const pool = new RelayPool({
+    _isOnline: async () => true,
     _createRelay: url => {
       const relay = {
         ws: { readyState: 1 }, subs: [],
@@ -245,7 +246,7 @@ test('failed recovery never certifies progress on that connection', async t => {
   live().close()
   await advance(1000)
   live().handlers.oneose()
-  history().close(new Error('recovery rejected'))
+  history().close(Object.assign(new Error('recovery rejected'), { category: 'transport' }))
   await advance(60000)
   assert.equal(progress(items).length, 0)
   assert.ok(items.some(item => item.error?.message === 'recovery rejected'))
@@ -262,7 +263,7 @@ test('a failed gap retains its baseline even after newer live deliveries', async
   const firstSince = history().filters[0].since
   live().handlers.oneose()
   live().handlers.onevent(event('during-recovery', NOW + 1))
-  history().close(new Error('recovery rejected'))
+  history().close(Object.assign(new Error('recovery rejected'), { category: 'transport' }))
   await tick()
   live().close()
   await advance(2000)

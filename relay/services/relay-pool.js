@@ -5,7 +5,8 @@ import { createPublishSettlements, firstFulfillment, publishSummary } from '../h
 import { ReadAdmission } from '../helpers/read-admission.js'
 import { drainableStream } from '../helpers/drainable-stream.js'
 import { maybeUnref } from '../helpers/timer.js'
-import { categorizeRelayError } from '../helpers/error.js'
+import { categorizeRelayError, relayTimeoutError } from '../helpers/error.js'
+import { ReadRetry, isRetryableReadFailure, needsConnectivityCheck, waitUntil } from '../helpers/read-retry.js'
 import { normalizeRelayUrl } from '../../url/index.js'
 import { RelayConnection } from './relay-connection.js'
 
@@ -76,11 +77,11 @@ function countResponseError () {
 }
 
 function countTimeoutError () {
-  return new Error('COUNT_TIMEOUT')
+  return relayTimeoutError('COUNT_TIMEOUT')
 }
 
 function getEventsTimeoutError () {
-  return new Error('GET_EVENTS_TIMEOUT')
+  return relayTimeoutError('GET_EVENTS_TIMEOUT')
 }
 
 function asError (error) {
@@ -138,11 +139,13 @@ export class RelayPool {
   #createRelay
   #WebSocket
   #admission
+  #readRetry
 
-  constructor ({ _createRelay, WebSocket: WebSocketImpl, ...capacity } = {}) {
+  constructor ({ _createRelay, _isOnline, _onOnline, WebSocket: WebSocketImpl, ...capacity } = {}) {
     this.#WebSocket = WebSocketImpl
     this.#createRelay = _createRelay ?? (url => new RelayConnection(url, this.#WebSocket ? { WebSocket: this.#WebSocket } : undefined))
     this.#admission = new ReadAdmission(capacity)
+    this.#readRetry = new ReadRetry({ checkOnline: _isOnline, watchOnline: _onOnline })
   }
 
   // Injects the WebSocket implementation used by new pooled connections (e.g.
@@ -600,6 +603,9 @@ export class RelayPool {
     const gapTasks = new Set()
     const liveSubs = new Map() // url → live sub
     const retryTimers = new Map()
+    const retryDelays = new Map()
+    const stoppedRelays = new Set()
+    const retainedRelays = new Set()
     const initialPending = new Set(urls)
     const initialOutcomes = new Map()
     const readyTimeouts = new Map()
@@ -708,7 +714,7 @@ export class RelayPool {
         clearTimeout(attempt.timer)
         attempt.stop.abort()
       }
-      for (const timer of retryTimers.values()) clearTimeout(timer)
+      for (const retry of retryTimers.values()) retry.abort()
       retryTimers.clear()
       liveSubs.forEach(sub => sub.close())
       liveSubs.clear()
@@ -768,14 +774,61 @@ export class RelayPool {
       }
     }
 
-    const scheduleReconnect = (url, reconnectDelay) => {
-      if (isDone || retryTimers.has(url)) return
-      const nextDelay = Math.min(reconnectDelay * 2, 5 * 60_000)
-      const timer = maybeUnref(setTimeout(() => {
-        retryTimers.delete(url)
-        subscribeToRelay(url, pendingGaps.get(url) ?? lastSeenAt.get(url) ?? openedAt.get(url) ?? null, nextDelay)
-      }, reconnectDelay))
-      retryTimers.set(url, timer)
+    const releaseRelay = url => {
+      if (retainedRelays.delete(url)) this.#decrementLiveSub(url)
+    }
+    const closeAttempt = (url, attempt) => {
+      if (!attempt || attempt.closed) return
+      attempt.closed = true
+      clearTimeout(attempt.timer)
+      attempt.stop.abort()
+      const sub = liveSubs.get(url)
+      liveSubs.delete(url)
+      sub?.close()
+      liveLeases.get(url)?.release()
+      liveLeases.delete(url)
+      readyRelays.delete(url)
+    }
+    const stopRelay = url => {
+      stoppedRelays.add(url)
+      retryTimers.get(url)?.abort()
+      retryTimers.delete(url)
+      closeAttempt(url, attempts.get(url))
+      releaseRelay(url)
+      if (stoppedRelays.size === urls.length) { finishReady(); teardown(true) }
+    }
+    const scheduleReconnect = (url, error) => {
+      if (isDone || stoppedRelays.has(url) || retryTimers.has(url)) return
+      if (!isRetryableReadFailure(error)) { stopRelay(url); return }
+      const retry = new AbortController()
+      const retrySignal = AbortSignal.any([gapAc.signal, retry.signal])
+      const failedAt = Date.now()
+      const delay = retryDelays.get(url) ?? 1000
+      const retryAt = Number.isFinite(error?.retryAt)
+        ? error.retryAt
+        : Number.isFinite(error?.retryAfterMs) && error.retryAfterMs > 0 ? failedAt + Math.min(error.retryAfterMs, 300000) : 0
+      retryTimers.set(url, retry)
+      ;(async () => {
+        const online = !needsConnectivityCheck(error) || await this.#readRetry.confirmOnline(retrySignal)
+        retrySignal.throwIfAborted()
+        const deadline = Math.max(failedAt + (online ? delay : 0), retryAt)
+        if (online) retryDelays.set(url, Math.min(delay * 2, 300000))
+        else await this.#readRetry.waitUntilOnline(retrySignal)
+        while (!retrySignal.aborted) {
+          await waitUntil(deadline, retrySignal)
+          if (needsConnectivityCheck(error) && !await this.#readRetry.confirmOnline(retrySignal)) {
+            await this.#readRetry.waitUntilOnline(retrySignal)
+            continue
+          }
+          retrySignal.throwIfAborted()
+          if (isDone || stoppedRelays.has(url) || retryTimers.get(url) !== retry) return
+          retryTimers.delete(url)
+          subscribeToRelay(url, pendingGaps.get(url) ?? lastSeenAt.get(url) ?? openedAt.get(url) ?? null)
+          return
+        }
+      })().catch(failure => {
+        if (!retrySignal.aborted && !isDone) { reportFailure(url, asError(failure)); stopRelay(url) }
+      })
     }
 
     // Schedule teardown when the wall clock reaches filter.until
@@ -799,26 +852,36 @@ export class RelayPool {
       })
       return (async () => {
         let completed = false
-        let failed = false
+        let error
         for await (const item of gapGen) {
           if (item?.type === 'event') {
             observeEvent(item.event, url)
             pushEvent(item.event, url, true)
           } else if (item?.type === 'error') {
-            failed = true
+            if (!error || !isRetryableReadFailure(item.error)) error = item.error
             if (!isDone) enqueue(item)
           } else if (item?.type === 'eose') {
             completed = item.relays?.length === 1 && ['eose', 'satisfied'].includes(item.relays[0].status)
+            if (!completed && !error) {
+              error = item.relays?.[0]?.error || categorizeRelayError(new Error('RELAY_RECONNECT_GAP_INCOMPLETE'), 'timeout')
+              if (!isDone) enqueue({ type: 'error', relay: url, error })
+            }
           }
         }
-        return completed && !failed
+        if (!completed && !error && !attempt.stop.signal.aborted && !isDone) {
+          error = new Error('RELAY_RECONNECT_GAP_INCOMPLETE')
+          reportFailure(url, error)
+        }
+        return { recovered: completed && !error, error }
       })().catch(err => {
-        reportFailure(url, asError(err))
-        return false
+        const error = asError(err)
+        if (!attempt.stop.signal.aborted) reportFailure(url, error)
+        return { recovered: false, error }
       }).finally(() => slots.history.release())
     }
 
-    const subscribeToRelay = (url, gapSince, reconnectDelay = 1000) => {
+    const subscribeToRelay = (url, gapSince) => {
+      if (isDone || stoppedRelays.has(url)) return
       let now = Math.floor(Date.now() / 1000)
       // Don't reconnect if we're past the until boundary
       if (filterUntil !== null && now >= filterUntil) return
@@ -829,10 +892,10 @@ export class RelayPool {
       attempts.set(url, attempt)
       let recoveryLease
       initialAdmissions.add(url)
-      Promise.resolve(reservation || this.#admission.acquire(normalizeRelayUrl(url), { live: true, history: recovering, signal: gapAc.signal, queueTimeout })).then(async slots => {
+      Promise.resolve(reservation || this.#admission.acquire(normalizeRelayUrl(url), { live: true, history: recovering, signal: AbortSignal.any([gapAc.signal, attempt.stop.signal]), queueTimeout })).then(async slots => {
         const lease = slots.live
         recoveryLease = recovering ? slots.history : null
-        if (isDone) { lease.release(); recoveryLease?.release(); return }
+        if (isDone || attempt.closed) { lease.release(); recoveryLease?.release(); return }
         liveLeases.set(url, lease)
         if (timeout !== null && initialPending.has(url)) {
           readyTimeouts.set(url, maybeUnref(setTimeout(() => {
@@ -844,7 +907,7 @@ export class RelayPool {
           }, timeout)))
         }
         const relay = await this.#getRelay(url)
-        if (isDone) { recoveryLease?.release(); return }
+        if (isDone || attempt.closed) { lease.release(); recoveryLease?.release(); return }
         now = Math.floor(Date.now() / 1000)
         if (filterUntil !== null && now >= filterUntil) { lease.release(); recoveryLease?.release(); return }
 
@@ -878,37 +941,39 @@ export class RelayPool {
           },
           onclose: error => {
             if (attempt.closed || attempts.get(url) !== attempt) return
-            attempt.closed = true
-            clearTimeout(attempt.timer)
-            attempt.stop.abort()
-            if (liveSubs.get(url) === liveSub) liveSubs.delete(url)
-            lease.release()
-            if (liveLeases.get(url) === lease) liveLeases.delete(url)
-            readyRelays.delete(url)
+            closeAttempt(url, attempt)
             if (isDone) return
-            if (error !== undefined) reportFailure(url, asError(error))
-            else {
-              const interruption = Object.assign(categorizeRelayError(new Error('RELAY_LIVE_INTERRUPTED'), 'transport'), { code: 'RELAY_LIVE_INTERRUPTED' })
-              enqueue({ type: 'error', relay: url, error: interruption })
-              reportClosed(url, interruption)
+            if (error !== undefined) { error = asError(error); reportFailure(url, error) } else {
+              error = Object.assign(categorizeRelayError(new Error('RELAY_LIVE_INTERRUPTED'), 'transport'), { code: 'RELAY_LIVE_INTERRUPTED' })
+              enqueue({ type: 'error', relay: url, error })
+              reportClosed(url, error)
             }
-            scheduleReconnect(url, reconnectDelay)
+            scheduleReconnect(url, error)
           },
           oneose: () => {
             if (isDone || attempt.closed || attempts.get(url) !== attempt || liveEose) return
             liveEose = true
             attempt.since = Math.max(sinceFloor, Math.floor(Date.now() / 1000))
             markInitialEose(url)
+            if (attempt.recovered) retryDelays.delete(url)
             scheduleProgress(attempt)
           }
         })
-        if (isDone) { liveSub.close(); recoveryLease?.release(); return }
+        if (isDone || attempt.closed) { liveSub.close(); lease.release(); recoveryLease?.release(); return }
         liveSubs.set(url, liveSub)
 
         if (recovering) {
-          const task = runReconnectGapFill(url, gapSince, now, slots, attempt).then(recovered => {
+          const task = runReconnectGapFill(url, gapSince, now, slots, attempt).then(({ recovered, error }) => {
             attempt.recovered = recovered
-            if (recovered && !attempt.closed && attempts.get(url) === attempt) pendingGaps.delete(url)
+            if (!attempt.closed && attempts.get(url) === attempt) {
+              if (recovered) {
+                pendingGaps.delete(url)
+                if (liveEose) retryDelays.delete(url)
+              } else if (error && !isDone) {
+                closeAttempt(url, attempt)
+                scheduleReconnect(url, error)
+              }
+            }
           }).finally(() => {
             const buf = liveBuffer
             liveBuffer = null
@@ -925,9 +990,10 @@ export class RelayPool {
         liveLeases.delete(url)
         readyRelays.delete(url)
         const reason = err instanceof Error ? err : new Error(String(err))
+        if (isDone || attempt.closed) return
+        closeAttempt(url, attempt)
         reportFailure(url, reason)
-        if (isDone) return
-        scheduleReconnect(url, reconnectDelay)
+        scheduleReconnect(url, reason)
       })
     }
 
@@ -946,6 +1012,7 @@ export class RelayPool {
 
     for (const url of urls) {
       this.#incrementLiveSub(url)
+      retainedRelays.add(url)
       subscribeToRelay(url, null) // no initial gap fill — that's getEventsFeedGenerator's job
     }
 
@@ -960,7 +1027,7 @@ export class RelayPool {
     } finally {
       signal?.removeEventListener('abort', abort)
       _stopSignal?.removeEventListener('abort', stop)
-      for (const url of urls) this.#decrementLiveSub(url)
+      for (const url of [...retainedRelays]) releaseRelay(url)
       teardown()
     }
   }

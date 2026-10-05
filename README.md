@@ -136,11 +136,38 @@ coverage of a disconnected interval. This is client-observed continuity, not a
 relay acknowledgement; delayed relay delivery or clock skew beyond the overlap
 can still leave gaps. A backward local clock cannot regress an emitted boundary.
 
-Every involuntary live close emits an error and still permits automatic recovery.
+Every involuntary live close emits an error. Recoverable failures permit automatic recovery.
 A close without an explicit cause uses `error.code === 'RELAY_LIVE_INTERRUPTED'`
 and `category === 'transport'`; a pre-EOSE close retains status `closed` in the
 initial report. Explicit causes are preserved. Caller cancellation, draining and
 expiry of `filter.until` do not manufacture interruption errors.
+
+### Failure-aware live recovery (0.11.15)
+
+Live readers retry connection/transport/timeouts and structured `rate-limited:`
+or `error:` refusals. Policy refusals (`blocked:`, `restricted:`, `auth-required:`,
+`pow:`), local authentication/validation failures and unknown errors stop that
+relay for this iterator. Other relays continue. When every route has stopped,
+the iterator finishes after draining accepted events and original diagnostics;
+its readiness snapshot never claims a failed route sent EOSE. A new explicit
+reader starts a new operation; refusals do not blacklist a relay across readers.
+
+Retry delays are 1, 2, 4... seconds, capped at five minutes without an attempt
+limit. The next attempt waits until max(backoff deadline, relay retryAt). A
+confirmed offline failure spends no backoff step: it waits for the existing
+shared `onOnline` monitor, without holding read-admission slots. Connectivity
+checks are bounded and shared per pool; structured relay responses need no new
+internet probe unless the browser indicates offline. Cancelled readers release
+their own waits without cancelling another reader's recovery.
+
+Successful live EOSE and any required reconnect history reset the delay.
+Transient reconnect-history failures retry while retaining their original gap
+baseline; definitive failures stop that route without certifying its gap.
+Accepted history and buffered live remain deliverable. Local queue-full,
+queue-timeout and disconnect admission failures retain local recovery; impossible
+capacity is terminal. Caller cancellation is silent. Native timeout messages stay
+unchanged and now consistently carry category `timeout`. Constructor hooks
+`_isOnline`/`_onOnline` are internal test injections, not an app bridge API.
 
 Process Nostr events only under `item.type === 'event'`. Handle controls you need
 and ignore unknown types; a new control is neither an event nor stream completion.
@@ -161,7 +188,7 @@ atomically before either REQ opens; completing history releases only its slot.
 One-shot queries and reconnect gap reads share this budget. Reconnection reserves
 live+history together when recovery is needed. Caller cancellation removes queued
 work; `disconnect(url)` also rejects queued work for that connection. Existing
-live streams retain their reconnect behavior until cancelled by their owner.
+live streams retain recovery for eligible failures until cancelled by their owner.
 
 All event reads accept `queueTimeout: 30000` (milliseconds, `null` disables).
 The network `timeout` starts **after admission for each relay**, including its

@@ -263,3 +263,19 @@ NIP-46 against the real pool with controlled transport and injected controls.
   reads retain normal caching. Never extend cooldown timestamps on report replay.
 - Public exclusions apply to both event passes and to seed discovery through
   relayListOptions. Missing events do not turn a native refusal into success.
+
+## Failure-aware live recovery
+
+- Live retries use the public same-relay predicate plus explicit local admission
+  recovery codes. Never retry validation, local authentication, policy refusals
+  or unknown failures. Stop only the affected reader/relay; drain accepted items
+  and finish naturally when all routes are terminal. Preserve readiness reports.
+- Share bounded connectivity checks and one online wait per pool through
+  `ReadRetry`. Cancellation is per consumer. Offline spends no backoff or read
+  slots; use max(backoff deadline, retryAt) and reset only after EOSE and gap
+  recovery succeed. Do not extend deadlines on online notifications.
+- A failed gap retains its original baseline. Transient gaps retry; definitive
+  gaps release the route while preserving accepted history/buffered live. No
+  progress may certify that disconnected interval. Keep overflow/drain contracts.
+- Timeouts retain native messages and category `timeout`. Internal connectivity
+  hooks belong to controlled tests; ordinary relay failures keep original errors.

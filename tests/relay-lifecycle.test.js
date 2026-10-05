@@ -10,6 +10,7 @@ const event = Object.freeze({ id: 'immutable', kind: 1, created_at: 1, tags: [],
 function fixture (t) {
   const relays = new Map()
   const pool = new RelayPool({
+    _isOnline: async () => true,
     _createRelay: url => {
       const relay = {
         ws: { readyState: 1 }, subs: [],

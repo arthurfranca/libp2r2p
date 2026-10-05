@@ -46,7 +46,7 @@ class FakeRelay {
       filters,
       handlers,
       isClosed: false,
-      close (reason = 'closed by caller') {
+      close (reason) {
         if (this.isClosed) return
         this.isClosed = true
         handlers.onclose?.(reason)
@@ -128,7 +128,7 @@ class FakeRelay {
 const { RelayPool, relayPool } = await import('../relay/index.js')
 
 function createRelayPool () {
-  return new RelayPool({ _createRelay: url => new FakeRelay(url) })
+  return new RelayPool({ _createRelay: url => new FakeRelay(url), _isOnline: async () => true })
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -2254,7 +2254,7 @@ describe('RelayPool read admission and snapshots', () => {
     autoEoseForLiveSubscriptions = true
   })
 
-  const configuredPool = options => new RelayPool({ _createRelay: url => new FakeRelay(url), ...options })
+  const configuredPool = options => new RelayPool({ _createRelay: url => new FakeRelay(url), _isOnline: async () => true, ...options })
   const active = relay => relay?.subscriptions.filter(sub => !sub.isClosed) ?? []
 
   it('coordinates 24 feeds on one normalized connection with at most two historical REQs', async () => {

@@ -2,7 +2,7 @@ import { ValidationError } from '../../error/index.js'
 import { maybeUnref } from './timer.js'
 
 export function admissionError (code, relay) {
-  return Object.assign(new Error(code), { code, relay, phase: 'admission' })
+  return Object.assign(new Error(code), { code, relay, phase: 'admission', ...(code === 'RELAY_READ_QUEUE_TIMEOUT' ? { category: 'timeout' } : {}) })
 }
 
 // One FIFO per pooled connection. A feed reserves both REQs atomically; its
