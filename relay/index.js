@@ -1,4 +1,5 @@
 export { freeRelays, nappRelays, seedRelays } from './constants/index.js'
+export { isRetryableRelayFailure, isReplaceableRelayFailure } from './helpers/failure.js'
 export { pickRelaysForPubkeys } from './helpers/routing.js'
 export { RelayPool, relayPool } from './services/relay-pool.js'
 export { getLatestEventsByPubkey } from './services/events.js'

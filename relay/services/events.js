@@ -45,7 +45,7 @@ function getSelectedRelaysByPubkey (pubkeys, relayToAuthors) {
 }
 
 // Fetches batched events and keeps the newest event per address.
-async function fetchLatestEventsByRelay (relayToAuthors, { kinds, dTagsByPubkey, getEvents }) {
+async function fetchLatestEventsByRelay (relayToAuthors, { kinds, dTagsByPubkey, getEvents, report, phase, signal }) {
   const requests = []
   for (const [relay, authors] of relayToAuthors) {
     const authorsByD = new Map()
@@ -57,8 +57,17 @@ async function fetchLatestEventsByRelay (relayToAuthors, { kinds, dTagsByPubkey,
     for (const [d, dAuthors] of authorsByD) {
       const filter = { kinds, authors: dAuthors }
       if (d) filter['#d'] = [d]
-      requests.push(getEvents(filter, [relay])
-        .then(response => ({ requested: new Set(dAuthors), events: (response.result || []).map(({ event }) => event) })))
+      requests.push(Promise.resolve().then(async () => {
+        signal?.throwIfAborted()
+        try {
+          const response = await getEvents(filter, [relay], signal ? { signal } : {})
+          report({ phase, authors: dAuthors, relays: response.relays || [], errors: response.errors || [] })
+          return { requested: new Set(dAuthors), events: (response.result || []).map(({ event }) => event) }
+        } catch (error) {
+          report({ phase, authors: dAuthors, relays: [{ relay, status: 'error', error }], error })
+          throw error
+        }
+      }))
     }
   }
 
@@ -95,11 +104,20 @@ export async function getLatestEventsByPubkey (pubkeys, {
   fallbackRelays = freeRelays.slice(0, DEFAULT_FALLBACK_RELAY_COUNT),
   relaysByPubkey,
   relayListOptions,
+  excludeRelaysByPubkey,
+  signal,
+  onQueryResult,
   _getRelaysByPubkey = getRelaysByPubkey,
   _getEvents = getEvents
 } = {}) {
+  signal?.throwIfAborted()
+  const requests = []
+  const report = request => { requests.push(request); onQueryResult?.(request) }
+  const excluded = pubkey => excludeRelaysByPubkey instanceof Map
+    ? excludeRelaysByPubkey.get(pubkey) || []
+    : excludeRelaysByPubkey?.[pubkey] || []
   const authors = [...new Set(pubkeys || [])].filter(Boolean)
-  if (!authors.length) return { events: [], byPubkey: {}, relaysByPubkey: {} }
+  if (!authors.length) return { events: [], byPubkey: {}, relaysByPubkey: {}, requests }
   if (!Array.isArray(kinds) || kinds.length === 0) {
     throw new ValidationError('MISSING_EVENT_KINDS', { message: 'Missing kinds' })
   }
@@ -110,9 +128,16 @@ export async function getLatestEventsByPubkey (pubkeys, {
   if (missingRelayAuthors.length) {
     let discovered
     try {
-      discovered = await _getRelaysByPubkey(missingRelayAuthors, relayListOptions)
+      discovered = await _getRelaysByPubkey(missingRelayAuthors, {
+        ...relayListOptions,
+        ...(signal ? { signal } : {}),
+        onQueryResult: request => { report({ ...request, phase: 'discovery' }); relayListOptions?.onQueryResult?.(request) }
+      })
     } catch (error) {
-      console.error('Failed to discover publisher relays:', error)
+      signal?.throwIfAborted()
+      if (!requests.some(request => request.phase === 'discovery' && request.error === error)) {
+        report({ phase: 'discovery', authors: missingRelayAuthors, relays: [], error })
+      }
       discovered = Object.fromEntries(missingRelayAuthors.map(pubkey => [pubkey, { read: [], write: [] }]))
     }
     for (const pubkey of missingRelayAuthors) {
@@ -120,14 +145,17 @@ export async function getLatestEventsByPubkey (pubkeys, {
     }
   }
 
+  signal?.throwIfAborted()
   const primaryAuthors = authors.filter(pubkey => relaysByAuthor[pubkey]?.[type]?.length)
-  const primaryRoutes = pickRelaysForPubkeys(primaryAuthors, relaysByAuthor, { maxPerPubkey, relayType })
+  const primaryRoutes = pickRelaysForPubkeys(primaryAuthors, relaysByAuthor, { maxPerPubkey, relayType, excludeRelaysByPubkey, emptyRelaysFallback: [] })
   const selectedRelays = getSelectedRelaysByPubkey(authors, primaryRoutes)
+  for (const pubkey of authors) for (const relay of excluded(pubkey)) selectedRelays[pubkey].add(relay)
   const latestByAddress = await fetchLatestEventsByRelay(primaryRoutes, {
     kinds,
     dTagsByPubkey,
-    getEvents: _getEvents
+    getEvents: _getEvents, report, phase: 'primary', signal
   })
+  signal?.throwIfAborted()
   const foundPubkeys = new Set(Object.values(latestByAddress).map(event => event.pubkey))
   const missingAuthors = authors.filter(pubkey => !foundPubkeys.has(pubkey))
 
@@ -145,13 +173,14 @@ export async function getLatestEventsByPubkey (pubkeys, {
       await fetchLatestEventsByRelay(fallbackRoutes, {
         kinds,
         dTagsByPubkey,
-        getEvents: _getEvents
+        getEvents: _getEvents, report, phase: 'fallback', signal
       })
     ))
   }
 
+  signal?.throwIfAborted()
   const events = Object.values(latestByAddress)
   const byPubkey = {}
   for (const event of events) byPubkey[event.pubkey] = event
-  return { events, byPubkey, relaysByPubkey: relaysByAuthor }
+  return { events, byPubkey, relaysByPubkey: relaysByAuthor, requests }
 }

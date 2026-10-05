@@ -1,19 +1,11 @@
 import { normalizeRelayUrl } from '../../url/index.js'
 import { ValidationError } from '../../error/index.js'
+import { isReplaceableRelayFailure } from '../../relay/helpers/failure.js'
 
-const REJECTION_PREFIXES = new Set(['blocked', 'restricted', 'auth-required', 'pow', 'rate-limited', 'error'])
-const TRANSPORT_CATEGORIES = new Set(['connection', 'transport', 'timeout'])
 const EXCLUSION_MS = 5 * 60 * 1000
 const normalized = relay => { try { return normalizeRelayUrl(relay) } catch { return '' } }
 
-// Only machine-readable relay policy/server failures qualify. Invalid events,
-// local signer denials and unknown prose must not rotate relays.
-export function isReplaceableRelayFailure (error) {
-  if (error?.name === 'Nip42AuthenticationError') return false
-  if (TRANSPORT_CATEGORIES.has(error?.category)) return true
-  if (error?.category && error.category !== 'relay') return false
-  return REJECTION_PREFIXES.has(/^([a-z-]+):/.exec(error?.message || '')?.[1])
-}
+export { isReplaceableRelayFailure }
 
 export function normalizeFallbackRelays (value = []) {
   if (!Array.isArray(value)) throw new ValidationError('INVALID_FALLBACK_RELAYS')

@@ -224,28 +224,27 @@ export function subscribeRelayListUpdates (pubkeys, {
 }
 
 async function loadMissingRelays (missingPubkeys, {
-  getEvents,
-  cacheMs,
-  timeout = RELAY_LIST_QUERY_TIMEOUT_MS,
-  timeoutAfterFirstEose = RELAY_LIST_QUERY_TIMEOUT_AFTER_FIRST_EOSE_MS,
-  relayUrlPolicy,
-  emptyRelaysFallback = freeRelays.slice(0, 2)
+  getEvents, cacheMs, timeout, timeoutAfterFirstEose, relayUrlPolicy,
+  emptyRelaysFallback, excludeRelays, signal
 }) {
-  const { result: events } = await getEvents({
-    kinds: [10002],
-    authors: missingPubkeys,
-    limit: missingPubkeys.length
-  }, seedRelays, {
-    timeout,
-    timeoutAfterFirstEose
-  })
-
+  let response
+  try {
+    response = await getEvents({ kinds: [10002], authors: missingPubkeys, limit: missingPubkeys.length },
+      seedRelays.filter(relay => !excludeRelays.includes(relay)), { timeout, timeoutAfterFirstEose, signal })
+    signal.throwIfAborted()
+  } catch (error) {
+    return { entries: {}, report: { authors: missingPubkeys, relays: [], error } }
+  }
+  const report = { authors: missingPubkeys, relays: response.relays || [], errors: response.errors || [] }
+  const complete = response.relays
+    ? response.relays.length > 0 && response.relays.every(item => item.status === 'eose')
+    : !response.errors?.length
   const latestByPubkey = {}
-  for (const { event } of events || []) {
+  for (const { event } of response.result || []) {
     if (!missingPubkeys.includes(event.pubkey)) continue
     if (isNewerRelayListEvent(event, latestByPubkey[event.pubkey])) latestByPubkey[event.pubkey] = event
   }
-
+  const entries = {}
   for (const pubkey of missingPubkeys) {
     const fetchedEvent = latestByPubkey[pubkey]
     const cachedEvent = relayCacheEventByPubkey[pubkey] || null
@@ -253,9 +252,29 @@ async function loadMissingRelays (missingPubkeys, {
     const relays = event
       ? parseRelayListEvent(event, relayUrlPolicy)
       : { read: [...emptyRelaysFallback], write: [...emptyRelaysFallback] }
-    setCachedRelays(pubkey, relays, event, cacheMs)
+    entries[pubkey] = { ...relays, event }
+    // A failed/incomplete lookup may use fallbacks for this call, but must not
+    // turn that failure into a forty-minute negative discovery cache entry.
+    if (fetchedEvent || complete) setCachedRelays(pubkey, relays, event, cacheMs)
   }
   pruneRelayCache()
+  return { entries, report }
+}
+
+// Each caller owns its wait, not another caller's shared discovery request.
+function waitForDiscovery (record, signal) {
+  signal?.throwIfAborted()
+  record.users++
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason)
+    signal?.addEventListener('abort', abort, { once: true })
+    record.promise.then(resolve, reject).finally(() => signal?.removeEventListener('abort', abort))
+  }).finally(() => {
+    if (--record.users === 0 && !record.finished) {
+      record.controller.abort()
+      record.remove()
+    }
+  })
 }
 
 export async function getRelaysByPubkey (pubkeys, {
@@ -266,40 +285,48 @@ export async function getRelaysByPubkey (pubkeys, {
   timeout = RELAY_LIST_QUERY_TIMEOUT_MS,
   timeoutAfterFirstEose = RELAY_LIST_QUERY_TIMEOUT_AFTER_FIRST_EOSE_MS,
   relayUrlPolicy,
-  emptyRelaysFallback = freeRelays.slice(0, 2)
+  emptyRelaysFallback = freeRelays.slice(0, 2),
+  excludeRelays = [],
+  signal,
+  onQueryResult
 } = {}) {
+  signal?.throwIfAborted()
   const pubkeyList = uniquePubkeys(pubkeys, { requireHex: _getEvents === getEvents })
   if (!pubkeyList.length) return {}
-
-  const loadPubkeys = forceRefresh
-    ? pubkeyList
-    : pubkeyList.filter(pubkey => !hasCachedKey(relaysByPubkey, pubkey))
-  const pubkeysToLoad = loadPubkeys.filter(pubkey => !relayRequestsByPubkey.has(pubkey))
+  // Different exclusions cannot share a request that contacts a refused relay.
+  const scope = JSON.stringify([...new Set(excludeRelays)].sort())
+  const key = pubkey => `${pubkey}:${scope}`
+  const loadPubkeys = forceRefresh ? pubkeyList : pubkeyList.filter(pubkey => !hasCachedKey(relaysByPubkey, pubkey))
+  const pubkeysToLoad = loadPubkeys.filter(pubkey => !relayRequestsByPubkey.has(key(pubkey)))
   if (pubkeysToLoad.length) {
-    const request = loadMissingRelays(pubkeysToLoad, {
-      getEvents: _getEvents,
-      cacheMs,
-      timeout,
-      timeoutAfterFirstEose,
-      relayUrlPolicy,
-      emptyRelaysFallback
-    }).finally(() => {
+    const record = { controller: new AbortController(), users: 0, finished: false }
+    record.remove = () => {
       for (const pubkey of pubkeysToLoad) {
-        if (relayRequestsByPubkey.get(pubkey) === request) relayRequestsByPubkey.delete(pubkey)
+        if (relayRequestsByPubkey.get(key(pubkey)) === record) relayRequestsByPubkey.delete(key(pubkey))
       }
-    })
-    for (const pubkey of pubkeysToLoad) relayRequestsByPubkey.set(pubkey, request)
+    }
+    record.promise = loadMissingRelays(pubkeysToLoad, {
+      getEvents: _getEvents, cacheMs, timeout, timeoutAfterFirstEose, relayUrlPolicy,
+      emptyRelaysFallback, excludeRelays, signal: record.controller.signal
+    }).finally(() => { record.finished = true; record.remove() })
+    for (const pubkey of pubkeysToLoad) relayRequestsByPubkey.set(key(pubkey), record)
   }
-
-  await Promise.all([...new Set(
-    loadPubkeys.map(pubkey => relayRequestsByPubkey.get(pubkey)).filter(Boolean)
-  )])
-
-  return Object.fromEntries(pubkeyList
-    .filter(pubkey => hasCachedKey(relaysByPubkey, pubkey))
-    .map(pubkey => {
-      const entry = cloneRelays(relaysByPubkey[pubkey])
-      if (includeEvents) entry.event = cloneRelayListEvent(relayCacheEventByPubkey[pubkey])
-      return [pubkey, entry]
-    }))
+  const entries = {}
+  const records = [...new Set(loadPubkeys.map(pubkey => relayRequestsByPubkey.get(key(pubkey))).filter(Boolean))]
+  await Promise.all(records.map(async record => {
+    const result = await waitForDiscovery(record, signal)
+    signal?.throwIfAborted()
+    // Deliver the same native diagnostics to every interested caller, including
+    // callers that joined an already running query.
+    onQueryResult?.(result.report)
+    if (result.report.error) throw result.report.error
+    Object.assign(entries, result.entries)
+  }))
+  signal?.throwIfAborted()
+  return Object.fromEntries(pubkeyList.map(pubkey => {
+    const source = hasCachedKey(relaysByPubkey, pubkey) ? relaysByPubkey[pubkey] : entries[pubkey]
+    const entry = cloneRelays(source || { read: emptyRelaysFallback, write: emptyRelaysFallback })
+    if (includeEvents) entry.event = cloneRelayListEvent(relayCacheEventByPubkey[pubkey] || entries[pubkey]?.event)
+    return [pubkey, entry]
+  }))
 }

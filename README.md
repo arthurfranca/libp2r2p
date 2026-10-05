@@ -877,8 +877,41 @@ the first pass routes through up to `maxPerPubkey` shared relays, and missing
 authors are retried on every remaining relay plus `fallbackRelays` (default:
 the first three `freeRelays`), excluding what was already queried. It accepts
 `relaysByPubkey` to reuse a previous discovery (only missing pubkeys are then
-discovered) and returns `{ events, byPubkey, relaysByPubkey }` so the merged
+discovered) and returns `{ events, byPubkey, relaysByPubkey, requests }` so the merged
 relay map can be passed back on later calls.
+
+
+Read diagnostics preserve native failures rather than treating an empty result
+as proof that every relay completed successfully. `requests` contains records
+`{ phase, authors, relays, errors?, error? }`: phase is `discovery`, `primary` or
+`fallback`; `relays` uses the pool's `{ relay, status, error? }` outcomes. An
+operation-wide exception is retained as `error`. Events remain in the existing
+result fields, never in diagnostic records. `onQueryResult(record)` receives each
+record as the underlying query settles, including before a later cancellation.
+
+Both discovery and latest-event queries accept `signal`. Cancelling one consumer
+of shared NIP-65 discovery releases only its interest; the underlying query is
+aborted when its last consumer leaves. Discovery's optional `onQueryResult`
+receives the same native report for every joining caller. Incomplete/failed
+lookups can use fallback relays for that call but never negatively cache a
+missing relay list for forty minutes. Actual lists and completely empty EOSE
+responses retain their normal cache behavior.
+
+`getLatestEventsByPubkey` accepts `excludeRelaysByPubkey` (object or Map) for both
+passes. `getRelaysByPubkey` accepts `excludeRelays` for seed discovery; pass it
+through `relayListOptions` when using the two-pass query. Different exclusion
+sets do not share in-flight discovery that could contact a refused relay.
+
+`isRetryableRelayFailure(error)` identifies connection/transport/timeouts and
+leading `rate-limited:`/`error:` relay failures. `isReplaceableRelayFailure(error)`
+also admits relay policy refusals (`blocked:`, `restricted:`, `auth-required:`,
+`pow:`) for routing to alternatives, preserving the messenger's existing policy.
+Local authentication denials, invalid events and unknown errors qualify for
+neither policy. Predicates classify individual native errors; callers decide
+how to handle mixed per-relay outcomes and application-specific aggregates.
+Existing rate-limit parsing preserves numeric positive `retry_after` seconds as
+`retryAfterMs` and absolute `retryAt`, bounded to five minutes. Schedulers must
+use the later of their backoff deadline and `retryAt`, not add the two delays.
 
 ## Binary encodings
 

@@ -246,3 +246,20 @@ NIP-46 against the real pool with controlled transport and injected controls.
   healthy subscriptions, fragment scope and cancellation. Readiness triggers paged
   gap recovery; live progress must never erase that interval. Keep bounded backoff,
   permanent-refusal handling and content-free buffer diagnostics.
+
+
+## Public relay read diagnostics
+
+- The relay export owns distinct retry/replacement predicates. Keep send routing
+  behavior unchanged when sharing their implementation: policy refusals can
+  select another relay without allowing repeated attempts on the same relay.
+- `getLatestEventsByPubkey` preserves per-query `requests` reports for discovery,
+  primary and fallback phases, plus immediate `onQueryResult` reports. Preserve
+  native errors, retryAt/retryAfterMs and partial events; no event payloads in
+  diagnostics. Cancellation must stop later routing passes.
+- Shared NIP-65 discovery retains per-consumer cancellation and reporting.
+  Exclusion sets scope shared requests. Failed/incomplete negative results must
+  not enter the forty-minute cache; valid relay lists and complete empty EOSE
+  reads retain normal caching. Never extend cooldown timestamps on report replay.
+- Public exclusions apply to both event passes and to seed discovery through
+  relayListOptions. Missing events do not turn a native refusal into success.

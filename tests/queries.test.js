@@ -106,7 +106,8 @@ test('getRelaysByPubkey fetches latest relay lists and falls back when absent', 
   const relays = await getRelaysByPubkey(['alice', 'bob'], {
     _getEvents: async (filter, relayUrls, options) => {
       calls.push({ filter, relayUrls })
-      assert.deepEqual(options, { timeout: 5000, timeoutAfterFirstEose: 500 })
+      assert.ok(options.signal instanceof AbortSignal)
+      assert.deepEqual({ ...options, signal: undefined }, { timeout: 5000, timeoutAfterFirstEose: 500, signal: undefined })
       return { result: ([relayListEvent('alice', 9, [['r', 'wss://alice.example', 'write']])]).map(event => ({ event, relay: 'wss://fixture.example' })) }
     }
   })
@@ -123,11 +124,11 @@ test('getRelaysByPubkey threads configurable relay-list query timing', async () 
     timeout: 2000,
     timeoutAfterFirstEose: 250,
     _getEvents: async (_filter, _relays, options) => {
-      calls.push(options)
+      calls.push({ ...options, signal: undefined })
       return { result: [] }
     }
   })
-  assert.deepEqual(calls, [{ timeout: 2000, timeoutAfterFirstEose: 250 }])
+  assert.deepEqual(calls, [{ timeout: 2000, timeoutAfterFirstEose: 250, signal: undefined }])
 })
 
 test('getRelaysByPubkey returns the latest relay-list event with includeEvents', async () => {
