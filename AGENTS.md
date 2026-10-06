@@ -232,7 +232,11 @@ NIP-46 against the real pool with controlled transport and injected controls.
   coverage and probes never consume tier budgets. Keep presence payloads and
   persisted ranges unchanged.
 
-- Honor optional numeric relay `retry_after` on rate-limited CLOSED/OK, bounded
+- Share `parseRelayRetryAdvice` through the public relay export. Accept only
+  temporal advice on leading rate-limited CLOSED/OK: finite positive `retry_at`
+  Unix seconds wins over `retry_after`, even after expiry. Never derive origin,
+  retry eligibility or routing from extra fields.
+- Honor optional absolute/relative relay timing on rate-limited CLOSED/OK, bounded
   to five minutes, without blocking CLOSE or sending cancelled work later.
   Preserve retryAfterMs/retryAt through subscription diagnostics. Existing
   operation deadlines remain authoritative; do not silently republish failures.

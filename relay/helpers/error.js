@@ -1,3 +1,5 @@
+import { parseRelayRetryAdvice } from './retry-advice.js'
+
 // Adds transport context without replacing native messages, codes or causes.
 export function categorizeRelayError (reason, category, fallback = 'RELAY_OPERATION_FAILED') {
   const error = reason instanceof Error ? reason : new Error(String(reason || fallback))
@@ -29,14 +31,10 @@ export function relayCloseError (event, category, cause) {
   return categorizeRelayError(error, category)
 }
 
-// retry_after is an optional relay extension, in seconds. Bound remote advice
-// to five minutes; invalid metadata must not stall unrelated operations.
+// Keep native diagnostics and attach only bounded timing advice. An absolute
+// deadline survives delayed delivery through a launcher-owned relay bridge.
 export function relayRejectionError (reason, extra, fallback) {
   const error = categorizeRelayError(reason, 'relay', fallback)
-  const seconds = extra?.retry_after
-  if (error.message.startsWith('rate-limited:') && typeof seconds === 'number' && Number.isFinite(seconds) && seconds > 0) {
-    error.retryAfterMs = Math.min(seconds, 300) * 1000
-    error.retryAt = Date.now() + error.retryAfterMs
-  }
+  Object.assign(error, parseRelayRetryAdvice(error.message, extra))
   return error
 }

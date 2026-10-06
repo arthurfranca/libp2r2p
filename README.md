@@ -936,9 +936,22 @@ also admits relay policy refusals (`blocked:`, `restricted:`, `auth-required:`,
 Local authentication denials, invalid events and unknown errors qualify for
 neither policy. Predicates classify individual native errors; callers decide
 how to handle mixed per-relay outcomes and application-specific aggregates.
-Existing rate-limit parsing preserves numeric positive `retry_after` seconds as
-`retryAfterMs` and absolute `retryAt`, bounded to five minutes. Schedulers must
-use the later of their backoff deadline and `retryAt`, not add the two delays.
+`parseRelayRetryAdvice(reason, extra, { now = Date.now() })`, exported by
+`libp2r2p/relay`, returns `{ retryAt, retryAfterMs? }` or `null`. It only interprets
+leading `rate-limited:` refusals. Optional `retry_at` is a Unix timestamp in
+seconds (fractions allowed), converted to milliseconds. Finite positive absolute
+advice takes precedence over `retry_after`, including when already expired;
+expired advice does not restart a relative wait. Future waits are capped at five
+minutes from processing. Missing/invalid absolute advice falls back to finite
+positive relative seconds, capped at 300. A valid relative value is retained as
+`retryAfterMs` even when the absolute deadline wins. Schedulers wait until
+max(local backoff deadline, retryAt), never sum the two or renew the deadline on
+online notifications.
+
+The optional Nostr extension works with older relays that only send
+`retry_after` and older consumers that ignore `retry_at`. Neither field supplies
+provenance or retry eligibility: `local`, `origin`, `retryable`, category and code
+claims in extras are ignored. Native messages, causes and codes remain intact.
 
 ## Binary encodings
 
@@ -1059,7 +1072,7 @@ user-facing send error.
 
 ### Relay backpressure and bounded synchronization (0.11.7)
 
-Optional numeric `retry_after` seconds on relay `CLOSED` and rejected `OK`
+Optional `retry_at` Unix seconds or numeric `retry_after` seconds on relay `CLOSED` and rejected `OK`
 responses are preserved as `retryAfterMs` and `retryAt` on native relay errors.
 Only `rate-limited:` responses apply this advice; invalid values are ignored
 and delays are capped at five minutes. New operations on that connection wait

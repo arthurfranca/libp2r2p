@@ -169,3 +169,26 @@ test('pool operation timeout cancels a publication waiting for relay cooldown', 
   await tick()
   assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 1)
 })
+
+test('delayed CLOSED uses retry_at and expired OK advice never restarts its relative wait', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 14000 })
+  const { relay, socket } = await connected()
+  t.after(() => relay.close())
+  let rejection
+  const first = relay.subscribe([{}], { onclose: error => { rejection = error } })
+  socket.receive(['CLOSED', first.id, 'rate-limited: busy', { retry_after: 10, retry_at: 20 }])
+  await tick()
+  assert.equal(rejection.retryAt, 20000)
+  const next = relay.subscribe([{}])
+  t.mock.timers.tick(5999)
+  assert.ok(!socket.sent.some(frame => frame[1] === next.id))
+  t.mock.timers.tick(1)
+  assert.equal(socket.sent.at(-1)[1], next.id)
+  t.mock.timers.tick(5000)
+  const published = signedEvent()
+  const result = assert.rejects(relay.publish(published), error => error.retryAt === 20000 && error.retryAfterMs === 10000)
+  socket.receive(['OK', published.id, false, 'rate-limited: busy', { retry_after: 10, retry_at: 20 }])
+  await result
+  const immediate = relay.subscribe([{}])
+  assert.equal(socket.sent.at(-1)[1], immediate.id)
+})
