@@ -745,6 +745,8 @@ test('private messenger pauses live watches offline, restarts them before durabl
   try {
     messenger = await new PrivateMessenger({
       _privateMessage: pm,
+      _isOnline: async () => true,
+      _onOnline: () => () => {},
       _privateChannel: {
         fetchHistory: async () => {
           order.push('recover')

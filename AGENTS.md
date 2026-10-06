@@ -283,3 +283,22 @@ NIP-46 against the real pool with controlled transport and injected controls.
   progress may certify that disconnected interval. Keep overflow/drain contracts.
 - Timeouts retain native messages and category `timeout`. Internal connectivity
   hooks belong to controlled tests; ordinary relay failures keep original errors.
+
+## Pause recovery and publication readiness
+
+- `readStatus()`/`onStateChanged` expose copied `{ closed, paused, pauseReasons }`
+  snapshots initially and on transitions; paused errors retain reason snapshots.
+- Custom session `Messenger` factories must implement `readStatus()` and emit
+  `options.onStateChanged` initially before resolving and on effective changes.
+  Reject missing/malformed state, close rejected instances and fence callbacks.
+  There is no polling compatibility for unobserved pauses; retain bounded retries
+  for other transient availability failures without an active pause.
+- Sessions park paused remote sends and wake on release independently of presence
+  and historical completion. Keep personal saves/self-chat independent.
+- Internally observed network/storage pauses own cancellable recovery jobs with
+  1..30s exponential backoff and 20% jitter. Offline waits share onOnline and spend
+  no step. Retryable watch setup failures recover their channel, not every writer.
+- Explicit external pauses do not gain automatic recovery by name. Session inbox
+  saves use `session-storage`, retry the actual reservation, and release after ACK.
+  Account loss/close stop jobs and stale continuations. Unchanged channels, peers
+  and availability must not recreate healthy watches.

@@ -1126,3 +1126,10 @@ are unchanged; newer live arrivals cannot erase a pending interval.
 count/bytes, incoming bytes, limits and oldest queued age. Queue bytes are UTF-8
 serialized volume, not heap use. Diagnostics never retain event contents or
 filters. Existing 1,000-item / 8-MiB live limits are unchanged.
+
+Private messenger status (`readStatus`, `onStateChanged`) exposes pause reasons
+without events or credentials. Sessions recover owned network/storage failures
+and wake pending sends on release rather than repeatedly publishing while paused.
+Custom session factories must expose `readStatus()` and deliver the initial and
+subsequent `onStateChanged` snapshots; missing observation is rejected instead of
+using polling compatibility. See [session lifecycle](private-messenger/session/README.md).

@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createSessionMessenger } from './helpers/session-messenger.js'
 import { getEventHash } from '../event/index.js'
 import { createPrivateMessageSession } from '../private-messenger/session/index.js'
 
@@ -13,16 +14,16 @@ const until = async predicate => {
 async function fixture (t, { publish, fallbackRelays, save = async () => ({ result: { ok: true } }), ...sessionOptions } = {}) {
   const errors = []; const sendErrors = []; const records = new Map(); const onlineListeners = new Set(); const priorities = []
   const store = () => ({ list: async () => [], put: async entry => records.set(entry.id, structuredClone(entry)), remove: async id => records.delete(id), close () {} })
-  let messengerOptions
+  let messengerOptions; let messenger
   const session = createPrivateMessageSession({
     owner, fallbackRelays, signer: { withSharedKey: () => ({ getPublicKey: async () => peer }) },
     messageStorage: { save }, openOutbox: store, openDownloads: store,
     Messenger: async options => {
       messengerOptions = options
-      return {
-        update () {}, resume () {}, pause () {}, close () {}, nextMessage: async () => null, broadcastRumor: publish,
+      return (messenger = createSessionMessenger(options, {
+        broadcastRumor: publish,
         prioritizeRange: async (channelPubkey, request) => { priorities.push({ channelPubkey, request }); return true }
-      }
+      }))
     },
     FileTransfer: () => ({ observe () {} }),
     _onOnline: listener => { onlineListeners.add(listener); return () => onlineListeners.delete(listener) },
@@ -31,7 +32,7 @@ async function fixture (t, { publish, fallbackRelays, save = async () => ({ resu
   })
   t.after(() => session.close())
   await session.setPeers([peer]); await session.setAvailable(true)
-  return { session, messengerOptions: () => messengerOptions, errors, sendErrors, records, onlineListeners, priorities, reconnect: () => Promise.all([...onlineListeners].map(listener => listener())) }
+  return { session, messenger: () => messenger, messengerOptions: () => messengerOptions, errors, sendErrors, records, onlineListeners, priorities, reconnect: () => Promise.all([...onlineListeners].map(listener => listener())) }
 }
 
 test('session enables content-key lookup by default and forwards it to the messenger', async t => {
@@ -96,8 +97,7 @@ test('session queues prioritized ranges until the channel exists', async t => {
     recoveryStorage: null,
     signer: { withSharedKey: () => ({ getPublicKey: async () => peer }) },
     messageStorage: { save: async () => ({ result: { ok: true } }) },
-    Messenger: async () => ({
-      update: async () => {}, resume: async () => {}, pause: async () => {}, close: async () => {}, nextMessage: async () => null,
+    Messenger: async options => createSessionMessenger(options, {
       prioritizeRange: async (channelPubkey, request) => { priorities.push({ channelPubkey, request }); return true }
     }),
     FileTransfer: () => ({ observe () {} }),
@@ -203,28 +203,25 @@ test('offline fallback stays pending without send-error feedback until availabil
   assert.equal(f.sendErrors.length, 0)
 })
 
-test('a paused messenger keeps the send pending and retries it on a bounded backoff', async t => {
+test('a paused messenger parks the send and wakes on state release without a retry timer', async t => {
   const timers = []
-  let paused = true
+  let publications = 0
   const f = await fixture(t, {
     _setTimeout: (fn, delay) => { const timer = { fn, delay, cancelled: false }; timers.push(timer); return timer },
     _clearTimeout: timer => { timer.cancelled = true },
-    _random: () => 0.5,
-    publish: async () => {
-      if (paused) throw new Error('PRIVATE_MESSENGER_PAUSED')
-      return { delivery: { reports: [{ success: true }] } }
-    }
+    publish: async () => { publications++; return { delivery: { reports: [{ success: true }] } } }
   })
+  await f.messenger().pause('network')
   const id = await f.session.enqueue({ peer, event })
   await until(() => f.records.get(id)?.status === 'pending' && f.records.get(id)?.failed === true)
-  assert.equal(f.sendErrors.length, 0, 'a paused messenger is not a user-facing send failure')
-  assert.equal(timers.filter(timer => !timer.cancelled).length, 1)
-  assert.equal(timers[0].delay, 1000)
-  paused = false
-  await timers[0].fn()
-  await until(() => !f.records.has(id))
   assert.equal(f.sendErrors.length, 0)
-  assert.equal(timers.filter(timer => !timer.cancelled).length, 1, 'a successful retry clears the backoff')
+  assert.equal(publications, 0)
+  assert.equal(timers.length, 0)
+  await f.messenger().resume('network')
+  await until(() => !f.records.has(id))
+  assert.equal(publications, 1)
+  assert.equal(f.sendErrors.length, 0)
+  assert.equal(timers.length, 0)
 })
 
 test('a transient outage owns a fresh online listener and resumes without an account-state change', async t => {
@@ -266,4 +263,126 @@ test('session forwards normalized fallback relays and rejects invalid public con
   const f = await fixture(t, { fallbackRelays: ['wss://FALLBACK.example/', 'wss://fallback.example'] })
   assert.deepEqual(f.messengerOptions().fallbackRelays, ['wss://fallback.example'])
   assert.throws(() => createPrivateMessageSession({ fallbackRelays: 'wss://fallback.example' }), { code: 'INVALID_FALLBACK_RELAYS' })
+})
+
+test('transient availability failures without a pause still use bounded send retries', async t => {
+  const timers = []
+  let available = false
+  const f = await fixture(t, {
+    _setTimeout: (fn, delay) => { const timer = { fn, delay }; timers.push(timer); return timer },
+    _clearTimeout: timer => { timer.cancelled = true },
+    _random: () => 0.5,
+    publish: async () => {
+      if (!available) throw new Error('CHAT_UNAVAILABLE')
+      return { delivery: { reports: [{ success: true }] } }
+    }
+  })
+  const id = await f.session.enqueue({ peer, event })
+  await until(() => f.records.get(id)?.failed)
+  assert.equal(f.messenger().readStatus().paused, false)
+  assert.equal(timers[0].delay, 1000)
+  available = true
+  await timers[0].fn()
+  await until(() => !f.records.has(id))
+  assert.equal(f.sendErrors.length, 0)
+})
+
+test('a pause overtaking a pending availability retry parks it until state release', async t => {
+  const timers = []
+  let publications = 0; let available = false
+  const f = await fixture(t, {
+    _setTimeout: (fn, delay) => { const timer = { fn, delay }; timers.push(timer); return timer },
+    _clearTimeout: timer => { timer.cancelled = true },
+    publish: async () => {
+      publications++
+      if (!available) throw new Error('CHAT_UNAVAILABLE')
+      return { delivery: { reports: [{ success: true }] } }
+    }
+  })
+  const id = await f.session.enqueue({ peer, event })
+  await until(() => f.records.get(id)?.failed)
+  await f.messenger().pause('network')
+  assert.equal(timers[0].cancelled, true)
+  await timers[0].fn()
+  assert.equal(publications, 1, 'even a stale timer cannot repeat a known pause')
+  available = true
+  await f.messenger().resume('network')
+  await until(() => !f.records.has(id))
+  assert.equal(publications, 2)
+})
+
+test('a pause raised during publication uses current state even without error reason metadata', async t => {
+  let publications = 0
+  const timers = []
+  const f = await fixture(t, {
+    _setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.at(-1) },
+    publish: async () => {
+      if (++publications === 1) {
+        await f.messenger().pause('storage')
+        throw new Error('PRIVATE_MESSENGER_PAUSED')
+      }
+      return { delivery: { reports: [{ success: true }] } }
+    }
+  })
+  const id = await f.session.enqueue({ peer, event })
+  await until(() => f.records.get(id)?.failed)
+  assert.equal(timers.length, 0)
+  await f.messenger().resume('storage')
+  await until(() => !f.records.has(id))
+  assert.equal(publications, 2)
+})
+
+test('session rejects factories missing state observation and closes rejected candidates', async t => {
+  for (const missing of ['reader', 'notification', 'snapshot']) {
+    let closes = 0
+    const session = createPrivateMessageSession({
+      owner, signer: { getPublicKey: async () => owner }, messageStorage: {},
+      openOutbox: async () => ({ list: async () => [], close () {} }),
+      Messenger: async options => {
+        const status = { closed: false, paused: false, pauseReasons: [] }
+        if (missing !== 'notification') options.onStateChanged(status)
+        return {
+          ...(missing !== 'reader' ? { readStatus: () => missing === 'snapshot' ? { paused: false } : status } : {}),
+          close: async () => { closes++; options.onStateChanged({ closed: true, paused: false, pauseReasons: [] }) }
+        }
+      }, onError: () => {}
+    })
+    t.after(() => session.close())
+    await assert.rejects(session.setAvailable(true), { name: 'ValidationError', code: missing === 'snapshot' ? 'INVALID_MESSENGER_STATUS' : 'MESSENGER_STATE_CONTRACT_REQUIRED' })
+    assert.equal(closes, 1)
+  }
+})
+
+test('callbacks from a rejected factory cannot unpause a replacement messenger', async t => {
+  let staleCallback; let current; let attempts = 0; let publications = 0
+  const records = new Map()
+  const session = createPrivateMessageSession({
+    owner, useContentKeys: false, signer: { withSharedKey: () => ({ getPublicKey: async () => peer }) },
+    messageStorage: { save: async () => ({ result: { ok: true } }) },
+    openOutbox: async () => ({ list: async () => [], put: async entry => records.set(entry.id, structuredClone(entry)), remove: async id => records.delete(id), close () {} }),
+    openDownloads: async () => ({ list: async () => [], close () {} }), FileTransfer: () => ({ observe () {} }),
+    Messenger: async options => {
+      if (++attempts === 1) {
+        staleCallback = options.onStateChanged
+        staleCallback({ closed: false, paused: false, pauseReasons: [] })
+        return { close () {} }
+      }
+      current = createSessionMessenger(options, { broadcastRumor: async () => { publications++; return { delivery: { reports: [{ success: true }] } } } })
+      await current.pause('vault')
+      return current
+    }, onError: () => {}
+  })
+  t.after(() => session.close())
+  await session.setPeers([peer])
+  await assert.rejects(session.setAvailable(true), { code: 'MESSENGER_STATE_CONTRACT_REQUIRED' })
+  await session.setAvailable(true)
+  const id = await session.enqueue({ peer, event })
+  await until(() => records.get(id)?.failed)
+  staleCallback({ closed: false, paused: false, pauseReasons: [] })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(publications, 0)
+  assert.equal(records.get(id).status, 'pending')
+  await current.resume('vault')
+  await until(() => !records.has(id))
+  assert.equal(publications, 1)
 })

@@ -40,13 +40,41 @@ or cancelled/closed sends. Apps own route visibility and user-intent filtering;
 automatic retries may also fail. Callbacks must not throw. Errors are not copied
 into persisted outbox records.
 
-Sends that only failed because the messenger was paused or otherwise
-unavailable (`PRIVATE_MESSENGER_PAUSED`, `CHAT_UNAVAILABLE`) stay pending
-without `onSendError`. The session re-pumps them on a bounded backoff
-(1–30 seconds with 20% jitter) in addition to availability/connectivity
-changes, so a paused messenger recovers without a manual retry. The backoff
-resets on a user `retry`, on `setAvailable(true)`, and once no retryable entry
-remains.
+Sends that only failed because the messenger was paused stay pending without
+`onSendError`. `PrivateMessenger.readStatus()` and optional `onStateChanged`
+provide isolated `{ closed, paused, pauseReasons }` snapshots, initially and on
+actual transitions. Paused errors retain their `pauseReasons` and native cause.
+The session parks remote sends and wakes them immediately on release; local
+personal copies and self-chat remain writable.
+
+A custom `Messenger(options)` factory must provide synchronous `readStatus()`
+and honor `options.onStateChanged`: deliver an initial snapshot before the factory
+resolves and notify each effective state change. Snapshots contain boolean
+`closed`/`paused` and a `pauseReasons` string array; `paused` reflects whether that
+array is nonempty. The session copies snapshots and rejects missing observation
+with `MESSENGER_STATE_CONTRACT_REQUIRED`, or malformed state with
+`INVALID_MESSENGER_STATUS` (`ValidationError`). Rejected instances are closed and
+obsolete callbacks are ignored. Wrappers can forward the complete options to
+`createPrivateMessenger(options)` unchanged.
+
+Observed pauses never fall back to polling sends. Other transient availability
+failures without an active pause retain bounded 1..30s send retries; a pause
+superseding such a retry parks it until the state notification releases it.
+
+Network pauses observed internally use shared `isOnline`/`onOnline` monitoring,
+including recovery when no second native online event arrives. Offline waiting
+spends no backoff. Retryable watch failures recover by channel without globally
+pausing publication. Background historical recovery does not gate text sends.
+Internal storage pauses repair pending state writes before release; explicit
+external pauses remain owned by their caller. Operational recovery retries use
+1, 2, 4... seconds, capped at 30 seconds with 20% jitter; permanent relay and
+local validation/auth/permission failures await explicit recovery.
+
+A failed session inbox save uses the separate `session-storage` reason. The
+session retries the actual reserved record and releases only after save and ACK.
+No message eviction or false historical coverage is introduced. Account
+unavailability stops its recovery timers; availability or explicit retry can
+reevaluate a local failure without clearing another owner's storage pause.
 
 `enqueue({ peer, event, context, requiredFiles, deletion })` preserves prepared
 identities. Local message commits and remote stages have independent checkpoints.
