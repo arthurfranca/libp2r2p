@@ -1,6 +1,6 @@
 // A bounded FIFO for asynchronous work. Acquired leases release explicitly;
 // queued cancellations never consume capacity or keep idle keyed gates alive.
-export function createAbortableSemaphore (capacity, onIdle = () => {}) {
+export function createAbortableSemaphore (capacity, onIdle = () => {}, { maxQueued = 256 } = {}) {
   const queue = []
   let active = 0
   const drain = () => {
@@ -21,7 +21,7 @@ export function createAbortableSemaphore (capacity, onIdle = () => {}) {
   return {
     acquire (signal) {
       signal?.throwIfAborted()
-      if (queue.length >= 256) return Promise.reject(Object.assign(new Error('PRIVATE_CHANNEL_HISTORY_QUEUE_FULL'), { code: 'PRIVATE_CHANNEL_HISTORY_QUEUE_FULL' }))
+      if (queue.length >= maxQueued) return Promise.reject(Object.assign(new Error('PRIVATE_CHANNEL_HISTORY_QUEUE_FULL'), { code: 'PRIVATE_CHANNEL_HISTORY_QUEUE_FULL' }))
       return new Promise((resolve, reject) => {
         const job = {
           signal, resolve, abort: () => {

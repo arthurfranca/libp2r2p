@@ -535,7 +535,8 @@ new channels are watched unless paused. Applications may explicitly watch again.
 
 Pauses, unwatch and close record the start of the gap, even for channels that
 have never received a message. Rewatch/resume uses live delivery plus historical
-recovery with overlap. A failed resume remains retryable under its pause reason.
+recovery with overlap. Remote recovery failures never restore the caller's pause
+reason: signer availability belongs exclusively to the account owner.
 Before opening a watch, the messenger persists a pending recovery interval.
 A first watch scans the configured recovery window (seven days by default),
 including messages sent before this identity first opened the channel. Successful
@@ -546,6 +547,24 @@ This also covers abrupt termination without `close()` and channels with no
 messages. Applications still supply signers and desired channels on reopening;
 storage is scoped by origin and user pubkey, not the transient session ID.
 Failed ingestion or incomplete relay fetch reports never complete the gap.
+
+`init()` and `createPrivateMessenger()` resolve after local preparation. Likewise,
+`update(options, { waitForBackground = false })` and
+`resume(reason, { waitForBackground = false })` wait for valid local channel
+configuration and mandatory durable writes, allowing sends independently of
+subscriptions, presence and history. Set `waitForBackground: true` to also await
+the initial background tasks associated with that call, not every future retry.
+Both modes share tasks; unchanged configuration does not recreate subscriptions.
+Later errors reach `onError` with the original error as `cause` and
+`operation: 'private-messenger.background'` plus a `phase`. Cancelled or obsolete
+tasks cannot deliver into a new channel generation. Mandatory persistence still
+owns its storage pause; incomplete history remains a pending recovery interval.
+Subscription setup is bounded separately from presence, so a slow announcement
+does not hold the other channels' readers. Sessions prioritize user persistence
+and publication before the next background presence signer call. Signing an outer
+envelope can overlap recovery-seed persistence, but no envelope is yielded for
+publication unless both succeed; only one outer is prepared at a time.
+
 `private-channel.fetch` reports incomplete reads as an `AggregateError` with
 stable `code: 'PRIVATE_CHANNEL_FETCH_INCOMPLETE'`. Its message names relays,
 completion statuses and native failure messages, including status-only failures.

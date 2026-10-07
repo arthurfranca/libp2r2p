@@ -1686,6 +1686,28 @@ test('wrapEvent chunks large jsonl without oversize events and unwraps reassembl
   assert.equal(routers.length, Number(routers[0].tags.find(t => t[0] === 'c')[2]))
 })
 
+test('outer signing overlaps seed persistence but never yields before durable success', async () => {
+  for (const failure of [null, new Error('seed storage unavailable')]) {
+    const alice = signer(); const bob = signer()
+    const seed = Promise.withResolvers(); const signed = Promise.withResolvers()
+    const channel = new Proxy(alice, {
+      get (target, key) {
+        if (key === 'signEvent') return async event => { const result = await target.signEvent(event); signed.resolve(); return result }
+        const value = Reflect.get(target, key, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      }
+    })
+    const stream = wrapEvents({ senderSigner: alice, privateChannelSigner: channel, receivers: [await bob.getPublicKey()], event: eventFixture(), _getIykcProofs: noContentKeys, onPreparedSeed: () => seed.promise })
+    let settled = false
+    const next = stream.next().finally(() => { settled = true }); next.catch(() => {})
+    await signed.promise
+    assert.equal(settled, false, 'a signed outer is not publishable until its seeds are persisted')
+    if (failure) { seed.reject(failure); await assert.rejects(next, error => error === failure) } else { seed.resolve(); assert.equal((await next).done, false) }
+    await stream.return()
+    assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+  }
+})
+
 test('wrapEvents cleans temporary chunks when the stream is stopped early', async () => {
   const alice = signer()
   const bob = signer()

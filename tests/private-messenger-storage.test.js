@@ -349,6 +349,7 @@ test('private messenger close stops network immediately and awaits watcher teard
     }
   })
   let closed = false
+  await messenger.update({}, { waitForBackground: true })
   const closing = messenger.close().then(() => { closed = true })
 
   assert.equal(stopped, true)

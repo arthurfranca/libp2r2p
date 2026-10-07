@@ -37,6 +37,22 @@ class PrivateMessenger extends RealPrivateMessenger {
     })
     instances.add(this)
   }
+
+  // These recovery fixtures inspect live callbacks immediately. Explicitly
+  // opt into remote readiness; default local readiness has its own regressions.
+  async init (options) {
+    await super.init(options)
+    await super.update({}, { waitForBackground: true })
+    return this
+  }
+
+  update (options, settings = { waitForBackground: true }) {
+    return super.update(options, this.initialized ? settings : { waitForBackground: false })
+  }
+
+  resume (reason, settings = { waitForBackground: true }) {
+    return super.resume(reason, settings)
+  }
 }
 
 const data = new Map()
@@ -1161,10 +1177,8 @@ test('private messenger refreshes NIP-65-derived watch relays from relay-list up
   assert.equal(relayUpdates.subscriptions.length, 1)
   assert.deepEqual(relayUpdates.subscriptions[0].pubkeys, ['user'])
   assert.equal(relayUpdates.subscriptions[0].options.relayType, 'read')
-  assert.deepEqual(pm.watchCalls[0].channels, ['derived'])
-  assert.deepEqual(pm.watchCalls[0].relays, ['wss://user.old-one.example', 'wss://user.old-two.example', 'wss://fallback.example'])
-  assert.deepEqual(pm.watchCalls[1].channels, ['explicit'])
-  assert.deepEqual(pm.watchCalls[1].relays, ['wss://explicit.example', 'wss://fallback.example', 'wss://user.old-two.example'])
+  assert.deepEqual(pm.watchCalls.find(call => call.channels[0] === 'derived').relays, ['wss://user.old-one.example', 'wss://user.old-two.example', 'wss://fallback.example'])
+  assert.deepEqual(pm.watchCalls.find(call => call.channels[0] === 'explicit').relays, ['wss://explicit.example', 'wss://fallback.example', 'wss://user.old-two.example'])
 
   userReadRelays = ['wss://user.old-two.example', 'wss://user.new.example']
   await relayUpdates.subscriptions[0].emit({ pubkey: 'user' })
@@ -2376,7 +2390,7 @@ test('failed recovery ingestion retains its range and does not advance lastSeenA
   } finally { await messenger.close() }
 })
 
-test('failed resume remains paused and can be retried', async () => {
+test('failed background resume does not restore an external pause and its owner can retry', async () => {
   const pm = fakePrivateMessage()
   const messenger = await new PrivateMessenger({ _privateMessage: pm, _privateChannel: { fetchHistory: async () => [] } }).init({ userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] })
   try {
@@ -2384,8 +2398,9 @@ test('failed resume remains paused and can be retried', async () => {
     const watch = pm.watch
     pm.watch = async () => { throw new Error('SIGNER_LOCKED') }
     await assert.rejects(messenger.resume('vault'), /SIGNER_LOCKED/)
-    assert.equal(messenger.pauseReasons.has('vault'), true)
+    assert.equal(messenger.pauseReasons.has('vault'), false)
     pm.watch = watch
+    await messenger.pause('vault')
     await messenger.resume('vault')
     assert.equal(messenger.pauseReasons.size, 0)
     assert.equal(messenger.stopByChannel.size, 1)
@@ -2786,7 +2801,10 @@ test('priority hedge starts the next relay after the delay and aborts the loser'
   assert.equal(aborted, true)
 })
 
-test('priority seeder fallback requires recent presence', async () => {
+test('priority seeder fallback requires recent presence', async t => {
+  // Drive the priority lane explicitly; the independent reload-gap timer must
+  // not race this count when the full suite takes longer than its one-second delay.
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 2_000_000_000_000 })
   const channel = '11'.repeat(32)
   const seeder = '22'.repeat(32)
   const now = Math.floor(Date.now() / 1000)
@@ -2814,7 +2832,8 @@ test('priority seeder fallback requires recent presence', async () => {
     const pm = fakePrivateMessage()
     const messenger = await new PrivateMessenger({
       _privateMessage: pm,
-      _privateChannel: { fetchHistory: failingFetch }
+      _privateChannel: { fetchHistory: failingFetch },
+      _isOnline: async () => true
     }).init({
       userSigner: signer('user'),
       channels: [{ pubkey: channel, signer: signer('channel'), relays: ['wss://relay.example'], seeders: [seeder] }]
@@ -2822,10 +2841,12 @@ test('priority seeder fallback requires recent presence', async () => {
     const range = messenger.readState().channels[channel].offlineRanges[0]
     await messenger.prioritizeRange(channel, { since: range.end - 100, ttlMs: 60000 })
     await messenger.runPriorityLane(channel, messenger.channels.get(channel), [range])
-    return {
+    const result = {
       asks: pm.sent.filter(entry => entry.method === 'ask'),
       record: [...messenger.recoveryRanges.values()].find(entry => entry.channelPubkey === channel)
     }
+    await messenger.close()
+    return result
   }
 
   assert.equal((await run(now - 3600)).asks.length, 0)

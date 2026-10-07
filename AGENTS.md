@@ -304,6 +304,30 @@ NIP-46 against the real pool with controlled transport and injected controls.
   Account loss/close stop jobs and stale continuations. Unchanged channels, peers
   and availability must not recreate healthy watches.
 
+## Local messaging readiness
+
+- Init/update/resume default to local readiness, including mandatory storage.
+  `update(options, { waitForBackground: true })` and the analogous resume option
+  await the initial shared background tasks, not an unbounded recovery loop.
+  Supervise remote tasks per channel; retain original errors under cause and
+  operation/phase diagnostics. Remote failures never restore an account pause.
+  Bound subscription/presence setup independently of historical read admission;
+  queued work belongs to configured channels and remains cancellable. Account-
+  scoped signer adapters cache successful immutable identities, not permissions.
+  Presence gets one setup slot independently of subscriptions, and yields before
+  its next signer RPC during session foreground persistence/publication. Cancelling
+  a waiting presence must release its admission and foreground observer.
+  Seed persistence may overlap one outer's encryption/signing, but both must
+  succeed before yield/publication. Settle both before cleaning prepared rows.
+- Sessions separate account generations from peer revisions and create one
+  messenger. Prepare at most four peers, at most three without foreground demand;
+  `preparePeer` prioritizes navigation/send/download. Deduplicate signer work,
+  register channels incrementally and never prune still-preparing stored channels
+  as part of incremental updates. Retention remains owned by maintenance.
+- Only actual account unavailability creates `signer`. Late local writes/resumes
+  cannot release a newer pause. Unrelated preparation must not block local saves
+  or ready conversations; removal/close cancels tasks and fences late signer results.
+
 ## Optional early send fallback
 
 - `fallbackDelayMs: null` preserves sequential fallback. Only automatic NIP-65

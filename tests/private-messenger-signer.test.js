@@ -6,6 +6,18 @@ import { createMessengerSigner } from '../private-messenger/session/index.js'
 
 const hex = char => char.repeat(64)
 
+test('session signer identity is shared after success but a failed lookup can be reevaluated', async () => {
+  let calls = 0
+  const failure = new Error('locked')
+  const adapter = createMessengerSigner({ getPublicKey: async () => { if (++calls === 1) throw failure; return hex('a') } })
+  const first = adapter.getPublicKey()
+  assert.equal(adapter.getPublicKey(), first)
+  await assert.rejects(first, error => error === failure)
+  assert.deepEqual(await Promise.all([adapter.getPublicKey(), adapter.getPublicKey()]), [hex('a'), hex('a')])
+  assert.equal(await adapter.getPublicKey(), hex('a'))
+  assert.equal(calls, 2)
+})
+
 function signerWith ({ encryptDoubleDH = false, decryptDoubleDH = false } = {}) {
   const calls = []
   const nip44v3 = {

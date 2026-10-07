@@ -47,6 +47,8 @@ async function fixture (t, { save = async () => ({ result: { ok: true } }) } = {
   })
   t.after(() => session.close())
   await session.setPeers([peer]); await session.setAvailable(true)
+  await session.preparePeer(peer)
+  await messenger.update({}, { waitForBackground: true })
   let createdAt = 2
   const send = (to = peer) => session.enqueue({ peer: to, event: { pubkey: owner, kind: 9, tags: [], content: 'outgoing', created_at: createdAt++ } })
   return {
@@ -89,6 +91,7 @@ test('session-storage retries the actual reservation and keeps independent pause
   await until(() => f.records.get(id)?.failed)
   await f.messenger.pause('vault')
   failing = false
+  await until(() => f.time.timers.size > 0)
   await f.time.tick(1000)
   assert.equal(saves, 2)
   assert.deepEqual(f.messenger.readStatus().pauseReasons, ['vault'])

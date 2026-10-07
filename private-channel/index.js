@@ -158,7 +158,8 @@ async function * wrapPreparedEvents ({ privateChannelSigner, receivers, receiver
   const routerReceiverTag = receiverTag ?? (receiverPubkeyList.length === 1 ? receiverPubkeyList[0] : '')
   const rowIndexes = preparedRowIndexesForReceivers(context.preparedRows, receivers)
   const total = preparedChunkCount(context.preparedRows, rowIndexes)
-  if (onPreparedSeed) {
+  const persistSeeds = async () => {
+    if (!onPreparedSeed) return
     const router = makeRouterEvent({ pubkey: routerPubkey, senderPubkey: context.senderPubkey, imkcPubkey: context.imkcPubkey, imkcProof: context.imkcProof, receiverPubkey: routerReceiverTag, chunkIndex: 0, chunkTotal: 1, fileChunkIndex, content: '' })
     const payloadRow = readPreparedRow(context.preparedRows, 0)
     for (const rowIndex of rowIndexes) {
@@ -179,12 +180,18 @@ async function * wrapPreparedEvents ({ privateChannelSigner, receivers, receiver
       content
     }), routerSeckey)
     const createdAt = nowSeconds()
-    const outer = await privateChannelSigner.signEvent({
+    const prepareOuter = async () => privateChannelSigner.signEvent({
       kind: PRIVATE_BROADCAST_KIND,
       created_at: createdAt,
       tags: privateBroadcastTags({ deletionPubkey, createdAt, expirationSeconds }),
       content: await nip44v3EncryptText(privateChannelSigner, context.channelReaderPubkey, PRIVATE_BROADCAST_KIND, JSON.stringify(router))
     })
+    // These independent steps may run together, but no envelope is yielded
+    // until every seed is durable. Settle both before releasing prepared rows.
+    const [persistence, prepared] = await Promise.allSettled([index === 1 ? persistSeeds() : undefined, prepareOuter()])
+    if (persistence.status === 'rejected') throw persistence.reason
+    if (prepared.status === 'rejected') throw prepared.reason
+    const outer = prepared.value
     if (eventByteLength(outer) > MAX_EVENT_BYTES) throw new ValidationError('EVENT_TOO_LARGE')
     yield outer
   }

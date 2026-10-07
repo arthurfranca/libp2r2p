@@ -15,10 +15,35 @@ back to sender-content whenever a proof is missing or the lookup fails. Misses
 are cached for 5 minutes (found proofs for 40), so a later prefetch picks up a
 key published after an earlier miss. Set it to `false` when the signer owns that discovery. The DM context is `dm`; file contexts are `dm:media:<root>`.
 `createMessengerSigner` adapts this byte signer to the transport's Base64 API.
+Each adapter belongs to an immutable account/channel identity: it shares the
+first successful public-key lookup and retries failed lookups only on a new call.
+Create a new adapter when changing identity. Signing/encryption still uses the
+real signer and its current permissions on every operation.
 
-Methods: `setPeers`, `setAvailable(boolean)`, `prefetchContentKeys(peers?)`,
+Methods: `setPeers`, `setAvailable(boolean)`, `preparePeer(peer)`, `prefetchContentKeys(peers?)`,
 `prioritizeRange(peer, options)`, `enqueue`, `retry`, `cancel`, `download`,
 `cancelDownload`, and `close`.
+
+The session creates one messenger for the account, independently of contact
+revisions. `setPeers` and `setAvailable` reconcile local configuration without
+awaiting all contacts or remote recovery. Channel preparation is incremental and
+deduplicated: at most four preparations run, with at most three in the background.
+`preparePeer(peer)` promotes an existing contact and resolves when its channel is
+locally writable. Call it when opening a conversation; enqueue, retry and remote
+download also request preparation automatically. An unprepared conversation does
+not block local saves or sends to a ready contact. Resolved identities are reused.
+The session also defers the next optional presence signer call while user outbox
+writes/publications are active. Existing signer calls, subscriptions and historical
+coverage remain intact; releasing foreground work resumes the waiting presence.
+Successful sends remove the final outbox record directly instead of encrypting a
+redundant final checkpoint; intermediate context/file checkpoints remain durable.
+
+Known transient preparation failures retry with bounded offline-aware backoff;
+unknown, permission and validation failures remain isolated to that contact until
+explicit preparation/retry or a real availability transition. Removing a contact,
+locking or closing discards obsolete signer results and cancels its queued work.
+Contact changes never invent a `signer` pause; only `setAvailable` controls that
+reason. Storage, capacity, network and explicit pauses keep their own owners.
 `prefetchContentKeys` warms the content-key lookup cache for the owner and the
 given peers (default: current peers); it is best-effort and never rejects.
 `prioritizeRange` registers an in-memory priority window for a conversation:
