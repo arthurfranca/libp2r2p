@@ -48,7 +48,7 @@ import * as privateMessage from '../private-message/index.js'
 import { isOnline, onOnline } from '../network/index.js'
 import { isRetryableRelayFailure, isReplaceableRelayFailure } from '../relay/index.js'
 import { createPauseRecovery, isRecoverableStorageFailure } from './helpers/pause-recovery.js'
-import { createSendRelayRouting, normalizeFallbackRelays } from './helpers/send-routing.js'
+import { createSendRelayRouting, normalizeFallbackRelays, normalizeFallbackDelay } from './helpers/send-routing.js'
 import { incompleteFetchError } from '../private-channel/helpers/fetch-error.js'
 import { recoveryRetryDelay, isPermanentRecoveryError } from './helpers/recovery-retry.js'
 import { normalizeRelayUrl } from '../url/index.js'
@@ -212,6 +212,7 @@ export class PrivateMessenger {
 
   constructor ({
     fallbackRelays = [],
+    fallbackDelayMs = null,
     offlineRecoverySeconds = DEFAULT_OFFLINE_RECOVERY_SECONDS,
     staleChannelSeconds = DEFAULT_STALE_CHANNEL_SECONDS,
     identityStorageRetentionSeconds = DEFAULT_IDENTITY_STORAGE_RETENTION_SECONDS,
@@ -254,6 +255,7 @@ export class PrivateMessenger {
   } = {}) {
     if (onStateChanged != null && typeof onStateChanged !== 'function') throw new ValidationError('INVALID_ON_STATE_CHANGED')
     this.fallbackRelays = normalizeFallbackRelays(fallbackRelays)
+    this.fallbackDelayMs = normalizeFallbackDelay(fallbackDelayMs)
     this.offlineRecoverySeconds = normalizeOfflineRecoverySeconds(offlineRecoverySeconds)
     this.staleChannelSeconds = normalizeStaleChannelSeconds(staleChannelSeconds)
     this.identityStorageRetentionSeconds = normalizeIdentityStorageRetentionSeconds(identityStorageRetentionSeconds)
@@ -304,6 +306,7 @@ export class PrivateMessenger {
     this._isOnline = _isOnline
     this.sendRelayExclusions = new Map()
     this.sendRoutingLifetime = new AbortController()
+    this.sendRoutingPause = new AbortController()
     this._setTimeout = _setTimeout
     this._clearTimeout = _clearTimeout
     this._setInterval = _setInterval
@@ -841,6 +844,8 @@ export class PrivateMessenger {
       peers: fixed && !recipients.length ? [this.userPubkey] : recipients, relaysByPubkey, recoveryRelays, primaryRelays: fixed?.map(normalizeRelayUrl), primaryRelayToReceivers: relayToReceivers, fallbackRelays: this.fallbackRelays,
       signal: signal ? AbortSignal.any([this.sendRoutingLifetime.signal, signal]) : this.sendRoutingLifetime.signal,
       exclusions: this.sendRelayExclusions.get(key).exclusions,
+      fallbackDelayMs: this.fallbackDelayMs, pauseSignal: this.sendRoutingPause.signal,
+      setTimer: this._setTimeout, clearTimer: this._clearTimeout,
       pickRelays: this._pickRelaysForPubkeys,
       publish: this._privateChannel.publish || privateChannel.publish,
       publishNymEvent: this._privateChannel.publishNymEvent || privateChannel.publishNymEvent,
@@ -1780,6 +1785,7 @@ export class PrivateMessenger {
     if (typeof reason !== 'string' || !reason.trim()) throw new ValidationError('PAUSE_REASON_REQUIRED')
     this.assertOpen()
     this.pauseReasons.add(reason)
+    this.sendRoutingPause.abort(this.pausedError())
     this.notifyStatus()
     for (const extension of this.extensions) extension.pause?.()
     this.recordInterruption(this.desiredChannels)
@@ -1797,6 +1803,7 @@ export class PrivateMessenger {
     const wasAutomatic = this.automaticPauses.has(reason)
     const removed = this.pauseReasons.delete(reason)
     this.automaticPauses.delete(reason)
+    if (!this.pauseReasons.size && this.sendRoutingPause.signal.aborted) this.sendRoutingPause = new AbortController()
     this.notifyStatus()
     if (reason === 'capacity' && removed) {
       clearInterval(this.capacityTimer)

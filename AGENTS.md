@@ -178,7 +178,7 @@ NIP-46 against the real pool with controlled transport and injected controls.
 
 - Automatic NIP-65 sends retry a finite candidate snapshot in pairs per recipient,
   preserving the exact signed outer event. Configured `fallbackRelays`
-  follow primary exhaustion and also support explicit per-call `relays`, channel
+  follow primary exhaustion by default and also support explicit per-call `relays`, channel
   `sendRelays` and channel/global `relays`, preserving explicit initial fanout and
   receiver sets. Automatic multi-recipient routing and explicit `relayToReceivers`
   maps use the same fallback policy. Maps keep precedence over fixed lists and
@@ -187,7 +187,8 @@ NIP-46 against the real pool with controlled transport and injected controls.
   injected sender. Retry each encrypted subset unchanged; never recreate wrappers
   or widen their recipients. Split replacement batches by the members they serve
   and require coverage of every member, even when some batches have ACKs. Exhaust
-  remaining primary routes before configured fallbacks. Preserve first-ACK latency
+  remaining primary routes before configured fallbacks unless automatic routing
+  opts into fallbackDelayMs. Preserve first-ACK latency
   within each batch and native errors in partially successful final reports.
 - `fallbackRelays` defaults to `[]` on the messenger/session constructors. Validate,
   normalize, deduplicate and snapshot URLs. Receive routing unions fallbacks with
@@ -302,3 +303,18 @@ NIP-46 against the real pool with controlled transport and injected controls.
   saves use `session-storage`, retry the actual reservation, and release after ACK.
   Account loss/close stop jobs and stale continuations. Unchanged channels, peers
   and availability must not recreate healthy watches.
+
+## Optional early send fallback
+
+- `fallbackDelayMs: null` preserves sequential fallback. Only automatic NIP-65
+  routing opts into a single absolute deadline per signed outer event; explicit
+  routes/maps keep their fanout/policy. At most two fallback relays per subset
+  start after confirmation of connectivity, or immediately on primary exhaustion.
+- Concurrent lanes share coverage/tried sets and stop new work on first complete
+  acceptance, cancellation or pause. Preserve original bytes/IDs/deletion keys,
+  native reports, 30s deadlines, rate advice and recipient-subset coverage. Waiting
+  three seconds is not failure; only actual eligible failures inform preferences.
+- Send signals settle unfinished reports with their original reason, never a
+  timeout, and release per-consumer waiters. Same-ID publishers share one wire
+  operation; cancelling one must preserve others. Deferred cooldown sends are
+  removed on last cancellation. Physical sockets and bridge APIs are unchanged.

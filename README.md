@@ -1056,7 +1056,7 @@ in pairs per recipient when
 selected relays reject publication or become unreachable while connectivity is
 confirmed. The exact encrypted outer events are reused. Optional `fallbackRelays` on
 `createPrivateMessenger` and `createPrivateMessageSession` are tried after the
-primary destinations, including explicit per-call `relays`, channel `sendRelays`
+primary destinations by default, including explicit per-call `relays`, channel `sendRelays`
 and channel/global `relays`, as well as explicit `relayToReceivers` maps.
 Retries preserve each encrypted recipient subset; success requires accepted
 publication covering every recipient in that subset. Receive routing adds them from the start for live
@@ -1133,3 +1133,10 @@ and wake pending sends on release rather than repeatedly publishing while paused
 Custom session factories must expose `readStatus()` and deliver the initial and
 subsequent `onStateChanged` snapshots; missing observation is rejected instead of
 using polling compatibility. See [session lifecycle](private-messenger/session/README.md).
+
+Private messenger/session constructors accept optional `fallbackDelayMs` (`null`
+by default). Automatic NIP-65 sends can start configured fallback relays after
+the chosen delay while primary publications retain their deadlines. Explicit
+routes keep sequential fallback; every encrypted recipient must be covered.
+`RelayPool.sendEvent` accepts a consumer `signal` without closing shared sockets.
+See [fallback and cancellation](private-messenger/session/README.md#relay-fallback).

@@ -186,23 +186,33 @@ export class RelayConnection {
   }
 
   #sendEventOperation (type, event, map, timeoutCode, signal) {
-    if (signal?.aborted) return Promise.reject(signal.reason || relayTimeoutError(timeoutCode))
-    if (map.has(event.id)) return map.get(event.id).promise
+    if (signal?.aborted) return Promise.reject(signal.reason)
+    let pending = map.get(event.id)
+    const created = !pending
+    if (created) {
+      const timer = maybeUnref(setTimeout(() => this.#settleEvent(map, event.id, relayTimeoutError(timeoutCode, this.#lastTransportError)), this.publishTimeout))
+      pending = { timer, waiters: new Set(), cancelSend: null }
+      map.set(event.id, pending)
+    }
     const deferred = Promise.withResolvers()
-    const timer = maybeUnref(setTimeout(() => this.#settleEvent(map, event.id, relayTimeoutError(timeoutCode, this.#lastTransportError)), this.publishTimeout))
-    const onAbort = () => this.#settleEvent(map, event.id, signal.reason || relayTimeoutError(timeoutCode))
-    const stopAbort = () => signal?.removeEventListener('abort', onAbort)
-    const pending = { ...deferred, timer, promise: deferred.promise, cancelSend: null, stopAbort }
-    map.set(event.id, pending)
+    const onAbort = () => {
+      pending.waiters.delete(waiter)
+      signal.removeEventListener('abort', onAbort)
+      deferred.reject(signal.reason)
+      if (!pending.waiters.size && map.get(event.id) === pending) {
+        map.delete(event.id)
+        pending.cancelSend?.()
+        clearTimeout(pending.timer)
+      }
+    }
+    const waiter = { ...deferred, stopAbort: () => signal?.removeEventListener('abort', onAbort) }
+    pending.waiters.add(waiter)
     signal?.addEventListener('abort', onAbort, { once: true })
-    pending.cancelSend = this.#dispatchWork(() => {
-      // Once transmitted, keep the existing ACK/report semantics. Before that,
-      // an operation-wide deadline must cancel the deferred publication.
-      stopAbort()
-      this.send(JSON.stringify([type, event]))
-    }, error => {
-      this.#settleEvent(map, event.id, error)
-    })
+    if (created) {
+      pending.cancelSend = this.#dispatchWork(() => {
+        this.send(JSON.stringify([type, event]))
+      }, error => this.#settleEvent(map, event.id, error))
+    }
     return deferred.promise
   }
 
@@ -225,10 +235,13 @@ export class RelayConnection {
     if (!pending) return
     map.delete(id)
     pending.cancelSend?.()
-    pending.stopAbort?.()
     clearTimeout(pending.timer)
-    if (reason) pending.reject(errorFrom(reason, 'OPERATION_REJECTED'))
-    else pending.resolve(value)
+    for (const waiter of pending.waiters) {
+      waiter.stopAbort()
+      if (reason) waiter.reject(errorFrom(reason, 'OPERATION_REJECTED'))
+      else waiter.resolve(value)
+    }
+    pending.waiters.clear()
   }
 
   #settleCount (id, payload, reason) {

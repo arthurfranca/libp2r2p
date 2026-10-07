@@ -10,7 +10,7 @@ import { decodeFileMetadata } from '../../nip94/index.js'
 import { createChatOutbox } from './helpers/work-storage.js'
 import { messengerSigner } from './helpers/signer.js'
 import { assertMessagePublished } from '../helpers/publication.js'
-import { normalizeFallbackRelays } from '../helpers/send-routing.js'
+import { normalizeFallbackRelays, normalizeFallbackDelay } from '../helpers/send-routing.js'
 import { createPauseRecovery, isRecoverableStorageFailure } from '../helpers/pause-recovery.js'
 
 export function wireEvent (value, owner) {
@@ -41,8 +41,9 @@ function messengerStatusSnapshot (value) {
   return { closed: value.closed, paused: value.paused, pauseReasons: [...value.pauseReasons] }
 }
 
-export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], useContentKeys = true, onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, _getIykcProofs = getIykcProofs, _setTimeout = setTimeout, _clearTimeout = clearTimeout, _random = Math.random, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
+export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], fallbackDelayMs = null, mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], useContentKeys = true, onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, _getIykcProofs = getIykcProofs, _setTimeout = setTimeout, _clearTimeout = clearTimeout, _random = Math.random, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
   fallbackRelays = normalizeFallbackRelays(fallbackRelays)
+  fallbackDelayMs = normalizeFallbackDelay(fallbackDelayMs)
   const reportedErrors = new WeakSet()
   const reportError = error => {
     if (error && (typeof error === 'object' || typeof error === 'function')) {
@@ -131,7 +132,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     let candidate
     try {
       candidate = await Messenger({
-        fallbackRelays, seedStorage: recoveryStorage?.seeds, userSigner, channels: [], useContentKeys,
+        fallbackRelays, fallbackDelayMs, seedStorage: recoveryStorage?.seeds, userSigner, channels: [], useContentKeys,
         onMessageQueued: () => { if (messengerBinding === binding) return drain() },
         onStateChanged: state => {
           if (closed || messengerBinding !== binding) return

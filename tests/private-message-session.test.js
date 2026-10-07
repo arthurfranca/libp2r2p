@@ -386,3 +386,10 @@ test('callbacks from a rejected factory cannot unpause a replacement messenger',
   await until(() => !records.has(id))
   assert.equal(publications, 1)
 })
+
+test('session forwards fallback delay without changing the default policy', async t => {
+  const unchanged = await fixture(t)
+  assert.equal(unchanged.messengerOptions().fallbackDelayMs, null)
+  const early = await fixture(t, { fallbackDelayMs: 3000 })
+  assert.equal(early.messengerOptions().fallbackDelayMs, 3000)
+})

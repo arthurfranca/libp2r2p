@@ -192,3 +192,102 @@ test('delayed CLOSED uses retry_at and expired OK advice never restarts its rela
   const immediate = relay.subscribe([{}])
   assert.equal(socket.sent.at(-1)[1], immediate.id)
 })
+
+test('cancelling one publication subscriber preserves another subscriber for the same event', async () => {
+  const { relay, socket } = await connected()
+  const event = signedEvent()
+  const cancelled = new AbortController(); const other = new AbortController()
+  const reason = new DOMException('cancelled', 'AbortError')
+  const first = assert.rejects(relay.publish(event, { signal: cancelled.signal }), error => error === reason)
+  const second = relay.publish(event, { signal: other.signal })
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 1)
+  cancelled.abort(reason)
+  await first
+  assert.equal(socket.readyState, 1)
+  socket.receive(['OK', event.id, true, 'saved'])
+  assert.equal(await second, 'saved')
+  await relay.close()
+})
+
+test('pool abort settles reports with the original cancellation without closing a shared socket', async t => {
+  const pool = new RelayPool({ WebSocket: FakeWebSocket })
+  t.after(() => pool.disconnectAll())
+  const cancelled = new AbortController()
+  const event = signedEvent()
+  const a = pool.sendEvent(event, ['wss://cancel.example'], { signal: cancelled.signal, timeout: null })
+  const socket = FakeWebSocket.instances.at(-1)
+  socket.open(); await tick()
+  const b = pool.sendEvent(event, ['wss://cancel.example'], { timeout: null })
+  await tick()
+  const reason = new DOMException('cancelled', 'AbortError')
+  cancelled.abort(reason)
+  const result = await a
+  assert.equal(result.success, false)
+  assert.equal((await result.promise).errors[0].reason, reason)
+  assert.equal(socket.readyState, 1)
+  socket.receive(['OK', event.id, true, 'saved'])
+  assert.equal((await b).success, true)
+})
+
+test('a pre-aborted publication never creates a socket or reports a timeout', async () => {
+  const pool = new RelayPool({ WebSocket: FakeWebSocket })
+  const before = FakeWebSocket.instances.length
+  const controller = new AbortController(); const reason = new Error('cancelled')
+  controller.abort(reason)
+  const result = await pool.sendEvent(signedEvent(), ['wss://preabort.example'], { signal: controller.signal })
+  assert.equal(FakeWebSocket.instances.length, before)
+  assert.equal(result.success, false)
+  assert.equal((await result.promise).errors[0].reason, reason)
+  await pool.disconnectAll()
+})
+
+test('publication rejects malformed cancellation signals before opening connections', async () => {
+  const pool = new RelayPool({ WebSocket: FakeWebSocket })
+  const before = FakeWebSocket.instances.length
+  await assert.rejects(pool.sendEvent(signedEvent(), ['wss://invalid-signal.example'], { signal: {} }), { code: 'INVALID_RELAY_SIGNAL' })
+  assert.equal(FakeWebSocket.instances.length, before)
+})
+
+test('pool cancellation preserves partial ACKs and original abort reasons', async t => {
+  const pool = new RelayPool({ WebSocket: FakeWebSocket })
+  t.after(() => pool.disconnectAll())
+  const controller = new AbortController()
+  const event = signedEvent()
+  const work = pool.sendEvent(event, ['wss://partial-a.example', 'wss://partial-b.example'], { signal: controller.signal })
+  const sockets = FakeWebSocket.instances.slice(-2)
+  for (const socket of sockets) socket.open()
+  await tick()
+  sockets[0].receive(['OK', event.id, true, 'saved'])
+  const accepted = await work
+  assert.equal(accepted.success, true)
+  const reason = new Error('cancel remaining publication')
+  controller.abort(reason)
+  const report = await accepted.promise
+  assert.equal(report.success, true)
+  assert.equal(report.fulfilled, 1)
+  assert.deepEqual(report.succeededRelays, ['wss://partial-a.example'])
+  assert.equal(report.errors[0].reason, reason)
+  assert.ok(sockets.every(socket => socket.readyState === 1))
+})
+
+test('last publication cancellation removes an EVENT deferred by absolute cooldown', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  const { relay, socket } = await connected()
+  t.after(() => relay.close())
+  const subscription = relay.subscribe([{}])
+  const limited = signedEvent()
+  const refused = assert.rejects(relay.publish(limited), error => error.retryAt === 20000)
+  socket.receive(['OK', limited.id, false, 'rate-limited: busy', { retry_at: 20 }])
+  await refused
+  const controller = new AbortController()
+  const deferred = signedEvent()
+  const reason = new Error('cancel deferred publication')
+  const cancelled = assert.rejects(relay.publish(deferred, { signal: controller.signal }), error => error === reason)
+  subscription.close()
+  assert.equal(socket.sent.at(-1)[0], 'CLOSE')
+  controller.abort(reason)
+  await cancelled
+  t.mock.timers.tick(10000)
+  assert.ok(!socket.sent.some(frame => frame[0] === 'EVENT' && frame[1].id === deferred.id))
+  assert.equal(socket.readyState, 1)
+})

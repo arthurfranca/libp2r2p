@@ -1,5 +1,6 @@
 import { normalizeRelayUrl } from '../../url/index.js'
 import { ValidationError } from '../../error/index.js'
+import { publishWithEarlyFallback } from './fallback-race.js'
 import { isReplaceableRelayFailure } from '../../relay/helpers/failure.js'
 
 const EXCLUSION_MS = 5 * 60 * 1000
@@ -10,6 +11,11 @@ export { isReplaceableRelayFailure }
 export function normalizeFallbackRelays (value = []) {
   if (!Array.isArray(value)) throw new ValidationError('INVALID_FALLBACK_RELAYS')
   return [...new Set(Array.from(value, normalizeRelayUrl))]
+}
+
+export function normalizeFallbackDelay (value = null) {
+  if (value !== null && (!Number.isSafeInteger(value) || value < 0 || value > 2147483647)) throw new ValidationError('INVALID_FALLBACK_DELAY')
+  return value
 }
 
 function routeEntries (routes) {
@@ -26,9 +32,11 @@ function routeGroups (routes) {
   return [...groups.values()]
 }
 
-export function createSendRelayRouting ({ peer, peers = [peer], relaysByPubkey, primaryRelays, primaryRelayToReceivers, fallbackRelays = [], exclusions, pickRelays, recoveryRelays, publish, publishNymEvent, sendEvent, isOnline, isCurrent, signal, now = Date.now }) {
+export function createSendRelayRouting ({ peer, peers = [peer], relaysByPubkey, primaryRelays, primaryRelayToReceivers, fallbackRelays = [], fallbackDelayMs = null, exclusions, pickRelays, recoveryRelays, publish, publishNymEvent, sendEvent, isOnline, isCurrent, signal, pauseSignal, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout }) {
   // Keep discovery's defaults when NIP-65 is unavailable. Explicit maps/lists
   // retain their fanout; configured fallbacks are a separate last-resort stage.
+  fallbackDelayMs = normalizeFallbackDelay(fallbackDelayMs)
+  const transportSignal = signal && pauseSignal ? AbortSignal.any([signal, pauseSignal]) : signal || pauseSignal
   const explicit = Boolean(primaryRelays || primaryRelayToReceivers)
   const primaryRoutes = primaryRelayToReceivers || (primaryRelays
     ? new Map(primaryRelays.map(relay => [relay, peers]))
@@ -61,12 +69,12 @@ export function createSendRelayRouting ({ peer, peers = [peer], relaysByPubkey, 
     return routes
   }
   const relayToReceivers = primaryRelayToReceivers || select(peers, exclusions.keys())
-  const current = () => !signal?.aborted && isCurrent()
+  const current = () => !transportSignal?.aborted && isCurrent()
   const rejected = report => (report?.errors || []).filter(item => candidateSet.has(normalized(item.relay)) && isReplaceableRelayFailure(item.reason))
-  const remember = errors => { for (const item of errors) exclusions.set(normalized(item.relay), now() + EXCLUSION_MS) }
+  const remember = errors => { for (const item of errors) if (candidateSet.has(normalized(item.relay))) exclusions.set(normalized(item.relay), now() + EXCLUSION_MS) }
   const online = async () => {
     if (!current()) return false
-    try { return await isOnline({ signal }) && current() } catch { return false }
+    try { return await isOnline({ signal: transportSignal }) && current() } catch { return false }
   }
 
   async function send (event, initialRelays, context = {}) {
@@ -77,6 +85,24 @@ export function createSendRelayRouting ({ peer, peers = [peer], relaysByPubkey, 
     const mirrors = initialRelays.filter(relay => !candidateSet.has(normalized(relay)))
     const initialPrimary = context.primaryRelays || (primaryRelays || peers.length === 1 ? routeEntries(relayToReceivers).map(([relay]) => relay) : [])
     const first = [...new Set(initialPrimary.map(normalizeRelayUrl))].filter(relay => !exclusions.has(relay))
+    if (!explicit && fallbackDelayMs !== null && fallbackRelays.length) {
+      const tried = new Set()
+      const pick = (pending, fallback) => {
+        const excluded = [...new Set([...exclusions.keys(), ...tried])]
+        const routes = pickRelays([...pending], fallback
+          ? Object.fromEntries([...pending].map(pubkey => [pubkey, { read: fallbackRelays }]))
+          : primaryByPeer, { relayType: 'read', maxPerPubkey: 2, excludeRelaysByPubkey: new Map([...pending].map(pubkey => [pubkey, excluded])), emptyRelaysFallback: [] })
+        return routeGroups(routes)[0]
+      }
+      const result = await publishWithEarlyFallback({
+        event, receivers, first: first.length ? { receivers, relays: first } : null, mirrors, tried,
+        nextPrimary: pending => pick(pending, false), nextFallback: pending => pick(pending, true),
+        sendEvent, isOnline, isCurrent, signal, pauseSignal, remember,
+        delay: fallbackDelayMs, now, setTimer, clearTimer
+      })
+      if (!result.success && current()) exclusions.clear()
+      return result
+    }
     let batch = first.length ? { receivers, relays: first } : null
     const tried = new Set()
     const errors = []
@@ -106,7 +132,7 @@ export function createSendRelayRouting ({ peer, peers = [peer], relaysByPubkey, 
       for (const relay of relays) tried.add(normalized(relay))
       // Every relay in this batch serves the same pending recipient subset.
       // One ACK covers that subset, never unrelated members of the ciphertext.
-      result = await sendEvent(event, relays)
+      result = await sendEvent(event, relays, { signal: transportSignal })
       const settled = Promise.resolve(result.promise)
       summaries.push(settled)
       if (result.success) {

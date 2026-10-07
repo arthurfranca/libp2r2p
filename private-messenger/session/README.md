@@ -110,7 +110,7 @@ const session = createPrivateMessageSession({
 })
 ```
 
-Automatic sends try each recipient's NIP-65 read relays first, at most two per
+By default, automatic sends try each recipient's NIP-65 read relays first, at most two per
 recipient per attempt, then the configured fallbacks in pairs. Explicit
 per-call `relays`, channel `sendRelays`/`relays` and global `relays` remain primary
 and also support configured fallbacks, including fixed multi-recipient sends.
@@ -121,6 +121,19 @@ fallbacks. Explicit maps retain their precedence over fixed lists, initial fanou
 and encrypted recipient subsets, without consulting recipient NIP-65 lists.
 The session coordinator remains a DM API; multi-recipient channels use
 `createPrivateMessenger` directly.
+
+Optional `fallbackDelayMs` defaults to `null` (sequential primary exhaustion).
+A nonnegative integer up to 2147483647 opts automatic NIP-65 routing into early
+fallback; explicit relay lists/maps retain the sequential policy. With `3000`,
+start at most two eligible fallback relays after three seconds without complete
+acceptance, or immediately after primary exhaustion. The deadline belongs to
+one signed outer event; later batches do not renew it. Primary operations retain
+their deadlines and can still win. Failed fallback operations leave primary
+alternatives available; no relay is tried twice. Multiple recipients require
+accepted coverage of every encrypted recipient subset. No wrapper, ID, recipient
+tag or deletion capability is recreated. Confirmed connectivity, exclusions and
+connection cooldowns remain authoritative; a waiting primary is not penalized
+merely because fallback started. Late native failures may inform later sends.
 
 On `blocked`, `restricted`, `auth-required`, `pow`, `rate-limited`, or `error`
 rejections, or connection/transport/timeout failures, replacement requires
@@ -141,7 +154,8 @@ publication report. A shared relay's first ACK covers all members assigned to
 that publication batch. If replacements use different relays for different
 members, every pending member must be covered before the outer event succeeds;
 a partial ACK cannot hide another member's failure. Remaining primary routes are
-exhausted before configured fallbacks. Redundant acknowledgements may update
+exhausted before configured fallbacks with the default null delay or explicit
+routes. Redundant acknowledgements may update
 future routing preferences without delaying a successfully covered send. Preferences are channel/recipient-scoped, in-memory,
 expire after five minutes, and never alter receive subscriptions. A fresh attempt
 can recheck an exhausted list. Additional fallback relays come only from the
@@ -159,3 +173,12 @@ relays. Validation/authorization failures are terminal without relay rotation.
 `broadcastRumor`/`broadcastEvent` accept a `signal` to stop further replacement
 publications; the session supplies it and aborts it on cancel/close. An already
 published event cannot be recalled by cancellation.
+
+`RelayPool.sendEvent(event, relays, { signal })` supports optional cancellation.
+It returns the existing result/report envelopes with the original abort reason
+for unfinished relays, preserving partial acceptance and avoiding synthetic
+timeouts. Cancellation releases publication waiters and deferred sends without
+closing shared sockets or cancelling another subscriber for the same event ID.
+Operations already transmitted cannot be recalled from relays. A messenger pause
+cancels its outstanding publication work and leaves the outbox pending; resume
+creates a fresh publication lifetime, without treating the pause as a user abort.

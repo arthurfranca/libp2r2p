@@ -9,7 +9,7 @@ import { finalizeEvent } from '../event/index.js'
 const urls = ['a', 'b', 'c', 'd', 'e'].map(name => `wss://${name}.example`)
 const event = finalizeEvent({ kind: 26300, created_at: 1, tags: [['p', 'b'.repeat(64)]], content: 'same encrypted outer payload' }, new Uint8Array(32).fill(7))
 const tick = () => new Promise(resolve => setImmediate(resolve))
-function fixture (t, { reasons = {}, online = true, fallbackRelays = [], primaryRelays, peers, relaysByPubkey, primaryRelayToReceivers, realPublish = false, recoveryRelays } = {}) {
+function fixture (t, { reasons = {}, online = true, fallbackRelays = [], primaryRelays, peers, relaysByPubkey, primaryRelayToReceivers, realPublish = false, recoveryRelays, fallbackDelayMs = null } = {}) {
   const state = { reasons, online, probes: 0, current: true, held: new Set(), pending: [], now: 1000 }
   const sends = []; const batches = []; const exclusions = new Map()
   const pool = new RelayPool({
@@ -36,10 +36,10 @@ function fixture (t, { reasons = {}, online = true, fallbackRelays = [], primary
   const publisher = options => options._publish(options.event, [...options.relayToReceivers.keys(), ...options.recoveryRelays].filter((url, i, list) => list.indexOf(url) === i))
   const controller = new AbortController()
   const routing = () => createSendRelayRouting({
-    peer: 'peer', peers, fallbackRelays, primaryRelays, primaryRelayToReceivers, relaysByPubkey: relaysByPubkey || { peer: { read: urls, write: ['wss://write-only.example'] } },
+    peer: 'peer', peers, fallbackRelays, fallbackDelayMs, primaryRelays, primaryRelayToReceivers, relaysByPubkey: relaysByPubkey || { peer: { read: urls, write: ['wss://write-only.example'] } },
     exclusions, pickRelays: pickRelaysForPubkeys, recoveryRelays: recoveryRelays || [...urls.slice(0, 2), ...fallbackRelays],
     publish: realPublish ? privateChannel.publish : publisher, publishNymEvent: realPublish ? privateChannel.publishNymEvent : publisher,
-    sendEvent: (event, relays) => { batches.push([...relays]); return pool.sendEvent(event, relays, { timeout: 2000 }) },
+    sendEvent: (event, relays, options) => { batches.push([...relays]); return pool.sendEvent(event, relays, { ...options, timeout: 2000 }) },
     isOnline: async () => { state.probes++; return state.online },
     isCurrent: () => state.current, signal: controller.signal, now: () => state.now
   })
@@ -365,4 +365,34 @@ test('an exhausted member can retry even when another member succeeded and no fa
   const [retried] = await publishGroup(f)
   assert.equal(retried.success, true)
   assert.deepEqual(f.batches.at(-1), shared)
+})
+
+test('installed relay pool returns early fallback acceptance before silent-primary diagnostics', async t => {
+  const fallback = 'wss://fallback.example'
+  const f = fixture(t, { fallbackRelays: [fallback], fallbackDelayMs: 10 })
+  f.state.held = new Set(urls)
+  const result = await f.publish(f.routing())
+  assert.equal(result.success, true)
+  assert.deepEqual(f.batches, [urls.slice(0, 2), [fallback]])
+  let complete = false
+  result.promise.then(() => { complete = true })
+  await tick()
+  assert.equal(complete, false)
+  for (const settle of f.state.pending.splice(0)) settle()
+  assert.equal((await result.promise).success, true)
+})
+
+test('early fallback retains real encrypted group recipients and deletion capability', async t => {
+  const f = groupFixture(t, { fallbackDelayMs: 10 })
+  f.state.held = new Set(shared)
+  const deletionPubkey = await dave.getPublicKey()
+  const [report] = await publishGroup(f, { deletionPubkey })
+  assert.equal(report.success, true)
+  assert.deepEqual(f.batches, [shared, fallback])
+  const outer = f.sends[0].event
+  await assertRecipients(outer, members.slice(0, 2))
+  assert.ok(outer.tags.some(tag => tag[0] === 's' && tag[1] === deletionPubkey))
+  assert.ok(f.sends.every(send => JSON.stringify(send.event) === JSON.stringify(outer)))
+  for (const settle of f.state.pending.splice(0)) settle()
+  assert.equal((await report.promise).success, true)
 })

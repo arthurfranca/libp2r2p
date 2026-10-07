@@ -76,7 +76,11 @@ export function createPublishSettlements (promises, timeout, { onSettled } = {})
     })
   }
 
-  return { promise, timeout: timeoutPending }
+  const cancel = reason => {
+    if (isFinished) return
+    for (let index = 0; index < settlements.length; index++) settle(index, { status: 'rejected', outcome: 'failed', reason })
+  }
+  return { promise, timeout: timeoutPending, cancel }
 }
 
 // Turns ordered relay settlements into a stable, caller-facing report. Failed

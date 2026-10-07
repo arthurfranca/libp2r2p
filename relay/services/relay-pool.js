@@ -1204,8 +1204,10 @@ export class RelayPool {
     timeout = SEND_TIMEOUT_MS,
     timeoutUntilFirstFulfillment = null,
     getAuthEvent,
-    onRelayResult
+    onRelayResult,
+    signal
   } = {}) {
+    if (signal != null && (typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) throw new ValidationError('INVALID_RELAY_SIGNAL')
     const urls = normalizedRelayUrls(relays)
     if (!urls.length) {
       const promise = Promise.resolve(publishSummary([], urls, {
@@ -1236,7 +1238,11 @@ export class RelayPool {
     // Resolves after every relay settles (or reaches the operation timeout) as
     // { success, total, fulfilled, succeededRelays, errors },
     // where errors contains { relay, reason } entries for failed relays.
+    const cancel = () => settlement.cancel(signal.reason)
+    if (signal?.aborted) cancel()
+    else signal?.addEventListener('abort', cancel, { once: true })
     const promise = settlement.promise
+      .finally(() => signal?.removeEventListener('abort', cancel))
       .then(settlements => publishSummary(settlements, urls, {
         includeSucceededRelays: true
       }))
@@ -1245,10 +1251,11 @@ export class RelayPool {
       const deferred = sendDeferreds[index]
       ;(async () => {
         try {
+          const operationSignal = sendControllers[index].signal
+          if (operationSignal.aborted) throw operationSignal.reason
           const relay = await this.#getRelay(url)
-          const signal = sendControllers[index].signal
-          if (signal.aborted) throw signal.reason
-          return await this.#publishEvent(relay, eventToSend, getAuthEvent, signal)
+          if (operationSignal.aborted) throw operationSignal.reason
+          return await this.#publishEvent(relay, eventToSend, getAuthEvent, operationSignal)
         } catch (err) {
           const reason = err instanceof Error ? err : new Error(String(err))
           if (reason instanceof Nip42AuthenticationError) throw reason
