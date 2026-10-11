@@ -234,9 +234,11 @@ NIP-46 against the real pool with controlled transport and injected controls.
   persisted ranges unchanged.
 
 - Share `parseRelayRetryAdvice` through the public relay export. Accept only
-  temporal advice on leading rate-limited CLOSED/OK: finite positive `retry_at`
-  Unix seconds wins over `retry_after`, even after expiry. Never derive origin,
-  retry eligibility or routing from extra fields.
+  temporal advice on leading rate-limited CLOSED/OK: canonical positive safe
+  integer `params` milliseconds, optionally prefixed with `@` for Unix milliseconds.
+  Preserve expired absolute deadlines. Never derive origin, retry eligibility or
+  routing from params; do not interpret legacy timing objects. Scope connection
+  cooldowns by EVENT/AUTH/REQ/COUNT after correlating pending operations.
 - Honor optional absolute/relative relay timing on rate-limited CLOSED/OK, bounded
   to five minutes, without blocking CLOSE or sending cancelled work later.
   Preserve retryAfterMs/retryAt through subscription diagnostics. Existing

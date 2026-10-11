@@ -955,22 +955,26 @@ also admits relay policy refusals (`blocked:`, `restricted:`, `auth-required:`,
 Local authentication denials, invalid events and unknown errors qualify for
 neither policy. Predicates classify individual native errors; callers decide
 how to handle mixed per-relay outcomes and application-specific aggregates.
-`parseRelayRetryAdvice(reason, extra, { now = Date.now() })`, exported by
+`parseRelayRetryAdvice(reason, params, { now = Date.now() })`, exported by
 `libp2r2p/relay`, returns `{ retryAt, retryAfterMs? }` or `null`. It only interprets
-leading `rate-limited:` refusals. Optional `retry_at` is a Unix timestamp in
-seconds (fractions allowed), converted to milliseconds. Finite positive absolute
-advice takes precedence over `retry_after`, including when already expired;
-expired advice does not restart a relative wait. Future waits are capped at five
-minutes from processing. Missing/invalid absolute advice falls back to finite
-positive relative seconds, capped at 300. A valid relative value is retained as
-`retryAfterMs` even when the absolute deadline wins. Schedulers wait until
+leading `rate-limited:` refusals. The optional string `params` is relative
+milliseconds (e.g. "2500") or an absolute Unix timestamp in milliseconds
+prefixed with `@` (e.g. "@1791738154332"). Values must be positive safe integers
+in canonical decimal form, without signs, whitespace, fractions or leading zeros.
+Relative values produce both `retryAfterMs` and `retryAt`; absolute values produce
+only `retryAt` and retain an expired deadline without starting a new wait.
+Future waits are capped at five minutes. Missing or invalid params are ignored
+and do not instruct clients to retry immediately. Schedulers wait until
 max(local backoff deadline, retryAt), never sum the two or renew the deadline on
 online notifications.
 
-The optional Nostr extension works with older relays that only send
-`retry_after` and older consumers that ignore `retry_at`. Neither field supplies
-provenance or retry eligibility: `local`, `origin`, `retryable`, category and code
-claims in extras are ignored. Native messages, causes and codes remain intact.
+Rate limits apply only to the client message type that triggered the refusal:
+`EVENT`, `AUTH`, `REQ` and `COUNT` have independent connection cooldowns. Responses
+are correlated with pending operations; unknown IDs never create cooldowns.
+CLOSE cleanup remains immediate. The launcher can replace valid relative params
+with `@` timestamps before queueing bridge delivery because its consumers share
+its clock. No legacy timing objects are interpreted. Params never supply provenance
+or retry eligibility; native messages, causes and codes remain intact.
 
 ## Binary encodings
 
@@ -1091,10 +1095,11 @@ user-facing send error.
 
 ### Relay backpressure and bounded synchronization (0.11.7)
 
-Optional `retry_at` Unix seconds or numeric `retry_after` seconds on relay `CLOSED` and rejected `OK`
-responses are preserved as `retryAfterMs` and `retryAt` on native relay errors.
-Only `rate-limited:` responses apply this advice; invalid values are ignored
-and delays are capped at five minutes. New operations on that connection wait
+Optional decimal `params` milliseconds or `@` Unix milliseconds on relay `CLOSED`
+and rejected `OK` responses are preserved as normalized `retryAt` (and
+`retryAfterMs` for relative params) on native relay errors. Only `rate-limited:`
+responses apply this advice; invalid values are ignored
+and delays are capped at five minutes. New operations of the refused type wait
 within their existing deadlines; active subscriptions remain live and `CLOSE`
 never waits. Cancelled or timed-out operations cannot be sent later. A rejection
 is still reported to the caller; this does not silently republish failed events.

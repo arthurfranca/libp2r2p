@@ -33,8 +33,8 @@ export function relayCloseError (event, category, cause) {
 
 // Keep native diagnostics and attach only bounded timing advice. An absolute
 // deadline survives delayed delivery through a launcher-owned relay bridge.
-export function relayRejectionError (reason, extra, fallback) {
+export function relayRejectionError (reason, params, fallback) {
   const error = categorizeRelayError(reason, 'relay', fallback)
-  Object.assign(error, parseRelayRetryAdvice(error.message, extra))
+  Object.assign(error, parseRelayRetryAdvice(error.message, params))
   return error
 }

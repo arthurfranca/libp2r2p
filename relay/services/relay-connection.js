@@ -50,7 +50,7 @@ export class RelayConnection {
   #publishes = new Map()
   #authentications = new Map()
   #counts = new Map()
-  #retryAt = 0
+  #retryAtByType = new Map()
 
   constructor (url, { WebSocket: WebSocketImpl = globalThis.WebSocket } = {}) {
     this.url = url
@@ -124,12 +124,12 @@ export class RelayConnection {
 
   // New work respects relay cooldowns; cleanup uses send() directly. These
   // waits stay within the caller's existing deadline and are cancellable.
-  #dispatchWork (send, fail) {
+  #dispatchWork (type, send, fail) {
     let timer = null
     let cancelled = false
     const dispatch = () => {
       if (cancelled) return
-      const remaining = this.#retryAt - Date.now()
+      const remaining = (this.#retryAtByType.get(type) ?? 0) - Date.now()
       if (remaining > 0) {
         timer = maybeUnref(setTimeout(dispatch, remaining))
         return
@@ -140,9 +140,9 @@ export class RelayConnection {
     return () => { cancelled = true; clearTimeout(timer) }
   }
 
-  #rejection (reason, extra, fallback) {
-    const error = relayRejectionError(reason, extra, fallback)
-    this.#retryAt = Math.max(this.#retryAt, error.retryAt || 0)
+  #rejection (type, reason, params, fallback) {
+    const error = relayRejectionError(reason, params, fallback)
+    if (error.retryAt !== undefined) this.#retryAtByType.set(type, Math.max(this.#retryAtByType.get(type) ?? 0, error.retryAt))
     return error
   }
 
@@ -163,7 +163,7 @@ export class RelayConnection {
     }
     const subscription = { filters, handlers, close, cancelSend: null }
     this.#subscriptions.set(id, subscription)
-    subscription.cancelSend = this.#dispatchWork(() => {
+    subscription.cancelSend = this.#dispatchWork('REQ', () => {
       this.send(JSON.stringify(['REQ', id, ...filters]))
       sent = true
     }, error => {
@@ -209,7 +209,7 @@ export class RelayConnection {
     pending.waiters.add(waiter)
     signal?.addEventListener('abort', onAbort, { once: true })
     if (created) {
-      pending.cancelSend = this.#dispatchWork(() => {
+      pending.cancelSend = this.#dispatchWork(type, () => {
         this.send(JSON.stringify([type, event]))
       }, error => this.#settleEvent(map, event.id, error))
     }
@@ -224,7 +224,7 @@ export class RelayConnection {
     const pending = { ...deferred, signal, onAbort, cancelSend: null }
     this.#counts.set(id, pending)
     signal?.addEventListener('abort', onAbort, { once: true })
-    pending.cancelSend = this.#dispatchWork(() => this.send(JSON.stringify(['COUNT', id, ...filters])), error => {
+    pending.cancelSend = this.#dispatchWork('COUNT', () => this.send(JSON.stringify(['COUNT', id, ...filters])), error => {
       this.#settleCount(id, null, error)
     })
     return deferred.promise
@@ -277,7 +277,8 @@ export class RelayConnection {
     if (data[0] === 'CLOSED') {
       const id = data[1]
       const subscription = this.#subscriptions.get(id)
-      const reason = this.#rejection(data[2], data[3], subscription ? 'SUBSCRIPTION_CLOSED' : 'COUNT_CLOSED')
+      if (!subscription && !this.#counts.has(id)) return
+      const reason = this.#rejection(subscription ? 'REQ' : 'COUNT', data[2], data[3], subscription ? 'SUBSCRIPTION_CLOSED' : 'COUNT_CLOSED')
       if (subscription) {
         this.#subscriptions.delete(id)
         subscription.cancelSend?.()
@@ -286,9 +287,11 @@ export class RelayConnection {
       return
     }
     if (data[0] === 'OK') {
-      const reason = data[2] === true ? null : this.#rejection(data[3], data[4], 'EVENT_REJECTED')
-      this.#settleEvent(this.#publishes, data[1], reason, data[3])
-      this.#settleEvent(this.#authentications, data[1], reason, data[3])
+      for (const [type, pending] of [['EVENT', this.#publishes], ['AUTH', this.#authentications]]) {
+        if (!pending.has(data[1])) continue
+        const reason = data[2] === true ? null : this.#rejection(type, data[3], data[4], 'EVENT_REJECTED')
+        this.#settleEvent(pending, data[1], reason, data[3])
+      }
       return
     }
     if (data[0] === 'AUTH' && typeof data[1] === 'string') {

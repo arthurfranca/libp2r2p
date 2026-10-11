@@ -97,7 +97,7 @@ test('rate-limit metadata delays new work but never CLOSE, and cancellation remo
   const active = relay.subscribe([{ kinds: [1] }])
   let rejection
   const limited = relay.subscribe([{ kinds: [2] }], { onclose: error => { rejection = error } })
-  socket.receive(['CLOSED', limited.id, 'rate-limited: too many messages', { retry_after: 2 }])
+  socket.receive(['CLOSED', limited.id, 'rate-limited: too many messages', '2000'])
   await tick()
   assert.equal(rejection.retryAfterMs, 2000)
   assert.equal(rejection.retryAt, 12000)
@@ -115,14 +115,14 @@ test('rate-limit metadata delays new work but never CLOSE, and cancellation remo
   assert.ok(!socket.sent.some(frame => frame[1] === cancelled.id))
 })
 
-test('publication retry_after is preserved and delaying work is bounded by its deadline', async t => {
+test('publication relative params is preserved and delaying work is bounded by its deadline', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
   const { relay, socket } = await connected()
   t.after(() => relay.close())
   const event = signedEvent()
   const first = relay.publish(event)
   const rejected = assert.rejects(first, error => error.retryAfterMs === 300000 && error.message === 'rate-limited: busy')
-  socket.receive(['OK', event.id, false, 'rate-limited: busy', { retry_after: 999999 }])
+  socket.receive(['OK', event.id, false, 'rate-limited: busy', '999999000'])
   await tick()
   await rejected
   relay.publishTimeout = 10
@@ -136,10 +136,10 @@ test('publication retry_after is preserved and delaying work is bounded by its d
 test('malformed or unrelated retry metadata cannot stall a connection', async t => {
   const { relay, socket } = await connected()
   t.after(() => relay.close())
-  for (const [reason, retry] of [['blocked: no', 60], ['rate-limited: busy', '60'], ['rate-limited: busy', -1]]) {
+  for (const [reason, retry] of [['blocked: no', '60000'], ['rate-limited: busy', '60.5'], ['rate-limited: busy', '-1']]) {
     let rejection
     const sub = relay.subscribe([{}], { onclose: error => { rejection = error } })
-    socket.receive(['CLOSED', sub.id, reason, { retry_after: retry }])
+    socket.receive(['CLOSED', sub.id, reason, retry])
     await tick()
     assert.equal(rejection.retryAfterMs, undefined)
     const next = relay.subscribe([{}])
@@ -157,7 +157,7 @@ test('pool operation timeout cancels a publication waiting for relay cooldown', 
   const socket = FakeWebSocket.instances.at(-1)
   socket.open()
   await tick()
-  socket.receive(['OK', event.id, false, 'rate-limited: busy', { retry_after: 2 }])
+  socket.receive(['OK', event.id, false, 'rate-limited: busy', '2000'])
   await first
   const second = pool.sendEvent(signedEvent(), ['wss://relay.example'], { timeout: 50 })
   await tick()
@@ -170,13 +170,13 @@ test('pool operation timeout cancels a publication waiting for relay cooldown', 
   assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 1)
 })
 
-test('delayed CLOSED uses retry_at and expired OK advice never restarts its relative wait', async t => {
+test('delayed CLOSED uses absolute params and expired OK advice never restarts its relative wait', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 14000 })
   const { relay, socket } = await connected()
   t.after(() => relay.close())
   let rejection
   const first = relay.subscribe([{}], { onclose: error => { rejection = error } })
-  socket.receive(['CLOSED', first.id, 'rate-limited: busy', { retry_after: 10, retry_at: 20 }])
+  socket.receive(['CLOSED', first.id, 'rate-limited: busy', '@20000'])
   await tick()
   assert.equal(rejection.retryAt, 20000)
   const next = relay.subscribe([{}])
@@ -186,8 +186,8 @@ test('delayed CLOSED uses retry_at and expired OK advice never restarts its rela
   assert.equal(socket.sent.at(-1)[1], next.id)
   t.mock.timers.tick(5000)
   const published = signedEvent()
-  const result = assert.rejects(relay.publish(published), error => error.retryAt === 20000 && error.retryAfterMs === 10000)
-  socket.receive(['OK', published.id, false, 'rate-limited: busy', { retry_after: 10, retry_at: 20 }])
+  const result = assert.rejects(relay.publish(published), error => error.retryAt === 20000 && error.retryAfterMs === undefined)
+  socket.receive(['OK', published.id, false, 'rate-limited: busy', '@20000'])
   await result
   const immediate = relay.subscribe([{}])
   assert.equal(socket.sent.at(-1)[1], immediate.id)
@@ -277,7 +277,7 @@ test('last publication cancellation removes an EVENT deferred by absolute cooldo
   const subscription = relay.subscribe([{}])
   const limited = signedEvent()
   const refused = assert.rejects(relay.publish(limited), error => error.retryAt === 20000)
-  socket.receive(['OK', limited.id, false, 'rate-limited: busy', { retry_at: 20 }])
+  socket.receive(['OK', limited.id, false, 'rate-limited: busy', '@20000'])
   await refused
   const controller = new AbortController()
   const deferred = signedEvent()
@@ -290,4 +290,60 @@ test('last publication cancellation removes an EVENT deferred by absolute cooldo
   t.mock.timers.tick(10000)
   assert.ok(!socket.sent.some(frame => frame[0] === 'EVENT' && frame[1].id === deferred.id))
   assert.equal(socket.readyState, 1)
+})
+
+// Exercise every operation against every other type on the same real connection.
+for (const limitedType of ['EVENT', 'AUTH', 'REQ', 'COUNT']) {
+  test(`${limitedType} cooldown delays only the same message type`, async t => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+    const { relay, socket } = await connected()
+    t.after(() => relay.close())
+    socket.receive(['AUTH', 'challenge'])
+    await tick()
+    const errors = []
+    const start = async type => {
+      if (type === 'REQ') return relay.subscribe([{}], { onclose: error => { if (error) errors.push(error) } }).id
+      if (type === 'COUNT') {
+        relay.countWithHll([{}]).catch(error => errors.push(error))
+        return socket.sent.at(-1)[1]
+      }
+      const event = signedEvent({ kind: type === 'AUTH' ? 22242 : 1 })
+      const pending = type === 'EVENT' ? relay.publish(event) : relay.authenticate(async () => event)
+      pending.catch(error => errors.push(error))
+      await tick()
+      return event.id
+    }
+    const id = await start(limitedType)
+    socket.receive(['EVENT', 'AUTH'].includes(limitedType)
+      ? ['OK', id, false, 'rate-limited: busy', '2500']
+      : ['CLOSED', id, 'rate-limited: busy', '2500'])
+    await tick()
+    assert.equal(errors[0].retryAt, 12500)
+    const before = socket.sent.length
+    for (const type of ['EVENT', 'AUTH', 'REQ', 'COUNT']) await start(type)
+    assert.deepEqual(socket.sent.slice(before).map(frame => frame[0]), ['EVENT', 'AUTH', 'REQ', 'COUNT'].filter(type => type !== limitedType))
+    t.mock.timers.tick(2499)
+    assert.equal(socket.sent.length, before + 3)
+    t.mock.timers.tick(1)
+    assert.equal(socket.sent.at(-1)[0], limitedType)
+  })
+}
+
+test('unmatched OK and CLOSED and late CLOSE confirmations cannot create cooldowns', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  const { relay, socket } = await connected()
+  t.after(() => relay.close())
+  const subscription = relay.subscribe([{}])
+  subscription.close()
+  socket.receive(['CLOSED', subscription.id, 'rate-limited: busy', '300000'])
+  socket.receive(['CLOSED', 'unknown', 'rate-limited: busy', '300000'])
+  socket.receive(['OK', 'unknown', false, 'rate-limited: busy', '300000'])
+  await tick()
+  const next = relay.subscribe([{}])
+  assert.equal(socket.sent.at(-1)[1], next.id)
+  const event = signedEvent()
+  const pending = relay.publish(event)
+  assert.equal(socket.sent.at(-1)[1].id, event.id)
+  socket.receive(['OK', event.id, true, 'saved'])
+  await pending
 })
