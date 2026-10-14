@@ -1,7 +1,6 @@
 import { ValidationError } from '../../error/index.js'
 import { getEventHash, isValidEvent } from '../../event/index.js'
-
-export const CONTENT_KEY_KIND = 18716
+import { CONTENT_KEY_ANNOUNCEMENT } from '../../kind/index.js'
 
 const HEX_PUBKEY = /^[0-9a-f]{64}$/
 const HEX_SIG = /^[0-9a-f]{128}$/i
@@ -15,7 +14,7 @@ export async function makeContentKeyEventForPubkey ({ userSigner, contentPubkey,
   if (!HEX_PUBKEY.test(contentPubkey || '')) throw new ValidationError('CONTENT_PUBKEY_REQUIRED')
 
   return userSigner.signEvent({
-    kind: CONTENT_KEY_KIND,
+    kind: CONTENT_KEY_ANNOUNCEMENT,
     created_at: createdAt,
     tags: [['cp', contentPubkey]],
     content: ''
@@ -32,7 +31,7 @@ export async function makeContentKeyEvent ({ userSigner, contentKeySigner, creat
 }
 
 export function parseContentKeyEvent (event) {
-  if (!event || event.kind !== CONTENT_KEY_KIND || event.content !== '') return null
+  if (!event || event.kind !== CONTENT_KEY_ANNOUNCEMENT || event.content !== '') return null
   if (!HEX_PUBKEY.test(event.pubkey) || !Number.isSafeInteger(event.created_at)) return null
   if (!Array.isArray(event.tags) || event.tags.length !== 1) return null
   if (!isValidEvent(event)) return null
@@ -67,7 +66,7 @@ function contentKeyProofError ({ ownerPubkey, contentPubkey, proof }) {
   if (!parsed) return 'INVALID_CONTENT_KEY_PROOF'
 
   const event = {
-    kind: CONTENT_KEY_KIND,
+    kind: CONTENT_KEY_ANNOUNCEMENT,
     pubkey: ownerPubkey,
     created_at: parsed.created_at,
     tags: [['cp', contentPubkey]],

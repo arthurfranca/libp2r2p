@@ -58,6 +58,7 @@ export const FILE_SERVER_PREFERENCE = 10096
 export const GOOD_WIKI_AUTHORS = 10101
 export const GOOD_WIKI_RELAYS = 10102
 export const NWC_WALLET_INFO = 13194
+export const CONTENT_KEY_ANNOUNCEMENT = 18716
 export const LIGHTNING_PUB_RPC = 21000
 export const AUTH = 22242
 export const NWC_WALLET_REQUEST = 23194
@@ -198,6 +199,7 @@ export const eventKinds = /* @__PURE__ */ Object.freeze({
   GOOD_WIKI_AUTHORS,
   GOOD_WIKI_RELAYS,
   NWC_WALLET_INFO,
+  CONTENT_KEY_ANNOUNCEMENT,
   LIGHTNING_PUB_RPC,
   AUTH,
   NWC_WALLET_REQUEST,

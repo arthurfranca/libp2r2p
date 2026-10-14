@@ -1,4 +1,5 @@
-import { CONTENT_KEY_KIND, parseContentKeyEvent } from '../event/index.js'
+import { parseContentKeyEvent } from '../event/index.js'
+import { CONTENT_KEY_ANNOUNCEMENT } from '../../kind/index.js'
 import { pickRelaysForPubkeys, getRelaysByPubkey, relayPool } from '../../relay/index.js'
 
 const QUERY_CACHE_MS = 40 * 60 * 1000
@@ -81,7 +82,7 @@ async function queryContentKeyProofs (pubkeyList, { _getEvents, _getRelaysByPubk
       .map(async ([relay, authors]) => {
         try {
           const { result } = await _getEvents({
-            kinds: [CONTENT_KEY_KIND],
+            kinds: [CONTENT_KEY_ANNOUNCEMENT],
             authors,
             limit: authors.length
           }, [relay], {

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 test('new public Nostr subpaths expose only the used surface', async () => {
   const expected = {
     'content-key/event': [
-      'CONTENT_KEY_KIND', 'assertValidContentKeyProof', 'assertValidIykcProof',
+      'assertValidContentKeyProof', 'assertValidIykcProof',
       'isValidContentKeyProof', 'isValidIykcProof', 'makeContentKeyEvent',
       'makeContentKeyEventForPubkey', 'makeContentKeyProof', 'makeIykcProof',
       'parseContentKeyEvent'
@@ -55,6 +55,7 @@ test('new public Nostr subpaths expose only the used surface', async () => {
       assert.ok(actual.includes('isRegularKind'))
       assert.ok(actual.includes('PERSONAL_COPY'))
       assert.ok(actual.includes('SITE_CURATION_SET'))
+      assert.ok(actual.includes('CONTENT_KEY_ANNOUNCEMENT'))
       continue
     }
     assert.deepEqual(actual, names.sort())

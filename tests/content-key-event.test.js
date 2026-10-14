@@ -3,11 +3,11 @@ import assert from 'node:assert/strict'
 import { isValidEvent } from '../event/index.js'
 import { ValidationError } from '../error/index.js'
 import { generateSecretKey } from '../key/index.js'
+import { CONTENT_KEY_ANNOUNCEMENT } from '../kind/index.js'
 
 import TestSigner from './helpers/test-signer.js'
 import { bytesToHex } from '../base16/index.js'
 import {
-  CONTENT_KEY_KIND,
   assertValidContentKeyProof,
   assertValidIykcProof,
   isValidContentKeyProof,
@@ -32,7 +32,7 @@ test('makeContentKeyEvent publishes a signed content pubkey proof', async () => 
   const event = await makeContentKeyEvent({ userSigner: user, contentKeySigner: contentKey, createdAt: 7 })
   const parsed = parseContentKeyEvent(event)
 
-  assert.equal(event.kind, CONTENT_KEY_KIND)
+  assert.equal(event.kind, CONTENT_KEY_ANNOUNCEMENT)
   assert.equal(event.pubkey, userPubkey)
   assert.deepEqual(event.tags, [['cp', contentPubkey]])
   assert.equal(parsed.iykcPubkey, contentPubkey)

@@ -692,6 +692,13 @@ Blossom server normalization accepts root `http:` origins for local
 development. Public Blossom validation additionally requires `https:` and a
 public host, and rejects credentials, paths, query strings and fragments.
 
+Starting with 0.11.21, import `CONTENT_KEY_ANNOUNCEMENT` (18716) from
+`libp2r2p/kind`. It is also included in `eventKinds` and used by content-key
+builders, proof validation and relay discovery. The announcement publishes a
+public content key for private communication and can be shared across apps.
+The former `CONTENT_KEY_KIND` export from `libp2r2p/content-key/event` has been
+removed; consumers must update that import.
+
 `classifyEvent()` from `libp2r2p/event` combines the exact NIP-01 kind
 ranges with tag-defined behavior. The first `d` tag may add `replaceable` or
 `addressable`, while an `expiration` tag equal to `created_at` adds
