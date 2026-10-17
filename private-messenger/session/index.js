@@ -558,6 +558,11 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     await writeDownloadIntent(() => downloads?.remove(id))
   }
   return {
+    async retryPendingDecryptions (options) {
+      if (closed || !available) return
+      await ensureMessenger()
+      if (!closed && available) return messenger?.retryPendingDecryptions(options)
+    },
     download, cancelDownload, preparePeer,
     // Peers-based so callers can prefetch as soon as a chat route opens, before
     // the shared-key channel exists. When group chats get real membership, add

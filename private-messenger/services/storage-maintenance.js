@@ -185,6 +185,7 @@ function storageDatabaseNames (userPubkey) {
   const prefix = `libp2r2p:private-messenger:${userPubkey}`
   return [
     `${prefix}:idb-queue`,
+    `${prefix}:pending-decryption:idb-queue`,
     `${prefix}:seeds:idb-queue`,
     `${prefix}:file-seeds:idb-queue`,
     `${prefix}:file-authorizations:idb-queue`,

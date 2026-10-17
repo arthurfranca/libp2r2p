@@ -488,6 +488,7 @@ test('zero identity storage retention removes the storage set after its final le
   assert.equal(await readRegistryRecord(indexedDB, userPubkey), null)
   const names = await databaseNames(indexedDB)
   assert.equal(names.has(`libp2r2p:private-messenger:${userPubkey}:idb-queue`), false)
+  assert.equal(names.has(`libp2r2p:private-messenger:${userPubkey}:pending-decryption:idb-queue`), false)
   assert.equal(names.has(`libp2r2p:private-messenger:${userPubkey}:seeds:idb-queue`), false)
   assert.equal(names.has(`libp2r2p:private-messenger:${userPubkey}:state:idb`), false)
 })
@@ -531,6 +532,7 @@ test('removing a configured channel starts its stale-channel retention window', 
       staleChannelSeconds: 10
     })
     const pubkey = 'removed-channel-user-channel'
+    await messenger.deferDecryption({ error: { code: 'CONTENT_KEY_NOT_FOUND' }, record: { format: 'outer_v1', channelPubkey: pubkey, outer: { id: 'pending', content: 'encrypted' } } })
     await messenger.update({ channels: [] })
     assert.equal(messenger.readState().channels[pubkey].lastWatchedAt, Math.floor(now / 1000))
 
@@ -541,6 +543,9 @@ test('removing a configured channel starts its stale-channel retention window', 
     now += 1_000
     await messenger.cleanupStaleChannels()
     assert.equal(messenger.readState().channels[pubkey], undefined)
+    assert.equal((await messenger.pendingDecryption.records()).length, 1, 'stale channel metadata does not add an item TTL')
+    await messenger.clearChannel(pubkey)
+    assert.deepEqual(await messenger.pendingDecryption.records(), [])
     await messenger.close()
   } finally {
     Date.now = originalNow

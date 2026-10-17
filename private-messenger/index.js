@@ -54,6 +54,9 @@ import { incompleteFetchError } from '../private-channel/helpers/fetch-error.js'
 import { recoveryRetryDelay, isPermanentRecoveryError } from './helpers/recovery-retry.js'
 import { normalizeRelayUrl } from '../url/index.js'
 import { deliveryInfo } from '../private-channel/helpers/rumor.js'
+import { migrateMessageQueue } from './services/migrate-message-queue.js'
+import { createPendingDecryption } from './services/pending-decryption.js'
+import { decryptionError, isDeferredDecryptionError } from '../private-channel/helpers/decryption-error.js'
 import { bytesToBase64 } from '../base64/index.js'
 import { ValidationError } from '../error/index.js'
 import { getRelaysByPubkey, pickRelaysForPubkeys, subscribeRelayListUpdates, relayPool } from '../relay/index.js'
@@ -419,6 +422,7 @@ export class PrivateMessenger {
       this.assertOpen()
       this.contentKeyPubkey = await this.contentKeySigner?.getPublicKey?.() || ''
       this.assertOpen()
+      await migrateMessageQueue(this._indexedDB, this.prefix)
       this.queue = await createQueue({
         prefix: this.prefix,
         indexes: MESSAGE_QUEUE_INDEXES,
@@ -427,6 +431,10 @@ export class PrivateMessenger {
         indexedDB: this._indexedDB
       })
       this.assertOpen()
+      this.pendingDecryption = await createPendingDecryption({
+        prefix: this.prefix, indexedDB: this._indexedDB,
+        report: detail => this.debug('pending-decryption', detail)
+      })
       this.seedQueue = this.seedStorage
         ? null
         : await createQueue({
@@ -446,16 +454,20 @@ export class PrivateMessenger {
       this.state = { channels: await this.stateStore.load() }
       await this.update({ userSigner, contentKeySigner, nymSigner: this.nymSigner, channels, relays, mode })
       this.initialized = true
+      this.retryPendingDecryptions().catch(error => this.onError?.(error))
       await this.refreshAndApplyStoragePolicy()
       this.broadcastStoragePolicyChange()
       return this
     } catch (err) {
+      this.decryptionRetry?.controller.abort(err)
+      await Promise.allSettled([this.decryptionRetry?.work])
       this.stopStorageMaintenance()
       this.stopStoragePolicyBroadcast()
       try { await this.queueOperationTail } catch {}
       try { await this.stateWriteTail } catch {}
       await Promise.allSettled([
         this.queue?.close?.(),
+        this.pendingDecryption?.close(),
         this.seedQueue?.close?.(),
         this.stateStore?.close?.()
       ])
@@ -1209,6 +1221,8 @@ export class PrivateMessenger {
           onMessage: message => this.receive(pubkey, () => this.handleMessage(pubkey, message), message),
           onSeed: seed => this.receive(pubkey, () => this.enqueueSeed(pubkey, seed), seed),
           onContentKeyUsage: usage => this.handleContentKeyUsage(pubkey, usage),
+          onDecryptionFailure: failure => this.deferDecryption(failure),
+          isDecryptionPending: record => this.pendingDecryption.has(record),
           receivedChunkTtlMs: this.receivedChunkTtlMsFor(channel),
           receivedChunkIndexedDB: this._indexedDB,
           onSubscriptionState: state => this.handleSubscriptionState(pubkey, state),
@@ -1241,6 +1255,11 @@ export class PrivateMessenger {
         continue
       }
       this.stopByChannel.set(pubkey, stop)
+      this.decryptionReadyChannels ??= new Set()
+      if (!this.decryptionReadyChannels.has(pubkey)) {
+        this.decryptionReadyChannels.add(pubkey)
+        this.retryPendingDecryptions().catch(error => this.onError?.(error))
+      }
       this.watchRevisionByChannel.set(pubkey, revision)
       this.updateChannelState(pubkey, {
         lastWatchedAt: nowSeconds(),
@@ -1829,6 +1848,7 @@ export class PrivateMessenger {
     if (typeof reason !== 'string' || !reason.trim()) throw new ValidationError('PAUSE_REASON_REQUIRED')
     this.assertOpen()
     this.pauseReasons.add(reason)
+    this.decryptionRetry?.controller.abort(this.pausedError())
     this.pauseRevisions.set(reason, (this.pauseRevisions.get(reason) || 0) + 1)
     this.sendRoutingPause.abort(this.pausedError())
     this.notifyStatus()
@@ -1865,6 +1885,7 @@ export class PrivateMessenger {
     }
     if (this.pauseReasons.size || this.closePromise) return
     const jobs = removed ? this.startChannelBackground(channels, { recover: true }) : [...this.channelBackground.values()].map(job => job.work)
+    if (removed) this.retryPendingDecryptions().catch(error => this.onError?.(error))
     if (removed) {
       for (const extension of this.extensions) {
         const work = Promise.resolve().then(() => { if (!this.pauseReasons.size && !this.closePromise) return extension.resume?.() })
@@ -2739,7 +2760,19 @@ export class PrivateMessenger {
     for (const line of splitJsonl(jsonl)) {
       const record = parseJson(line, null)
       if (!record) continue
-      const recovered = await this.messageFromBackfillRecord(channelPubkey, record)
+      const pendingRecord = record.recordType === ROUTER_SEED_RECORD_TYPE && isPrivateChannelRouter(record.router)
+        ? { format: 'routerRow_v1', channelPubkey, router: record.router, outer: { id: '', created_at: record.lastSeenAt || record.router.created_at } }
+        : null
+      if (pendingRecord && await this.pendingDecryption.has(pendingRecord)) continue
+      let recovered
+      try { recovered = await this.messageFromBackfillRecord(channelPubkey, record) } catch (cause) {
+        const error = decryptionError(cause, { channelPubkey })
+        if (!isDeferredDecryptionError(error) || record.recordType !== ROUTER_SEED_RECORD_TYPE) throw error
+        await this.deferDecryption({
+          error, record: pendingRecord
+        })
+        continue
+      }
       if (!recovered) continue
       await this.enqueueRumor(recovered.type, channelPubkey, {
         event: recovered.event,
@@ -2847,6 +2880,8 @@ export class PrivateMessenger {
       onNymEvent: (event, outer, meta) => this.receive(channelPubkey, () => this.enqueueRumor('nym', channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }),
       onSeedEvent: seed => this.receive(channelPubkey, () => this.enqueueSeed(channelPubkey, seed), seed),
       onContentKeyUsage: usage => this.handleContentKeyUsage(channelPubkey, usage),
+      onDecryptionFailure: failure => this.deferDecryption(failure),
+      isDecryptionPending: record => this.pendingDecryption.has(record),
       onError: err => { throw err }
     }
   }
@@ -3085,9 +3120,11 @@ export class PrivateMessenger {
     this.dropRecoveryState(pubkey)
     return this.runQueueOperation(async () => {
       this.channels.delete(pubkey)
+      this.decryptionReadyChannels?.delete(pubkey)
       this.removeChannelState(pubkey)
       await this.flushStateWrites()
       await this.queue.removeBy('byChannel', pubkey)
+      await this.pendingDecryption?.clearChannel(pubkey)
       await (this.seedStorage ? this.seedStorage.removeLocal({ channelPubkey: pubkey }) : this.seedQueue.removeBy('byChannel', pubkey))
       await this.touchStorageActivity({ force: true })
       this.ensureRelayListWatcher()
@@ -3096,6 +3133,74 @@ export class PrivateMessenger {
 
   async clearQueue () {
     return this.runQueueOperation(() => this.queue.clear())
+  }
+
+  async deferDecryption (failure) {
+    this.assertOpen()
+    const pubkey = failure.record.channelPubkey
+    if (this.pauseReasons.size || !this.channels.has(pubkey)) throw this.pausedError()
+    try { return await this.pendingDecryption.save(failure) } catch (error) {
+      this.recordInterruption([pubkey], failure.record.outer?.created_at)
+      if (isRecoverableStorageFailure(error)) this.pauseInternally('storage').catch(err => this.onError?.(err))
+      throw error
+    }
+  }
+
+  retryPendingDecryptions ({ force = false } = {}) {
+    if (typeof force !== 'boolean') throw new ValidationError('INVALID_FORCE')
+    if (this.closePromise || this.pauseReasons.size || !this.initialized) return Promise.resolve()
+    if (this.decryptionRetry && !this.decryptionRetry.controller.signal.aborted) {
+      this.decryptionRetry.again = true
+      this.decryptionRetry.force ||= force
+      return this.decryptionRetry.work
+    }
+    const job = { controller: new AbortController(), again: false, force, work: null }
+    const previous = this.decryptionRetry?.work
+    this.decryptionRetry = job
+    const { signal } = job.controller
+    const run = async () => {
+      do {
+        signal.throwIfAborted()
+        job.again = false
+        const force = job.force
+        job.force = false
+        const groups = new Map()
+        for (const record of await this.pendingDecryption.records({ force })) {
+          if (!groups.has(record.channelPubkey)) groups.set(record.channelPubkey, [])
+          groups.get(record.channelPubkey).push(record)
+        }
+        for (const [channelPubkey, records] of groups) {
+          signal.throwIfAborted()
+          const channel = this.channels.get(channelPubkey)
+          if (!channel || !this.desiredChannels.has(channelPubkey)) continue
+          const current = () => { signal.throwIfAborted(); if (this.channels.get(channelPubkey) !== channel) throw new Error('PRIVATE_CHANNEL_CHANGED') }
+          await this._privateChannel.replayDeferredDecryptions({
+            records, signal, receiverSigner: this.userSigner, receiverPubkey: this.userPubkey,
+            privateChannelSigner: channel.signer, privateChannelReaderSigner: channel.readerSigner,
+            privateChannelReaderPubkey: channel.readerPubkey, mode: channel.mode,
+            receivedChunkScope: `${this.prefix}:pending`, receivedChunkIndexedDB: this._indexedDB,
+            onEvent: (event, outer, meta) => {
+              current()
+              return this.receive(channelPubkey, () => this.enqueueRumor(eventType(event), channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer })
+            },
+            onNymEvent: (event, outer, meta) => {
+              current()
+              return this.receive(channelPubkey, () => this.enqueueRumor('nym', channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer })
+            },
+            onSeedEvent: seed => { current(); return this.receive(channelPubkey, () => this.enqueueSeed(channelPubkey, seed), seed) },
+            onRecovered: record => { current(); return this.pendingDecryption.recovered(record) },
+            onFailure: (record, error) => { current(); return this.pendingDecryption.failed(record, error) }
+          })
+        }
+      } while (job.again)
+    }
+    job.work = Promise.resolve(previous).catch(() => {}).then(() => {
+      const locks = globalThis.navigator?.locks
+      return locks?.request ? locks.request(`${this.prefix}:pending-decryption:retry`, { signal }, run) : run()
+    }).catch(error => { if (!signal.aborted) throw error }).finally(() => {
+      if (this.decryptionRetry === job) this.decryptionRetry = null
+    })
+    return job.work
   }
 
   async cleanupStaleChannels ({ storageSnapshot } = {}) {
@@ -3150,6 +3255,7 @@ export class PrivateMessenger {
   }
 
   close () {
+    this.decryptionRetry?.controller.abort(new Error('PRIVATE_MESSENGER_CLOSED'))
     if (this.closePromise) return this.closePromise
     const initSettledPromise = this.initSettledPromise
     this.sendRoutingLifetime.abort()
@@ -3189,11 +3295,13 @@ export class PrivateMessenger {
       await Promise.allSettled([...this.deliveryReads])
       await Promise.all([...this.deliveries].map(delivery => delivery.nack()))
       await this.stateWriteTail
+      await Promise.allSettled([this.decryptionRetry?.work])
       try { await this.storageTouchPromise } catch {}
       await this.storageMaintenancePromise
       try { await this.storagePolicyRefreshTail } catch {}
       await Promise.all([
         this.queue?.close?.(),
+        this.pendingDecryption?.close(),
         this.seedQueue?.close?.(),
         this.stateStore?.close?.()
       ])

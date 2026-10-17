@@ -81,6 +81,20 @@ suite pass; report independently scoped problems separately.
 
 ## Private messaging lifecycle
 
+- Version 0.11.22 migrates only the known message-queue three-field provenance
+  index, atomically preserving rows/order/accounting. Keep generic queue schema
+  rejection strict. Pending decryption uses its own 16 MiB FIFO ciphertext queue,
+  without TTL; explicit channel/identity cleanup includes it. Only missing keys
+  and MAC failures are deferrable, and commits precede history coverage.
+  Retry on initialization/resume/key notifications, never polling. Three MAC
+  attempts persist across visits; force is explicit. A successful retry admits
+  the normal inbox before deleting ciphertext. Pause/close fence late results.
+  Keep unknown/storage/permission errors operational, with unchanged ACK/NACK.
+- Confirmed content-key announcements use rememberContentKeyEvent. Preserve
+  timestamp/lowest-ID ordering and prevent stale query results from escaping to
+  either the cache or its callers. Diagnostics contain only selected public
+  coordinates, never ciphertext, scopes, payloads, keys or signers.
+
 - `idb-queue.putBy` performs an atomic upsert through a declared unique,
   non-multiEntry index. `existingOnly` checkpoints must never recreate removed
   items. Preserve queue position on replacement, transactional byte accounting,

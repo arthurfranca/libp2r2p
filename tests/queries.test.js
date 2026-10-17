@@ -5,7 +5,7 @@ import { generateSecretKey } from '../key/index.js'
 import TestSigner from './helpers/test-signer.js'
 import { bytesToHex } from '../base16/index.js'
 import { makeContentKeyEvent } from '../content-key/event/index.js'
-import { getIykcProofs, clearContentKeyCache } from '../content-key/services/iykc-proof.js'
+import { getIykcProofs, clearContentKeyCache, rememberContentKeyEvent } from '../content-key/services/iykc-proof.js'
 import {
   cacheRelayListEvent,
   clearRelayQueryCache,
@@ -25,9 +25,53 @@ function signer () {
   return TestSigner.getOrCreate(bytesToHex(generateSecretKey()))
 }
 
+test('published content-key announcement wins over a pending stale query and negative cache', async () => {
+  const user = signer()
+  const owner = await user.getPublicKey()
+  const older = await makeContentKeyEvent({ userSigner: user, contentKeySigner: signer(), createdAt: 1 })
+  const newer = await makeContentKeyEvent({ userSigner: user, contentKeySigner: signer(), createdAt: 2 })
+  const gate = Promise.withResolvers()
+  const started = Promise.withResolvers()
+  const options = { _getRelaysByPubkey: async () => ({ [owner]: { write: ['wss://fixture.example'] } }), _getEvents: async () => { started.resolve(); return gate.promise } }
+  const reading = getIykcProofs([owner], options)
+  await started.promise
+  assert.equal(rememberContentKeyEvent(newer), true)
+  assert.equal(rememberContentKeyEvent(older), false)
+  gate.resolve({ result: [{ event: older }] })
+  assert.equal((await reading)[owner].iykcPubkey, newer.tags[0][1])
+  assert.equal((await getIykcProofs([owner], options))[owner].iykcPubkey, newer.tags[0][1])
+  clearContentKeyCache()
+  await getIykcProofs([owner], { ...options, _getEvents: async () => ({ result: [] }) })
+  rememberContentKeyEvent(newer)
+  assert.equal((await getIykcProofs([owner], options))[owner].iykcPubkey, newer.tags[0][1])
+  assert.throws(() => rememberContentKeyEvent({ ...newer, sig: 'bad' }), { code: 'INVALID_CONTENT_KEY_EVENT' })
+})
+
 function relayListEvent (pubkey, createdAt, tags) {
   return { kind: 10002, pubkey, created_at: createdAt, tags, content: '' }
 }
+
+test('content-key tie break and publication during a mixed cached batch reach all waiters', async () => {
+  const user = signer(); const other = signer()
+  const owner = await user.getPublicKey(); const peer = await other.getPublicKey()
+  const tied = await Promise.all([signer(), signer()].map(contentKeySigner => makeContentKeyEvent({ userSigner: user, contentKeySigner, createdAt: 3 })))
+  tied.sort((a, b) => a.id.localeCompare(b.id))
+  rememberContentKeyEvent(tied[1])
+  assert.equal(rememberContentKeyEvent(tied[0]), true)
+  assert.equal(rememberContentKeyEvent(tied[1]), false)
+  const newer = await makeContentKeyEvent({ userSigner: user, contentKeySigner: signer(), createdAt: 4 })
+  const gate = Promise.withResolvers(); const started = Promise.withResolvers()
+  const options = {
+    _getRelaysByPubkey: async () => ({ [peer]: { write: ['wss://fixture.example'] } }),
+    _getEvents: async () => { started.resolve(); return gate.promise }
+  }
+  const reading = getIykcProofs([owner, peer], options)
+  const waiting = getIykcProofs([owner, peer], options)
+  await started.promise
+  rememberContentKeyEvent(newer)
+  gate.resolve({ result: [] })
+  for (const result of await Promise.all([reading, waiting])) assert.equal(result[owner].iykcPubkey, newer.tags[0][1])
+})
 
 test('cacheRelayListEvent tracks newer relay-list events and exposes changed sets', () => {
   const first = cacheRelayListEvent(relayListEvent('alice', 1, [['r', 'wss://one.example']]))

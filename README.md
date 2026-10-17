@@ -242,6 +242,49 @@ stream according to the existing partial-failure rules.
 
 ## Private Messenger
 
+### Pending ciphertext recovery (0.11.22)
+
+The known three-field message deduplication index is migrated automatically to
+include provenance, preserving positions, records and byte accounting. Other
+incompatible queue definitions still fail explicitly; no database reset is needed.
+
+PrivateMessenger defers `CONTENT_KEY_NOT_FOUND` and `INVALID_MAC` packets to its
+separate `${prefix}:pending-decryption:idb-queue`: 16 MiB FIFO, ciphertext only,
+no per-item TTL. Duplicate packets and attempts preserve their queue positions.
+Explicit channel removal and identity storage maintenance remove their pending
+records. Oversized records and capacity eviction are reported as discards.
+Stale channel metadata cleanup does not expire pending ciphertext.
+History continues only after deferral commits; storage/permission failures are
+not converted into successful coverage. Deferral is not message delivery.
+
+Call `retryPendingDecryptions()` after new content keys become available. Initial
+readiness and resume also request a pass. A single background worker coalesces
+requests, uses an origin/identity Web Lock when available, and stops on pause or
+close. Missing-key retries have no polling timer. MAC failures permit three total
+attempts, persisted across reloads; exhausted packets remain until FIFO eviction.
+`retryPendingDecryptions({ force: true })` explicitly retries exhausted packets.
+Success enters the normal acknowledged inbox before removing the pending item.
+The session coordinator forwards this API. Private-channel consumers may opt in
+with `onDecryptionFailure({ error, record })`, returning true only after durable
+handling, and replay records with `replayDeferredDecryptions`. Without the hook,
+standalone readers retain their existing error behavior.
+The optional `isDecryptionPending(record)` hook skips an already persisted
+packet before decryption; PrivateMessenger uses it for live/history/seeder
+duplicates so retransmission cannot bypass the MAC attempt budget.
+
+For standalone replay, pass `records: [{ id, channelPubkey, packet }]`, where
+`packet` is the ciphertext record received by the failure hook, together with
+the current receiver/channel signers and receiver pubkey. `onEvent` and
+`onNymEvent` admit normal deliveries; `onRecovered(record)` removes durable
+pending ciphertext only after admission, and `onFailure(record, error)` retains
+it and records the failed attempt. Both settlement callbacks are required.
+An optional AbortSignal fences processing; one batch shares a fragment processor.
+
+`rememberContentKeyEvent(event)` from `libp2r2p/content-key` validates and remembers
+a confirmed local announcement. Newest timestamp, then lowest ID, wins. Pending
+discovery queries cannot overwrite or return an older result; normal positive
+and negative cache windows remain unchanged.
+
 The main API is `createPrivateMessenger` from `libp2r2p/private-messenger`.
 It coordinates private-channel wrapping, relay watching, recovery state, and
 content-key lookup for direct or group-style private app messages.

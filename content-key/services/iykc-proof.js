@@ -1,6 +1,7 @@
 import { parseContentKeyEvent } from '../event/index.js'
 import { CONTENT_KEY_ANNOUNCEMENT } from '../../kind/index.js'
 import { pickRelaysForPubkeys, getRelaysByPubkey, relayPool } from '../../relay/index.js'
+import { ValidationError } from '../../error/index.js'
 
 const QUERY_CACHE_MS = 40 * 60 * 1000
 const NEGATIVE_CACHE_MS = 5 * 60 * 1000
@@ -10,6 +11,7 @@ const contentKeysByPubkey = Object.create(null)
 const iykcCacheTimersByPubkey = Object.create(null)
 const iykcCacheAddedAtByPubkey = Object.create(null)
 const inFlightByPubkey = new Map()
+const announcementOrder = new Map()
 
 const getEvents = (...args) => relayPool.getEvents(...args)
 
@@ -37,6 +39,7 @@ function cloneContentKey (contentKey) {
 }
 
 function deleteCachedValue (cache, timers, addedAt, key) {
+  if (cache === contentKeysByPubkey) announcementOrder.delete(key)
   clearTimeout(timers[key])
   delete cache[key]
   delete timers[key]
@@ -72,6 +75,23 @@ export function clearContentKeyCache () {
   for (const key of Object.keys(iykcCacheTimersByPubkey)) delete iykcCacheTimersByPubkey[key]
   for (const key of Object.keys(iykcCacheAddedAtByPubkey)) delete iykcCacheAddedAtByPubkey[key]
   inFlightByPubkey.clear()
+  announcementOrder.clear()
+}
+
+// Remember only authenticated announcements, including those just published
+// locally. An older query may still finish, but cannot undo this selection.
+export function rememberContentKeyEvent (event) {
+  const proof = parseContentKeyEvent(event)
+  if (!proof) throw new ValidationError('INVALID_CONTENT_KEY_EVENT')
+  const previous = announcementOrder.get(event.pubkey)
+  if (previous && (previous.createdAt > event.created_at ||
+      (previous.createdAt === event.created_at && previous.id <= event.id))) return false
+  announcementOrder.set(event.pubkey, { createdAt: event.created_at, id: event.id })
+  setCachedValue(contentKeysByPubkey, iykcCacheTimersByPubkey, iykcCacheAddedAtByPubkey,
+    event.pubkey, cloneContentKey(proof), QUERY_CACHE_MS)
+  pruneCache(contentKeysByPubkey, iykcCacheTimersByPubkey, iykcCacheAddedAtByPubkey, IYKC_CACHE_MAX_ITEMS)
+  for (const key of announcementOrder.keys()) if (!hasCachedKey(contentKeysByPubkey, key)) announcementOrder.delete(key)
+  return true
 }
 
 async function queryContentKeyProofs (pubkeyList, { _getEvents, _getRelaysByPubkey, cacheMs, negativeCacheMs }) {
@@ -102,18 +122,28 @@ async function queryContentKeyProofs (pubkeyList, { _getEvents, _getRelaysByPubk
   for (const event of eventGroups.flat()) {
     const parsed = parseContentKeyEvent(event)
     if (!parsed) continue
-    if (!latestByPubkey[event.pubkey] || event.created_at > latestByPubkey[event.pubkey].created_at) {
-      latestByPubkey[event.pubkey] = { created_at: event.created_at, ...parsed }
+    const previous = latestByPubkey[event.pubkey]
+    if (!previous || event.created_at > previous.created_at ||
+        (event.created_at === previous.created_at && event.id < previous.id)) {
+      latestByPubkey[event.pubkey] = { created_at: event.created_at, id: event.id, ...parsed }
     }
   }
 
   const out = {}
   for (const pubkey of pubkeyList) {
     const entry = latestByPubkey[pubkey]
+    const selected = announcementOrder.get(pubkey)
+    if (selected && (!entry || selected.createdAt > entry.created_at ||
+        (selected.createdAt === entry.created_at && selected.id <= entry.id))) {
+      const cached = cloneContentKey(contentKeysByPubkey[pubkey])
+      if (cached) out[pubkey] = cached
+      continue
+    }
     const proof = entry
       ? { iykcPubkey: entry.iykcPubkey, iykcProof: entry.iykcProof }
       : null
     if (proof) {
+      announcementOrder.set(pubkey, { createdAt: entry.created_at, id: entry.id })
       setCachedValue(contentKeysByPubkey, iykcCacheTimersByPubkey, iykcCacheAddedAtByPubkey, pubkey, cloneContentKey(proof), cacheMs)
       out[pubkey] = proof
     } else if (negativeCacheMs > 0) {
@@ -123,6 +153,7 @@ async function queryContentKeyProofs (pubkeyList, { _getEvents, _getRelaysByPubk
     }
   }
   pruneCache(contentKeysByPubkey, iykcCacheTimersByPubkey, iykcCacheAddedAtByPubkey, IYKC_CACHE_MAX_ITEMS)
+  for (const key of announcementOrder.keys()) if (!hasCachedKey(contentKeysByPubkey, key)) announcementOrder.delete(key)
   return out
 }
 
@@ -168,6 +199,14 @@ export async function getIykcProofs (pubkeys, {
       const cached = cloneContentKey(contentKeysByPubkey[pubkey])
       if (cached) out[pubkey] = cached
     }
+  }
+  // A batch may wait for another author after reading an already cached proof.
+  // Reconcile again before returning so a publication during that wait wins too.
+  for (const pubkey of pubkeyList) {
+    if (!hasCachedKey(contentKeysByPubkey, pubkey)) continue
+    const cached = cloneContentKey(contentKeysByPubkey[pubkey])
+    if (cached) out[pubkey] = cached
+    else delete out[pubkey]
   }
   return out
 }

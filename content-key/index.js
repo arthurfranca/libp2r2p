@@ -1,1 +1,1 @@
-export { getIykcProofs } from './services/iykc-proof.js'
+export { getIykcProofs, rememberContentKeyEvent } from './services/iykc-proof.js'

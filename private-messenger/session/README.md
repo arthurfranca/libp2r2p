@@ -4,6 +4,12 @@
 outbox and IRFS attachments without presentation state. It builds on
 PrivateMessenger and the file coordinator, not another recovery protocol.
 
+`retryPendingDecryptions({ force = false } = {})` forwards a background pass to
+the account messenger while available. Call after committed content-key changes;
+ordinary availability recovery already requests a pass. Ciphertext stays in the
+separate bounded FIFO until admitted to the normal inbox, evicted or explicitly
+cleared. This does not retry application storage/permission failures as crypto.
+
 Provide `owner`, a byte-based NIP-44 v3 `signer` with `withSharedKey`, and either
 `eventStore` or a `messageStorage.save(event, { peerPubkey, hearsay })` adapter.
 Optional `chunkStorage` and `recoveryStorage` (`seeds`, `authorizations`) select

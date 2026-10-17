@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { ValidationError } from '../error/index.js'
 import { ASK_KIND, REPLY_KIND, TELL_KIND } from '../private-message/index.js'
-import { EXPIRATION_SECONDS } from '../private-channel/index.js'
+import { EXPIRATION_SECONDS, ROUTER_KIND } from '../private-channel/index.js'
 import { readHistory } from '../private-channel/helpers/history.js'
 import {
   createEventReplyPacker,
@@ -210,6 +210,70 @@ test('private messenger defaults to larger bounded IndexedDB queues', () => {
 
   assert.equal(messenger.messageQueueMaxBytes, 16 * 1024 * 1024)
   assert.equal(messenger.seedQueueMaxBytes, 64 * 1024 * 1024)
+})
+
+test('pending decryption coalesces workers, fences locked delivery and admits before removal', async () => {
+  const entered = Promise.withResolvers(); const release = Promise.withResolvers()
+  let calls = 0; let active = 0; let peak = 0
+  const event = { id: 'recovered-id', kind: 9, pubkey: 'alice', created_at: 10, tags: [], content: 'recovered' }
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _privateChannel: {
+      fetchHistory: async () => [],
+      replayDeferredDecryptions: async ({ records, signal, onEvent, onRecovered }) => {
+        if (!records.length) return
+        calls++; peak = Math.max(peak, ++active)
+        try {
+          if (calls === 1) { entered.resolve(); await release.promise }
+          signal.throwIfAborted()
+          for (const record of records) {
+            await onEvent(event, record.packet.outer, { senderPubkey: 'alice', provenance: 'direct' })
+            assert.ok(await messenger.queue.someBy('byChannelTypeEventId', ['channel', 'message', event.id, 'direct']))
+            await onRecovered(record)
+          }
+        } finally { active-- }
+      }
+    }
+  }).init({ userSigner: signer('retry-owner'), channels: [{ signer: signer('channel'), relays: ['wss://fixture.example'] }] })
+  await messenger.retryPendingDecryptions()
+  await messenger.deferDecryption({ error: new ValidationError('CONTENT_KEY_NOT_FOUND'), record: { format: 'outer_v1', channelPubkey: 'channel', outer: { id: 'encrypted-packet', content: 'ciphertext' } } })
+  const first = messenger.retryPendingDecryptions()
+  await entered.promise
+  assert.equal(messenger.retryPendingDecryptions(), first)
+  await messenger.pause('locked')
+  release.resolve()
+  await first
+  assert.equal((await messenger.pendingDecryption.records()).length, 1)
+  assert.equal(await messenger.nextMessage(), null)
+  await messenger.resume('locked')
+  await messenger.retryPendingDecryptions()
+  assert.equal(peak, 1)
+  assert.deepEqual(await messenger.pendingDecryption.records(), [])
+  assert.equal((await takeMessage(messenger)).event.id, event.id)
+  await messenger.close()
+})
+
+test('seeder replies defer one encrypted row and keep admitting following rows', async () => {
+  const messenger = await new PrivateMessenger({ _privateMessage: fakePrivateMessage() }).init({
+    userSigner: signer('seed-receiver'), channels: [{ signer: signer('channel'), relays: ['wss://fixture.example'] }]
+  })
+  await messenger.retryPendingDecryptions()
+  let failedAttempts = 0
+  messenger.messageFromBackfillRecord = async (channelPubkey, record) => {
+    if (record.router.pubkey === 'unreadable') { failedAttempts++; throw new ValidationError('INVALID_MAC') }
+    return { type: 'message', event: { id: 'newer', kind: 9, pubkey: 'alice', tags: [], created_at: 20, content: 'valid message' }, meta: { senderPubkey: 'alice' } }
+  }
+  const rows = ['unreadable', 'readable'].map(pubkey => ({
+    recordType: ROUTER_SEED_RECORD_TYPE,
+    router: { kind: ROUTER_KIND, pubkey, created_at: 10, tags: [['c', '0', '1'], ['f', 'alice']], content: jsonlContent(payloadRow(), JSON.stringify(['seed-receiver', 'encrypted-row'])) }
+  }))
+  const reply = { payload: { payload: { jsonl: rows.map(row => JSON.stringify(row)).join('\n') } }, event: { pubkey: 'seeder' } }
+  await messenger.consumeMissingMessagesReply('channel', reply)
+  assert.equal((await takeMessage(messenger)).event.id, 'newer')
+  assert.equal((await messenger.pendingDecryption.records()).length, 1)
+  await messenger.consumeMissingMessagesReply('channel', reply)
+  assert.equal(failedAttempts, 1, 'repeated seed rows do not decrypt a pending packet again')
+  await messenger.close()
 })
 
 test('private messenger persists queued messages in IndexedDB across instances', async () => {
