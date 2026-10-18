@@ -3,15 +3,19 @@
 export function createForegroundWork () {
   let active = 0
   const waiters = new Set()
+  const observers = new Set()
+  const notify = () => { for (const listener of observers) listener(active > 0) }
   const lifetime = new AbortController()
   return {
     enter () {
       active++
+      notify()
       let released = false
       return () => {
         if (released) return
         released = true
         if (--active === 0) for (const wake of [...waiters]) wake()
+        notify()
       }
     },
     wait (signal) {
@@ -24,6 +28,7 @@ export function createForegroundWork () {
         combined.addEventListener('abort', finish, { once: true })
       })
     },
-    close () { lifetime.abort(); waiters.clear() }
+    observe (listener) { observers.add(listener); listener(active > 0); return () => observers.delete(listener) },
+    close () { lifetime.abort(); waiters.clear(); observers.clear() }
   }
 }

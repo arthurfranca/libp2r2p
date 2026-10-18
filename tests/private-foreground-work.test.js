@@ -28,3 +28,11 @@ test('cancelled or closed background waits never invoke the signer later', async
   await assert.rejects(waiting, { name: 'AbortError' })
   release(); await Promise.resolve(); assert.equal(calls, 0)
 })
+
+test('foreground activity observation tracks overlapping work and supports unsubscribe', () => {
+  const gate = createForegroundWork(); const states = []
+  const stop = gate.observe(active => states.push(active))
+  const release = gate.enter(); const other = gate.enter()
+  release(); release(); other(); stop(); gate.enter(); gate.close()
+  assert.deepEqual(states, [false, true, true, true, false])
+})

@@ -98,6 +98,12 @@ export async function createPendingDecryption ({ prefix, indexedDB, maxBytes = P
       for await (const item of queue.storedItems()) if (force || item.macAttempts < 3) records.push(item)
       return records
     },
+    current (item, { force = false } = {}) {
+      return serial(async () => {
+        const stored = await queue.getBy('byId', item.id)
+        return stored && (force || stored.macAttempts < 3) ? stored : null
+      })
+    },
     recovered (item) {
       return serial(async () => {
         await queue.removeBy('byId', item.id)

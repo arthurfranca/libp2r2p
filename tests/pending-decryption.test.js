@@ -62,6 +62,8 @@ test('ciphertext pending queue survives restart, deduplicates, caps MAC attempts
   assert.equal(first.macAttempts, 2)
   await pending.failed(first, new ValidationError('INVALID_MAC'))
   assert.deepEqual(await pending.records(), [])
+  assert.equal(await pending.current(first), null)
+  assert.equal((await pending.current(first, { force: true })).macAttempts, 3)
   assert.equal((await pending.records({ force: true })).length, 1)
   await pending.save({ error: new ValidationError('INVALID_MAC'), record: { format: 'outer_v1', channelPubkey: 'channel', outer: { id: 'oversized', content: 'x'.repeat(3000) } } })
   assert.equal((await pending.records({ force: true })).length, 1)
@@ -128,13 +130,19 @@ for (const code of ['CONTENT_KEY_NOT_FOUND', 'INVALID_MAC']) {
     }
     let pending = await createPendingDecryption({ prefix: code, indexedDB })
     const delivered = []
+    let activeProcessing = 0
     await channel.fetchHistory({
       receiverSigner: receiver, receiverPubkey: bobPubkey, privateChannelSigner: alice, privateChannelPubkeys: [alicePubkey],
       relays: ['wss://fixture.example'], receivedChunkIndexedDB: indexedDB, partial: true, since: 0, until: 20,
-      onDecryptionFailure: failure => pending.save(failure),
-      onEvent: event => delivered.push(event),
+      _onProcessing: pubkey => {
+        assert.equal(pubkey, alicePubkey); activeProcessing++
+        return () => { activeProcessing-- }
+      },
+      onDecryptionFailure: failure => { assert.equal(activeProcessing, 1); return pending.save(failure) },
+      onEvent: event => { assert.equal(activeProcessing, 1); delivered.push(event) },
       _getEvents: async () => ({ result: [...damaged, ...good].map(event => ({ event })), relays: [{ relay: 'wss://fixture.example', status: 'eose' }] })
     })
+    assert.equal(activeProcessing, 0)
     assert.equal(delivered.length, 1)
     assert.equal(delivered[0].content, 'newer valid message')
     const records = await pending.records()
@@ -173,3 +181,25 @@ for (const code of ['CONTENT_KEY_NOT_FOUND', 'INVALID_MAC']) {
     await pending.close()
   })
 }
+
+test('fragmented outer replay keeps one processor across scheduled record boundaries', async () => {
+  const indexedDB = new IDBFactory()
+  const alice = signer(); const bob = signer()
+  const channelPubkey = await alice.getPublicKey(); const receiverPubkey = await bob.getPublicKey()
+  const original = { kind: 9, created_at: 10, tags: [], content: 'fragmented-body'.repeat(24000) }
+  const packets = await channel.wrapEvent({ senderSigner: alice, receivers: [receiverPubkey], event: original, _getIykcProofs: async () => ({}) })
+  assert.ok(packets.length > 4)
+  const records = packets.map((outer, index) => ({ id: String(index), channelPubkey, packet: { format: 'outer_v1', channelPubkey, outer } }))
+  const recovered = new Set(); const delivered = []
+  let admissions = 0
+  await channel.replayDeferredDecryptions({
+    records, receiverSigner: bob, receiverPubkey, privateChannelSigner: alice, receivedChunkIndexedDB: indexedDB,
+    _runRecord: async (_record, work) => { admissions++; await new Promise(resolve => setTimeout(resolve, 0)); await work() },
+    onEvent: event => delivered.push(event), onRecovered: record => recovered.add(record.id),
+    onFailure: (_record, error) => { throw error }
+  })
+  assert.equal(admissions, packets.length)
+  assert.equal(delivered.length, 1)
+  assert.equal(delivered[0].content, original.content)
+  assert.equal(recovered.size, records.length)
+})

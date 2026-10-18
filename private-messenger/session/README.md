@@ -10,6 +10,19 @@ ordinary availability recovery already requests a pass. Ciphertext stays in the
 separate bounded FIFO until admitted to the normal inbox, evicted or explicitly
 cleared. This does not retry application storage/permission failures as crypto.
 
+Construction accepts `pendingDecryptionReady` (default `true`). Pass `false` to
+hold pending queue reads/replay until `setPendingDecryptionReady(true)` releases
+them after initial presentation. This never pauses live reception, sends or
+channel preparation. Recovery waits for 250 ms of channel inactivity; a five-second
+maximum admits one packet during sustained activity. It yields between records,
+with at most four consecutive preferred records before another eligible channel.
+`setPendingDecryptionPriority(peer | null)` retains a peer preference through
+preparation; self-chat/`null` or removal clear it. Deadlines prevent preference
+from starving other channels. Account unavailability/close still cancel recovery;
+`force` bypasses only the MAC attempt limit. Awaiting the retry API awaits its
+scheduled pass, so do not await it on the interface's critical startup path.
+
+
 Provide `owner`, a byte-based NIP-44 v3 `signer` with `withSharedKey`, and either
 `eventStore` or a `messageStorage.save(event, { peerPubkey, hearsay })` adapter.
 Optional `chunkStorage` and `recoveryStorage` (`seeds`, `authorizations`) select

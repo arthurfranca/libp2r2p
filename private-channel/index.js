@@ -717,7 +717,7 @@ function createProcessor ({
   onNymEvent,
   onSeedEvent,
   onContentKeyUsage,
-  onDecryptionFailure, isDecryptionPending,
+  onDecryptionFailure, isDecryptionPending, _onProcessing,
   onError,
   receivedChunkScope = '',
   receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS,
@@ -741,7 +741,14 @@ function createProcessor ({
   storeReady.catch(() => {})
 
   async function processOuterEvent (outer) {
-    await storeReady
+    const release = _onProcessing?.(outer.pubkey)
+    try {
+      await storeReady
+      return await processReadyOuterEvent(outer)
+    } finally { release?.() }
+  }
+
+  async function processReadyOuterEvent (outer) {
     let groupKey = ''
     let routerDecrypted = false
     try {
@@ -982,7 +989,7 @@ function shouldIgnoreGroupError (err) {
 
 // Replay ciphertext only. Keep one fragment processor for the entire batch;
 // incomplete outer groups remain pending until a later key/channel transition.
-export async function replayDeferredDecryptions ({ records, onRecovered, onFailure, ...options }) {
+export async function replayDeferredDecryptions ({ records, onRecovered, onFailure, _runRecord = (_record, work) => work(), ...options }) {
   if (!Array.isArray(records) || records.some(record => typeof record?.id !== 'string' ||
       typeof record.channelPubkey !== 'string' || !['outer_v1', 'routerRow_v1'].includes(record.packet?.format))) throw new ValidationError('INVALID_DEFERRED_RECORDS')
   if (typeof onRecovered !== 'function' || typeof onFailure !== 'function') throw new ValidationError('DEFERRED_CALLBACKS_REQUIRED')
@@ -1017,44 +1024,48 @@ export async function replayDeferredDecryptions ({ records, onRecovered, onFailu
   })
   try {
     for (const record of records) {
-      options.signal?.throwIfAborted()
-      current = record
-      chunked = false
-      try {
-        if (record.packet.format === 'outer_v1') {
-          await processor(record.packet.outer)
-          if (!chunked) await onRecovered(record)
-        } else {
-          const event = await unwrapRouterEvent({
-            receiverSigner: options.receiverSigner, receiverPubkey: options.receiverPubkey,
-            channelPubkey: record.channelPubkey, router: record.packet.router
-          })
-          options.signal?.throwIfAborted()
-          if (event) {
-            await options.onEvent?.(event, record.packet.outer, {
-              router: record.packet.router, channelPubkey: record.channelPubkey,
-              ...deliveryInfo(event, readSenderTag(record.packet.router))
-            })
-          }
-          await onRecovered(record)
-        }
-      } catch (error) {
+      await _runRecord(record, async () => {
         options.signal?.throwIfAborted()
-        await onFailure(record, decryptionError(error, { channelPubkey: record.channelPubkey, eventId: record.packet.outer?.id }))
-      }
+        current = record
+        chunked = false
+        try {
+          if (record.packet.format === 'outer_v1') {
+            await processor(record.packet.outer)
+            if (!chunked) await onRecovered(record)
+          } else {
+            const event = await unwrapRouterEvent({
+              receiverSigner: options.receiverSigner, receiverPubkey: options.receiverPubkey,
+              channelPubkey: record.channelPubkey, router: record.packet.router
+            })
+            options.signal?.throwIfAborted()
+            if (event) {
+              await options.onEvent?.(event, record.packet.outer, {
+                router: record.packet.router, channelPubkey: record.channelPubkey,
+                ...deliveryInfo(event, readSenderTag(record.packet.router))
+              })
+            }
+            await onRecovered(record)
+          }
+        } catch (error) {
+          options.signal?.throwIfAborted()
+          await onFailure(record, decryptionError(error, { channelPubkey: record.channelPubkey, eventId: record.packet.outer?.id }))
+        }
+        for (const key of completed) {
+          for (const id of groups.get(key) || []) {
+            const recovered = records.find(record => record.id === id)
+            if (recovered) await onRecovered(recovered)
+          }
+          groups.delete(key)
+        }
+        completed.clear()
+      })
       // Let live ingestion and foreground signer work run between records.
       await new Promise(resolve => setTimeout(resolve, 0))
-    }
-    for (const key of completed) {
-      for (const id of groups.get(key) || []) {
-        const record = records.find(record => record.id === id)
-        if (record) await onRecovered(record)
-      }
     }
   } finally { processor.close() }
 }
 
-export async function fetch ({ signal, receiverSigner, iykcSigner, privateChannelSigner = receiverSigner, privateChannelSignersByPubkey, privateChannelReaderSigner = privateChannelSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, privateChannelPubkey, privateChannelPubkeys, receiverPubkey, relays, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onDecryptionFailure, isDecryptionPending, onError, since, until, limit, mode = 'leecher', modeByPubkey, receivedChunkScope = '', receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS, receivedChunkTtlMsByPubkey, receivedChunkMaxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES, receivedChunkIndexedDB = globalThis.indexedDB, ignoredGroupTtlMs = DEFAULT_IGNORED_GROUP_TTL_MS, ignoredGroupMaxEntries = DEFAULT_IGNORED_GROUP_MAX_ENTRIES, _getEvents = getEvents }) {
+export async function fetch ({ signal, receiverSigner, iykcSigner, privateChannelSigner = receiverSigner, privateChannelSignersByPubkey, privateChannelReaderSigner = privateChannelSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, privateChannelPubkey, privateChannelPubkeys, receiverPubkey, relays, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onDecryptionFailure, isDecryptionPending, _onProcessing, onError, since, until, limit, mode = 'leecher', modeByPubkey, receivedChunkScope = '', receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS, receivedChunkTtlMsByPubkey, receivedChunkMaxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES, receivedChunkIndexedDB = globalThis.indexedDB, ignoredGroupTtlMs = DEFAULT_IGNORED_GROUP_TTL_MS, ignoredGroupMaxEntries = DEFAULT_IGNORED_GROUP_MAX_ENTRIES, _getEvents = getEvents }) {
   if (!relays?.length) throw new ValidationError('NO_RELAYS')
   const authors = privateChannelPubkeyList({ privateChannelPubkey, privateChannelPubkeys })
   const filter = { kinds: [PRIVATE_BROADCAST_KIND] }
@@ -1073,7 +1084,7 @@ export async function fetch ({ signal, receiverSigner, iykcSigner, privateChanne
   const elapsedMs = Math.round(performance.now() - startedAt)
   const events = result.map(({ event }) => event)
   events.sort((a, b) => a.created_at - b.created_at)
-  const processOuterEvent = createProcessor({ receiverSigner, iykcSigner, privateChannelSigner, privateChannelSignersByPubkey, privateChannelReaderSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, receiverPubkey, mode, modeByPubkey, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onDecryptionFailure, isDecryptionPending, onError, receivedChunkScope, receivedChunkTtlMs, receivedChunkTtlMsByPubkey, receivedChunkMaxBytes, receivedChunkIndexedDB, ignoredGroupTtlMs, ignoredGroupMaxEntries })
+  const processOuterEvent = createProcessor({ receiverSigner, iykcSigner, privateChannelSigner, privateChannelSignersByPubkey, privateChannelReaderSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, receiverPubkey, mode, modeByPubkey, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onDecryptionFailure, isDecryptionPending, _onProcessing, onError, receivedChunkScope, receivedChunkTtlMs, receivedChunkTtlMsByPubkey, receivedChunkMaxBytes, receivedChunkIndexedDB, ignoredGroupTtlMs, ignoredGroupMaxEntries })
   try {
     for (const event of events) {
       signal?.throwIfAborted()
@@ -1103,7 +1114,7 @@ export async function fetchHistory ({ receiverSigner, privateChannelSigner = rec
   } finally { processOuterEvent.close() }
 }
 
-export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = receiverSigner, privateChannelSignersByPubkey, privateChannelReaderSigner = privateChannelSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, privateChannelPubkey, privateChannelPubkeys, receiverPubkey, relays, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onDecryptionFailure, isDecryptionPending, onError, since = nowSeconds() - 5, limit, liveOnly = false, mode = 'leecher', modeByPubkey, receivedChunkScope = '', receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS, receivedChunkTtlMsByPubkey, receivedChunkMaxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES, receivedChunkIndexedDB = globalThis.indexedDB, ignoredGroupTtlMs = DEFAULT_IGNORED_GROUP_TTL_MS, ignoredGroupMaxEntries = DEFAULT_IGNORED_GROUP_MAX_ENTRIES, _liveEventsGenerator = getLiveEventsGenerator, _eventsFeedGenerator = getEventsFeedGenerator }) {
+export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = receiverSigner, privateChannelSignersByPubkey, privateChannelReaderSigner = privateChannelSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, privateChannelPubkey, privateChannelPubkeys, receiverPubkey, relays, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onDecryptionFailure, isDecryptionPending, _onProcessing, onError, since = nowSeconds() - 5, limit, liveOnly = false, mode = 'leecher', modeByPubkey, receivedChunkScope = '', receivedChunkTtlMs = DEFAULT_RECEIVED_CHUNK_TTL_MS, receivedChunkTtlMsByPubkey, receivedChunkMaxBytes = DEFAULT_RECEIVED_CHUNK_MAX_BYTES, receivedChunkIndexedDB = globalThis.indexedDB, ignoredGroupTtlMs = DEFAULT_IGNORED_GROUP_TTL_MS, ignoredGroupMaxEntries = DEFAULT_IGNORED_GROUP_MAX_ENTRIES, _liveEventsGenerator = getLiveEventsGenerator, _eventsFeedGenerator = getEventsFeedGenerator }) {
   if (!relays?.length) throw new ValidationError('NO_RELAYS')
   if (receiverSigner && !receiverSigner?.nip44DecryptDoubleDH && !receiverSigner?.nip44v3Decrypt) throw new ValidationError('RECEIVER_SIGNER_NIP44V3_DECRYPT_UNSUPPORTED')
   if (!privateChannelReaderSigner && !privateChannelReaderSignersByPubkey && !privateChannelSigner && !privateChannelSignersByPubkey) throw new ValidationError('PRIVATE_CHANNEL_READER_REQUIRED')
@@ -1112,7 +1123,7 @@ export function subscribe ({ receiverSigner, iykcSigner, privateChannelSigner = 
   const filter = { kinds: [PRIVATE_BROADCAST_KIND], since }
   if (authors.length) filter.authors = authors
   if (limit != null) filter.limit = limit
-  const processOuterEvent = createProcessor({ receiverSigner, iykcSigner, privateChannelSigner, privateChannelSignersByPubkey, privateChannelReaderSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, receiverPubkey, mode, modeByPubkey, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onDecryptionFailure, isDecryptionPending, onError, receivedChunkScope, receivedChunkTtlMs, receivedChunkTtlMsByPubkey, receivedChunkMaxBytes, receivedChunkIndexedDB, ignoredGroupTtlMs, ignoredGroupMaxEntries })
+  const processOuterEvent = createProcessor({ receiverSigner, iykcSigner, privateChannelSigner, privateChannelSignersByPubkey, privateChannelReaderSigner, privateChannelReaderSignersByPubkey, privateChannelReaderPubkey, privateChannelReaderPubkeysByPubkey, receiverPubkey, mode, modeByPubkey, onChunk, onEvent, onNymEvent, onSeedEvent, onContentKeyUsage, onDecryptionFailure, isDecryptionPending, _onProcessing, onError, receivedChunkScope, receivedChunkTtlMs, receivedChunkTtlMsByPubkey, receivedChunkMaxBytes, receivedChunkIndexedDB, ignoredGroupTtlMs, ignoredGroupMaxEntries })
   const controller = new AbortController()
   const events = liveOnly
     ? _liveEventsGenerator(filter, relays, {

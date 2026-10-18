@@ -56,6 +56,23 @@ function fakeSubscribeFactory () {
   return { calls, closed, fakeSubscribe }
 }
 
+test('live processing observers stay scoped to their channel and release after callback replacement', async () => {
+  const { calls, fakeSubscribe } = fakeSubscribeFactory()
+  const receiver = signer('observer-owner')
+  const events = []
+  const observer = name => pubkey => { events.push(`start:${name}:${pubkey}`); return () => events.push(`end:${name}:${pubkey}`) }
+  const settings = { channels: ['a', 'b'], relays: ['wss://observer.example'], receiverSigner: receiver, _subscribe: fakeSubscribe }
+  await watch({ ...settings, channels: ['a'], _onProcessing: observer('old') })
+  await watch({ ...settings, channels: ['b'], _onProcessing: observer('b') })
+  const subscription = calls.at(-1)
+  const release = subscription._onProcessing('a')
+  await watch({ ...settings, channels: ['a'], _onProcessing: observer('new') })
+  release()
+  subscription._onProcessing('a')()
+  subscription._onProcessing('b')()
+  assert.deepEqual(events, ['start:old:a', 'end:old:a', 'start:new:a', 'end:new:a', 'start:b:b', 'end:b:b'])
+})
+
 test('watch merges overlapping relay subscriptions by channel author', async () => {
   const { calls, closed, fakeSubscribe } = fakeSubscribeFactory()
   const channel1 = signer('channel1')

@@ -264,7 +264,36 @@ close. Missing-key retries have no polling timer. MAC failures permit three tota
 attempts, persisted across reloads; exhausted packets remain until FIFO eviction.
 `retryPendingDecryptions({ force: true })` explicitly retries exhausted packets.
 Success enters the normal acknowledged inbox before removing the pending item.
-The session coordinator forwards this API. Private-channel consumers may opt in
+The session coordinator forwards this API.
+
+Pending recovery waits for 250 ms without channel setup, live/history processing
+or publication activity. Session foreground persistence/publication also delays
+it. After at most five seconds of eligible waiting, a busy channel may advance
+one packet, then receives a fresh deadline. Idle channels take batches of up to
+four records, yielding a task between every record. A busy channel does not hold
+up other channels; overdue channels precede the preferred foreground channel.
+Only requested passes run: a missing key never starts a polling loop. Timer
+throttling or an in-flight signer/storage call can extend actual elapsed time.
+
+`pendingDecryptionReady` defaults to `true` on messenger/session construction.
+Apps may pass `false` and call `setPendingDecryptionReady(true)` after their
+initial interface is presented; `false` holds only pending recovery, not live
+reception, publication or channel setup. The idle/deadline windows start after
+release. `setPendingDecryptionPriority(pubkey | null)` selects a channel on the
+messenger or a peer on the session; self-chat/`null` clear the session preference.
+The session retains a peer preference until preparation finishes and clears it
+on peer removal. Keep startup release and account lifecycle fencing in the app.
+
+`retryPendingDecryptions()` resolves after the requested scheduled pass (including
+an aggregated follow-up). `force: true` only overrides the MAC attempt ceiling;
+it does not bypass availability or admission. Requests before the first snapshot
+share that pass; requests during it aggregate into one following pass. Queue
+reads wait for initial release. Each packet is revalidated under the identity
+Web Lock when available; waits hold neither that lock nor the normal inbox/IDB
+queues. Fragment assembly survives scheduling boundaries. Pause/close cancel
+waits; channel removal fences its queued and in-flight results.
+
+Private-channel consumers may opt in
 with `onDecryptionFailure({ error, record })`, returning true only after durable
 handling, and replay records with `replayDeferredDecryptions`. Without the hook,
 standalone readers retain their existing error behavior.

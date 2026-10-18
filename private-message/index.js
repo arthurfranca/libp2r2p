@@ -477,6 +477,7 @@ export function createPrivateMessageSession ({ _setTimeout = setTimeout, _clearT
           return dispatchSeedEvent(seed)
         },
         onContentKeyUsage: dispatchContentKeyUsage,
+        _onProcessing: pubkey => watchCallbacks(pubkey)._onProcessing?.(pubkey),
         isDecryptionPending: record => watchCallbacks(record.channelPubkey).isDecryptionPending?.(record),
         onDecryptionFailure: failure => watchCallbacks(failure.record.channelPubkey).onDecryptionFailure?.(failure),
         onError: err => reportSubscriptionError(channels, err)
@@ -524,7 +525,7 @@ export function createPrivateMessageSession ({ _setTimeout = setTimeout, _clearT
     onSeed,
     onChunk,
     onContentKeyUsage,
-    onDecryptionFailure, isDecryptionPending,
+    onDecryptionFailure, isDecryptionPending, _onProcessing,
     onSubscriptionState,
     onError,
     receivedChunkTtlMs,
@@ -545,7 +546,7 @@ export function createPrivateMessageSession ({ _setTimeout = setTimeout, _clearT
     const ownPubkey = receiverPubkey || await receiverSigner?.getPublicKey?.()
     if (identity !== undefined && identity !== ownPubkey) throw new ValidationError('PRIVATE_MESSAGE_IDENTITY_MISMATCH')
     identity = ownPubkey
-    const callbacks = { onAsk, onReply, onTell, onYell, onNym, onMessage, onSeed, onChunk, onContentKeyUsage, onDecryptionFailure, isDecryptionPending, onSubscriptionState, onError }
+    const callbacks = { onAsk, onReply, onTell, onYell, onNym, onMessage, onSeed, onChunk, onContentKeyUsage, onDecryptionFailure, isDecryptionPending, _onProcessing, onSubscriptionState, onError }
 
     for (const channel of channelList) {
       if (watchRequests.get(channel) !== request) continue

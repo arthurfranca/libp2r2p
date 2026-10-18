@@ -13,6 +13,7 @@ const until = async predicate => {
 }
 async function fixture (t, { publish, fallbackRelays, save = async () => ({ result: { ok: true } }), ...sessionOptions } = {}) {
   const errors = []; const sendErrors = []; const records = new Map(); const onlineListeners = new Set(); const priorities = []
+  const decryptionReady = []; const decryptionPriorities = []
   const store = () => ({ list: async () => [], put: async entry => records.set(entry.id, structuredClone(entry)), remove: async id => records.delete(id), close () {} })
   let messengerOptions; let messenger
   const session = createPrivateMessageSession({
@@ -22,6 +23,8 @@ async function fixture (t, { publish, fallbackRelays, save = async () => ({ resu
       messengerOptions = options
       return (messenger = createSessionMessenger(options, {
         broadcastRumor: publish,
+        setPendingDecryptionReady: value => decryptionReady.push(value),
+        setPendingDecryptionPriority: value => decryptionPriorities.push(value),
         prioritizeRange: async (channelPubkey, request) => { priorities.push({ channelPubkey, request }); return true }
       }))
     },
@@ -32,12 +35,30 @@ async function fixture (t, { publish, fallbackRelays, save = async () => ({ resu
   })
   t.after(() => session.close())
   await session.setPeers([peer]); await session.setAvailable(true)
-  return { session, messenger: () => messenger, messengerOptions: () => messengerOptions, errors, sendErrors, records, onlineListeners, priorities, reconnect: () => Promise.all([...onlineListeners].map(listener => listener())) }
+  return { session, messenger: () => messenger, messengerOptions: () => messengerOptions, errors, sendErrors, records, onlineListeners, priorities, decryptionReady, decryptionPriorities, reconnect: () => Promise.all([...onlineListeners].map(listener => listener())) }
 }
 
 test('session enables content-key lookup by default and forwards it to the messenger', async t => {
   const f = await fixture(t)
   assert.equal(f.messengerOptions().useContentKeys, true)
+})
+
+test('session forwards pending-decryption admission and maps peer priority to prepared channels', async t => {
+  const f = await fixture(t, { pendingDecryptionReady: false })
+  assert.equal(f.messengerOptions().pendingDecryptionReady, false)
+  assert.equal(f.decryptionReady.at(-1), false)
+  f.session.setPendingDecryptionPriority(peer)
+  await f.session.preparePeer(peer)
+  assert.equal(f.decryptionPriorities.at(-1), peer)
+  f.session.setPendingDecryptionReady(true)
+  assert.equal(f.decryptionReady.at(-1), true)
+  f.session.setPendingDecryptionPriority(owner)
+  assert.equal(f.decryptionPriorities.at(-1), null)
+  f.session.setPendingDecryptionPriority(peer)
+  await f.session.setPeers([])
+  assert.equal(f.decryptionPriorities.at(-1), null)
+  assert.throws(() => f.session.setPendingDecryptionReady(null), { code: 'INVALID_PENDING_DECRYPTION_READY' })
+  assert.throws(() => f.session.setPendingDecryptionPriority('invalid'), { code: 'INVALID_PENDING_DECRYPTION_PRIORITY' })
 })
 
 test('session can disable content-key lookup', async t => {

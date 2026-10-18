@@ -44,9 +44,11 @@ function messengerStatusSnapshot (value) {
   return { closed: value.closed, paused: value.paused, pauseReasons: [...value.pauseReasons] }
 }
 
-export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], fallbackDelayMs = null, mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], useContentKeys = true, onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, _isOnline = isOnline, _getIykcProofs = getIykcProofs, _setTimeout = setTimeout, _clearTimeout = clearTimeout, _random = Math.random, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
+export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], fallbackDelayMs = null, mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], useContentKeys = true, pendingDecryptionReady = true, onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, _isOnline = isOnline, _getIykcProofs = getIykcProofs, _setTimeout = setTimeout, _clearTimeout = clearTimeout, _random = Math.random, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
   fallbackRelays = normalizeFallbackRelays(fallbackRelays)
   fallbackDelayMs = normalizeFallbackDelay(fallbackDelayMs)
+  if (typeof pendingDecryptionReady !== 'boolean') throw new ValidationError('INVALID_PENDING_DECRYPTION_READY')
+  let pendingDecryptionPeer = null
   const reportedErrors = new WeakSet()
   const reportError = error => {
     if (error && (typeof error === 'object' || typeof error === 'function')) {
@@ -139,7 +141,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     let candidate
     try {
       candidate = await Messenger({
-        fallbackRelays, fallbackDelayMs, seedStorage: recoveryStorage?.seeds, userSigner, channels: [], useContentKeys, _waitForForeground: foreground.wait,
+        fallbackRelays, fallbackDelayMs, pendingDecryptionReady, seedStorage: recoveryStorage?.seeds, userSigner, channels: [], useContentKeys, _waitForForeground: foreground.wait, _observeForeground: foreground.observe,
         onMessageQueued: () => { if (messengerBinding === binding) return drain() },
         onStateChanged: state => {
           if (closed || messengerBinding !== binding) return
@@ -152,6 +154,8 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       if (typeof candidate?.readStatus !== 'function' || !notified) throw new ValidationError('MESSENGER_STATE_CONTRACT_REQUIRED')
       const status = messengerStatusSnapshot(candidate.readStatus())
       messenger = candidate
+      messenger.setPendingDecryptionReady?.(pendingDecryptionReady)
+      messenger.setPendingDecryptionPriority?.(channels.get(pendingDecryptionPeer)?.pubkey ?? null)
       stateChanged(status)
     } catch (error) {
       messengerBinding = null
@@ -168,6 +172,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       signal.throwIfAborted()
       const channel = { signer: scoped, pubkey, readerPubkey: pubkey, mode, seeders: seedersForPeer(peer) }
       channels.set(peer, channel)
+      if (peer === pendingDecryptionPeer) messenger?.setPendingDecryptionPriority?.(channel.pubkey)
       await schedule()
       signal.throwIfAborted()
       return channel
@@ -558,6 +563,16 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     await writeDownloadIntent(() => downloads?.remove(id))
   }
   return {
+    setPendingDecryptionReady (ready) {
+      if (typeof ready !== 'boolean') throw new ValidationError('INVALID_PENDING_DECRYPTION_READY')
+      pendingDecryptionReady = ready
+      if (!closed) messenger?.setPendingDecryptionReady?.(ready)
+    },
+    setPendingDecryptionPriority (peer) {
+      if (peer !== null && !/^[0-9a-f]{64}$/.test(peer || '')) throw new ValidationError('INVALID_PENDING_DECRYPTION_PRIORITY')
+      pendingDecryptionPeer = peer === owner ? null : peer
+      if (!closed) messenger?.setPendingDecryptionPriority?.(channels.get(pendingDecryptionPeer)?.pubkey ?? null)
+    },
     async retryPendingDecryptions (options) {
       if (closed || !available) return
       await ensureMessenger()
@@ -605,6 +620,10 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       if (next.size === peers.size && [...next].every(peer => peers.has(peer))) return configuring
       peers.clear(); for (const peer of next) peers.add(peer)
       preparation.reconcile(peers)
+      if (pendingDecryptionPeer && !peers.has(pendingDecryptionPeer)) {
+        pendingDecryptionPeer = null
+        messenger?.setPendingDecryptionPriority?.(null)
+      }
       for (const peer of channels.keys()) {
         if (!peers.has(peer)) {
           channels.delete(peer); pendingPriorityRanges.delete(peer)

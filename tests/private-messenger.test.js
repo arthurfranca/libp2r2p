@@ -239,6 +239,13 @@ test('pending decryption coalesces workers, fences locked delivery and admits be
   await messenger.deferDecryption({ error: new ValidationError('CONTENT_KEY_NOT_FOUND'), record: { format: 'outer_v1', channelPubkey: 'channel', outer: { id: 'encrypted-packet', content: 'ciphertext' } } })
   const first = messenger.retryPendingDecryptions()
   await entered.promise
+  const live = { id: 'live-during-held-retry', kind: 9, pubkey: 'alice', created_at: 20, tags: [], content: 'new message' }
+  const watch = messenger._privateMessage.watchCalls.find(options => options.channels.includes('channel'))
+  await watch.onMessage({ event: live, senderPubkey: 'alice', provenance: 'direct' })
+  assert.equal((await takeMessage(messenger)).event.id, live.id)
+  await messenger.broadcastRumor({ channelPubkey: 'channel', receiverPubkeys: ['alice'], rumor: live })
+  assert.equal(messenger._privateMessage.sent.at(-1).method, 'broadcastRumor')
+  assert.equal((await messenger.pendingDecryption.records()).length, 1)
   assert.equal(messenger.retryPendingDecryptions(), first)
   await messenger.pause('locked')
   release.resolve()
@@ -251,6 +258,40 @@ test('pending decryption coalesces workers, fences locked delivery and admits be
   assert.deepEqual(await messenger.pendingDecryption.records(), [])
   assert.equal((await takeMessage(messenger)).event.id, event.id)
   await messenger.close()
+})
+
+test('startup admission protects queue reads while live reception and sending remain available', async () => {
+  let replayed = 0
+  const messenger = await new PrivateMessenger({
+    pendingDecryptionReady: false, _privateMessage: fakePrivateMessage(),
+    _privateChannel: {
+      fetchHistory: async () => [],
+      replayDeferredDecryptions: async ({ records, _runRecord, onRecovered }) => {
+        for (const record of records) await _runRecord(record, async () => { replayed++; await onRecovered(record) })
+      }
+    }
+  }).init({ userSigner: signer('gated-owner'), channels: [{ signer: signer('channel'), relays: ['wss://fixture.example'] }] })
+  let reads = 0
+  const records = messenger.pendingDecryption.records
+  messenger.pendingDecryption.records = options => { reads++; return records(options) }
+  await messenger.deferDecryption({ error: new ValidationError('CONTENT_KEY_NOT_FOUND'), record: { format: 'outer_v1', channelPubkey: 'channel', outer: { id: 'held', content: 'ciphertext' } } })
+  const first = messenger.retryPendingDecryptions()
+  assert.equal(messenger.retryPendingDecryptions(), first)
+  const live = { id: 'live-before-admission', kind: 9, pubkey: 'alice', created_at: 20, tags: [], content: 'new message' }
+  await messenger._privateMessage.watchCalls[0].onMessage({ event: live, senderPubkey: 'alice', provenance: 'direct' })
+  assert.equal((await takeMessage(messenger)).event.id, live.id)
+  await messenger.broadcastRumor({ channelPubkey: 'channel', receiverPubkeys: ['alice'], rumor: live })
+  assert.equal(messenger._privateMessage.sent.at(-1).method, 'broadcastRumor')
+  assert.equal(reads, 0)
+  assert.equal(replayed, 0)
+  messenger.setPendingDecryptionReady(true)
+  await first
+  assert.equal(reads, 1, 'startup and repeated requests share one snapshot')
+  assert.equal(replayed, 1)
+  messenger.setPendingDecryptionReady(false)
+  const pending = messenger.retryPendingDecryptions()
+  await messenger.close(); await pending
+  assert.equal(replayed, 1)
 })
 
 test('seeder replies defer one encrypted row and keep admitting following rows', async () => {

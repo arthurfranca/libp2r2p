@@ -90,6 +90,17 @@ suite pass; report independently scoped problems separately.
   attempts persist across visits; force is explicit. A successful retry admits
   the normal inbox before deleting ciphertext. Pause/close fence late results.
   Keep unknown/storage/permission errors operational, with unchanged ACK/NACK.
+- Pending decryption admission is owned by `decryption-scheduler`: startup gate,
+  250 ms channel quiet time, five-second maximum deferral, one overdue packet or
+  at most four consecutive preferred records, and a task yield between records.
+  Track setup, live/history processing (including deferred failures), publication
+  and session foreground work. Never wait with the inbox tail, an IDB transaction
+  or retry Web Lock held. Revalidate each packet under that lock and retain one
+  fragment processor across scheduling boundaries. Gates control only replay;
+  live ingestion and publication remain independent. Public messenger/session
+  admission/priority methods retain intent before construction/peer preparation.
+  Startup/key requests coalesce before snapshots; later requests aggregate one
+  follow-up. No polling of failed packets, no automatic force or DB migration.
 - Confirmed content-key announcements use rememberContentKeyEvent. Preserve
   timestamp/lowest-ID ordering and prevent stale query results from escaping to
   either the cache or its callers. Diagnostics contain only selected public

@@ -56,6 +56,7 @@ import { normalizeRelayUrl } from '../url/index.js'
 import { deliveryInfo } from '../private-channel/helpers/rumor.js'
 import { migrateMessageQueue } from './services/migrate-message-queue.js'
 import { createPendingDecryption } from './services/pending-decryption.js'
+import { createDecryptionScheduler } from './services/decryption-scheduler.js'
 import { decryptionError, isDeferredDecryptionError } from '../private-channel/helpers/decryption-error.js'
 import { bytesToBase64 } from '../base64/index.js'
 import { ValidationError } from '../error/index.js'
@@ -236,6 +237,7 @@ export class PrivateMessenger {
     autoDeletionCapability = true,
     _indexedDB = globalThis.indexedDB,
     useContentKeys = true,
+    pendingDecryptionReady = true,
     onContentKeyChange,
     onMessageQueued,
     onStateChanged,
@@ -248,6 +250,8 @@ export class PrivateMessenger {
     _subscribeRelayListUpdates = subscribeRelayListUpdates,
     _isOnline = isOnline,
     _waitForForeground,
+    _observeForeground,
+    _now = Date.now,
     _onOnline = onOnline,
     _random = Math.random,
     _setTimeout = globalThis.setTimeout.bind(globalThis),
@@ -259,6 +263,7 @@ export class PrivateMessenger {
     _BroadcastChannel = _indexedDB === globalThis.indexedDB ? globalThis.BroadcastChannel : undefined
   } = {}) {
     if (onStateChanged != null && typeof onStateChanged !== 'function') throw new ValidationError('INVALID_ON_STATE_CHANGED')
+    if (typeof pendingDecryptionReady !== 'boolean') throw new ValidationError('INVALID_PENDING_DECRYPTION_READY')
     this.fallbackRelays = normalizeFallbackRelays(fallbackRelays)
     this.fallbackDelayMs = normalizeFallbackDelay(fallbackDelayMs)
     this.offlineRecoverySeconds = normalizeOfflineRecoverySeconds(offlineRecoverySeconds)
@@ -383,6 +388,9 @@ export class PrivateMessenger {
     this.closePromise = null
     this.initSettledPromise = null
     this.initialized = false
+    this.pendingDecryptionReady = pendingDecryptionReady
+    this.decryptionScheduler = createDecryptionScheduler({ ready: pendingDecryptionReady, now: _now, setTimer: _setTimeout, clearTimer: _clearTimeout })
+    this.stopDecryptionForeground = _observeForeground?.(active => this.decryptionScheduler.foreground(active))
     this.notifyStatus()
   }
 
@@ -1222,6 +1230,7 @@ export class PrivateMessenger {
           onSeed: seed => this.receive(pubkey, () => this.enqueueSeed(pubkey, seed), seed),
           onContentKeyUsage: usage => this.handleContentKeyUsage(pubkey, usage),
           onDecryptionFailure: failure => this.deferDecryption(failure),
+          _onProcessing: pubkey => this.decryptionScheduler.activity(pubkey),
           isDecryptionPending: record => this.pendingDecryption.has(record),
           receivedChunkTtlMs: this.receivedChunkTtlMsFor(channel),
           receivedChunkIndexedDB: this._indexedDB,
@@ -1734,7 +1743,10 @@ export class PrivateMessenger {
   unwatch (channels) {
     const pubkeys = channels ? uniq(Array.isArray(channels) ? channels : [channels]) : [...this.desiredChannels]
     for (const extension of this.extensions) extension.unwatch?.(pubkeys)
-    for (const pubkey of pubkeys) this.desiredChannels.delete(pubkey)
+    for (const pubkey of pubkeys) {
+      this.desiredChannels.delete(pubkey)
+      this.decryptionScheduler.remove(pubkey)
+    }
     for (const [key, pending] of this.pendingStorageWrites) if (pubkeys.includes(pending.record.channelPubkey)) this.pendingStorageWrites.delete(key)
     this.syncPauseRecovery()
     for (const pubkey of pubkeys) this.dropRecoveryState(pubkey)
@@ -1904,6 +1916,7 @@ export class PrivateMessenger {
       if (job) { jobs.push(job.work); continue }
       const controller = new AbortController()
       const channel = this.channels.get(pubkey)
+      const releaseActivity = this.decryptionScheduler.activity(pubkey)
       job = { controller, work: null }
       this.channelBackground.set(pubkey, job)
       const active = () => this.initialized && !controller.signal.aborted && !this.closePromise && !this.pauseReasons.size && this.channels.get(pubkey) === channel && this.desiredChannels.has(pubkey)
@@ -1940,6 +1953,7 @@ export class PrivateMessenger {
         throw error
       })
       job.work = Promise.race([work, cancelled]).finally(() => {
+        releaseActivity()
         controller.signal.removeEventListener('abort', stopAbort)
         if (this.channelBackground.get(pubkey) === job) this.channelBackground.delete(pubkey)
       })
@@ -1949,18 +1963,19 @@ export class PrivateMessenger {
     return jobs
   }
 
-  receive (pubkey, operation, message = {}) {
+  receive (pubkey, operation, message = {}, { trackActivity = true } = {}) {
     if (this.closePromise) {
       if (this.storageActive) this.recordInterruption([pubkey], messageTime(message))
       return Promise.reject(new Error('PRIVATE_MESSENGER_CLOSED'))
     }
+    const releaseActivity = trackActivity ? this.decryptionScheduler.activity(pubkey) : () => {}
     return this.queueIncoming(async () => {
       if (this.pauseReasons.size || !this.desiredChannels.has(pubkey)) {
         this.recordInterruption([pubkey], messageTime(message))
         throw this.pausedError()
       }
       return operation()
-    })
+    }).finally(releaseActivity)
   }
 
   nip65WatchChannelPubkeys () {
@@ -2274,180 +2289,204 @@ export class PrivateMessenger {
 
   async ask ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
-    const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [receiverPubkey], relays, relayToReceivers })
-    this.debugSend('ask', channelPubkey, { code, receiverPubkey })
-    return this._privateMessage.ask({
-      senderSigner: this.userSigner,
-      imkcSigner: this.contentKeySigner,
-      privateChannelSigner: channel.signer,
-      privateChannelReaderPubkey: channel.readerPubkey,
-      receiverPubkey,
-      ...routing,
-      expirationSeconds: this.eventExpirationSecondsFor(channel),
-      temporaryStorageArea: this.temporaryStorageArea,
-      deletionPubkey,
-      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
-      message,
-      code,
-      payload,
-      error,
-      content,
-      onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
-      _getIykcProofs: this.contentKeyLookup()
-    })
+    const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
+    try {
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [receiverPubkey], relays, relayToReceivers })
+      this.debugSend('ask', channelPubkey, { code, receiverPubkey })
+      return await this._privateMessage.ask({
+        senderSigner: this.userSigner,
+        imkcSigner: this.contentKeySigner,
+        privateChannelSigner: channel.signer,
+        privateChannelReaderPubkey: channel.readerPubkey,
+        receiverPubkey,
+        ...routing,
+        expirationSeconds: this.eventExpirationSecondsFor(channel),
+        temporaryStorageArea: this.temporaryStorageArea,
+        deletionPubkey,
+        autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
+        message,
+        code,
+        payload,
+        error,
+        content,
+        onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
+        _getIykcProofs: this.contentKeyLookup()
+      })
+    } finally { releaseActivity() }
   }
 
   async reply ({ channelPubkey = this.defaultChannelPubkey(), question, receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
-    const resolvedReceiverPubkey = receiverPubkey || question?.pubkey || ''
-    const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [resolvedReceiverPubkey], relays, relayToReceivers })
-    this.debugSend('reply', channelPubkey, { code, receiverPubkey: receiverPubkey || question?.pubkey || '' })
-    return this._privateMessage.reply({
-      senderSigner: this.userSigner,
-      imkcSigner: this.contentKeySigner,
-      privateChannelSigner: channel.signer,
-      privateChannelReaderPubkey: channel.readerPubkey,
-      question,
-      receiverPubkey,
-      ...routing,
-      expirationSeconds: this.eventExpirationSecondsFor(channel),
-      temporaryStorageArea: this.temporaryStorageArea,
-      deletionPubkey,
-      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
-      message,
-      code,
-      payload,
-      error,
-      content,
-      onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
-      _getIykcProofs: this.contentKeyLookup()
-    })
+    const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
+    try {
+      const resolvedReceiverPubkey = receiverPubkey || question?.pubkey || ''
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [resolvedReceiverPubkey], relays, relayToReceivers })
+      this.debugSend('reply', channelPubkey, { code, receiverPubkey: receiverPubkey || question?.pubkey || '' })
+      return await this._privateMessage.reply({
+        senderSigner: this.userSigner,
+        imkcSigner: this.contentKeySigner,
+        privateChannelSigner: channel.signer,
+        privateChannelReaderPubkey: channel.readerPubkey,
+        question,
+        receiverPubkey,
+        ...routing,
+        expirationSeconds: this.eventExpirationSecondsFor(channel),
+        temporaryStorageArea: this.temporaryStorageArea,
+        deletionPubkey,
+        autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
+        message,
+        code,
+        payload,
+        error,
+        content,
+        onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
+        _getIykcProofs: this.contentKeyLookup()
+      })
+    } finally { releaseActivity() }
   }
 
   async tell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
-    const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [receiverPubkey], relays, relayToReceivers })
-    this.debugSend('tell', channelPubkey, { code, receiverPubkey })
-    return this._privateMessage.tell({
-      senderSigner: this.userSigner,
-      imkcSigner: this.contentKeySigner,
-      privateChannelSigner: channel.signer,
-      privateChannelReaderPubkey: channel.readerPubkey,
-      receiverPubkey,
-      ...routing,
-      expirationSeconds: this.eventExpirationSecondsFor(channel),
-      temporaryStorageArea: this.temporaryStorageArea,
-      deletionPubkey,
-      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
-      message,
-      code,
-      payload,
-      error,
-      content,
-      onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
-      _getIykcProofs: this.contentKeyLookup()
-    })
+    const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
+    try {
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [receiverPubkey], relays, relayToReceivers })
+      this.debugSend('tell', channelPubkey, { code, receiverPubkey })
+      return await this._privateMessage.tell({
+        senderSigner: this.userSigner,
+        imkcSigner: this.contentKeySigner,
+        privateChannelSigner: channel.signer,
+        privateChannelReaderPubkey: channel.readerPubkey,
+        receiverPubkey,
+        ...routing,
+        expirationSeconds: this.eventExpirationSecondsFor(channel),
+        temporaryStorageArea: this.temporaryStorageArea,
+        deletionPubkey,
+        autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
+        message,
+        code,
+        payload,
+        error,
+        content,
+        onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
+        _getIykcProofs: this.contentKeyLookup()
+      })
+    } finally { releaseActivity() }
   }
 
   async yell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
-    const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
-    this.debugSend('yell', channelPubkey, { code, receiverPubkeys })
-    return this._privateMessage.yell({
-      senderSigner: this.userSigner,
-      imkcSigner: this.contentKeySigner,
-      privateChannelSigner: channel.signer,
-      privateChannelReaderPubkey: channel.readerPubkey,
-      receiverPubkeys,
-      ...routing,
-      expirationSeconds: this.eventExpirationSecondsFor(channel),
-      temporaryStorageArea: this.temporaryStorageArea,
-      deletionPubkey,
-      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
-      message,
-      code,
-      payload,
-      error,
-      content,
-      onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
-      _getIykcProofs: this.contentKeyLookup()
-    })
+    const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
+    try {
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
+      this.debugSend('yell', channelPubkey, { code, receiverPubkeys })
+      return await this._privateMessage.yell({
+        senderSigner: this.userSigner,
+        imkcSigner: this.contentKeySigner,
+        privateChannelSigner: channel.signer,
+        privateChannelReaderPubkey: channel.readerPubkey,
+        receiverPubkeys,
+        ...routing,
+        expirationSeconds: this.eventExpirationSecondsFor(channel),
+        temporaryStorageArea: this.temporaryStorageArea,
+        deletionPubkey,
+        autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
+        message,
+        code,
+        payload,
+        error,
+        content,
+        onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
+        _getIykcProofs: this.contentKeyLookup()
+      })
+    } finally { releaseActivity() }
   }
 
   async broadcastRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, deletionPubkey, signal }) {
     const channel = this.requireWritableChannel(channelPubkey)
-    const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers, signal })
-    this.debugSend('broadcastRumor', channelPubkey, { receiverPubkeys })
-    return this._privateMessage.broadcastRumor({
-      senderSigner: this.userSigner,
-      imkcSigner: this.contentKeySigner,
-      privateChannelSigner: channel.signer,
-      privateChannelReaderPubkey: channel.readerPubkey,
-      receiverPubkeys,
-      ...routing,
-      expirationSeconds: this.eventExpirationSecondsFor(channel),
-      temporaryStorageArea: this.temporaryStorageArea,
-      deletionPubkey,
-      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
-      rumor,
-      onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
-      _getIykcProofs: this.contentKeyLookup()
-    })
+    const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
+    try {
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers, signal })
+      this.debugSend('broadcastRumor', channelPubkey, { receiverPubkeys })
+      return await this._privateMessage.broadcastRumor({
+        senderSigner: this.userSigner,
+        imkcSigner: this.contentKeySigner,
+        privateChannelSigner: channel.signer,
+        privateChannelReaderPubkey: channel.readerPubkey,
+        receiverPubkeys,
+        ...routing,
+        expirationSeconds: this.eventExpirationSecondsFor(channel),
+        temporaryStorageArea: this.temporaryStorageArea,
+        deletionPubkey,
+        autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
+        rumor,
+        onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
+        _getIykcProofs: this.contentKeyLookup()
+      })
+    } finally { releaseActivity() }
   }
 
   async broadcastEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, deletionPubkey, signal }) {
     const channel = this.requireWritableChannel(channelPubkey)
-    const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers, signal })
-    this.debugSend('broadcastEvent', channelPubkey, { receiverPubkeys })
-    return this._privateMessage.broadcastEvent({
-      senderSigner: this.userSigner,
-      imkcSigner: this.contentKeySigner,
-      privateChannelSigner: channel.signer,
-      privateChannelReaderPubkey: channel.readerPubkey,
-      receiverPubkeys,
-      ...routing,
-      expirationSeconds: this.eventExpirationSecondsFor(channel),
-      temporaryStorageArea: this.temporaryStorageArea,
-      deletionPubkey,
-      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
-      event,
-      onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
-      _getIykcProofs: this.contentKeyLookup()
-    })
+    const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
+    try {
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers, signal })
+      this.debugSend('broadcastEvent', channelPubkey, { receiverPubkeys })
+      return await this._privateMessage.broadcastEvent({
+        senderSigner: this.userSigner,
+        imkcSigner: this.contentKeySigner,
+        privateChannelSigner: channel.signer,
+        privateChannelReaderPubkey: channel.readerPubkey,
+        receiverPubkeys,
+        ...routing,
+        expirationSeconds: this.eventExpirationSecondsFor(channel),
+        temporaryStorageArea: this.temporaryStorageArea,
+        deletionPubkey,
+        autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
+        event,
+        onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
+        _getIykcProofs: this.contentKeyLookup()
+      })
+    } finally { releaseActivity() }
   }
 
   async broadcastNymRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, nymSigner, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
-    const resolvedNymSigner = this.requireNymSigner(channel, nymSigner)
-    const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
-    this.debugSend('broadcastNymRumor', channelPubkey, { receiverPubkeys })
-    return this._privateMessage.broadcastNymRumor({
-      nymSigner: resolvedNymSigner,
-      privateChannelSigner: channel.signer,
-      privateChannelReaderPubkey: channel.readerPubkey,
-      ...routing,
-      expirationSeconds: this.eventExpirationSecondsFor(channel),
-      deletionPubkey,
-      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
-      rumor
-    })
+    const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
+    try {
+      const resolvedNymSigner = this.requireNymSigner(channel, nymSigner)
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
+      this.debugSend('broadcastNymRumor', channelPubkey, { receiverPubkeys })
+      return await this._privateMessage.broadcastNymRumor({
+        nymSigner: resolvedNymSigner,
+        privateChannelSigner: channel.signer,
+        privateChannelReaderPubkey: channel.readerPubkey,
+        ...routing,
+        expirationSeconds: this.eventExpirationSecondsFor(channel),
+        deletionPubkey,
+        autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
+        rumor
+      })
+    } finally { releaseActivity() }
   }
 
   async broadcastNymEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, nymSigner, deletionPubkey }) {
     const channel = this.requireWritableChannel(channelPubkey)
-    const resolvedNymSigner = this.requireNymSigner(channel, nymSigner)
-    const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
-    this.debugSend('broadcastNymEvent', channelPubkey, { receiverPubkeys })
-    return this._privateMessage.broadcastNymEvent({
-      nymSigner: resolvedNymSigner,
-      privateChannelSigner: channel.signer,
-      privateChannelReaderPubkey: channel.readerPubkey,
-      ...routing,
-      expirationSeconds: this.eventExpirationSecondsFor(channel),
-      deletionPubkey,
-      autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
-      event
-    })
+    const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
+    try {
+      const resolvedNymSigner = this.requireNymSigner(channel, nymSigner)
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
+      this.debugSend('broadcastNymEvent', channelPubkey, { receiverPubkeys })
+      return await this._privateMessage.broadcastNymEvent({
+        nymSigner: resolvedNymSigner,
+        privateChannelSigner: channel.signer,
+        privateChannelReaderPubkey: channel.readerPubkey,
+        ...routing,
+        expirationSeconds: this.eventExpirationSecondsFor(channel),
+        deletionPubkey,
+        autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
+        event
+      })
+    } finally { releaseActivity() }
   }
 
   async publishSeederPresence (channelPubkey = this.defaultChannelPubkey(), { signal } = {}) {
@@ -2881,6 +2920,7 @@ export class PrivateMessenger {
       onSeedEvent: seed => this.receive(channelPubkey, () => this.enqueueSeed(channelPubkey, seed), seed),
       onContentKeyUsage: usage => this.handleContentKeyUsage(channelPubkey, usage),
       onDecryptionFailure: failure => this.deferDecryption(failure),
+      _onProcessing: pubkey => this.decryptionScheduler.activity(pubkey),
       isDecryptionPending: record => this.pendingDecryption.has(record),
       onError: err => { throw err }
     }
@@ -3146,22 +3186,36 @@ export class PrivateMessenger {
     }
   }
 
+  setPendingDecryptionReady (ready) {
+    if (typeof ready !== 'boolean') throw new ValidationError('INVALID_PENDING_DECRYPTION_READY')
+    this.pendingDecryptionReady = ready
+    this.decryptionScheduler.setReady(ready)
+  }
+
+  setPendingDecryptionPriority (pubkey) {
+    if (pubkey !== null && !/^[0-9a-f]{64}$/.test(pubkey || '')) throw new ValidationError('INVALID_PENDING_DECRYPTION_PRIORITY')
+    this.decryptionScheduler.priority(pubkey)
+  }
+
   retryPendingDecryptions ({ force = false } = {}) {
     if (typeof force !== 'boolean') throw new ValidationError('INVALID_FORCE')
     if (this.closePromise || this.pauseReasons.size || !this.initialized) return Promise.resolve()
     if (this.decryptionRetry && !this.decryptionRetry.controller.signal.aborted) {
-      this.decryptionRetry.again = true
+      // Before a pass reads its snapshot, new requests belong to that pass.
+      if (this.decryptionRetry.started) this.decryptionRetry.again = true
       this.decryptionRetry.force ||= force
       return this.decryptionRetry.work
     }
-    const job = { controller: new AbortController(), again: false, force, work: null }
+    const job = { controller: new AbortController(), again: false, force, started: false, work: null }
     const previous = this.decryptionRetry?.work
     this.decryptionRetry = job
     const { signal } = job.controller
     const run = async () => {
       do {
+        await this.decryptionScheduler.waitReady(signal)
         signal.throwIfAborted()
         job.again = false
+        job.started = true
         const force = job.force
         job.force = false
         const groups = new Map()
@@ -3169,35 +3223,59 @@ export class PrivateMessenger {
           if (!groups.has(record.channelPubkey)) groups.set(record.channelPubkey, [])
           groups.get(record.channelPubkey).push(record)
         }
-        for (const [channelPubkey, records] of groups) {
-          signal.throwIfAborted()
+        const results = await Promise.allSettled([...groups].map(async ([channelPubkey, records]) => {
           const channel = this.channels.get(channelPubkey)
-          if (!channel || !this.desiredChannels.has(channelPubkey)) continue
-          const current = () => { signal.throwIfAborted(); if (this.channels.get(channelPubkey) !== channel) throw new Error('PRIVATE_CHANNEL_CHANGED') }
-          await this._privateChannel.replayDeferredDecryptions({
-            records, signal, receiverSigner: this.userSigner, receiverPubkey: this.userPubkey,
-            privateChannelSigner: channel.signer, privateChannelReaderSigner: channel.readerSigner,
-            privateChannelReaderPubkey: channel.readerPubkey, mode: channel.mode,
-            receivedChunkScope: `${this.prefix}:pending`, receivedChunkIndexedDB: this._indexedDB,
-            onEvent: (event, outer, meta) => {
-              current()
-              return this.receive(channelPubkey, () => this.enqueueRumor(eventType(event), channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer })
-            },
-            onNymEvent: (event, outer, meta) => {
-              current()
-              return this.receive(channelPubkey, () => this.enqueueRumor('nym', channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer })
-            },
-            onSeedEvent: seed => { current(); return this.receive(channelPubkey, () => this.enqueueSeed(channelPubkey, seed), seed) },
-            onRecovered: record => { current(); return this.pendingDecryption.recovered(record) },
-            onFailure: (record, error) => { current(); return this.pendingDecryption.failed(record, error) }
-          })
-        }
+          if (!channel || !this.desiredChannels.has(channelPubkey)) return
+          const current = () => {
+            signal.throwIfAborted()
+            if (this.pauseReasons.size || this.channels.get(channelPubkey) !== channel || !this.desiredChannels.has(channelPubkey)) throw new Error('PRIVATE_CHANNEL_CHANGED')
+          }
+          try {
+            await this._privateChannel.replayDeferredDecryptions({
+              records, signal, receiverSigner: this.userSigner, receiverPubkey: this.userPubkey,
+              privateChannelSigner: channel.signer, privateChannelReaderSigner: channel.readerSigner,
+              privateChannelReaderPubkey: channel.readerPubkey, mode: channel.mode,
+              receivedChunkScope: `${this.prefix}:pending`, receivedChunkIndexedDB: this._indexedDB,
+              _runRecord: async (record, process) => {
+                let done = false
+                while (!done) {
+                  current()
+                  done = await this.decryptionScheduler.run(channelPubkey, () => {
+                    const attempt = async () => {
+                      current()
+                      if (!this.pendingDecryptionReady) return false
+                      if (await this.pendingDecryption.current(record, { force })) await process()
+                      return true
+                    }
+                    const locks = globalThis.navigator?.locks
+                    return locks?.request ? locks.request(`${this.prefix}:pending-decryption:retry`, { signal }, attempt) : attempt()
+                  }, signal)
+                }
+              },
+              onEvent: (event, outer, meta) => {
+                current()
+                return this.receive(channelPubkey, () => this.enqueueRumor(eventType(event), channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }, { trackActivity: false })
+              },
+              onNymEvent: (event, outer, meta) => {
+                current()
+                return this.receive(channelPubkey, () => this.enqueueRumor('nym', channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }, { trackActivity: false })
+              },
+              onSeedEvent: seed => { current(); return this.receive(channelPubkey, () => this.enqueueSeed(channelPubkey, seed), seed, { trackActivity: false }) },
+              onRecovered: record => { current(); return this.pendingDecryption.recovered(record) },
+              onFailure: (record, error) => { current(); return this.pendingDecryption.failed(record, error) }
+            })
+          } catch (error) {
+            if (this.channels.get(channelPubkey) === channel && this.desiredChannels.has(channelPubkey)) throw error
+          } finally { this.decryptionScheduler.finish(channelPubkey) }
+        }))
+        const failed = results.find(result => result.status === 'rejected')
+        if (failed) throw failed.reason
+        job.started = false
       } while (job.again)
     }
-    job.work = Promise.resolve(previous).catch(() => {}).then(() => {
-      const locks = globalThis.navigator?.locks
-      return locks?.request ? locks.request(`${this.prefix}:pending-decryption:retry`, { signal }, run) : run()
-    }).catch(error => { if (!signal.aborted) throw error }).finally(() => {
+    job.work = Promise.resolve(previous).catch(() => {}).then(run).catch(error => {
+      if (!signal.aborted) throw error
+    }).finally(() => {
       if (this.decryptionRetry === job) this.decryptionRetry = null
     })
     return job.work
@@ -3256,6 +3334,8 @@ export class PrivateMessenger {
 
   close () {
     this.decryptionRetry?.controller.abort(new Error('PRIVATE_MESSENGER_CLOSED'))
+    this.decryptionScheduler.close()
+    this.stopDecryptionForeground?.()
     if (this.closePromise) return this.closePromise
     const initSettledPromise = this.initSettledPromise
     this.sendRoutingLifetime.abort()
