@@ -44,7 +44,7 @@ function messengerStatusSnapshot (value) {
   return { closed: value.closed, paused: value.paused, pauseReasons: [...value.pauseReasons] }
 }
 
-export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], fallbackDelayMs = null, mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], useContentKeys = true, pendingDecryptionReady = true, onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, _isOnline = isOnline, _getIykcProofs = getIykcProofs, _setTimeout = setTimeout, _clearTimeout = clearTimeout, _random = Math.random, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
+export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], fallbackDelayMs = null, mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], useContentKeys = true, pendingDecryptionReady = true, onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, onDebug, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, _isOnline = isOnline, _getIykcProofs = getIykcProofs, _setTimeout = setTimeout, _clearTimeout = clearTimeout, _random = Math.random, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
   fallbackRelays = normalizeFallbackRelays(fallbackRelays)
   fallbackDelayMs = normalizeFallbackDelay(fallbackDelayMs)
   if (typeof pendingDecryptionReady !== 'boolean') throw new ValidationError('INVALID_PENDING_DECRYPTION_READY')
@@ -66,6 +66,14 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const entries = new Map()
   const cancelled = new Set()
   const sendControllers = new Map()
+  const localReady = new Set()
+  const localIdleWaiters = new Set()
+  const cleanups = new Map()
+  const queuedAt = new WeakMap()
+  const debug = (entry, stage, startedAt) => {
+    if (!onDebug) return
+    try { onDebug({ stage, eventId: entry.id, peer: entry.peer, at: Date.now(), ...(startedAt != null ? { elapsedMs: Date.now() - startedAt } : {}) }) } catch {}
+  }
   const offlineSends = new Set()
   const pausedSends = new Set()
   let messengerStatus
@@ -123,15 +131,22 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   let messengerWork
   let fileSetupWork
   let sending
+  let enqueuing = 0
+  let localSaving = false
+  let relocal = false
   let repump
   let draining
   let redrain = false
   const idleWaiters = new Set()
-  const settled = () => { if (!sending && !draining) { for (const resolve of idleWaiters) resolve(); idleWaiters.clear() } }
+  const settled = () => { if (!sending && !localSaving && !enqueuing && !draining && !cleanups.size) { for (const resolve of idleWaiters) resolve(); idleWaiters.clear() } }
   const emit = () => onOutbox([...entries.values()].filter(entry => !entry.deletion))
   const ready = () => (initialized ??= (async () => {
-    storage = await openOutbox({ owner, signer })
-    for (const entry of await storage.list()) entries.set(entry.id, entry)
+    storage = await openOutbox({ owner, signer, onDebug })
+    for (const entry of await storage.list()) {
+      entries.set(entry.id, entry)
+      if (entry.localSaved.every(Boolean)) localReady.add(entry.id)
+      queuedAt.set(entry, Date.now())
+    }
     emit()
   })().catch(async error => { await storage?.close(); storage = null; initialized = null; throw error }))
   async function createMessenger () {
@@ -167,6 +182,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
 
   const preparation = createPeerPreparation({
     prepare: async (peer, signal) => {
+      const startedAt = Date.now()
       const scoped = messengerSigner(signer.withSharedKey(peer, 'dm'))
       const pubkey = await scoped.getPublicKey()
       signal.throwIfAborted()
@@ -175,6 +191,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       if (peer === pendingDecryptionPeer) messenger?.setPendingDecryptionPriority?.(channel.pubkey)
       await schedule()
       signal.throwIfAborted()
+      if (onDebug) { try { onDebug({ stage: 'channel-ready', peer, elapsedMs: Date.now() - startedAt }) } catch {} }
       return channel
     },
     onReady: () => { drain(); pump() }, onError: reportError,
@@ -365,7 +382,23 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     // Published is relay acceptance, never a peer receipt.
     await assertMessagePublished(report, event)
   }
-  async function sendEntry (entry) {
+  async function cleanupEntry (entry) {
+    if (cleanups.has(entry.id)) return cleanups.get(entry.id)
+    const startedAt = Date.now()
+    const work = Promise.resolve().then(() => storage.remove(entry.id)).then(() => {
+      entries.delete(entry.id); localReady.delete(entry.id)
+      debug(entry, 'outbox-cleanup', startedAt)
+      emit()
+    }).catch(error => {
+      // Delivery has already succeeded. Cleanup must never become a send error.
+      entry.failed = true; entry.retryable = true
+      reportError(error)
+      if (!closed && available) scheduleSendRetry()
+    }).finally(() => { cleanups.delete(entry.id); if (![...entries.values()].some(pendingRetryable) && !cleanups.size) resetSendRetry(); settled() })
+    cleanups.set(entry.id, work)
+    return work
+  }
+  async function sendEntry (entry, localOnly = false) {
     const releaseForeground = foreground.enter()
     entry.status = 'pending'; emit()
     const controller = new AbortController()
@@ -375,19 +408,32 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         if (storage.has && !await storage.has(entry.id)) cancelled.add(entry.id)
         if (closed || !available || cancelled.has(entry.id) || (entry.peer !== owner && !peers.has(entry.peer))) throw new Error('CHAT_UNAVAILABLE')
       }
-      // Personal copies must commit even if publishing attachment bytes
-      // fails offline. Remote progress remains independently retryable.
-      for (let index = 0; index < entry.events.length; index++) {
-        await active()
-        const event = entry.events[index]
-        if (!entry.localSaved[index]) {
+      if (localOnly) {
+        debug(entry, 'local-start', queuedAt.get(entry))
+        const startedAt = Date.now()
+        for (let index = 0; index < entry.events.length; index++) {
+          await active()
+          if (entry.localSaved[index]) continue
+          const event = entry.events[index]
           const hearsay = !event.sig && event.pubkey !== owner
           const result = await messageStorage.save(event, { peerPubkey: entry.peer, hearsay })
           if (result?.result?.code === 'blocked') { cancelled.add(entry.id); await active() }
           if (!result?.result?.ok) throw Object.assign(new Error('MESSAGE_STORAGE_FAILED'), { code: result?.result?.code?.toUpperCase() })
           entry.localSaved[index] = true
-          await storage.put(entry, { existing: true })
         }
+        debug(entry, 'local-stored', startedAt)
+        await active()
+        if (entry.peer === owner) {
+          entry.status = 'saved'; emit()
+          cleanupEntry(entry)
+        } else {
+          // Retry this checkpoint even when a preceding attempt saved all copies
+          // but failed to persist progress. Only then admit remote publication.
+          await storage.put(entry, { existing: true })
+          await active()
+          localReady.add(entry.id)
+        }
+        return
       }
       if (entry.peer !== owner && !preparation.get(entry.peer)) {
         if (preparation.error(entry.peer)) throw preparation.error(entry.peer)
@@ -414,11 +460,17 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
           emit()
           await active()
           await storage.put({ ...entry, chunkIndex: entry.chunkIndex + 1 }, { existing: true })
+          // Let the independent local stage finish newly admitted texts before
+          // selecting publications at this chunk boundary. It never awaits us.
+          if ([...entries.values()].some(pending => !pending.files.length && pending.peer !== owner && !pending.failed && !localReady.has(pending.id))) {
+            await pumpLocal()
+            if (localSaving) await new Promise(resolve => localIdleWaiters.add(resolve))
+          }
           // Newly queued text and deletion controls can pass an in-flight file.
           let admitted = 0
           for (const pending of entries.values()) {
             if (closed || !available || admitted >= 8) break
-            if (pending.files.length || pending.failed || cancelled.has(pending.id) || (pending.peer !== owner && !peers.has(pending.peer))) continue
+            if (!localReady.has(pending.id) || pending.peer === owner || pending.status === 'saved' || pending.files.length || pending.failed || cancelled.has(pending.id) || (pending.peer !== owner && !peers.has(pending.peer))) continue
             admitted++
             await sendEntry(pending)
           }
@@ -427,15 +479,16 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       for (; entry.index < entry.events.length; entry.index++) {
         await active()
         const event = entry.events[entry.index]
-        if (entry.peer !== owner) await publish(entry.peer, event, controller.signal)
+        const startedAt = Date.now()
+        await publish(entry.peer, event, controller.signal)
+        debug(entry, 'publication-accepted', startedAt)
         await active()
         // The final durable operation is removal. Avoid encrypting a checkpoint
         // that would immediately be deleted; earlier context stages still checkpoint.
         if (entry.index + 1 < entry.events.length) await storage.put({ ...entry, index: entry.index + 1 }, { existing: true })
       }
-      await storage.remove(entry.id)
-      entries.delete(entry.id)
-      emit()
+      entry.status = 'saved'; emit()
+      cleanupEntry(entry)
     } catch (cause) {
       // Pauses can surface at any stage (text publication, file authorization
       // or chunk delivery). Normalize all of them into the retryable path.
@@ -483,6 +536,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       for (const entry of entries.values()) {
         if (!pendingRetryable(entry) || pausedSends.has(entry.id)) continue
         entry.failed = false
+        if (entry.status === 'saved') { cleanupEntry(entry); continue }
         retried = true
       }
       if (retried) pump()
@@ -505,10 +559,26 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       return schedule()
     })
   }
-  async function pump () {
+  async function pumpLocal () {
     if (!available || closed || !storage) return
-    // A retry that lands while a pump is already running must not be skipped
-    // just because that pass already walked past the entry.
+    if (localSaving) { relocal = true; return }
+    localSaving = true
+    try {
+      do {
+        relocal = false
+        for (const entry of entries.values()) {
+          if (closed || !available) break
+          if (entry.failed || cancelled.has(entry.id) || (entry.peer !== owner && !peers.has(entry.peer))) continue
+          if (entry.status === 'saved') { cleanupEntry(entry); continue }
+          if (localReady.has(entry.id) && entry.peer !== owner) continue
+          await sendEntry(entry, true)
+          pumpRemote()
+        }
+      } while (relocal)
+    } finally { localSaving = false; for (const resolve of localIdleWaiters) resolve(); localIdleWaiters.clear(); settled() }
+  }
+  async function pumpRemote () {
+    if (!available || closed || !storage || !messenger) return
     if (sending) { repump = true; return }
     sending = true
     try {
@@ -516,22 +586,23 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         repump = false
         for (const entry of entries.values()) {
           if (closed || !available) break
-          if ((entry.peer !== owner && !peers.has(entry.peer)) || entry.failed || cancelled.has(entry.id)) continue
-          if (entry.peer !== owner && entry.localSaved.every(Boolean) && !preparation.get(entry.peer) && !preparation.error(entry.peer)) {
+          if (entry.peer === owner || entry.status === 'saved' || !localReady.has(entry.id) || !peers.has(entry.peer) || entry.failed || cancelled.has(entry.id)) continue
+          if (!preparation.get(entry.peer) && !preparation.error(entry.peer)) {
             preparation.request(entry.peer).catch(() => {})
             continue
           }
-          if (entry.peer !== owner && entry.files.length && !fileTransfers) continue
+          if (entry.files.length && !fileTransfers) continue
           await sendEntry(entry)
         }
       } while (repump)
     } finally {
       sending = false
       watchOfflineSends()
-      if (![...entries.values()].some(pendingRetryable)) resetSendRetry()
+      if (![...entries.values()].some(pendingRetryable) && !cleanups.size) resetSendRetry()
       settled()
     }
   }
+  async function pump () { await Promise.all([pumpLocal(), pumpRemote()]) }
   const intentId = file => getEventHash({ kind: 0, pubkey: owner, created_at: 0, tags: [], content: `${file.peer}:${file.root}` })
   async function download (file, options = {}) {
     if (file.peer === owner) return file
@@ -648,6 +719,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         inboxRecovery.stop(); await messenger?.pause('signer'); return
       }
       await ready()
+      pumpLocal()
       for (const entry of entries.values()) if (pendingRetryable(entry)) entry.failed = false
       if (storageBlocked) inboxRecovery.start({ immediate: true })
       if (!changed && messenger && !configurationFailed) { preparation.setAvailable(true); pump(); return configuring }
@@ -656,6 +728,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     async enqueue ({ peer, event, context = [], requiredFiles = [], deletion = false }) {
       if (closed || !available || (peer !== owner && !peers.has(peer))) throw new Error('CHAT_UNAVAILABLE')
       const releaseForeground = foreground.enter()
+      enqueuing++
       try {
         await ready()
         const main = wireEvent(event, owner)
@@ -663,11 +736,19 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         const events = [...context.map(value => wireEvent(value, owner)), main]
         const files = events.filter(value => value.kind === 1063).map(value => ({ ...decodeFileMetadata(value), optional: !requiredFiles.includes(getEventHash(value)) })).filter(file => file.service === 'irfs').flatMap(file => [file, ...(file.thumbnail?.root ? [{ ...file.thumbnail, optional: file.optional }] : [])])
         const entry = { id, peer, event: { ...main, id }, events, files, index: 0, fileIndex: 0, chunkIndex: 0, localSaved: context.map(() => true).concat(false), status: 'pending', deletion }
+        const startedAt = Date.now()
+        debug(entry, 'outbox-start')
         await storage.put(entry)
+        debug(entry, 'outbox-stored', startedAt)
+        queuedAt.set(entry, Date.now())
+        if (cancelled.has(id)) { await storage.remove(id); throw new Error('CHAT_UNAVAILABLE') }
+        // An accepted durable intent survives shutdown/locking for replay. Only
+        // explicit cancellation removes it; no late callback or work is admitted.
+        if (closed) return id
         entries.set(id, entry); emit(); pump()
-        if (peer !== owner) preparePeer(peer).catch(() => {})
+        if (available && peer !== owner) preparePeer(peer).catch(() => {})
         return id
-      } finally { releaseForeground() }
+      } finally { releaseForeground(); enqueuing--; settled() }
     },
     async retry (id) {
       offlineSends.delete(id); pausedSends.delete(id); watchOfflineSends()
@@ -681,7 +762,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       sendControllers.get(id)?.abort()
       offlineSends.delete(id); pausedSends.delete(id); watchOfflineSends()
       await ready()
-      entries.delete(id)
+      entries.delete(id); localReady.delete(id)
       await storage.remove(id)
       emit()
     },
@@ -693,7 +774,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         for (const controller of sendControllers.values()) controller.abort()
         await Promise.allSettled([configuring, initialized, messengerWork, fileSetupWork])
         await messenger?.pause('closed')
-        if (sending || draining) await new Promise(resolve => idleWaiters.add(resolve))
+        if (sending || localSaving || enqueuing || draining || cleanups.size) await new Promise(resolve => idleWaiters.add(resolve))
         await messenger?.close()
         await storage?.close()
         await downloadWriteTail.catch(reportError)

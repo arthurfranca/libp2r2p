@@ -414,3 +414,156 @@ test('session forwards fallback delay without changing the default policy', asyn
   const early = await fixture(t, { fallbackDelayMs: 3000 })
   assert.equal(early.messengerOptions().fallbackDelayMs, 3000)
 })
+
+test('remote publication cannot block local self or another peer copy', async t => {
+  const gate = Promise.withResolvers(); let publishing = false
+  const saved = []; const states = []
+  const f = await fixture(t, {
+    publish: async () => { publishing = true; await gate.promise; return { delivery: { reports: [{ success: true }] } } },
+    save: async value => { saved.push(value.content); return { result: { ok: true } } },
+    onOutbox: entries => states.push(structuredClone(entries))
+  })
+  t.after(() => gate.resolve())
+  await f.session.enqueue({ peer, event })
+  await until(() => publishing)
+  const self = await f.session.enqueue({ peer: owner, event: { ...event, content: 'self' } })
+  await f.session.enqueue({ peer, event: { ...event, content: 'next remote' } })
+  await until(() => saved.includes('self') && saved.includes('next remote'))
+  assert.ok(states.some(entries => entries.some(entry => entry.id === self && entry.status === 'saved')))
+  gate.resolve()
+})
+
+test('self succeeds with network paused and does not checkpoint before cleanup', async t => {
+  const writes = []; const rows = new Map(); const states = []
+  const cleanup = Promise.withResolvers(); let removing = false
+  const f = await fixture(t, {
+    publish: () => assert.fail('self must not publish'),
+    openOutbox: async () => ({
+      list: async () => [], put: async entry => { writes.push(entry.id); rows.set(entry.id, structuredClone(entry)) },
+      has: async id => rows.has(id),
+      remove: async id => { removing = true; await cleanup.promise; rows.delete(id) }, close () {}
+    }),
+    onOutbox: entries => states.push(structuredClone(entries))
+  })
+  t.after(() => cleanup.resolve())
+  await f.messenger().pause('network')
+  const id = await f.session.enqueue({ peer: owner, event })
+  await until(() => removing)
+  assert.equal(writes.length, 1)
+  assert.ok(states.some(entries => entries.some(entry => entry.id === id && entry.status === 'saved')))
+  const next = await f.session.enqueue({ peer: owner, event: { ...event, content: 'second' } })
+  await until(() => states.some(entries => entries.some(entry => entry.id === next && entry.status === 'saved')))
+  cleanup.resolve()
+})
+
+test('a failed local checkpoint cannot admit publication; retry persists before sending', async t => {
+  const rows = new Map(); let checkpoints = 0; let publications = 0
+  const f = await fixture(t, {
+    publish: async () => { publications++; assert.ok(checkpoints >= 3); return { delivery: { reports: [{ success: true }] } } },
+    openOutbox: async () => ({
+      list: async () => [], put: async (entry, options) => {
+        if (options?.existing && ++checkpoints === 1) throw new Error('checkpoint unavailable')
+        rows.set(entry.id, structuredClone(entry))
+      }, remove: async id => rows.delete(id), close () {}
+    })
+  })
+  const id = await f.session.enqueue({ peer, event })
+  await until(() => rows.get(id)?.failed)
+  assert.equal(publications, 0)
+  await f.session.retry(id)
+  await until(() => !rows.has(id))
+  assert.equal(publications, 1)
+})
+
+test('cleanup failure retries only removal, preserving saved status and send callbacks', async t => {
+  const timers = []; const rows = new Map(); const states = []
+  let saves = 0; let removes = 0
+  const f = await fixture(t, {
+    save: async () => { saves++; return { result: { ok: true } } },
+    _setTimeout: (fn, delay) => { const timer = { fn, delay }; timers.push(timer); return timer }, _clearTimeout: () => {},
+    openOutbox: async () => ({ list: async () => [], put: async entry => rows.set(entry.id, structuredClone(entry)), remove: async id => { if (++removes === 1) throw new Error('cleanup unavailable'); rows.delete(id) }, close () {} }),
+    onOutbox: entries => states.push(structuredClone(entries))
+  })
+  const id = await f.session.enqueue({ peer: owner, event })
+  await until(() => timers.length > 0)
+  assert.equal(states.at(-1).find(entry => entry.id === id).status, 'saved')
+  assert.equal(f.sendErrors.length, 0)
+  await timers.at(-1).fn()
+  await until(() => !rows.has(id))
+  assert.equal(saves, 1)
+  assert.equal(removes, 2)
+})
+
+test('local self commit does not await messenger construction', async t => {
+  const gate = Promise.withResolvers(); const saved = []
+  const f = createPrivateMessageSession({
+    owner, signer: {}, recoveryStorage: null, useContentKeys: false,
+    messageStorage: { save: async value => { saved.push(value); return { result: { ok: true } } } },
+    openOutbox: async () => ({ list: async () => [], put: async () => {}, remove: async () => {}, close () {} }),
+    openDownloads: async () => ({ list: async () => [], close () {} }),
+    Messenger: async options => { await gate.promise; return createSessionMessenger(options) },
+    FileTransfer: () => ({ observe () {} }), _onOnline: () => () => {}, onError: () => {}
+  })
+  const configuring = f.setAvailable(true)
+  t.after(async () => { gate.resolve(); await configuring; await f.close() })
+  await f.enqueue({ peer: owner, event })
+  await until(() => saved.length === 1)
+  gate.resolve()
+})
+
+test('close waits for an initial outbox write and preserves the intent without late admission', async t => {
+  const write = Promise.withResolvers(); let writing = false; let closed = false; let saves = 0; let retained = false
+  const f = await fixture(t, {
+    save: async () => { saves++; return { result: { ok: true } } },
+    openOutbox: async () => ({ list: async () => [], put: async () => { writing = true; await write.promise; retained = true }, remove: async () => { assert.equal(closed, false); retained = false }, close: () => { closed = true } })
+  })
+  const enqueue = f.session.enqueue({ peer: owner, event })
+  await until(() => writing)
+  const closing = f.session.close()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(closed, false)
+  write.resolve()
+  assert.equal(await enqueue, getEventHash(event))
+  await closing
+  assert.equal(saves, 0)
+  assert.equal(retained, true)
+  assert.equal(closed, true)
+})
+
+test('self replay after a crash preserves identity and does not duplicate persisted inner events', async t => {
+  const rows = new Map(); const committed = new Set(); let writes = 0
+  const cleanup = Promise.withResolvers(); let cleaning = false
+  const store = { list: async () => [...rows.values()].map(value => structuredClone(value)), put: async entry => rows.set(entry.id, structuredClone(entry)), remove: async id => { cleaning = true; await cleanup.promise; rows.delete(id) }, close () {} }
+  const save = async value => { writes++; committed.add(getEventHash(value)); return { result: { ok: true } } }
+  const f = await fixture(t, { save, openOutbox: async () => store })
+  const id = await f.session.enqueue({ peer: owner, event })
+  await until(() => cleaning)
+  const crashSnapshot = structuredClone(rows.get(id))
+  assert.deepEqual(crashSnapshot.localSaved, [false], 'self does not write the redundant checkpoint')
+  cleanup.resolve(); await f.session.close()
+  rows.set(id, crashSnapshot)
+  const replay = await fixture(t, { save, openOutbox: async () => store })
+  await until(() => !rows.has(id))
+  assert.equal(committed.size, 1)
+  assert.equal(writes, 2)
+  await replay.session.close()
+})
+
+test('live inbox persistence and ACK remain independent of an outgoing publication', async t => {
+  const gate = Promise.withResolvers(); let publishing = false; let acknowledged = false
+  const saved = []
+  const f = await fixture(t, {
+    publish: async () => { publishing = true; await gate.promise; return { delivery: { reports: [{ success: true }] } } },
+    save: async value => { saved.push(value.content); return { result: { ok: true } } }
+  })
+  t.after(() => gate.resolve())
+  await f.session.enqueue({ peer, event })
+  await until(() => publishing)
+  const incoming = { ...event, pubkey: peer, content: 'incoming' }
+  let delivery = { message: { channelPubkey: peer, senderPubkey: peer, event: { ...incoming, id: getEventHash(incoming) } }, ack: async () => { acknowledged = true }, nack: () => assert.fail('valid incoming must not nack') }
+  f.messenger().nextMessage = async () => { const value = delivery; delivery = null; return value }
+  await f.messengerOptions().onMessageQueued()
+  assert.equal(acknowledged, true)
+  assert.ok(saved.includes('incoming'))
+  gate.resolve()
+})

@@ -72,7 +72,7 @@ The coordinator resolves the peer's channel and queues the request until the
 channel exists. Priorities expire after `priorityTtlMs` (10 minutes) or once
 covered, and are dropped with recovery state. They are process-local and reset
 on reload.
-Callbacks are `onOutbox`, `onMedia`,
+Callbacks are optional `onDebug`, `onOutbox`, `onMedia`,
 `onError`, and optional `onSendError(error, { id, peer })`. The caller maps its
 account permissions/connectivity/lock state to availability and owns view subscriptions. There are no DOM or UI imports.
 
@@ -226,3 +226,26 @@ closing shared sockets or cancelling another subscriber for the same event ID.
 Operations already transmitted cannot be recalled from relays. A messenger pause
 cancels its outstanding publication work and leaves the outbox pending; resume
 creates a fresh publication lifetime, without treating the pause as a user abort.
+
+## Independent local persistence and publication
+
+One encrypted outbox feeds two independent serial processors. Local persistence
+never waits for peer preparation or an in-flight publication. Remote entries
+become publishable only after their local progress checkpoint commits; failed
+checkpoints are retried even if the copies have already committed. Text may
+continue passing uploads between chunks after its local stage is ready.
+
+Self entries emit `status: 'saved'` as soon as local persistence succeeds. They
+do not write a redundant localSaved checkpoint before removal. Remote entries
+emit that status after the first valid relay ACK for every required publication,
+without waiting for redundant relays. Outbox cleanup runs independently; failures
+retain saved status and retry only removal with the session backoff, never
+`onSendError`. Consumers must accept saved entries while removal is pending.
+A crash before removal replays the original event identity into idempotent storage.
+Account shutdown fences late admissions and waits for both processors and cleanup.
+
+`onDebug(record)` is disabled by default. Records carry fixed stage names, public
+event/peer identifiers and elapsed milliseconds for admission, local processing,
+channel preparation, publication acceptance and cleanup. Callback failures never
+change delivery. Connect only in development; never log events or crypto buffers.
+Custom outbox factories also receive this optional callback for storage timings.
