@@ -1,0 +1,87 @@
+{
+  "id": "80f2deb5edfe8948ce94631c20c8453ee88714d7187e0abcb0cf3d165e0af138",
+  "peer": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "event": {
+    "kind": 1063,
+    "created_at": 1700000100,
+    "tags": [
+      [
+        "url",
+        "https://nostr.alt/nfile1qqsd7f6ynwp39r2wfrekxz8jn4vnruswvqmaxmq3yj0g0mf5zj25twq94ayqm"
+      ],
+      [
+        "m",
+        "application/octet-stream"
+      ],
+      [
+        "r",
+        "df27449b83128d4e48f36308f29d5931f20e6037d36c11249e87ed34149545b8"
+      ],
+      [
+        "size",
+        "51001"
+      ],
+      [
+        "service",
+        "irfs"
+      ]
+    ],
+    "content": "",
+    "pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "id": "80f2deb5edfe8948ce94631c20c8453ee88714d7187e0abcb0cf3d165e0af138"
+  },
+  "events": [
+    {
+      "kind": 1063,
+      "created_at": 1700000100,
+      "tags": [
+        [
+          "url",
+          "https://nostr.alt/nfile1qqsd7f6ynwp39r2wfrekxz8jn4vnruswvqmaxmq3yj0g0mf5zj25twq94ayqm"
+        ],
+        [
+          "m",
+          "application/octet-stream"
+        ],
+        [
+          "r",
+          "df27449b83128d4e48f36308f29d5931f20e6037d36c11249e87ed34149545b8"
+        ],
+        [
+          "size",
+          "51001"
+        ],
+        [
+          "service",
+          "irfs"
+        ]
+      ],
+      "content": "",
+      "pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "files": [
+    {
+      "url": "https://nostr.alt/nfile1qqsd7f6ynwp39r2wfrekxz8jn4vnruswvqmaxmq3yj0g0mf5zj25twq94ayqm",
+      "mime": "application/octet-stream",
+      "caption": "",
+      "download": "0",
+      "service": "irfs",
+      "root": "df27449b83128d4e48f36308f29d5931f20e6037d36c11249e87ed34149545b8",
+      "size": 51001,
+      "optional": true
+    }
+  ],
+  "index": 0,
+  "fileIndex": 0,
+  "chunkIndex": 1,
+  "localSaved": [
+    true
+  ],
+  "status": "pending",
+  "deletion": false,
+  "uploadProgress": {
+    "completed": 51000,
+    "total": 51001
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "id": "44d227ca9d80b8b8ac2a19910be24aa371b0a1d43da8016cf9e8beae65020a06",
+  "peer": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "event": {
+    "kind": 9,
+    "created_at": 1700000001,
+    "tags": [],
+    "content": "outbox upgrade fixture",
+    "pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "id": "44d227ca9d80b8b8ac2a19910be24aa371b0a1d43da8016cf9e8beae65020a06"
+  },
+  "events": [
+    {
+      "kind": 9,
+      "created_at": 1700000000,
+      "tags": [],
+      "content": "quoted fixture",
+      "pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "kind": 9,
+      "created_at": 1700000001,
+      "tags": [],
+      "content": "outbox upgrade fixture",
+      "pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "files": [],
+  "index": 0,
+  "fileIndex": 0,
+  "chunkIndex": 0,
+  "localSaved": [
+    true,
+    false
+  ],
+  "status": "pending",
+  "deletion": false
+}

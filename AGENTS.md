@@ -344,8 +344,11 @@ NIP-46 against the real pool with controlled transport and injected controls.
   Presence gets one setup slot independently of subscriptions, and yields before
   its next signer RPC during session foreground persistence/publication. Cancelling
   a waiting presence must release its admission and foreground observer.
-  Seed persistence may overlap one outer's encryption/signing, but both must
-  succeed before yield/publication. Settle both before cleaning prepared rows.
+  `onPreparedSeed` receives the signed publication and existing router/jsonl
+  data. Direct messengers persist seeds; sessions commit the encrypted outbox
+  checkpoint, then archive independently. Pending rows participate in recovery
+  reads. Replay the same signed fragments and bind them to the inner event,
+  channel and recipients. Never remove an entry before archival and its writes.
 - Sessions separate account generations from peer revisions and create one
   messenger. Prepare at most four peers, at most three without foreground demand;
   `preparePeer` prioritizes navigation/send/download. Deduplicate signer work,
@@ -369,3 +372,7 @@ NIP-46 against the real pool with controlled transport and injected controls.
   timeout, and release per-consumer waiters. Same-ID publishers share one wire
   operation; cancelling one must preserve others. Deferred cooldown sends are
   removed on last cancellation. Physical sockets and bridge APIs are unchanged.
+
+- Optional session `attemptStartedAt` is monotonic and runtime-only. Include
+  preparation in the fallback budget, reset retries/reloads and budget each upload
+  chunk separately. Missing timestamps retain the publication-local delay.

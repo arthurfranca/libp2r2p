@@ -1,7 +1,7 @@
 import { normalizeRelayUrl } from '../url/index.js'
 import { isValidEvent } from '../event/index.js'
 import { ValidationError } from '../error/index.js'
-import { generateKeypair } from '../key/index.js'
+import { generateKeypair, keypairFromSeckey } from '../key/index.js'
 import * as privateChannel from '../private-channel/index.js'
 import { normalizeRumor, deliveryInfo } from '../private-channel/helpers/rumor.js'
 
@@ -41,16 +41,32 @@ function normalizeDeletionPubkey (deletionPubkey) {
   return deletionPubkey.toLowerCase()
 }
 
-function resolveDeletionCapability ({ deletionPubkey, deletionSeckey, autoDeletionCapability = true }) {
+function resolveDeletionCapability ({ deletionPubkey, deletionSeckey, autoDeletionCapability = true, preparedPublication }) {
   if (deletionSeckey !== undefined) throw new ValidationError('DELETION_SECKEY_NOT_ACCEPTED')
   if (typeof autoDeletionCapability !== 'boolean') throw new ValidationError('AUTO_DELETION_CAPABILITY_BOOLEAN_REQUIRED')
 
   const normalizedDeletionPubkey = normalizeDeletionPubkey(deletionPubkey)
+  if (preparedPublication) {
+    const capability = preparedPublication.deletionCapability
+    if (!capability || (capability.deletionPubkey !== undefined && normalizeDeletionPubkey(capability.deletionPubkey) !== capability.deletionPubkey) ||
+        (normalizedDeletionPubkey && normalizedDeletionPubkey !== capability.deletionPubkey) ||
+        (capability.deletionSeckey !== undefined && keypairFromSeckey(capability.deletionSeckey).pubkey !== capability.deletionPubkey) ||
+        preparedPublication.events?.some(event => event.tags.find(tag => tag[0] === 's')?.[1] !== capability.deletionPubkey)) throw new ValidationError('INVALID_PREPARED_PUBLICATION')
+    return { ...capability }
+  }
   if (normalizedDeletionPubkey) return { deletionPubkey: normalizedDeletionPubkey }
   if (!autoDeletionCapability) return {}
 
   const { pubkey, seckey } = generateKeypair()
   return { deletionPubkey: pubkey, deletionSeckey: seckey }
+}
+
+function preparedSeedHandler (onPreparedSeed, deletion) {
+  if (!onPreparedSeed) return undefined
+  return seed => {
+    seed.publication.deletionCapability = deletion
+    return onPreparedSeed(seed)
+  }
 }
 
 function withDelivery (result, reports, deletionSeckey) {
@@ -652,10 +668,11 @@ async function sendPrivateMessage ({
   _getIykcProofs,
   fileChunkIndex,
   onPreparedSeed,
+  preparedPublication,
   _publish = privateChannel.publish
 }) {
   if (!privateChannelSigner?.getPublicKey) throw new ValidationError('PRIVATE_CHANNEL_WRITER_REQUIRED')
-  return _publish({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed, _getIykcProofs })
+  return _publish({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed, preparedPublication, _getIykcProofs })
 }
 
 async function sendNymMessage ({
@@ -860,13 +877,14 @@ export async function broadcastRumor ({
   autoDeletionCapability = true,
   fileChunkIndex,
   onPreparedSeed,
+  preparedPublication,
   _publish = privateChannel.publish
 }) {
   const receivers = uniq(receiverPubkeys)
   if (!receivers.length) throw new ValidationError('NO_RECEIVERS')
   const { event, wireEvent } = await makeOutgoingRumor({ senderSigner, rumor })
-  const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
-  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed, _getIykcProofs, _publish })
+  const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability, preparedPublication })
+  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublication, _getIykcProofs, _publish })
   return withDelivery({ rumor: event }, reports, deletion.deletionSeckey)
 }
 
@@ -888,13 +906,14 @@ export async function broadcastEvent ({
   autoDeletionCapability = true,
   fileChunkIndex,
   onPreparedSeed,
+  preparedPublication,
   _publish = privateChannel.publish
 }) {
   const receivers = uniq(receiverPubkeys)
   if (!receivers.length) throw new ValidationError('NO_RECEIVERS')
   const wireEvent = assertValidSignedEvent({ ...event, tags: cloneTags(event?.tags) })
-  const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
-  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed, _getIykcProofs, _publish })
+  const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability, preparedPublication })
+  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublication, _getIykcProofs, _publish })
   return withDelivery({ event: wireEvent }, reports, deletion.deletionSeckey)
 }
 

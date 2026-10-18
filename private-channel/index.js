@@ -143,6 +143,7 @@ async function prepareRoutedMessage ({ senderSigner, imkcSigner, privateChannelS
       channelPubkey,
       channelReaderPubkey,
       preparedRows,
+      innerEventId: getEventHash({ ...event, pubkey: event.pubkey || senderPubkey }),
       imkcPubkey,
       imkcProof
     }
@@ -152,69 +153,74 @@ async function prepareRoutedMessage ({ senderSigner, imkcSigner, privateChannelS
   }
 }
 
-async function * wrapPreparedEvents ({ privateChannelSigner, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey, expirationSeconds = EXPIRATION_SECONDS, context }) {
-  const routerSeckey = generateSecretKey()
-  const routerPubkey = getPublicKey(routerSeckey)
-  const receiverPubkeyList = receiverPubkeys(receivers)
-  const routerReceiverTag = receiverTag ?? (receiverPubkeyList.length === 1 ? receiverPubkeyList[0] : '')
-  const rowIndexes = preparedRowIndexesForReceivers(context.preparedRows, receivers)
-  const total = preparedChunkCount(context.preparedRows, rowIndexes)
-  const persistSeeds = async () => {
-    if (!onPreparedSeed) return
-    const router = makeRouterEvent({ pubkey: routerPubkey, senderPubkey: context.senderPubkey, imkcPubkey: context.imkcPubkey, imkcProof: context.imkcProof, receiverPubkey: routerReceiverTag, chunkIndex: 0, chunkTotal: 1, fileChunkIndex, content: '' })
-    const payloadRow = readPreparedRow(context.preparedRows, 0)
-    for (const rowIndex of rowIndexes) {
-      await onPreparedSeed({ channelPubkey: context.channelPubkey, router, jsonl: `${payloadRow}\n${readPreparedRow(context.preparedRows, rowIndex)}\n` })
+async function * wrapPreparedEvents ({ privateChannelSigner, senderSigner, event, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey, expirationSeconds = EXPIRATION_SECONDS, context, preparedPublication }) {
+  let publication = preparedPublication
+  if (publication) {
+    const channelPubkey = await privateChannelSigner.getPublicKey()
+    const expected = receiverPubkeys(receivers).sort().join(',')
+    const innerEventId = getEventHash({ ...event, pubkey: event.pubkey || await senderSigner.getPublicKey() })
+    if (publication.innerEventId !== innerEventId || publication.channelPubkey !== channelPubkey || !Array.isArray(publication.receiverPubkeys) || publication.receiverPubkeys.slice().sort().join(',') !== expected ||
+        !Array.isArray(publication.events) || !publication.events.length || !Array.isArray(publication.seeds) ||
+        publication.events.some(event => !isValidEvent(event) || event.pubkey !== channelPubkey || event.kind !== PRIVATE_BROADCAST_KIND)) {
+      throw new ValidationError('INVALID_PREPARED_PUBLICATION')
     }
+    if (publication.events.some(event => Number(event.tags.find(tag => tag[0] === 'expiration')?.[1]) <= nowSeconds())) throw new ValidationError('PREPARED_PUBLICATION_EXPIRED')
+  } else {
+    const routerSeckey = generateSecretKey()
+    const routerPubkey = getPublicKey(routerSeckey)
+    const receiverPubkeyList = receiverPubkeys(receivers)
+    const routerReceiverTag = receiverTag ?? (receiverPubkeyList.length === 1 ? receiverPubkeyList[0] : '')
+    const rowIndexes = preparedRowIndexesForReceivers(context.preparedRows, receivers)
+    const total = preparedChunkCount(context.preparedRows, rowIndexes)
+    const seedRouter = makeRouterEvent({ pubkey: routerPubkey, senderPubkey: context.senderPubkey, imkcPubkey: context.imkcPubkey, imkcProof: context.imkcProof, receiverPubkey: routerReceiverTag, chunkIndex: 0, chunkTotal: 1, fileChunkIndex, content: '' })
+    const payloadRow = readPreparedRow(context.preparedRows, 0)
+    const seeds = rowIndexes.map(rowIndex => ({ channelPubkey: context.channelPubkey, router: seedRouter, jsonl: `${payloadRow}\n${readPreparedRow(context.preparedRows, rowIndex)}\n` }))
+    const events = []
+    let index = 0
+    for (const content of preparedChunks(context.preparedRows, rowIndexes)) {
+      const router = finalizeEvent(makeRouterEvent({
+        pubkey: routerPubkey, senderPubkey: context.senderPubkey, imkcPubkey: context.imkcPubkey,
+        imkcProof: context.imkcProof, receiverPubkey: routerReceiverTag, fileChunkIndex,
+        chunkIndex: index++, chunkTotal: total, content
+      }), routerSeckey)
+      const createdAt = nowSeconds()
+      const outer = await privateChannelSigner.signEvent({
+        kind: PRIVATE_BROADCAST_KIND, created_at: createdAt,
+        tags: privateBroadcastTags({ deletionPubkey, createdAt, expirationSeconds }),
+        content: await nip44v3EncryptText(privateChannelSigner, context.channelReaderPubkey, PRIVATE_BROADCAST_KIND, JSON.stringify(router))
+      })
+      if (eventByteLength(outer) > MAX_EVENT_BYTES) throw new ValidationError('EVENT_TOO_LARGE')
+      events.push(outer)
+    }
+    publication = { innerEventId: context.innerEventId, channelPubkey: context.channelPubkey, receiverPubkeys: receiverPubkeyList, events, seeds }
   }
-  let index = 0
-  for (const content of preparedChunks(context.preparedRows, rowIndexes)) {
-    const router = finalizeEvent(makeRouterEvent({
-      pubkey: routerPubkey,
-      senderPubkey: context.senderPubkey,
-      imkcPubkey: context.imkcPubkey,
-      imkcProof: context.imkcProof,
-      receiverPubkey: routerReceiverTag,
-      fileChunkIndex,
-      chunkIndex: index++,
-      chunkTotal: total,
-      content
-    }), routerSeckey)
-    const createdAt = nowSeconds()
-    const prepareOuter = async () => privateChannelSigner.signEvent({
-      kind: PRIVATE_BROADCAST_KIND,
-      created_at: createdAt,
-      tags: privateBroadcastTags({ deletionPubkey, createdAt, expirationSeconds }),
-      content: await nip44v3EncryptText(privateChannelSigner, context.channelReaderPubkey, PRIVATE_BROADCAST_KIND, JSON.stringify(router))
-    })
-    // These independent steps may run together, but no envelope is yielded
-    // until every seed is durable. Settle both before releasing prepared rows.
-    const [persistence, prepared] = await Promise.allSettled([index === 1 ? persistSeeds() : undefined, prepareOuter()])
-    if (persistence.status === 'rejected') throw persistence.reason
-    if (prepared.status === 'rejected') throw prepared.reason
-    const outer = prepared.value
-    if (eventByteLength(outer) > MAX_EVENT_BYTES) throw new ValidationError('EVENT_TOO_LARGE')
-    yield outer
+  // The callback commits recovery data before any bytes leave this publisher.
+  // A session commits its encrypted journal; a direct messenger commits seeds.
+  if (onPreparedSeed) {
+    for (const seed of publication.seeds) await onPreparedSeed({ ...seed, publication })
   }
+  yield * publication.events
 }
 
 // Streaming version of wrapEvent
-export async function * wrapEvents ({ senderSigner, imkcSigner, privateChannelSigner = senderSigner, privateChannelReaderPubkey, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey, event, expirationSeconds = EXPIRATION_SECONDS, temporaryStorageArea, _getIykcProofs = getIykcProofs }) {
+export async function * wrapEvents ({ senderSigner, imkcSigner, privateChannelSigner = senderSigner, privateChannelReaderPubkey, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey, event, expirationSeconds = EXPIRATION_SECONDS, temporaryStorageArea, _getIykcProofs = getIykcProofs, preparedPublication }) {
   const normalizedDeletionPubkey = normalizeDeletionPubkey(deletionPubkey)
-  const context = await prepareRoutedMessage({
-    senderSigner,
-    imkcSigner,
-    privateChannelSigner,
-    privateChannelReaderPubkey,
-    receivers,
-    event,
-    temporaryStorageArea,
-    _getIykcProofs
-  })
+  const context = preparedPublication
+    ? null
+    : await prepareRoutedMessage({
+      senderSigner,
+      imkcSigner,
+      privateChannelSigner,
+      privateChannelReaderPubkey,
+      receivers,
+      event,
+      temporaryStorageArea,
+      _getIykcProofs
+    })
   try {
-    yield * wrapPreparedEvents({ privateChannelSigner, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey: normalizedDeletionPubkey, expirationSeconds, context })
+    yield * wrapPreparedEvents({ privateChannelSigner, senderSigner, event, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey: normalizedDeletionPubkey, expirationSeconds, context, preparedPublication })
   } finally {
-    cleanupEnvelopeRows(context.preparedRows)
+    if (context) cleanupEnvelopeRows(context.preparedRows)
   }
 }
 
@@ -552,35 +558,37 @@ function withRecoveryRelays (relays, recoveryRelays) {
   return uniq([...(relays || []), ...(recoveryRelays || [])])
 }
 
-export async function publish ({ senderSigner, imkcSigner, privateChannelSigner = senderSigner, privateChannelReaderPubkey, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, _getIykcProofs = getIykcProofs, _publish = sendToRelays }) {
+export async function publish ({ senderSigner, imkcSigner, privateChannelSigner = senderSigner, privateChannelReaderPubkey, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, _getIykcProofs = getIykcProofs, _publish = sendToRelays, preparedPublication }) {
   const normalizedDeletionPubkey = normalizeDeletionPubkey(deletionPubkey)
   const results = []
   // Relays are grouped only when they have the exact same recipient pubkey set
   const groups = groupedRelayReceivers({ relayToReceivers, receivers })
   if (groups) {
-    const context = await prepareRoutedMessage({
-      senderSigner,
-      imkcSigner,
-      privateChannelSigner,
-      privateChannelReaderPubkey,
-      receivers,
-      event,
-      temporaryStorageArea,
-      _getIykcProofs
-    })
+    const context = preparedPublication
+      ? null
+      : await prepareRoutedMessage({
+        senderSigner,
+        imkcSigner,
+        privateChannelSigner,
+        privateChannelReaderPubkey,
+        receivers,
+        event,
+        temporaryStorageArea,
+        _getIykcProofs
+      })
     try {
       for (const group of groups) {
-        for await (const wrappedEvent of wrapPreparedEvents({ privateChannelSigner, receivers: group.receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey: normalizedDeletionPubkey, expirationSeconds, context })) {
+        for await (const wrappedEvent of wrapPreparedEvents({ privateChannelSigner, senderSigner, event, receivers: group.receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey: normalizedDeletionPubkey, expirationSeconds, context, preparedPublication })) {
           results.push(await _publish(wrappedEvent, withRecoveryRelays(group.relays, recoveryRelays), { receiverPubkeys: receiverPubkeys(group.receivers), primaryRelays: group.relays }))
         }
       }
     } finally {
-      cleanupEnvelopeRows(context.preparedRows)
+      if (context) cleanupEnvelopeRows(context.preparedRows)
     }
     return results
   }
 
-  for await (const wrappedEvent of wrapEvents({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey: normalizedDeletionPubkey, event, expirationSeconds, temporaryStorageArea, _getIykcProofs })) {
+  for await (const wrappedEvent of wrapEvents({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey: normalizedDeletionPubkey, event, expirationSeconds, temporaryStorageArea, _getIykcProofs, preparedPublication })) {
     results.push(await _publish(wrappedEvent, withRecoveryRelays(relays, recoveryRelays), { receiverPubkeys: receiverPubkeys(receivers), primaryRelays: relays }))
   }
   return results

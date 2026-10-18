@@ -32,10 +32,11 @@ function routeGroups (routes) {
   return [...groups.values()]
 }
 
-export function createSendRelayRouting ({ peer, peers = [peer], relaysByPubkey, primaryRelays, primaryRelayToReceivers, fallbackRelays = [], fallbackDelayMs = null, exclusions, pickRelays, recoveryRelays, publish, publishNymEvent, sendEvent, isOnline, isCurrent, signal, pauseSignal, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout }) {
+export function createSendRelayRouting ({ peer, peers = [peer], relaysByPubkey, primaryRelays, primaryRelayToReceivers, fallbackRelays = [], fallbackDelayMs = null, exclusions, pickRelays, recoveryRelays, publish, publishNymEvent, sendEvent, isOnline, isCurrent, signal, pauseSignal, attemptStartedAt, monotonicNow = () => performance.now(), now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout }) {
   // Keep discovery's defaults when NIP-65 is unavailable. Explicit maps/lists
   // retain their fanout; configured fallbacks are a separate last-resort stage.
   fallbackDelayMs = normalizeFallbackDelay(fallbackDelayMs)
+  if (attemptStartedAt !== undefined && (!Number.isFinite(attemptStartedAt) || attemptStartedAt < 0)) throw new ValidationError('INVALID_ATTEMPT_STARTED_AT')
   const transportSignal = signal && pauseSignal ? AbortSignal.any([signal, pauseSignal]) : signal || pauseSignal
   const explicit = Boolean(primaryRelays || primaryRelayToReceivers)
   const primaryRoutes = primaryRelayToReceivers || (primaryRelays
@@ -98,7 +99,7 @@ export function createSendRelayRouting ({ peer, peers = [peer], relaysByPubkey, 
         event, receivers, first: first.length ? { receivers, relays: first } : null, mirrors, tried,
         nextPrimary: pending => pick(pending, false), nextFallback: pending => pick(pending, true),
         sendEvent, isOnline, isCurrent, signal, pauseSignal, remember,
-        delay: fallbackDelayMs, now, setTimer, clearTimer
+        delay: fallbackDelayMs, attemptStartedAt, monotonicNow, now, setTimer, clearTimer
       })
       if (!result.success && current()) exclusions.clear()
       return result

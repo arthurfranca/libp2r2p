@@ -144,14 +144,14 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     if (decoded.root !== file.root || (index !== undefined && decoded.index !== index) || (file.size !== undefined && (decoded.total !== Math.ceil(file.size / IRFS_CHUNK_BYTES) || (decoded.index === decoded.total - 1 && decoded.contentBytes.length !== file.size - decoded.index * IRFS_CHUNK_BYTES)))) throw new ValidationError('FILE_CHUNK_DESCRIPTOR_MISMATCH')
     return decoded
   }
-  async function routing (file, receiverPubkey, signal) {
+  async function routing (file, receiverPubkey, signal, attemptStartedAt, onDebug) {
     const parent = messenger.requireWritableChannel(file.controlChannelPubkey)
-    return messenger.resolveSendRouting({ channel: parent, receiverPubkeys: [receiverPubkey], signal })
+    return messenger.resolveSendRouting({ channel: parent, receiverPubkeys: [receiverPubkey], signal, attemptStartedAt, onDebug })
   }
   function sendOptions (file, routes) {
     return { senderSigner: messenger.userSigner, imkcSigner: messenger.contentKeySigner, privateChannelSigner: file.signer, ...routes, temporaryStorageArea: messenger.temporaryStorageArea, expirationSeconds: messenger.eventExpirationSecondsFor(file.controlChannelPubkey), _getIykcProofs: messenger.contentKeyLookup() }
   }
-  async function publishChunk (descriptor, event, { signal } = {}) {
+  async function publishChunk (descriptor, event, { signal, attemptStartedAt, onPreparedSeed, preparedPublication, onDebug } = {}) {
     const file = await register(descriptor)
     usable(file)
     const decoded = checked(file, event)
@@ -162,7 +162,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     }
     let result
     try {
-      const options = { ...sendOptions(file, await routing(file, file.peerPubkey, signal)), receiverPubkeys: [file.peerPubkey], fileChunkIndex: decoded.index, ...(messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? { onPreparedSeed: seed => saveSeed(file, seed) } : {}) }
+      const options = { ...sendOptions(file, await routing(file, file.peerPubkey, signal, attemptStartedAt, onDebug)), receiverPubkeys: [file.peerPubkey], fileChunkIndex: decoded.index, preparedPublication, ...(onPreparedSeed ? { onPreparedSeed } : messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? { onPreparedSeed: seed => saveSeed(file, seed) } : {}) }
       result = event.sig ? await _messages.broadcastEvent({ ...options, event }) : await _messages.broadcastRumor({ ...options, rumor: event })
       await assertMessagePublished(result, result?.rumor || result?.event || { ...event, pubkey: event.pubkey || messenger.userPubkey })
     } catch (error) { await uploadLeases.get(file.root)?.(); uploadLeases.delete(file.root); throw error }
@@ -463,5 +463,5 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
   const timer = setInterval(() => { prune().catch(onError) }, 60000)
   timer.unref?.()
   messenger.extensions.add(extension)
-  return { register, authorizeSeeding, publishChunk, download, readChunk: (root, index) => storage.read(root, index), stream: (descriptor, options = {}) => storage.stream ? storage.stream(descriptor, options) : chunkStream({ read: storage.read.bind(storage), ...descriptor, ...options }), close: extension.close, cancel (control, root) { const job = jobs.get(keyFor(control, root)); if (job) { job.pauseRequested = false; cancelJob(job) } }, observe (listener) { listeners.add(listener); for (const job of jobs.values()) emit(job); return () => listeners.delete(listener) } }
+  return { register, authorizeSeeding, publishChunk, archiveSeed: async (descriptor, seed) => saveSeed(await register(descriptor), seed), download, readChunk: (root, index) => storage.read(root, index), stream: (descriptor, options = {}) => storage.stream ? storage.stream(descriptor, options) : chunkStream({ read: storage.read.bind(storage), ...descriptor, ...options }), close: extension.close, cancel (control, root) { const job = jobs.get(keyFor(control, root)); if (job) { job.pauseRequested = false; cancelJob(job) } }, observe (listener) { listeners.add(listener); for (const job of jobs.values()) emit(job); return () => listeners.delete(listener) } }
 }

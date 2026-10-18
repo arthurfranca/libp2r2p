@@ -14,6 +14,7 @@ import { createChatOutbox } from './helpers/work-storage.js'
 import { messengerSigner } from './helpers/signer.js'
 import { assertMessagePublished } from '../helpers/publication.js'
 import { normalizeFallbackRelays, normalizeFallbackDelay } from '../helpers/send-routing.js'
+import { createPublicationJournal, withPendingSeeds } from './helpers/publication-journal.js'
 import { createPauseRecovery, isRecoverableStorageFailure } from '../helpers/pause-recovery.js'
 
 export function wireEvent (value, owner) {
@@ -65,14 +66,15 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const channels = new Map()
   const entries = new Map()
   const cancelled = new Set()
+  const attemptStarts = new Map()
   const sendControllers = new Map()
   const localReady = new Set()
   const localIdleWaiters = new Set()
   const cleanups = new Map()
   const queuedAt = new WeakMap()
-  const debug = (entry, stage, startedAt) => {
+  const debug = (entry, stage, startedAt, coordinates = {}) => {
     if (!onDebug) return
-    try { onDebug({ stage, eventId: entry.id, peer: entry.peer, at: Date.now(), ...(startedAt != null ? { elapsedMs: Date.now() - startedAt } : {}) }) } catch {}
+    try { onDebug({ stage, eventId: entry.id, peer: entry.peer, at: Date.now(), ...coordinates, ...(startedAt != null ? { elapsedMs: Date.now() - startedAt } : {}) }) } catch {}
   }
   const offlineSends = new Set()
   const pausedSends = new Set()
@@ -97,7 +99,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       return
     }
     clearSendRetry()
-    for (const id of pausedSends) { const entry = entries.get(id); if (entry) entry.failed = false }
+    for (const id of pausedSends) { const entry = entries.get(id); if (entry) { entry.failed = false; attemptStarts.set(entry.id, performance.now()) } }
     pausedSends.clear()
     // The callback can run inside construction/resume, before configure settles.
     queueMicrotask(() => pump())
@@ -139,11 +141,30 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   let redrain = false
   const idleWaiters = new Set()
   const settled = () => { if (!sending && !localSaving && !enqueuing && !draining && !cleanups.size) { for (const resolve of idleWaiters) resolve(); idleWaiters.clear() } }
-  const emit = () => onOutbox([...entries.values()].filter(entry => !entry.deletion))
+  const emit = () => onOutbox([...entries.values()].filter(entry => !entry.deletion && !entry.cancelled))
+  const journal = createPublicationJournal({
+    entries, store: () => storage, onError: reportError, debug, setTimer: _setTimeout, clearTimer: _clearTimeout, random: _random,
+    archive: async (entry, rows) => {
+      if (recoveryStorage?.seeds) { for (const row of rows) await recoveryStorage.seeds.put(row) } else if (entry.prepared.target.file) {
+        for (const seed of entry.prepared.publication.seeds) await fileTransfers.archiveSeed(entry.prepared.target.file, seed)
+      } else {
+        for (const seed of entry.prepared.publication.seeds) await messenger.enqueueSeed(seed.channelPubkey, seed)
+      }
+    },
+    changed: entry => {
+      if (!entry.prepared && (entry.status === 'saved' || entry.cancelled)) cleanupEntry(entry)
+      else if (!closed && available) pumpRemote()
+    }
+  })
+  const seedStorage = recoveryStorage?.seeds ? withPendingSeeds(recoveryStorage.seeds, () => journal.pendingRows()) : undefined
   const ready = () => (initialized ??= (async () => {
     storage = await openOutbox({ owner, signer, onDebug })
     for (const entry of await storage.list()) {
+      // Old encrypted entries retain progress and enter this same pipeline.
+      if (entry.cancelled) cancelled.add(entry.id)
       entries.set(entry.id, entry)
+      journal.adopt(entry)
+      attemptStarts.set(entry.id, performance.now())
       if (entry.localSaved.every(Boolean)) localReady.add(entry.id)
       queuedAt.set(entry, Date.now())
     }
@@ -156,7 +177,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     let candidate
     try {
       candidate = await Messenger({
-        fallbackRelays, fallbackDelayMs, pendingDecryptionReady, seedStorage: recoveryStorage?.seeds, userSigner, channels: [], useContentKeys, _waitForForeground: foreground.wait, _observeForeground: foreground.observe,
+        fallbackRelays, fallbackDelayMs, pendingDecryptionReady, seedStorage, _pendingSeedRecords: () => journal.pendingRows(), userSigner, channels: [], useContentKeys, _waitForForeground: foreground.wait, _observeForeground: foreground.observe,
         onMessageQueued: () => { if (messengerBinding === binding) return drain() },
         onStateChanged: state => {
           if (closed || messengerBinding !== binding) return
@@ -236,7 +257,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       fileSetupWork = setupFiles().catch(error => { fileSetupWork = null; if (!closed) reportError(error) })
     }
     fileSetupWork.then(() => { if (!closed && available) restoreDownloads() }).catch(reportError)
-    drain(); pump()
+    journal.wake(); drain(); pump()
   }
   async function setupFiles () {
     if (!fileTransfers) {
@@ -244,7 +265,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         messenger, onError: reportError,
         resolveChannel: ({ peerPubkey, info }) => messengerSigner(signer.withSharedKey(peerPubkey, info)),
         storage: chunkStorage,
-        seedStorage: recoveryStorage?.seeds,
+        seedStorage,
         authorizationStorage: recoveryStorage?.authorizations
       })
       fileTransfers.observe(state => {
@@ -368,10 +389,24 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       if (again && !storageBlocked && !closed && available) queueMicrotask(() => drain())
     }
   }
-  async function publish (peer, event, signal) {
+  async function publish (entry, event, signal) {
+    const peer = entry.peer
     if (preparation.error(peer)) throw preparation.error(peer)
     if (!available || !peers.has(peer) || !channels.has(peer)) throw unavailableError(new Error('CHAT_UNAVAILABLE'), signal)
-    const options = { channelPubkey: channels.get(peer)?.pubkey, receiverPubkeys: [peer], signal }
+    const channelPubkey = channels.get(peer)?.pubkey
+    const retention = mode === 'seeder' || mode === 'watchtower' ? messenger.offlineRecoverySecondsFor?.(channelPubkey) ?? 0 : 0
+    const preparationStartedAt = Date.now()
+    const options = {
+      channelPubkey, receiverPubkeys: [peer], signal, attemptStartedAt: attemptStarts.get(entry.id),
+      onDebug: onDebug ? value => debug(entry, value.stage, undefined, value) : undefined,
+      preparedPublication: entry.prepared?.publication,
+      onPreparedSeed: async seed => {
+        debug(entry, 'envelope-prepared', preparationStartedAt, { publicationId: seed.publication.events[0].id })
+        await journal.stage(entry, seed, { index: entry.index }, retention)
+        signal.throwIfAborted()
+      }
+    }
+    debug(entry, 'envelope-preparation')
     let report
     try {
       report = event.sig ? await messenger.broadcastEvent({ ...options, event }) : await messenger.broadcastRumor({ ...options, rumor: event })
@@ -383,10 +418,11 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     await assertMessagePublished(report, event)
   }
   async function cleanupEntry (entry) {
+    if (entry.prepared) { journal.wake(); return }
     if (cleanups.has(entry.id)) return cleanups.get(entry.id)
     const startedAt = Date.now()
-    const work = Promise.resolve().then(() => storage.remove(entry.id)).then(() => {
-      entries.delete(entry.id); localReady.delete(entry.id)
+    const work = Promise.resolve().then(async () => { await journal.flush(entry); await storage.remove(entry.id) }).then(() => {
+      entries.delete(entry.id); localReady.delete(entry.id); attemptStarts.delete(entry.id)
       debug(entry, 'outbox-cleanup', startedAt)
       emit()
     }).catch(error => {
@@ -399,6 +435,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     return work
   }
   async function sendEntry (entry, localOnly = false) {
+    if (entry.status === 'saved') return
     const releaseForeground = foreground.enter()
     entry.status = 'pending'; emit()
     const controller = new AbortController()
@@ -429,7 +466,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         } else {
           // Retry this checkpoint even when a preceding attempt saved all copies
           // but failed to persist progress. Only then admit remote publication.
-          await storage.put(entry, { existing: true })
+          await journal.write(entry)
           await active()
           localReady.add(entry.id)
         }
@@ -443,49 +480,55 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       if (entry.peer !== owner && messengerStatus?.paused) {
         throw unavailableError(Object.assign(new Error('PRIVATE_MESSENGER_PAUSED'), { pauseReasons: [...messengerStatus.pauseReasons] }), controller.signal)
       }
-      // Read/publish one chunk at a time. Progress is durable after each
-      // accepted chunk; replay after interruption keeps its original identity.
-      for (; entry.peer !== owner && entry.fileIndex < entry.files.length; entry.fileIndex++, entry.chunkIndex = 0) {
+      if (entry.prepared?.accepted) { journal.wake(); return }
+      // One prepared unit per entry. Archive waits yield this entry, not the pump.
+      for (; entry.fileIndex < entry.files.length; entry.fileIndex++, entry.chunkIndex = 0) {
         const file = entry.files[entry.fileIndex]
+        const descriptor = { controlChannelPubkey: channels.get(entry.peer).pubkey, peerPubkey: entry.peer, root: file.root, size: file.size }
         await active()
-        await fileTransfers.authorizeSeeding({ controlChannelPubkey: channels.get(entry.peer).pubkey, peerPubkey: entry.peer, root: file.root, size: file.size }, { receiverPubkeys: [entry.peer], sharedAt: entry.event.created_at })
-        for (; entry.chunkIndex < Math.ceil(file.size / IRFS_CHUNK_BYTES); entry.chunkIndex++) {
+        await fileTransfers.authorizeSeeding(descriptor, { receiverPubkeys: [entry.peer], sharedAt: entry.event.created_at })
+        while (entry.chunkIndex < Math.ceil(file.size / IRFS_CHUNK_BYTES)) {
+          const chunkStartedAt = performance.now()
           await active()
           const chunk = chunkStorage ? await chunkStorage.read(file.root, entry.chunkIndex, file) : await fileTransfers.readChunk(file.root, entry.chunkIndex)
           if (!chunk || decodeIrfsChunk(chunk).root !== file.root) { if (file.optional) break; throw new Error('FILE_UNAVAILABLE') }
-          if (!fileTransfers) throw new Error('FILE_TRANSFER_UNAVAILABLE')
-          await fileTransfers.publishChunk({ controlChannelPubkey: channels.get(entry.peer).pubkey, peerPubkey: entry.peer, root: file.root, size: file.size }, wireEvent(chunk, owner), { signal: controller.signal })
-          const completed = entry.files.slice(0, entry.fileIndex).reduce((sum, value) => sum + value.size, 0) + Math.min(file.size, (entry.chunkIndex + 1) * IRFS_CHUNK_BYTES)
+          const recover = mode === 'watchtower' ? messenger.offlineRecoverySecondsFor?.(descriptor.controlChannelPubkey) ?? 0 : 0
+          const target = { file: descriptor, fileIndex: entry.fileIndex, chunkIndex: entry.chunkIndex }
+          await fileTransfers.publishChunk(descriptor, wireEvent(chunk, owner), {
+            signal: controller.signal, attemptStartedAt: chunkStartedAt, onDebug: onDebug ? value => debug(entry, value.stage, undefined, value) : undefined, preparedPublication: entry.prepared?.publication,
+            onPreparedSeed: async seed => { await journal.stage(entry, seed, target, recover); controller.signal.throwIfAborted() }
+          })
+          entry.chunkIndex++
+          const completed = entry.files.slice(0, entry.fileIndex).reduce((sum, value) => sum + value.size, 0) + Math.min(file.size, entry.chunkIndex * IRFS_CHUNK_BYTES)
           entry.uploadProgress = { completed, total: entry.files.reduce((sum, value) => sum + value.size, 0) }
           emit()
           await active()
-          await storage.put({ ...entry, chunkIndex: entry.chunkIndex + 1 }, { existing: true })
-          // Let the independent local stage finish newly admitted texts before
-          // selecting publications at this chunk boundary. It never awaits us.
+          if (entry.prepared) { journal.accept(entry); return }
+          await journal.write(entry)
           if ([...entries.values()].some(pending => !pending.files.length && pending.peer !== owner && !pending.failed && !localReady.has(pending.id))) {
             await pumpLocal()
             if (localSaving) await new Promise(resolve => localIdleWaiters.add(resolve))
           }
-          // Newly queued text and deletion controls can pass an in-flight file.
           let admitted = 0
           for (const pending of entries.values()) {
             if (closed || !available || admitted >= 8) break
-            if (!localReady.has(pending.id) || pending.peer === owner || pending.status === 'saved' || pending.files.length || pending.failed || cancelled.has(pending.id) || (pending.peer !== owner && !peers.has(pending.peer))) continue
+            if (!localReady.has(pending.id) || pending.peer === owner || pending.status === 'saved' || pending.files.length || pending.failed || cancelled.has(pending.id) || pending.prepared?.accepted || !peers.has(pending.peer)) continue
             admitted++
             await sendEntry(pending)
           }
         }
       }
-      for (; entry.index < entry.events.length; entry.index++) {
+      while (entry.index < entry.events.length) {
         await active()
         const event = entry.events[entry.index]
         const startedAt = Date.now()
-        await publish(entry.peer, event, controller.signal)
+        await publish(entry, event, controller.signal)
         debug(entry, 'publication-accepted', startedAt)
         await active()
-        // The final durable operation is removal. Avoid encrypting a checkpoint
-        // that would immediately be deleted; earlier context stages still checkpoint.
-        if (entry.index + 1 < entry.events.length) await storage.put({ ...entry, index: entry.index + 1 }, { existing: true })
+        entry.index++
+        if (entry.index === entry.events.length) { entry.status = 'saved'; emit() }
+        if (entry.prepared) { journal.accept(entry); return }
+        if (entry.index < entry.events.length) await journal.write(entry)
       }
       entry.status = 'saved'; emit()
       cleanupEntry(entry)
@@ -493,9 +536,12 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       // Pauses can surface at any stage (text publication, file authorization
       // or chunk delivery). Normalize all of them into the retryable path.
       const error = cause?.retryWhenAvailable ? cause : (isUnavailableSend(cause) ? unavailableError(cause, controller.signal) : cause)
-      if (cancelled.has(entry.id)) { await storage.remove(entry.id); entries.delete(entry.id) } else {
+      if (cancelled.has(entry.id)) {
+        entry.cancelled = true
+        if (entry.prepared) { await journal.write(entry); journal.wake() } else { await storage.remove(entry.id); entries.delete(entry.id) }
+      } else {
         entry.status = error.retryWhenAvailable ? 'pending' : 'error'; entry.failed = true; entry.retryable = retryable(error)
-        await storage.put(entry, { existing: true }).catch(reportError)
+        await journal.write(entry).catch(reportError)
         if (entry.peer !== owner && error.retryWhenAvailable && messenger?.readStatus().paused) pausedSends.add(entry.id)
         else if (isUnavailableSend(cause) && cause.pauseReasons?.length && available && !closed) {
           // Release can race persistence of the failed attempt. Do not lose
@@ -536,6 +582,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       for (const entry of entries.values()) {
         if (!pendingRetryable(entry) || pausedSends.has(entry.id)) continue
         entry.failed = false
+        attemptStarts.set(entry.id, performance.now())
         if (entry.status === 'saved') { cleanupEntry(entry); continue }
         retried = true
       }
@@ -553,7 +600,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       if (closed || !available) return
       for (const id of offlineSends) {
         const entry = entries.get(id)
-        if (entry?.retryable) entry.failed = false
+        if (entry?.retryable) { entry.failed = false; attemptStarts.set(entry.id, performance.now()) }
       }
       offlineSends.clear()
       return schedule()
@@ -586,6 +633,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         repump = false
         for (const entry of entries.values()) {
           if (closed || !available) break
+          if (entry.prepared?.accepted) { journal.wake(); continue }
           if (entry.peer === owner || entry.status === 'saved' || !localReady.has(entry.id) || !peers.has(entry.peer) || entry.failed || cancelled.has(entry.id)) continue
           if (!preparation.get(entry.peer) && !preparation.error(entry.peer)) {
             preparation.request(entry.peer).catch(() => {})
@@ -714,19 +762,22 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       else clearSendRetry()
       if (changed) lifecycle++
       if (!available) {
+        journal.setAvailable(false)
         preparation.setAvailable(false)
         for (const peer of channels.keys()) if (!preparation.get(peer)) channels.delete(peer)
         inboxRecovery.stop(); await messenger?.pause('signer'); return
       }
       await ready()
+      journal.setAvailable(true)
       pumpLocal()
-      for (const entry of entries.values()) if (pendingRetryable(entry)) entry.failed = false
+      for (const entry of entries.values()) if (pendingRetryable(entry)) { entry.failed = false; attemptStarts.set(entry.id, performance.now()) }
       if (storageBlocked) inboxRecovery.start({ immediate: true })
       if (!changed && messenger && !configurationFailed) { preparation.setAvailable(true); pump(); return configuring }
       return schedule()
     },
-    async enqueue ({ peer, event, context = [], requiredFiles = [], deletion = false }) {
+    async enqueue ({ peer, event, context = [], requiredFiles = [], deletion = false, attemptStartedAt }) {
       if (closed || !available || (peer !== owner && !peers.has(peer))) throw new Error('CHAT_UNAVAILABLE')
+      if (attemptStartedAt !== undefined && (!Number.isFinite(attemptStartedAt) || attemptStartedAt < 0)) throw new ValidationError('INVALID_ATTEMPT_STARTED_AT')
       const releaseForeground = foreground.enter()
       enqueuing++
       try {
@@ -741,6 +792,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         await storage.put(entry)
         debug(entry, 'outbox-stored', startedAt)
         queuedAt.set(entry, Date.now())
+        if (attemptStartedAt !== undefined) attemptStarts.set(id, attemptStartedAt)
         if (cancelled.has(id)) { await storage.remove(id); throw new Error('CHAT_UNAVAILABLE') }
         // An accepted durable intent survives shutdown/locking for replay. Only
         // explicit cancellation removes it; no late callback or work is admitted.
@@ -755,15 +807,15 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       if (storageBlocked) inboxRecovery.start({ immediate: true })
       await ready()
       const entry = entries.get(id)
-      if (entry) { entry.failed = false; resetSendRetry(); if (entry.peer !== owner) preparePeer(entry.peer).catch(() => {}); return pump() }
+      if (entry) { attemptStarts.set(id, performance.now()); journal.retry(); entry.failed = false; resetSendRetry(); if (entry.peer !== owner) preparePeer(entry.peer).catch(() => {}); return pump() }
     },
     async cancel (id) {
       cancelled.add(id)
       sendControllers.get(id)?.abort()
       offlineSends.delete(id); pausedSends.delete(id); watchOfflineSends()
       await ready()
-      entries.delete(id); localReady.delete(id)
-      await storage.remove(id)
+      const entry = entries.get(id)
+      if (entry?.prepared) { entry.cancelled = true; await journal.write(entry); journal.wake() } else { entries.delete(id); localReady.delete(id); await storage.remove(id) }
       emit()
     },
     close () {
@@ -775,6 +827,8 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         await Promise.allSettled([configuring, initialized, messengerWork, fileSetupWork])
         await messenger?.pause('closed')
         if (sending || localSaving || enqueuing || draining || cleanups.size) await new Promise(resolve => idleWaiters.add(resolve))
+        await journal.close()
+        if (cleanups.size) await new Promise(resolve => idleWaiters.add(resolve))
         await messenger?.close()
         await storage?.close()
         await downloadWriteTail.catch(reportError)

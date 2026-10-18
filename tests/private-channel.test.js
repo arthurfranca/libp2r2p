@@ -1686,7 +1686,7 @@ test('wrapEvent chunks large jsonl without oversize events and unwraps reassembl
   assert.equal(routers.length, Number(routers[0].tags.find(t => t[0] === 'c')[2]))
 })
 
-test('outer signing overlaps seed persistence but never yields before durable success', async () => {
+test('prepared signed envelopes never yield before the recovery checkpoint succeeds', async () => {
   for (const failure of [null, new Error('seed storage unavailable')]) {
     const alice = signer(); const bob = signer()
     const seed = Promise.withResolvers(); const signed = Promise.withResolvers()
@@ -1706,6 +1706,26 @@ test('outer signing overlaps seed persistence but never yields before durable su
     await stream.return()
     assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
   }
+})
+
+test('a checkpoint holds every signed fragment and replays identical envelopes without cryptography', async () => {
+  const alice = signer(), bob = signer()
+  const peer = await bob.getPublicKey()
+  let publication
+  const options = { senderSigner: alice, privateChannelSigner: alice, receivers: [peer], event: eventFixture('x'.repeat(getJsonlChunkByteSize())), _getIykcProofs: noContentKeys }
+  const original = await wrapEvent({ ...options, onPreparedSeed: seed => { publication = structuredClone(seed.publication) } })
+  assert.ok(original.length > 1)
+  assert.deepEqual(publication.events, original)
+  const cannotEncrypt = new Proxy(alice, {
+    get: (target, key) => {
+      if (['signEvent', 'nip44v3Encrypt', 'nip44EncryptDoubleDH'].includes(key)) return () => assert.fail('Replay must reuse the signed envelope')
+      const value = Reflect.get(target, key, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    }
+  })
+  const replay = await wrapEvent({ ...options, senderSigner: cannotEncrypt, privateChannelSigner: cannotEncrypt, preparedPublication: publication })
+  assert.deepEqual(replay, original)
+  await assert.rejects(wrapEvent({ ...options, event: eventFixture('a different message'), preparedPublication: publication }), { code: 'INVALID_PREPARED_PUBLICATION' })
 })
 
 test('wrapEvents cleans temporary chunks when the stream is stopped early', async () => {

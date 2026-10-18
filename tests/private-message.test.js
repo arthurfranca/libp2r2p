@@ -627,3 +627,18 @@ test('unwatch cancels a watch still resolving its receiver identity', async () =
   await watching
   assert.equal(calls.length, 0)
 })
+
+test('prepared replay retains its original deletion capability', async () => {
+  let prepared
+  const _publish = async options => {
+    const publication = options.preparedPublication || { events: [{ tags: [['s', options.deletionPubkey]] }] }
+    await options.onPreparedSeed({ publication })
+    assert.equal(options.deletionPubkey, publication.deletionCapability.deletionPubkey)
+    return [{ success: true }]
+  }
+  const options = { senderSigner: signer(pubkeyFixture(3)), receiverPubkeys: ['alice'], rumor: { kind: 9, tags: [], created_at: 1700000000, content: 'repeat' }, _publish, onPreparedSeed: seed => { prepared = structuredClone(seed.publication) } }
+  const original = await broadcastRumor(options)
+  const replay = await broadcastRumor({ ...options, preparedPublication: prepared })
+  assert.equal(replay.delivery.deletionSeckey, original.delivery.deletionSeckey)
+  await assert.rejects(broadcastRumor({ ...options, preparedPublication: { ...prepared, deletionCapability: {} } }), /INVALID_PREPARED_PUBLICATION/)
+})

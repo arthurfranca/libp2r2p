@@ -233,6 +233,7 @@ export class PrivateMessenger {
     messageQueueMaxBytes = DEFAULT_MESSAGE_QUEUE_MAX_BYTES,
     seedQueueMaxBytes = DEFAULT_SEED_QUEUE_MAX_BYTES,
     seedStorage,
+    _pendingSeedRecords = () => [],
     temporaryStorageArea = globalThis.sessionStorage,
     autoDeletionCapability = true,
     _indexedDB = globalThis.indexedDB,
@@ -290,6 +291,7 @@ export class PrivateMessenger {
     this.messageQueueMaxBytes = messageQueueMaxBytes
     this.seedQueueMaxBytes = seedQueueMaxBytes
     this.seedStorage = seedStorage
+    this._pendingSeedRecords = _pendingSeedRecords
     this.temporaryStorageArea = temporaryStorageArea
     this.autoDeletionCapability = normalizeAutoDeletionCapability(autoDeletionCapability)
     this._indexedDB = _indexedDB
@@ -887,7 +889,8 @@ export class PrivateMessenger {
     return uniq([...primary, ...this.fallbackRelays].map(normalizeRelayUrl))
   }
 
-  async resolveSendRouting ({ channel, receiverPubkeys, relays, relayToReceivers, signal }) {
+  async resolveSendRouting ({ channel, receiverPubkeys, relays, relayToReceivers, signal, attemptStartedAt, onDebug }) {
+    if (attemptStartedAt !== undefined && (!Number.isFinite(attemptStartedAt) || attemptStartedAt < 0)) throw new ValidationError('INVALID_ATTEMPT_STARTED_AT')
     const recoveryRelays = await this.recoveryMirrorRelays(channel.pubkey)
     if (relayToReceivers && !this.fallbackRelays.length) return { relayToReceivers, recoveryRelays }
     const fixed = relayToReceivers ? null : relays?.length ? uniq(relays) : channel.sendRelays.length ? channel.sendRelays : channel.relays.length ? channel.relays : null
@@ -903,12 +906,17 @@ export class PrivateMessenger {
       peers: fixed && !recipients.length ? [this.userPubkey] : recipients, relaysByPubkey, recoveryRelays, primaryRelays: fixed?.map(normalizeRelayUrl), primaryRelayToReceivers: relayToReceivers, fallbackRelays: this.fallbackRelays,
       signal: signal ? AbortSignal.any([this.sendRoutingLifetime.signal, signal]) : this.sendRoutingLifetime.signal,
       exclusions: this.sendRelayExclusions.get(key).exclusions,
-      fallbackDelayMs: this.fallbackDelayMs, pauseSignal: this.sendRoutingPause.signal,
+      fallbackDelayMs: this.fallbackDelayMs, attemptStartedAt, pauseSignal: this.sendRoutingPause.signal,
       setTimer: this._setTimeout, clearTimer: this._clearTimeout,
       pickRelays: this._pickRelaysForPubkeys,
       publish: this._privateChannel.publish || privateChannel.publish,
       publishNymEvent: this._privateChannel.publishNymEvent || privateChannel.publishNymEvent,
-      sendEvent: (...args) => relayPool.sendEvent(...args),
+      sendEvent: async (...args) => {
+        const startedAt = onDebug ? performance.now() : 0
+        const result = await relayPool.sendEvent(...args)
+        if (result.success && onDebug) { try { onDebug({ stage: 'first-ack', publicationId: args[0].id, elapsedMs: performance.now() - startedAt }) } catch {} }
+        return result
+      },
       isOnline: this._isOnline,
       isCurrent: () => !this.closePromise && !this.pauseReasons.size && this.channels.has(channel.pubkey)
     })
@@ -2401,11 +2409,11 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async broadcastRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, deletionPubkey, signal }) {
+  async broadcastRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, onDebug }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
-      const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers, signal })
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers, signal, attemptStartedAt, onDebug })
       this.debugSend('broadcastRumor', channelPubkey, { receiverPubkeys })
       return await this._privateMessage.broadcastRumor({
         senderSigner: this.userSigner,
@@ -2419,17 +2427,18 @@ export class PrivateMessenger {
         deletionPubkey,
         autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
         rumor,
-        onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
+        onPreparedSeed: onPreparedSeed || this.outgoingSeedHandler(channelPubkey),
+        preparedPublication,
         _getIykcProofs: this.contentKeyLookup()
       })
     } finally { releaseActivity() }
   }
 
-  async broadcastEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, deletionPubkey, signal }) {
+  async broadcastEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, onDebug }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
-      const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers, signal })
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers, signal, attemptStartedAt, onDebug })
       this.debugSend('broadcastEvent', channelPubkey, { receiverPubkeys })
       return await this._privateMessage.broadcastEvent({
         senderSigner: this.userSigner,
@@ -2443,7 +2452,8 @@ export class PrivateMessenger {
         deletionPubkey,
         autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
         event,
-        onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
+        onPreparedSeed: onPreparedSeed || this.outgoingSeedHandler(channelPubkey),
+        preparedPublication,
         _getIykcProofs: this.contentKeyLookup()
       })
     } finally { releaseActivity() }
@@ -2782,8 +2792,17 @@ export class PrivateMessenger {
     })
 
     if (this.offlineRecoverySecondsFor(channelPubkey)) {
+      const seen = new Set()
+      const key = seed => seed.router ? routerSeedRowKey(seed) : nymCarrierSeedKey(seed)
+      const pending = this._pendingSeedRecords({ channelPubkey, receiverPubkey: message.event?.pubkey, since, until })
+      for (const seed of pending) {
+        if (seed.channelPubkey !== channelPubkey || (seed.receiverPubkey && seed.receiverPubkey !== message.event?.pubkey) || seed.expiresAt <= nowSeconds()) continue
+        if (since !== undefined && (seed.lastSeenAt || seed.router.created_at) < since) continue
+        if (until !== undefined && (seed.firstSeenAt || seed.router.created_at) > until) continue
+        seen.add(key(seed)); await packer.update(seed)
+      }
       for await (const seed of this.seedStorage ? this.seedStorage.iterate({ channelPubkey, receiverPubkey: message.event?.pubkey, since, until }) : this.seedQueue.storedItemsBy('byChannel', channelPubkey)) {
-        if (seedRecordTime(seed) < nowSeconds() - this.offlineRecoverySecondsFor(channelPubkey)) continue
+        if (seen.has(key(seed)) || seedRecordTime(seed) < nowSeconds() - this.offlineRecoverySecondsFor(channelPubkey)) continue
         if (this.seedStorage && !await this.seedStorage.has(seed)) continue
         await packer.update(seed)
       }

@@ -633,9 +633,13 @@ tasks cannot deliver into a new channel generation. Mandatory persistence still
 owns its storage pause; incomplete history remains a pending recovery interval.
 Subscription setup is bounded separately from presence, so a slow announcement
 does not hold the other channels' readers. Sessions prioritize user persistence
-and publication before the next background presence signer call. Signing an outer
-envelope can overlap recovery-seed persistence, but no envelope is yielded for
-publication unless both succeed; only one outer is prepared at a time.
+and publication before the next background presence signer call. `onPreparedSeed`
+receives its existing router/jsonl fields plus `publication`, containing all
+signed fragments, recipient/channel identities and recovery rows for that logical
+event. The callback commits durable recovery before publication: a direct
+messenger uses its seed store; the session uses its encrypted outbox journal and
+archives indexed personal copies independently. No alternative legacy publisher
+is retained. Only one logical event/chunk is prepared per session entry at a time.
 
 `private-channel.fetch` reports incomplete reads as an `AggregateError` with
 stable `code: 'PRIVATE_CHANNEL_FETCH_INCOMPLETE'`. Its message names relays,
@@ -1241,5 +1245,9 @@ Private messenger/session constructors accept optional `fallbackDelayMs` (`null`
 by default). Automatic NIP-65 sends can start configured fallback relays after
 the chosen delay while primary publications retain their deadlines. Explicit
 routes keep sequential fallback; every encrypted recipient must be covered.
+Session `enqueue` accepts optional monotonic `attemptStartedAt`; supplied values
+make preparation consume that delay. Retries/reloads start a fresh attempt and
+uploads budget each chunk independently. Monotonic clocks never enter storage or
+Nostr events. Omitted timestamps keep the publication-local delay.
 `RelayPool.sendEvent` accepts a consumer `signal` without closing shared sockets.
 See [fallback and cancellation](private-messenger/session/README.md#relay-fallback).

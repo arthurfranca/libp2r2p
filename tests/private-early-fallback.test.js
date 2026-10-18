@@ -30,7 +30,7 @@ function clock () {
     }
   }
 }
-function fixture ({ delay = 3000, read = primaries, fallbacks = [fallback], outcomes = {}, online = true, primaryRelays, primaryRelayToReceivers, peers = [peer], relaysByPubkey } = {}) {
+function fixture ({ attemptStartedAt, delay = 3000, read = primaries, fallbacks = [fallback], outcomes = {}, online = true, primaryRelays, primaryRelayToReceivers, peers = [peer], relaysByPubkey } = {}) {
   const time = clock(); const calls = []; const exclusions = new Map(); const controller = new AbortController(); const pause = new AbortController()
   const state = { online, current: true, probes: 0 }
   const sendEvent = async (value, relays, { signal } = {}) => {
@@ -65,7 +65,7 @@ function fixture ({ delay = 3000, read = primaries, fallbacks = [fallback], outc
   const publish = options => options._publish(options.event, [...options.relayToReceivers.keys(), ...options.recoveryRelays])
   const routing = createSendRelayRouting({
     peers, relaysByPubkey: relaysByPubkey || Object.fromEntries(peers.map(pubkey => [pubkey, { read }])), primaryRelays, primaryRelayToReceivers,
-    fallbackRelays: fallbacks, fallbackDelayMs: delay, exclusions, pickRelays: pickRelaysForPubkeys, recoveryRelays: [], publish, publishNymEvent: publish,
+    fallbackRelays: fallbacks, fallbackDelayMs: delay, attemptStartedAt, monotonicNow: time.now, exclusions, pickRelays: pickRelaysForPubkeys, recoveryRelays: [], publish, publishNymEvent: publish,
     sendEvent, isOnline: async () => { state.probes++; return state.online }, isCurrent: () => state.current,
     signal: controller.signal, pauseSignal: pause.signal, now: time.now, setTimer: time.setTimer, clearTimer: time.clearTimer
   })
@@ -90,6 +90,19 @@ test('ten silent primaries yield to fallback at three seconds, keeping deadlines
   assert.equal(f.exclusions.size, 2, 'actual late failures inform the next send')
   assert.equal(f.calls.length, 2, 'late failures cannot resume the winning race')
   assert.equal(f.time.timers.size, 0)
+})
+
+test('preparation consumes the fallback budget and an overdue envelope starts both lanes immediately', async () => {
+  for (const elapsed of [2000, 5000]) {
+    const f = fixture({ attemptStartedAt: 0, outcomes: { [fallback]: { after: 1, success: true } } })
+    await f.time.advance(elapsed)
+    const work = f.publish()
+    await f.time.advance(Math.max(0, 3000 - elapsed) + 1)
+    assert.equal((await work).success, true)
+    assert.deepEqual(f.calls.map(call => call.at), [elapsed, Math.max(3000, elapsed)])
+    f.controller.abort()
+    await flush()
+  }
 })
 
 test('early primary acceptance cancels the fallback and returns before redundant outcomes', async () => {

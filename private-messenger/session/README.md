@@ -170,8 +170,11 @@ Optional `fallbackDelayMs` defaults to `null` (sequential primary exhaustion).
 A nonnegative integer up to 2147483647 opts automatic NIP-65 routing into early
 fallback; explicit relay lists/maps retain the sequential policy. With `3000`,
 start at most two eligible fallback relays after three seconds without complete
-acceptance, or immediately after primary exhaustion. The deadline belongs to
-one signed outer event; later batches do not renew it. Primary operations retain
+acceptance, or immediately after primary exhaustion. Optional `enqueue({ ..., attemptStartedAt })`
+uses `performance.now()` from the caller's realm to include preparation in the
+budget. Without it, the deadline starts at publication. Later batches do not
+renew it; retries/reloads start a new attempt and uploads budget each chunk.
+Primary operations retain
 their deadlines and can still win. Failed fallback operations leave primary
 alternatives available; no relay is tried twice. Multiple recipients require
 accepted coverage of every encrypted recipient subset. No wrapper, ID, recipient
@@ -249,3 +252,34 @@ event/peer identifiers and elapsed milliseconds for admission, local processing,
 channel preparation, publication acceptance and cleanup. Callback failures never
 change delivery. Connect only in development; never log events or crypto buffers.
 Custom outbox factories also receive this optional callback for storage timings.
+
+## Durable prepared publications
+
+Each remote entry may contain optional `prepared` progress in its existing
+encrypted JSON. It holds the signed envelope fragments, compact recovery seeds,
+recipient/channel and inner-event identities, event/chunk position, retention
+and accepted/archived flags. Old entries without it retain `localSaved`, index
+and file/chunk progress and enter the same preparation path; there is no database
+migration or alternate publisher. Replays validate signatures and identity and
+reuse the exact envelopes without repeating cryptography or extending expiry.
+
+The existing `onPreparedSeed` callback now also supplies `publication`. The
+session commits that minimal journal before transmitting; direct messengers
+retain their local seed-store durability. Only after that commit can relay
+publication proceed. One independent serial worker converts recovery seeds into
+their configured archive. Pending durable rows participate in recovery reads
+immediately, including during a blocked archive write. No new seeds are enabled
+for modes which did not previously retain them.
+
+First acceptance of every required envelope emits saved independently of archive
+or cleanup. ACK progress checkpoints serialize with other entry writes. A crash
+between ACK and its checkpoint may replay the same envelope; acknowledged durable
+progress only archives. Archive failure never becomes `onSendError` or changes
+saved status. Removal waits for archival and outstanding entry writes.
+
+At most one unit awaits archival per entry; a stalled upload yields its remote
+slot to other texts rather than accumulating the entire file. Cancel stops wire
+work but retains potentially transmitted seeds until archival finishes. Close
+drains active local operations and leaves durable backoff work for restart.
+Diagnostics add publication/seed IDs, checkpoint time, archive wait/execution and
+first-ACK timing, without message or ciphertext contents.

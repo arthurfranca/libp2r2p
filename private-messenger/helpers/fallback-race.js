@@ -2,7 +2,7 @@ import { isReplaceableRelayFailure } from '../../relay/helpers/failure.js'
 
 // Each invocation owns one already signed outer event and its encrypted subset.
 // Lanes share coverage and the tried set; only started reports outlive the race.
-export function publishWithEarlyFallback ({ event, receivers, first, mirrors, tried, nextPrimary, nextFallback, sendEvent, isOnline, isCurrent, signal, pauseSignal, remember, delay, now, setTimer, clearTimer }) {
+export function publishWithEarlyFallback ({ event, receivers, first, mirrors, tried, nextPrimary, nextFallback, sendEvent, isOnline, isCurrent, signal, pauseSignal, remember, delay, attemptStartedAt, monotonicNow = () => performance.now(), now, setTimer, clearTimer }) {
   const pending = new Set(receivers)
   const summaries = []
   const transportSignal = signal && pauseSignal ? AbortSignal.any([signal, pauseSignal]) : signal || pauseSignal
@@ -120,7 +120,8 @@ export function publishWithEarlyFallback ({ event, receivers, first, mirrors, tr
   }
   if (transportSignal?.aborted || !isCurrent()) { finish(false); return outcome.promise }
   transportSignal?.addEventListener('abort', interrupted, { once: true })
-  const deadline = now() + delay
+  const remaining = attemptStartedAt === undefined ? delay : Math.max(0, delay - Math.max(0, monotonicNow() - attemptStartedAt))
+  const deadline = now() + remaining
   const failed = reason => {
     if (done) return
     done = true; clearTimer(timer); timer = null
