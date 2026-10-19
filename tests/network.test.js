@@ -5,6 +5,7 @@ import { createConnectivityMonitor, isOnline, onOnline } from '../network/index.
 const flush = () => new Promise(resolve => setImmediate(resolve))
 
 function harness (check) {
+  let now = 0
   const timers = new Set()
   const target = new EventTarget()
   const monitor = createConnectivityMonitor({
@@ -12,6 +13,7 @@ function harness (check) {
     eventTarget: target,
     document: target,
     _random: () => 0.5,
+    _now: () => now,
     _setTimeout: function (handler, delay) {
       assert.equal(this, globalThis)
       const timer = { handler, delay }
@@ -27,11 +29,13 @@ function harness (check) {
     ...monitor,
     target,
     timers,
+    elapse (ms) { now += ms },
     async tick (delay) {
       assert.equal(timers.size, 1)
       const timer = [...timers][0]
       assert.equal(timer.delay, delay)
       timers.delete(timer)
+      now += delay
       timer.handler()
       await flush()
     }
@@ -226,4 +230,70 @@ test('a fast first failure starts the remaining candidates immediately', async t
   await flush()
   assert.equal(calls[2].options.signal.aborted, true)
   assert.equal(calls[3].options.signal.aborted, true)
+})
+
+test('urgent subscriptions advance a shared backoff, are bounded and preserve the normal retry step', async () => {
+  let probes = 0
+  const h = harness(async () => { probes++; return false })
+  const normal = h.onOnline(() => {})
+  await flush()
+  for (const delay of [5000, 15000, 30000]) await h.tick(delay)
+  // Last ordinary check at 50s; the next normal check is due at 110s.
+  const urgent = h.onOnline(() => {}, { expediteForMs: 90000 })
+  assert.equal(h.timers.size, 1)
+  await h.tick(2000)
+  for (let i = 0; i < 5; i++) await h.tick(5000)
+  assert.equal(probes, 10)
+  await h.tick(3000) // capped at 30s: expiry itself does not probe
+  assert.equal(probes, 10)
+  await h.tick(30000) // original 110s deadline, no reset to a 5s backoff
+  assert.equal(probes, 11)
+  await h.tick(60000)
+  urgent(); normal()
+})
+
+test('new urgent demand respects two seconds, shares pending work and does not overlap slow probes', async () => {
+  const held = Promise.withResolvers()
+  let probes = 0
+  const h = harness(() => ++probes === 1 ? false : held.promise)
+  const normal = h.onOnline(() => {})
+  await flush()
+  const a = h.onOnline(() => {}, { expediteForMs: 30000 })
+  h.elapse(1000)
+  const b = h.onOnline(() => {}, { expediteForMs: 30000 })
+  await h.tick(1000)
+  assert.equal(probes, 2)
+  const c = h.onOnline(() => {}, { expediteForMs: 30000 })
+  assert.equal(h.timers.size, 0)
+  h.elapse(7000)
+  held.resolve(false); await flush()
+  await h.tick(0) // long probe already spent the five-second interval
+  assert.equal(probes, 3)
+  a(); b(); c(); normal()
+})
+
+test('urgent requests recheck cached online status and unsubscribe removes only their own demand', async () => {
+  let online = true; let probes = 0
+  const h = harness(async () => { probes++; return online })
+  const normal = h.onOnline(() => {})
+  await flush()
+  online = false
+  const a = h.onOnline(() => {}, { expediteForMs: 30000 })
+  const b = h.onOnline(() => {}, { expediteForMs: 10000 })
+  a()
+  await h.tick(2000)
+  await h.tick(5000)
+  assert.equal(probes, 3)
+  b()
+  await h.tick(53000)
+  assert.equal(probes, 4)
+  normal()
+})
+
+test('expedite duration validates without starting work', () => {
+  const h = harness(async () => false)
+  for (const expediteForMs of [-1, NaN, Infinity, '30000']) {
+    assert.throws(() => h.onOnline(() => {}, { expediteForMs }), { code: 'INVALID_EXPEDITE_FOR_MS' })
+  }
+  assert.equal(h.timers.size, 0)
 })

@@ -28,6 +28,8 @@ async function fixture (t, { save = async () => ({ result: { ok: true } }) } = {
     owner, mode: 'leecher', useContentKeys: false,
     signer: { getPublicKey: async () => owner, withSharedKey: () => ({ getPublicKey: async () => channel }) },
     messageStorage: { save }, openOutbox: store, openDownloads: store, FileTransfer: () => ({ observe () {} }),
+    _now: time.now, _isOnline: async () => network.online,
+    _onOnline: fn => { network.listeners.add(fn); return () => network.listeners.delete(fn) },
     onError: error => errors.push(error), _setTimeout: time.setTimer, _clearTimeout: time.clearTimer, _random: () => 0.5,
     Messenger: async options => {
       messenger = new PrivateMessenger({
@@ -107,7 +109,7 @@ test('network recovery waits offline without spending backoff and route failure 
   const id = await f.send()
   await until(() => f.records.get(id)?.failed)
   await f.time.tick(1000)
-  assert.equal(f.network.listeners.size, 1)
+  assert.equal(f.network.listeners.size, 2)
   assert.equal(f.network.watches, 1)
   await f.time.tick(60000)
   assert.equal(f.network.watches, 1)
@@ -272,4 +274,19 @@ test('definitive and unknown relay watch refusals do not restore a global networ
 
 test('state observation rejects malformed callback arguments with a validation code', () => {
   assert.throws(() => new PrivateMessenger({ onStateChanged: true }), error => error.name === 'ValidationError' && error.code === 'INVALID_ON_STATE_CHANGED')
+})
+
+test('a confirmed online notification resumes recovery without a duplicate connectivity probe', async () => {
+  const time = clock(); const listeners = new Set(); let checks = 0; let attempts = 0
+  const job = createPauseRecovery({
+    attempt: async () => { attempts++ }, online: async () => { checks++; return false },
+    onOnline: fn => { listeners.add(fn); return () => listeners.delete(fn) },
+    retryable: () => true, onError: error => { throw error }, now: time.now, setTimer: time.setTimer, clearTimer: time.clearTimer
+  })
+  await job.start({ immediate: true })
+  assert.equal(checks, 1); assert.equal(attempts, 0)
+  for (const callback of listeners) callback()
+  await time.tick(0)
+  assert.equal(checks, 1); assert.equal(attempts, 1)
+  assert.equal(listeners.size, 0)
 })

@@ -567,3 +567,105 @@ test('live inbox persistence and ACK remain independent of an outgoing publicati
   assert.ok(saved.includes('incoming'))
   gate.resolve()
 })
+
+test('network urgency is shared, renewed only by user intent and removed on cancel/lock/close', async t => {
+  let now = 0
+  const listeners = new Map(); const windows = []
+  const f = await fixture(t, {
+    _now: () => now,
+    _onOnline: (listener, options) => { windows.push(options.expediteForMs); listeners.set(listener, options); return () => listeners.delete(listener) }
+  })
+  await f.messenger().pause('network')
+  const a = await f.session.enqueue({ peer, event })
+  await until(() => f.records.get(a)?.failed)
+  assert.equal(listeners.size, 1); assert.equal(windows.at(-1), 30000)
+  now = 10000
+  const b = await f.session.enqueue({ peer, event: { ...event, created_at: 2 } })
+  await until(() => f.records.get(b)?.failed)
+  assert.equal(listeners.size, 1); assert.equal(windows.at(-1), 30000)
+  await f.session.cancel(b)
+  assert.equal(listeners.size, 1); assert.equal(windows.at(-1), 20000)
+  now = 20000
+  await f.session.retry(a)
+  assert.equal(listeners.size, 1); assert.equal(windows.at(-1), 30000)
+  await until(() => f.records.get(a)?.failed)
+  const calls = windows.length
+  // An observed connectivity confirmation never releases an explicit pause.
+  await [...listeners.keys()][0]()
+  assert.deepEqual(f.messenger().readStatus().pauseReasons, ['network'])
+  assert.equal(listeners.size, 0)
+  assert.equal(windows.length, calls)
+  await f.session.setAvailable(false)
+  await f.session.setAvailable(true)
+  await until(() => listeners.size === 1)
+  assert.equal(windows.at(-1), 0) // unlock/restored work cannot renew urgency
+  await f.session.close()
+  assert.equal(listeners.size, 0)
+})
+
+test('self-chat never subscribes to urgent network checks', async t => {
+  let checks = 0
+  const f = await fixture(t, { _onOnline: () => { checks++; return () => {} } })
+  await f.messenger().pause('network')
+  await f.session.enqueue({ peer: owner, event })
+  await until(() => f.records.size === 0)
+  assert.equal(checks, 0)
+})
+
+test('restored outbox work waits online normally without opening an urgent window', async t => {
+  const id = getEventHash(event); const windows = []
+  const records = new Map([[id, { id, peer, event: { ...event, id }, events: [event], files: [], index: 0, fileIndex: 0, chunkIndex: 0, localSaved: [true], status: 'pending' }]])
+  let snapshot = []
+  const f = await fixture(t, {
+    openOutbox: async () => ({ list: async () => [...records.values()], put: async entry => records.set(entry.id, structuredClone(entry)), remove: async key => records.delete(key), close () {} }),
+    Messenger: async options => { const messenger = createSessionMessenger(options); await messenger.pause('network'); return messenger },
+    onOutbox: entries => { snapshot = entries },
+    _onOnline: (_listener, options) => { windows.push(options.expediteForMs); return () => {} }
+  })
+  await until(() => snapshot[0]?.failed)
+  assert.deepEqual(windows, [0])
+  await f.session.close()
+})
+
+test('manual offline retry replaces its wait without stopping the shared monitor', async t => {
+  const live = new Set(); let stoppedAll = false; let established = false
+  const f = await fixture(t, {
+    publish: async () => { throw Object.assign(new Error('OFFLINE'), { retryWhenAvailable: true, retryWhenOnline: true }) },
+    _onOnline: listener => {
+      live.add(listener)
+      return () => { live.delete(listener); if (established && !live.size) stoppedAll = true }
+    }
+  })
+  const id = await f.session.enqueue({ peer, event })
+  await until(() => live.size === 1)
+  established = true
+  await f.session.retry(id)
+  await until(() => f.records.get(id)?.failed)
+  assert.equal(stoppedAll, false)
+  assert.equal(live.size, 1)
+  established = false
+  await f.session.close()
+})
+
+test('unchanged account availability retains the network wait; removing a peer ends its demand', async t => {
+  let subscriptions = 0; let live = 0
+  const f = await fixture(t, {
+    _onOnline: () => { subscriptions++; live++; return () => { live-- } }
+  })
+  await f.messenger().pause('network')
+  await f.session.enqueue({ peer, event })
+  await until(() => live === 1)
+  await f.session.setAvailable(true)
+  assert.equal(subscriptions, 1); assert.equal(live, 1)
+  await f.session.setPeers([])
+  assert.equal(live, 0)
+})
+
+test('a terminal send failure does not keep network urgency alive', async t => {
+  let checks = 0
+  const f = await fixture(t, { publish: async () => { throw new Error('PERMISSION_DENIED') }, _onOnline: () => { checks++; return () => {} } })
+  await f.session.enqueue({ peer, event })
+  await until(() => f.sendErrors.length === 1)
+  await f.messenger().pause('network')
+  assert.equal(checks, 0)
+})

@@ -30,3 +30,34 @@ Successful probes do not guarantee a particular relay or HTTP server is reachabl
 Handle request failures, cancellations, and timeouts separately. Browsers can
 suspend background tabs, so recovery notification has no wall-clock guarantee.
 Consumers should keep their own work queues but should not duplicate probe loops.
+
+
+## Expedited connectivity detection
+
+`onOnline(handler, { strict = false, expediteForMs = 0, onDebug })` can request
+an optional urgent window (clamped to 30,000 ms; finite, nonnegative durations).
+The same realm/mode monitor coalesces subscriptions: urgent requests can advance
+the next check, at least two seconds after the previous start. Failed checks
+repeat at five seconds between starts, without overlapping slow checks. Native
+online/focus/visibility wakeups remain available. Removing a subscription removes
+its demand without stopping other listeners.
+
+The urgent loop does not spend/reset the ordinary jittered backoff. At expiry it
+returns to the ordinary deadline, or a fresh interval of the preserved retry step
+if that deadline passed; it never catches up missed checks. For example, a normal
+60-second wait remains a 60-second step after an unsuccessful urgent window.
+Connectivity returning after the window must await normal recovery or a new user
+send/retry; automatic retries never extend urgency. `expediteForMs` is scheduling
+advice, not evidence of Internet connectivity or a relay/ACK delivery deadline.
+
+Private-message sessions remember a runtime-only 30-second deadline for new
+remote intents and manual retry. Only work actually waiting for network subscribes
+with the remaining time, sharing one subscription per session. Self-chat, restored
+outbox entries, chunks and automatic retries never renew that deadline. Lock and
+close discard urgency. A confirmed monitor result resumes the existing automatic
+pause owner without another immediate probe; explicit pauses remain caller-owned.
+
+Optional `onDebug` reports only probe reason, state, remaining window and duration.
+Consumers wire it only in development; it is disabled by default. The monitor
+retains no diagnostic history. Session diagnostics additionally correlate the
+network wait and pause-release duration with the event ID.

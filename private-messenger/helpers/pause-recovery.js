@@ -33,11 +33,14 @@ export function createPauseRecovery ({ attempt, online, onOnline, retryable, onE
     const run = () => {
       if (!active() || job.work) return job.work
       const work = (async () => {
-        if (online && !await online({ signal: job.controller.signal })) {
+        const confirmedOnline = job.confirmedOnline
+        job.confirmedOnline = false
+        if (online && !confirmedOnline && !await online({ signal: job.controller.signal })) {
           if (!active()) return
           job.stopOnline = onOnline(() => {
             if (!active()) return
             job.stopOnline?.(); job.stopOnline = null
+            job.confirmedOnline = true
             schedule(0)
           })
           return

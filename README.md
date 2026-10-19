@@ -10,7 +10,8 @@ power-ups used by that messenger.
 
 For remote-work scheduling, see [`libp2r2p/network`](network/README.md):
 `isOnline` probes connectivity and `onOnline` shares recovery monitoring,
-including retries when the browser omits its native `online` event.
+including retries when the browser omits its native `online` event and optional
+30-second expedited windows for foreground remote sends.
 
 ## Relay reads and lifecycle
 

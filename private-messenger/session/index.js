@@ -45,7 +45,7 @@ function messengerStatusSnapshot (value) {
   return { closed: value.closed, paused: value.paused, pauseReasons: [...value.pauseReasons] }
 }
 
-export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], fallbackDelayMs = null, mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], useContentKeys = true, pendingDecryptionReady = true, onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, onDebug, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, _isOnline = isOnline, _getIykcProofs = getIykcProofs, _setTimeout = setTimeout, _clearTimeout = clearTimeout, _random = Math.random, openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
+export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], fallbackDelayMs = null, mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], useContentKeys = true, pendingDecryptionReady = true, onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, onDebug, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, _isOnline = isOnline, _getIykcProofs = getIykcProofs, _setTimeout = setTimeout, _clearTimeout = clearTimeout, _random = Math.random, _now = () => performance.now(), openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
   fallbackRelays = normalizeFallbackRelays(fallbackRelays)
   fallbackDelayMs = normalizeFallbackDelay(fallbackDelayMs)
   if (typeof pendingDecryptionReady !== 'boolean') throw new ValidationError('INVALID_PENDING_DECRYPTION_READY')
@@ -67,6 +67,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const entries = new Map()
   const cancelled = new Set()
   const attemptStarts = new Map()
+  const networkUrgency = new Map()
   const sendControllers = new Map()
   const localReady = new Set()
   const localIdleWaiters = new Set()
@@ -79,6 +80,8 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const offlineSends = new Set()
   const pausedSends = new Set()
   let messengerStatus
+  let networkPauseStartedAt
+  let networkConfirmed = false
   let messengerBinding
   let storageBlocked = false
   const inboxRecovery = createPauseRecovery({
@@ -89,22 +92,31 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   let inboxError
   const stateChanged = state => {
     if (closed) return
+    const wasNetworkPaused = messengerStatus?.pauseReasons.includes('network')
     messengerStatus = messengerStatusSnapshot(state)
+    if (!wasNetworkPaused && state.pauseReasons.includes('network')) { networkPauseStartedAt = _now(); networkConfirmed = false }
+    if (wasNetworkPaused && !state.pauseReasons.includes('network')) {
+      for (const entry of entries.values()) if (entry.peer !== owner && entry.status !== 'saved') debug(entry, 'network-pause-released', undefined, { elapsedMs: _now() - networkPauseStartedAt })
+      networkPauseStartedAt = undefined; networkConfirmed = false
+    }
     if (!available || state.closed) return
     if (state.paused) {
       for (const entry of entries.values()) {
         if (entry.peer !== owner && entry.failed && entry.status === 'pending') pausedSends.add(entry.id)
       }
       if (![...entries.values()].some(entry => pendingRetryable(entry) && !pausedSends.has(entry.id))) clearSendRetry()
+      watchOfflineSends()
       return
     }
     clearSendRetry()
     for (const id of pausedSends) { const entry = entries.get(id); if (entry) { entry.failed = false; attemptStarts.set(entry.id, performance.now()) } }
     pausedSends.clear()
+    watchOfflineSends()
     // The callback can run inside construction/resume, before configure settles.
     queueMicrotask(() => pump())
   }
   let stopOnline
+  let requestedUrgency = 0
   let sendRetryTimer
   let sendRetryDelay = SEND_RETRY_MIN_MS
   let messenger
@@ -152,6 +164,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       }
     },
     changed: entry => {
+      watchOfflineSends()
       if (!entry.prepared && (entry.status === 'saved' || entry.cancelled)) cleanupEntry(entry)
       else if (!closed && available) pumpRemote()
     }
@@ -559,7 +572,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       emit()
     } finally { sendControllers.delete(entry.id); releaseForeground() }
   }
-  function stopOnlineRetry () { stopOnline?.(); stopOnline = undefined }
+  function stopOnlineRetry () { stopOnline?.(); stopOnline = undefined; requestedUrgency = 0 }
   // Transient availability failures without an active messenger pause retain
   // bounded retries. Observed pauses wait exclusively for their release.
   function clearSendRetry () {
@@ -591,21 +604,47 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     sendRetryTimer.unref?.()
   }
   function watchOfflineSends () {
-    if (closed || !available || !offlineSends.size) { stopOnlineRetry(); return }
-    if (stopOnline) return
-    // A fresh listener receives confirmed connectivity even when a brief outage
-    // occurred between the app's long-lived monitor checks.
+    const waiting = [...entries.values()].filter(entry => entry.peer !== owner && peers.has(entry.peer) && entry.status !== 'saved' && !entry.cancelled && !cancelled.has(entry.id) && !entry.prepared?.accepted && (!entry.failed || pendingRetryable(entry)) &&
+      (offlineSends.has(entry.id) || (!networkConfirmed && messengerStatus?.pauseReasons.includes('network'))))
+    for (const id of networkUrgency.keys()) {
+      const entry = entries.get(id)
+      if (!entry || entry.status === 'saved' || entry.cancelled || cancelled.has(id)) networkUrgency.delete(id)
+    }
+    if (closed || !available || !waiting.length) { stopOnlineRetry(); return }
+    const deadline = Math.max(0, ...waiting.map(entry => networkUrgency.get(entry.id) ?? 0))
+    if (stopOnline && deadline === requestedUrgency) return
+    const previous = stopOnline
+    requestedUrgency = deadline
+    const startedAt = _now()
+    // Replacing a subscription retains the shared loop and its backoff. This is
+    // only done when a new user action extends the window, never per chunk/retry.
     stopOnline = _onOnline(() => {
       stopOnlineRetry()
       if (closed || !available) return
+      networkConfirmed = true
+      for (const entry of waiting) debug(entry, 'network-confirmed', undefined, { elapsedMs: _now() - startedAt })
       for (const id of offlineSends) {
         const entry = entries.get(id)
         if (entry?.retryable) { entry.failed = false; attemptStarts.set(entry.id, performance.now()) }
       }
       offlineSends.clear()
+      // The messenger's automatic recovery owns its network pause; the same
+      // monitor also notifies that recovery job. Never resume explicit pauses.
       return schedule()
+    }, {
+      expediteForMs: Math.max(0, deadline - _now()),
+      ...(onDebug
+        ? {
+            onDebug: measure => {
+              const entry = waiting[0]
+              debug(entry, measure.stage, undefined, measure)
+            }
+          }
+        : {})
     })
+    previous?.()
   }
+
   async function pumpLocal () {
     if (!available || closed || !storage) return
     if (localSaving) { relocal = true; return }
@@ -738,6 +777,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       const next = new Set([...values].filter(peer => peer !== owner))
       if (next.size === peers.size && [...next].every(peer => peers.has(peer))) return configuring
       peers.clear(); for (const peer of next) peers.add(peer)
+      watchOfflineSends()
       preparation.reconcile(peers)
       if (pendingDecryptionPeer && !peers.has(pendingDecryptionPeer)) {
         pendingDecryptionPeer = null
@@ -757,7 +797,8 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       const changed = available !== (value === true)
       available = value === true
       if (!changed && !available) return
-      stopOnlineRetry(); offlineSends.clear()
+      if (changed || !available) { stopOnlineRetry(); offlineSends.clear() }
+      if (!available) { networkUrgency.clear(); networkConfirmed = false }
       if (available) resetSendRetry()
       else clearSendRetry()
       if (changed) lifecycle++
@@ -778,6 +819,8 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     async enqueue ({ peer, event, context = [], requiredFiles = [], deletion = false, attemptStartedAt }) {
       if (closed || !available || (peer !== owner && !peers.has(peer))) throw new Error('CHAT_UNAVAILABLE')
       if (attemptStartedAt !== undefined && (!Number.isFinite(attemptStartedAt) || attemptStartedAt < 0)) throw new ValidationError('INVALID_ATTEMPT_STARTED_AT')
+      const urgencyUntil = _now() + 30000
+      const urgencyLifecycle = lifecycle
       const releaseForeground = foreground.enter()
       enqueuing++
       try {
@@ -797,17 +840,26 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         // An accepted durable intent survives shutdown/locking for replay. Only
         // explicit cancellation removes it; no late callback or work is admitted.
         if (closed) return id
-        entries.set(id, entry); emit(); pump()
+        entries.set(id, entry)
+        if (peer !== owner && available && lifecycle === urgencyLifecycle) networkUrgency.set(id, urgencyUntil)
+        watchOfflineSends(); emit(); pump()
         if (available && peer !== owner) preparePeer(peer).catch(() => {})
         return id
       } finally { releaseForeground(); enqueuing--; settled() }
     },
     async retry (id) {
-      offlineSends.delete(id); pausedSends.delete(id); watchOfflineSends()
       if (storageBlocked) inboxRecovery.start({ immediate: true })
       await ready()
       const entry = entries.get(id)
-      if (entry) { attemptStarts.set(id, performance.now()); journal.retry(); entry.failed = false; resetSendRetry(); if (entry.peer !== owner) preparePeer(entry.peer).catch(() => {}); return pump() }
+      if (!entry) return
+      if (entry.peer !== owner && entry.status !== 'saved' && available) networkUrgency.set(id, _now() + 30000)
+      // Renew while the old wait is still subscribed, preserving the monitor's
+      // generation/backoff even if this session is its only consumer.
+      watchOfflineSends()
+      offlineSends.delete(id); pausedSends.delete(id)
+      attemptStarts.set(id, performance.now()); journal.retry(); entry.failed = false; resetSendRetry()
+      if (entry.peer !== owner) preparePeer(entry.peer).catch(() => {})
+      return pump()
     },
     async cancel (id) {
       cancelled.add(id)
@@ -821,7 +873,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     close () {
       return (closeWork ??= (async () => {
         closed = true; available = false; lifecycle++
-        stopOnlineRetry(); offlineSends.clear(); activeDownloads.clear(); pendingPriorityRanges.clear()
+        stopOnlineRetry(); offlineSends.clear(); networkUrgency.clear(); activeDownloads.clear(); pendingPriorityRanges.clear()
         clearSendRetry(); inboxRecovery.stop(); preparation.close(); foreground.close(); pausedSends.clear()
         for (const controller of sendControllers.values()) controller.abort()
         await Promise.allSettled([configuring, initialized, messengerWork, fileSetupWork])

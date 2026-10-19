@@ -133,6 +133,8 @@ export function createConnectivityMonitor ({
   _setTimeout = globalThis.setTimeout,
   _clearTimeout = globalThis.clearTimeout,
   _random = Math.random,
+  _now = () => performance.now(),
+  onDebug,
   reportError = error => console.error('Online listener failed', error)
 } = {}) {
   if (check !== undefined && typeof check !== 'function') throw new ValidationError('INVALID_CONNECTIVITY_CHECK')
@@ -148,21 +150,49 @@ export function createConnectivityMonitor ({
     try { Promise.resolve(entry.handler()).catch(reportError) } catch (error) { reportError(error) }
   }
 
-  function schedule (current) {
-    if (session !== current || !listeners.size) return
-    const delay = current.online ? 60000 : RETRY_DELAYS[Math.min(current.retry++, RETRY_DELAYS.length - 1)]
+  const urgencyEnd = () => Math.max(0, ...[...listeners].map(entry => entry.expediteUntil))
+  function arm (current) {
+    if (session !== current || current.pending || !listeners.size) return
+    if (current.timer != null) clearTimer(current.timer)
+    const now = _now()
+    const until = urgencyEnd()
+    const urgent = until > now && (!current.online || current.urgentDue != null)
+    // Urgent checks do not consume or reset the ordinary retry sequence.
+    if (!urgent && current.normalDue <= now) current.normalDue = now + current.normalDelay
+    let due = current.normalDue
+    if (urgent) due = Math.min(until, current.urgentDue ?? current.lastStartedAt + 5000)
     current.timer = setTimer(() => {
       current.timer = null
-      return probe(current)
-    }, Math.round(delay * (0.8 + _random() * 0.4)))
+      if (urgent && _now() >= urgencyEnd()) { arm(current); return }
+      return probe(current, urgent ? 'expedited' : 'backoff')
+    }, Math.max(0, due - now))
     current.timer?.unref?.()
   }
 
-  async function probe (current) {
+  function schedule (current, expedited) {
+    if (session !== current || !listeners.size) return
+    if (!expedited || current.online) {
+      const delay = current.online ? 60000 : RETRY_DELAYS[Math.min(current.retry++, RETRY_DELAYS.length - 1)]
+      current.normalDelay = Math.round(delay * (0.8 + _random() * 0.4))
+      current.normalDue = _now() + current.normalDelay
+    }
+    current.urgentDue = null
+    arm(current)
+  }
+
+  async function probe (current, reason = 'wake') {
     if (session !== current || current.pending) return
     if (current.timer != null) clearTimer(current.timer)
     current.timer = null
     current.pending = true
+    current.lastStartedAt = _now()
+    const expedited = reason === 'expedited'
+    const startedAt = _now()
+    const report = values => {
+      const entry = { stage: 'connectivity-probe', reason, expediteRemainingMs: Math.max(0, urgencyEnd() - _now()), ...values }
+      for (const callback of [onDebug, ...[...listeners].map(listener => listener.onDebug)]) { try { callback?.(entry) } catch {} }
+    }
+    report({ state: 'started' })
     try {
       const online = await runCheck({ signal: current.controller.signal })
       if (session !== current) return
@@ -179,12 +209,13 @@ export function createConnectivityMonitor ({
       for (const entry of listeners) entry.delivered = false
     } finally {
       current.pending = false
-      schedule(current)
+      report({ state: current.online ? 'online' : 'offline', elapsedMs: _now() - startedAt })
+      schedule(current, expedited)
     }
   }
 
   function start () {
-    const current = { online: false, retry: 0, timer: null, pending: false, controller: new AbortController() }
+    const current = { online: false, retry: 0, timer: null, pending: false, lastStartedAt: -Infinity, normalDue: Infinity, normalDelay: 5000, urgentDue: null, controller: new AbortController() }
     session = current
     current.wake = () => { probe(current) }
     current.connectionChanged = () => {
@@ -213,18 +244,29 @@ export function createConnectivityMonitor ({
   }
 
   // Notify once on confirmed initial connectivity, then after each detected reconnection.
-  function onOnline (handler) {
+  function onOnline (handler, { expediteForMs = 0, onDebug } = {}) {
     if (typeof handler !== 'function') throw new ValidationError('INVALID_ONLINE_HANDLER')
-    const entry = { handler, delivered: false }
+    if (!Number.isFinite(expediteForMs) || expediteForMs < 0) throw new ValidationError('INVALID_EXPEDITE_FOR_MS')
+    if (onDebug !== undefined && typeof onDebug !== 'function') throw new ValidationError('INVALID_CONNECTIVITY_DEBUG')
+    const entry = { handler, onDebug, delivered: false, expediteUntil: _now() + Math.min(expediteForMs, 30000) }
     listeners.add(entry)
     if (!session) start()
     else {
       const current = session
-      queueMicrotask(() => { probe(current) })
+      if (expediteForMs > 0 || urgencyEnd() > _now()) {
+        current.urgentDue = Math.max(_now(), current.lastStartedAt + 2000)
+        arm(current)
+      } else {
+        queueMicrotask(() => {
+          if (urgencyEnd() > _now()) arm(current)
+          else probe(current)
+        })
+      }
     }
     return () => {
       if (!listeners.delete(entry)) return
       if (!listeners.size) stop()
+      else arm(session)
     }
   }
 
@@ -234,12 +276,12 @@ export function createConnectivityMonitor ({
 const defaultMonitors = new Map()
 
 // Share probes, capped backoff and wake-up listeners per mode in this realm.
-export function onOnline (handler, { strict = false } = {}) {
+export function onOnline (handler, { strict = false, expediteForMs = 0, onDebug } = {}) {
   const key = strict ? 'strict' : 'lenient'
   let monitor = defaultMonitors.get(key)
   if (!monitor) {
     monitor = createConnectivityMonitor({ strict })
     defaultMonitors.set(key, monitor)
   }
-  return monitor.onOnline(handler)
+  return monitor.onOnline(handler, { expediteForMs, onDebug })
 }

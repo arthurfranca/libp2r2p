@@ -376,3 +376,17 @@ NIP-46 against the real pool with controlled transport and injected controls.
 - Optional session `attemptStartedAt` is monotonic and runtime-only. Include
   preparation in the fallback budget, reset retries/reloads and budget each upload
   chunk separately. Missing timestamps retain the publication-local delay.
+
+
+## Expedited connectivity recovery
+
+- Network monitor `expediteForMs` is opt-in, capped at 30s. Coalesce by realm/mode,
+  probe every 5s between starts without overlap and honor the 2s minimum for new
+  urgent subscriptions. Preserve ordinary backoff and native wake events.
+- Sessions renew runtime urgency only for new remote intents/manual retry. One
+  online-wait subscription covers pending network work; cancellation, saved ACK,
+  unavailable account and close remove applicable demand. Self and restored work
+  never renew it. Positive monitor confirmation skips the recovery job's next
+  duplicate check; only automatic recovery may release its owned network pause.
+- Diagnostic callbacks are optional, contain IDs/measures only, and are wired by
+  development consumers. There is no relay-backoff, message-wire or bridge change.
