@@ -1252,3 +1252,8 @@ uploads budget each chunk independently. Monotonic clocks never enter storage or
 Nostr events. Omitted timestamps keep the publication-local delay.
 `RelayPool.sendEvent` accepts a consumer `signal` without closing shared sockets.
 See [fallback and cancellation](private-messenger/session/README.md#relay-fallback).
+
+The 0.11.27 session publishes independently of local event-store persistence after
+its initial durable intent and exact-envelope checkpoint. `deliveryConfirmed`
+and the copied `localPersistence` summary distinguish relay acceptance from
+local storage. See `private-messenger/session/README.md` for retry and cleanup.

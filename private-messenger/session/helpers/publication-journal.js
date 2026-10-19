@@ -4,13 +4,19 @@ import { isRecoverableStorageFailure } from '../../helpers/pause-recovery.js'
 
 export function createPublicationJournal ({ entries, store, archive, changed, onError, debug, setTimer = setTimeout, clearTimer = clearTimeout, random = Math.random }) {
   const writes = new Map()
+  const waitingWrites = new Map()
   const failed = new Set()
   const durable = new WeakSet()
   const queued = new WeakMap()
   let working; let stopped = false; let enabled = false; let timer; let delay = 1000
   function write (entry) {
+    if (waitingWrites.has(entry.id)) return waitingWrites.get(entry.id)
     const previous = writes.get(entry.id) || Promise.resolve()
-    const work = previous.catch(() => {}).then(() => store().put(structuredClone(entry), { existing: true }))
+    const work = previous.catch(() => {}).then(() => {
+      waitingWrites.delete(entry.id)
+      return store().put(structuredClone(entry), { existing: true })
+    })
+    waitingWrites.set(entry.id, work)
     writes.set(entry.id, work)
     work.finally(() => { if (writes.get(entry.id) === work) writes.delete(entry.id) }).catch(() => {})
     return work

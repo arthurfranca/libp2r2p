@@ -217,3 +217,25 @@ test('an initial call without an attempt timestamp preserves the publication-loc
   await until(() => !f.rows.has(id))
   assert.deepEqual(starts, [undefined])
 })
+
+test('queued journal checkpoints coalesce but the exact prepared publication remains behind its durable barrier', async () => {
+  const { createPublicationJournal } = await import('../private-messenger/session/helpers/publication-journal.js')
+  const first = Promise.withResolvers(); const second = Promise.withResolvers(); const writes = []
+  const entry = { id: 'coalesced', localSaved: [false], index: 0 }
+  const journal = createPublicationJournal({ entries: new Map([[entry.id, entry]]), store: () => ({ put: async (value, options) => { writes.push(value); assert.equal(options.existing, true); await (writes.length === 1 ? first.promise : second.promise) } }), archive: async () => {}, changed () {}, onError: assert.fail, debug () {} })
+  const initial = journal.write(entry)
+  await new Promise(resolve => setImmediate(resolve))
+  entry.localSaved[0] = true
+  const progress = journal.write(entry)
+  let staged = false
+  const checkpoint = journal.stage(entry, { publication: { events: [{ id: 'exact-envelope' }], seeds: [] } }, { index: 0 }, 0).then(() => { staged = true })
+  first.resolve(); await initial
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(writes.length, 2)
+  assert.equal(staged, false)
+  assert.deepEqual(writes[1].localSaved, [true])
+  assert.equal(writes[1].prepared.publication.events[0].id, 'exact-envelope')
+  second.resolve(); await Promise.all([progress, checkpoint])
+  assert.equal(staged, true)
+  await journal.close()
+})

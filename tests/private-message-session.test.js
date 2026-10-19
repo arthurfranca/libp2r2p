@@ -1,4 +1,5 @@
 import { test } from 'node:test'
+import { readFile } from 'node:fs/promises'
 import assert from 'node:assert/strict'
 import { createSessionMessenger } from './helpers/session-messenger.js'
 import { getEventHash } from '../event/index.js'
@@ -456,23 +457,41 @@ test('self succeeds with network paused and does not checkpoint before cleanup',
   cleanup.resolve()
 })
 
-test('a failed local checkpoint cannot admit publication; retry persists before sending', async t => {
-  const rows = new Map(); let checkpoints = 0; let publications = 0
+test('a blocked local store cannot hold remote ACK, and local failure retries without republishing', async t => {
+  const gate = Promise.withResolvers(); const states = []
+  let publications = 0; let saves = 0
   const f = await fixture(t, {
-    publish: async () => { publications++; assert.ok(checkpoints >= 3); return { delivery: { reports: [{ success: true }] } } },
-    openOutbox: async () => ({
-      list: async () => [], put: async (entry, options) => {
-        if (options?.existing && ++checkpoints === 1) throw new Error('checkpoint unavailable')
-        rows.set(entry.id, structuredClone(entry))
-      }, remove: async id => rows.delete(id), close () {}
-    })
+    save: async () => { saves++; if (saves === 1) { await gate.promise; throw new Error('local storage temporarily unavailable') }; return { result: { ok: true } } },
+    publish: async () => { publications++; return { delivery: { reports: [{ success: true }] } } },
+    onOutbox: entries => states.push(structuredClone(entries))
   })
   const id = await f.session.enqueue({ peer, event })
-  await until(() => rows.get(id)?.failed)
-  assert.equal(publications, 0)
-  await f.session.retry(id)
-  await until(() => !rows.has(id))
+  await until(() => states.at(-1)?.some(entry => entry.id === id && entry.status === 'saved'))
   assert.equal(publications, 1)
+  assert.equal(f.records.has(id), true)
+  assert.equal(states.at(-1)[0].localPersistence.state, 'pending')
+  gate.resolve()
+  await until(() => states.at(-1)?.some(entry => entry.localPersistence.state === 'failed'))
+  assert.equal(states.at(-1)[0].status, 'saved')
+  assert.equal(f.sendErrors.length, 0)
+  await f.session.retry(id)
+  await until(() => !f.records.has(id))
+  assert.equal(publications, 1)
+  assert.equal(saves, 2)
+})
+
+test('reload resumes pending local persistence of a confirmed remote entry without retransmission', async t => {
+  let published = 0; let saved = 0
+  const id = getEventHash(event)
+  const rows = new Map([[id, { id, peer, event: { ...event, id }, events: [event], files: [], index: 1, fileIndex: 0, chunkIndex: 0, localSaved: [false], deliveryConfirmed: true, status: 'saved' }]])
+  const f = await fixture(t, {
+    publish: async () => { published++; throw new Error('must not republish') },
+    save: async value => { saved++; assert.equal(getEventHash(value), id); return { result: { ok: true } } },
+    openOutbox: async () => ({ list: async () => [...rows.values()], put: async entry => rows.set(id, structuredClone(entry)), remove: async id => rows.delete(id), close () {} })
+  })
+  await until(() => !rows.has(id))
+  assert.equal(saved, 1); assert.equal(published, 0)
+  assert.equal(f.errors.length, 0)
 })
 
 test('cleanup failure retries only removal, preserving saved status and send callbacks', async t => {
@@ -668,4 +687,130 @@ test('a terminal send failure does not keep network urgency alive', async t => {
   await until(() => f.sendErrors.length === 1)
   await f.messenger().pause('network')
   assert.equal(checks, 0)
+})
+
+test('automatic local retry cannot clear a terminal remote failure', async t => {
+  const gate = Promise.withResolvers(); const timers = []
+  let publications = 0; let saves = 0
+  const f = await fixture(t, {
+    save: async () => { if (++saves === 1) { await gate.promise; throw new Error('storage unavailable') }; return { result: { ok: true } } },
+    publish: async () => { publications++; throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'PERMISSION_DENIED' }) },
+    _setTimeout: (fn, delay) => { const value = { fn, delay }; timers.push(value); return value }, _clearTimeout () {}
+  })
+  const id = await f.session.enqueue({ peer, event })
+  await until(() => f.records.get(id)?.failed)
+  gate.resolve()
+  await until(() => timers.length > 0)
+  await timers[0].fn()
+  await until(() => saves === 2)
+  assert.equal(publications, 1)
+  assert.equal(f.records.get(id).failed, true)
+  assert.equal(f.records.get(id).retryable, false)
+})
+
+test('close drains a held local save after remote confirmation before closing storage', async () => {
+  const gate = Promise.withResolvers(); const states = []; const closed = []
+  const f = createPrivateMessageSession({
+    owner, signer: { withSharedKey: () => ({ getPublicKey: async () => peer }) }, recoveryStorage: null,
+    messageStorage: { save: async () => { await gate.promise; closed.push('local-commit'); return { result: { ok: true } } } },
+    openOutbox: async () => ({ list: async () => [], put: async () => {}, remove: async () => { closed.push('cleanup') }, close: async () => { closed.push('storage-close') } }),
+    openDownloads: async () => ({ list: async () => [], close () {} }),
+    Messenger: async options => createSessionMessenger(options, { broadcastRumor: async () => ({ delivery: { reports: [{ success: true }] } }) }), FileTransfer: () => ({ observe () {} }),
+    onOutbox: entries => states.push(structuredClone(entries)), onError: assert.fail, _onOnline: () => () => {}
+  })
+  await f.setPeers([peer]); await f.setAvailable(true)
+  const id = await f.enqueue({ peer, event })
+  await until(() => states.at(-1)?.some(entry => entry.id === id && entry.status === 'saved'))
+  let finished = false
+  const closing = f.close().then(() => { finished = true })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(finished, false)
+  assert.equal(closed.includes('storage-close'), false)
+  gate.resolve(); await closing
+  assert.ok(closed.indexOf('local-commit') < closed.indexOf('storage-close'))
+})
+
+test('self-chat retry is pending while its next local attempt runs', async t => {
+  const held = Promise.withResolvers(); const states = []
+  let attempts = 0
+  t.after(() => held.resolve())
+  const f = await fixture(t, { save: async () => { if (++attempts === 1) throw new Error('storage unavailable'); await held.promise; return { result: { ok: true } } }, onOutbox: value => states.push(structuredClone(value)) })
+  const id = await f.session.enqueue({ peer: owner, event })
+  await until(() => states.at(-1)?.some(entry => entry.status === 'error'))
+  const retry = f.session.retry(id)
+  await until(() => attempts === 2)
+  assert.equal(states.at(-1).find(entry => entry.id === id).status, 'pending')
+  held.resolve(); await retry
+  await until(() => !f.records.has(id))
+})
+
+test('a local tombstone aborts an envelope still held at its durable checkpoint', async t => {
+  const local = Promise.withResolvers(); const checkpoint = Promise.withResolvers()
+  const checkpointStarted = Promise.withResolvers(); const rows = new Map()
+  let signal; let transmissions = 0
+  t.after(() => { local.resolve(); checkpoint.resolve() })
+  const f = await fixture(t, {
+    save: async () => { await local.promise; return { result: { ok: false, code: 'blocked' } } },
+    publish: async options => {
+      signal = options.signal
+      await options.onPreparedSeed({ publication: { events: [{ id: 'prepared-envelope' }], seeds: [] } })
+      signal.throwIfAborted()
+      transmissions++
+      return { delivery: { reports: [{ success: true }] } }
+    },
+    openOutbox: async () => ({
+      list: async () => [], put: async (entry, options) => {
+        if (options?.existing && entry.prepared) { checkpointStarted.resolve(); await checkpoint.promise }
+        rows.set(entry.id, structuredClone(entry))
+      }, remove: async id => rows.delete(id), close () {}
+    })
+  })
+  await f.session.enqueue({ peer, event })
+  await checkpointStarted.promise
+  local.resolve()
+  await until(() => signal.aborted)
+  checkpoint.resolve()
+  await until(() => !rows.size)
+  assert.equal(transmissions, 0)
+})
+
+test('confirmed local retry retains its failure summary until the durable local commit', async t => {
+  const gate = Promise.withResolvers(); const states = []
+  let saves = 0
+  t.after(() => gate.resolve())
+  const f = await fixture(t, {
+    save: async () => { if (++saves === 1) throw new Error('local storage failed'); if (saves === 2) await gate.promise; return { result: { ok: true } } },
+    publish: async () => ({ delivery: { reports: [{ success: true }] } }),
+    onOutbox: value => states.push(structuredClone(value))
+  })
+  const id = await f.session.enqueue({ peer, event })
+  await until(() => states.at(-1)?.some(entry => entry.id === id && entry.status === 'saved' && entry.localPersistence.state === 'failed'))
+  const retried = f.session.retry(id)
+  await until(() => saves === 2)
+  await f.session.enqueue({ peer: owner, event: { ...event, content: 'unrelated next message', created_at: 2 } })
+  const pending = states.at(-1).find(entry => entry.id === id)
+  assert.equal(pending.status, 'saved')
+  assert.equal(pending.localPersistence.state, 'failed', 'unrelated snapshots cannot hide the warning before the retry commits')
+  assert.equal(pending.localPersistence.retryable, false, 'the same local attempt is already admitted')
+  gate.resolve(); await retried
+  await until(() => !f.records.has(id))
+})
+
+test('legacy failed local intents retain manual retry policy when normalized into the new flow', async t => {
+  const legacy = JSON.parse(await readFile(new URL('./fixtures/private-outbox/0.11.24-initial.json', import.meta.url)))
+  Object.assign(legacy, { peer: owner, failed: true, retryable: false, status: 'error' })
+  const rows = new Map([[legacy.id, legacy]]); const states = []
+  let saves = 0
+  const f = await fixture(t, {
+    save: async () => { saves++; return { result: { ok: true } } },
+    openOutbox: async () => ({ list: async () => [...rows.values()], put: async entry => rows.set(entry.id, structuredClone(entry)), remove: async id => rows.delete(id), close () {} }),
+    onOutbox: value => states.push(structuredClone(value))
+  })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(saves, 0, 'upgrading must not retry a permanent old local failure automatically')
+  assert.equal(states.at(-1)[0].localPersistence.state, 'failed')
+  assert.equal(states.at(-1)[0].localPersistence.retryable, false)
+  await f.session.retry(legacy.id)
+  await until(() => !rows.has(legacy.id))
+  assert.equal(saves, 1)
 })

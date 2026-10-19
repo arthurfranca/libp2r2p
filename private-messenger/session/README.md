@@ -77,7 +77,8 @@ Callbacks are optional `onDebug`, `onOutbox`, `onMedia`,
 account permissions/connectivity/lock state to availability and owns view subscriptions. There are no DOM or UI imports.
 
 `onSendError` identifies the main outbox message even when its quote, metadata,
-file chunks, or local persistence failed. The original error is also reported to
+file chunks, or self-chat persistence failed. Remote local-persistence failures
+use onError and the copied localPersistence summary, never a send failure. The original error is also reported to
 `onError` unchanged. It fires once per failed send attempt (including retries),
 not when persisted failures are read, nor for inbox/download/deletion operations
 or cancelled/closed sends. Apps own route visibility and user-intent filtering;
@@ -233,10 +234,10 @@ creates a fresh publication lifetime, without treating the pause as a user abort
 ## Independent local persistence and publication
 
 One encrypted outbox feeds two independent serial processors. Local persistence
-never waits for peer preparation or an in-flight publication. Remote entries
-become publishable only after their local progress checkpoint commits; failed
-checkpoints are retried even if the copies have already committed. Text may
-continue passing uploads between chunks after its local stage is ready.
+never waits for peer preparation or an in-flight publication. After the initial encrypted intent commits, remote preparation and publication
+never wait for event-store persistence. Only the exact prepared-envelope
+checkpoint gates transmission. Text continues passing uploads between chunks;
+its local stage need not have completed. Both stages use the admitted inner ID.
 
 Self entries emit `status: 'saved'` as soon as local persistence succeeds. They
 do not write a redundant localSaved checkpoint before removal. Remote entries
@@ -275,7 +276,7 @@ First acceptance of every required envelope emits saved independently of archive
 or cleanup. ACK progress checkpoints serialize with other entry writes. A crash
 between ACK and its checkpoint may replay the same envelope; acknowledged durable
 progress only archives. Archive failure never becomes `onSendError` or changes
-saved status. Removal waits for archival and outstanding entry writes.
+saved status. Removal waits for local persistence, archival and outstanding entry writes.
 
 At most one unit awaits archival per entry; a stalled upload yields its remote
 slot to other texts rather than accumulating the entire file. Cancel stops wire
@@ -283,3 +284,35 @@ work but retains potentially transmitted seeds until archival finishes. Close
 drains active local operations and leaves durable backoff work for restart.
 Diagnostics add publication/seed IDs, checkpoint time, archive wait/execution and
 first-ACK timing, without message or ciphertext contents.
+
+## Independent delivery status (0.11.27)
+
+`deliveryConfirmed` is an optional boolean in encrypted outbox JSON. It records
+relay confirmation separately from `localSaved`. Old entries normalize from
+saved delivery status, never from local progress; their event/file indices and
+prepared envelopes remain unchanged. No database migration is needed.
+
+`onOutbox` adds `localPersistence: { state, retryable }`, where state is pending,
+saved or failed. It is a presentation summary with no native error objects.
+A saved remote entry may still have pending/failed local work. Keep it visible
+through reload until the local store catches up. `retry(id)` on a confirmed
+entry repeats local/archival cleanup only and never renews network urgency.
+Recoverable local failures retain bounded backoff without clearing terminal
+remote errors or releasing network pauses. Self-chat still confirms on commit.
+
+Entry updates serialize through existing-only checkpoints; not-yet-started
+writes coalesce and capture the latest monotonic progress at transaction start.
+Prepared-publication callers wait for the resulting durable snapshot. An ACK
+checkpoint may merge local progress but never requires it. Shutdown/lock waits
+for admitted local writes; cancellation cannot recreate a removed intent.
+
+The local failure summary remains failed while a retry is queued or running;
+unrelated snapshots cannot hide its warning before commit. Retry admission is
+runtime-only and temporarily makes that summary non-retryable. A failed retry
+restores retryability after its operation ends; a successful commit clears the
+failure. This does not change the already confirmed remote status.
+
+Legacy single-stage failure flags with incomplete local progress normalize into
+local failure state, preserving manual-only retry refusals. The new delivery
+marker distinguishes those records from a modern remote failure racing local
+persistence. Both formats enter the same processors after normalization.

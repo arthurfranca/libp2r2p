@@ -390,3 +390,13 @@ NIP-46 against the real pool with controlled transport and injected controls.
   duplicate check; only automatic recovery may release its owned network pause.
 - Diagnostic callbacks are optional, contain IDs/measures only, and are wired by
   development consumers. There is no relay-backoff, message-wire or bridge change.
+
+## Independent send stages (0.11.27)
+
+After durable admission, local and remote processors run independently for the
+same immutable inner event. Only exact-envelope durability gates transmission.
+Keep deliveryConfirmed separate from localSaved; normalize old saved statuses,
+never infer ACK from local progress. Retain confirmed entries until local save,
+archive and cleanup finish. localPersistence is a copied summary without errors.
+Confirmed retries never republish or renew network urgency. Coalesce queued
+existing-only writes without weakening their preparation barrier or cancellation.
