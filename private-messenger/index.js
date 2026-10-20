@@ -52,6 +52,7 @@ import { backgroundSigner } from './helpers/background-signer.js'
 import { createSendRelayRouting, normalizeFallbackRelays, normalizeFallbackDelay } from './helpers/send-routing.js'
 import { incompleteFetchError } from '../private-channel/helpers/fetch-error.js'
 import { recoveryRetryDelay, isPermanentRecoveryError } from './helpers/recovery-retry.js'
+import { assertMessagePublished, publicationFailureDiagnostic, sanitizePublicationError } from './helpers/publication.js'
 import { normalizeRelayUrl } from '../url/index.js'
 import { deliveryInfo } from '../private-channel/helpers/rumor.js'
 import { migrateMessageQueue } from './services/migrate-message-queue.js'
@@ -2755,13 +2756,17 @@ export class PrivateMessenger {
           payload: { since, until }
         })
         asks.push(ask)
-        const reports = ask?.delivery?.reports
-        if (!Array.isArray(reports) || !reports.length || reports.some(report => report?.success !== true)) {
-          throw new Error('PRIVATE_MESSAGE_NOT_PUBLISHED')
-        }
+        await assertMessagePublished(ask, ask.question)
       } catch (err) {
-        failures.push({ seeder, error: err })
-        console.warn('private-messenger seeder recovery ask failed', seeder, err?.message ?? err)
+        const error = sanitizePublicationError(err, {
+          operation: 'seeder-recovery-ask',
+          channelPubkey,
+          seederPubkey: seeder,
+          since,
+          until
+        })
+        failures.push({ seeder, error })
+        console.warn('private-messenger seeder recovery ask failed', JSON.stringify(publicationFailureDiagnostic(error)))
       }
     }
     return { asks, failures }

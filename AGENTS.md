@@ -400,3 +400,14 @@ never infer ACK from local progress. Retain confirmed entries until local save,
 archive and cleanup finish. localPersistence is a copied summary without errors.
 Confirmed retries never republish or renew network urgency. Coalesce queued
 existing-only writes without weakening their preparation barrier or cancellation.
+
+## Recovery publication diagnostics (0.11.28)
+
+Seeder recovery asks use the same required-publication coverage as other private
+messages. Failed asks retain a fixed `MESSAGE_NOT_PUBLISHED` code, sanitized
+report/relay classifications, the logical ask event ID and channel/seeder/range
+context. Keep native report causes non-enumerable for retry classification; never
+put arbitrary relay messages, ciphertext or event payloads in diagnostics.
+Traverse those retained causes when deciding transient versus permanent retry.
+Do not advance recovered coverage or weaken first-ACK semantics when publication
+confirmation is missing or incomplete.

@@ -2024,14 +2024,17 @@ test('recovery retains the full range until every seeder ask is delivered', asyn
     {
       name: 'delivery failure',
       seeders: ['one'],
-      ask: async () => ({ question: { id: 'one' }, delivery: { reports: [{ success: false }] } }),
+      ask: async () => ({
+        question: { pubkey: 'a'.repeat(64), kind: ASK_KIND, created_at: now, tags: [], content: '' },
+        delivery: { reports: [{ success: false }] }
+      }),
       retained: true
     },
     {
       name: 'one failed seeder among several',
       seeders: ['one', 'two'],
       ask: async options => ({
-        question: { id: options.receiverPubkey },
+        question: { pubkey: 'a'.repeat(64), kind: ASK_KIND, created_at: now, tags: [], content: '' },
         delivery: { reports: [{ success: options.receiverPubkey === 'one' }] }
       }),
       retained: true
@@ -2039,8 +2042,8 @@ test('recovery retains the full range until every seeder ask is delivered', asyn
     {
       name: 'all seeders delivered',
       seeders: ['one', 'two'],
-      ask: async options => ({
-        question: { id: options.receiverPubkey },
+      ask: async () => ({
+        question: { pubkey: 'a'.repeat(64), kind: ASK_KIND, created_at: now, tags: [], content: '' },
         delivery: { reports: [{ success: true }] }
       }),
       retained: false
@@ -2076,6 +2079,75 @@ test('recovery retains the full range until every seeder ask is delivered', asyn
       await messenger.close()
     })
   }
+})
+
+test('recovery asks preserve classified publication failures for retry diagnostics', async t => {
+  const now = Math.floor(Date.now() / 1000)
+  const range = { start: now - 20, end: now - 10 }
+  await seedMessengerState({ channel: { offlineRanges: [range] } }, 'diagnostic-user')
+  const reason = Object.assign(new Error('rate-limited: arbitrary diagnostic text'), {
+    category: 'relay',
+    code: 'RATE_LIMITED',
+    retryAt: Date.now() + 5000
+  })
+  const pm = fakePrivateMessage()
+  pm.ask = async () => ({
+    question: { pubkey: 'a'.repeat(64), kind: ASK_KIND, created_at: now, tags: [], content: '' },
+    delivery: {
+      reports: [{
+        success: false,
+        retryWhenAvailable: true,
+        retryWhenOnline: true,
+        promise: Promise.resolve({
+          total: 1,
+          fulfilled: 0,
+          errors: [{ relay: 'wss://relay.example', reason }]
+        })
+      }]
+    }
+  })
+  const warn = t.mock.method(console, 'warn', () => {})
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    _privateChannel: { fetchHistory: async () => [] }
+  }).init({
+    userSigner: signer('diagnostic-user'),
+    channels: [{
+      pubkey: 'channel',
+      signer: signer('channel'),
+      relays: ['wss://relay.example'],
+      seeders: ['seeder']
+    }]
+  })
+
+  const errors = await messenger.recoverOfflineRanges(['channel'])
+  assert.equal(errors.length, 1)
+  const [error] = errors
+  assert.equal(error.message, 'PRIVATE_MESSAGE_NOT_PUBLISHED')
+  assert.equal(error.code, 'MESSAGE_NOT_PUBLISHED')
+  assert.equal(error.operation, 'seeder-recovery-ask')
+  assert.equal(error.channelPubkey, 'channel')
+  assert.equal(error.seederPubkey, 'seeder')
+  assert.ok(Number.isSafeInteger(error.since))
+  assert.ok(error.since <= range.start, 'recovery may widen the left edge by its online skew')
+  assert.ok(Number.isSafeInteger(error.until))
+  assert.ok(error.until >= range.end)
+  assert.equal(error.retryWhenAvailable, true)
+  assert.equal(error.retryWhenOnline, true)
+  assert.deepEqual(error.reports[0].errors[0], {
+    relay: 'wss://relay.example',
+    code: 'RATE_LIMITED',
+    category: 'relay',
+    name: 'Error',
+    retryAt: reason.retryAt
+  })
+
+  const warning = warn.mock.calls.find(args => args.arguments[0] === 'private-messenger seeder recovery ask failed')
+  assert.ok(warning)
+  const serialized = String(warning.arguments[1])
+  assert.match(serialized, /"code":"MESSAGE_NOT_PUBLISHED"/)
+  assert.match(serialized, /"seederPubkey":"seeder"/)
+  assert.doesNotMatch(serialized, /arbitrary diagnostic text/)
 })
 
 test('missing-message replies ignore raw event rows', async () => {

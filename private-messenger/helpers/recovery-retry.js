@@ -19,6 +19,11 @@ export function recoveryRetryDelay (errors, delay) {
       if (['timeout', 'cutoff', 'closed'].includes(entry.status)) retry = true
       visit(entry.error)
     }
+    for (const report of error.reports || []) {
+      if (report.retryWhenAvailable || report.retryWhenOnline) retry = true
+      for (const entry of report.errors || []) visit(entry.reason ?? entry.error)
+    }
+    for (const reason of error.retryReasons || []) visit(reason)
     visit(error.cause)
   }
   errors.forEach(visit)
@@ -36,6 +41,10 @@ export function isPermanentRecoveryError (error) {
         /^(auth-required:|restricted:|blocked:|invalid:|pow:)/.test(value.message || '')) return true
     for (const child of value.errors || []) if (visit(child)) return true
     for (const entry of value.relays || []) if (visit(entry.error)) return true
+    for (const report of value.reports || []) {
+      for (const entry of report.errors || []) if (visit(entry.reason ?? entry.error)) return true
+    }
+    for (const reason of value.retryReasons || []) if (visit(reason)) return true
     return visit(value.cause)
   }
   return visit(error)

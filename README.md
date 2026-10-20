@@ -1257,3 +1257,10 @@ The 0.11.27 session publishes independently of local event-store persistence aft
 its initial durable intent and exact-envelope checkpoint. `deliveryConfirmed`
 and the copied `localPersistence` summary distinguish relay acceptance from
 local storage. See `private-messenger/session/README.md` for retry and cleanup.
+
+The 0.11.28 private messenger preserves classified publication failures for
+seeder recovery asks. Diagnostics include the logical ask ID, channel, seeder
+and range, plus report and relay classifications; arbitrary relay text is not
+logged. Native report causes remain available privately to recovery retry
+policy. Required publication coverage, first-ACK semantics and range recovery
+behavior are unchanged.

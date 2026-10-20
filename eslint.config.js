@@ -1,9 +1,9 @@
-import neostandard from 'neostandard'
+import neostandard, { resolveIgnoresFromGitignore } from 'neostandard'
 import globals from 'globals'
 
 export default [
   ...neostandard({
-    // options
+    ignores: [...resolveIgnoresFromGitignore(), 'dist']
   }), {
     files: ['**/*.js'],
     languageOptions: {
@@ -25,11 +25,6 @@ export default [
         { argsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_', varsIgnorePattern: '^_$' }
       ],
       'one-var': 'off'
-    },
-    ignores: [
-      '.history',
-      'dist',
-      'node_modules'
-    ]
+    }
   }
 ]
