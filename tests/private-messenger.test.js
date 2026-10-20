@@ -27,6 +27,14 @@ class PrivateMessenger extends RealPrivateMessenger {
     // returns a bounded summary instead of retaining all those outer events.
     const channel = options._privateChannel ?? { fetchHistory: async () => [] }
     super({
+      // Stub background discovery/connectivity as well as message transport.
+      // Tests that inspect relay-list updates supply their own subscription.
+      _getRelaysByPubkey: async pubkeys => Object.fromEntries(pubkeys.map(pubkey => [pubkey, {
+        read: ['wss://relay.example'], write: ['wss://relay.example']
+      }])),
+      _subscribeRelayListUpdates: () => () => {},
+      _isOnline: async () => true,
+      _onOnline: () => () => {},
       ...options, _privateChannel: {
         ...channel, fetchHistory: async args => {
           const result = await channel.fetchHistory?.(args) ?? []
