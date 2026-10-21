@@ -3,7 +3,11 @@ import { afterEach, test } from 'node:test'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { createQueue } from '../idb-queue/index.js'
 import { migrateMessageQueue } from '../private-messenger/services/migrate-message-queue.js'
-import { createPendingDecryption } from '../private-messenger/services/pending-decryption.js'
+import {
+  createPendingDecryption,
+  pendingContentKeyGroup,
+  pendingMissingContentKeyGroup
+} from '../private-messenger/services/pending-decryption.js'
 import * as channel from '../private-channel/index.js'
 import Signer from './helpers/test-signer.js'
 import { generateSecretKey } from '../key/index.js'
@@ -72,6 +76,44 @@ test('ciphertext pending queue survives restart, deduplicates, caps MAC attempts
   assert.ok((await pending.queue.getCapacity()).usedBytes <= 2400)
   await pending.clearChannel('channel')
   assert.deepEqual(await pending.records({ force: true }), [])
+  await pending.close()
+})
+
+test('pending records retain only validated content-key coordinates and replace them on failure', async () => {
+  const indexedDB = new IDBFactory()
+  const pending = await createPendingDecryption({ prefix: 'content-key-metadata', indexedDB })
+  const receiver = '11'.repeat(32)
+  const own = '22'.repeat(32)
+  const peer = '33'.repeat(32)
+  const record = { format: 'outer_v1', channelPubkey: 'channel', outer: { id: 'encrypted', content: 'ciphertext' } }
+  const missing = Object.assign(new Error('CONTENT_KEY_NOT_FOUND'), {
+    code: 'CONTENT_KEY_NOT_FOUND',
+    receiverPubkey: receiver,
+    ownContentPubkey: own,
+    peerContentPubkey: peer,
+    hasOwnContentKey: false
+  })
+  await pending.save({ error: missing, record })
+  let [item] = await pending.records()
+  assert.deepEqual(
+    Object.fromEntries(['receiverPubkey', 'ownContentPubkey', 'peerContentPubkey', 'hasOwnContentKey'].map(key => [key, item[key]])),
+    { receiverPubkey: receiver, ownContentPubkey: own, peerContentPubkey: peer, hasOwnContentKey: false }
+  )
+  assert.equal(pendingContentKeyGroup(item), `${receiver}:${own}`)
+  assert.equal(pendingMissingContentKeyGroup(item), `${receiver}:${own}`)
+
+  await pending.failed(item, Object.assign(new Error('invalid MAC'), {
+    code: 'INVALID_MAC',
+    receiverPubkey: receiver,
+    ownContentPubkey: '44'.repeat(32),
+    hasOwnContentKey: true
+  }))
+  ;[item] = await pending.records()
+  assert.equal(item.code, 'INVALID_MAC')
+  assert.equal(item.ownContentPubkey, '44'.repeat(32))
+  assert.equal(item.peerContentPubkey, undefined)
+  assert.equal(item.hasOwnContentKey, true)
+  assert.equal(pendingMissingContentKeyGroup(item), '')
   await pending.close()
 })
 

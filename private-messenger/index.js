@@ -57,7 +57,7 @@ import { assertMessagePublished, publicationFailureDiagnostic, sanitizePublicati
 import { normalizeRelayUrl } from '../url/index.js'
 import { deliveryInfo } from '../private-channel/helpers/rumor.js'
 import { migrateMessageQueue } from './services/migrate-message-queue.js'
-import { createPendingDecryption } from './services/pending-decryption.js'
+import { createPendingDecryption, pendingContentKeyGroup, pendingMissingContentKeyGroup } from './services/pending-decryption.js'
 import { createDecryptionScheduler } from './services/decryption-scheduler.js'
 import { decryptionError, isDeferredDecryptionError } from '../private-channel/helpers/decryption-error.js'
 import { bytesToBase64 } from '../base64/index.js'
@@ -3259,12 +3259,7 @@ export class PrivateMessenger {
         job.started = true
         const force = job.force
         job.force = false
-        const groups = new Map()
-        for (const record of await this.pendingDecryption.records({ force })) {
-          if (!groups.has(record.channelPubkey)) groups.set(record.channelPubkey, [])
-          groups.get(record.channelPubkey).push(record)
-        }
-        const results = await Promise.allSettled([...groups].map(async ([channelPubkey, records]) => {
+        const replay = async (channelPubkey, records, callbacks = {}) => {
           const channel = this.channels.get(channelPubkey)
           if (!channel || !this.desiredChannels.has(channelPubkey)) return
           const current = () => {
@@ -3302,15 +3297,78 @@ export class PrivateMessenger {
                 return this.receive(channelPubkey, () => this.enqueueRumor('nym', channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }, { trackActivity: false })
               },
               onSeedEvent: seed => { current(); return this.receive(channelPubkey, () => this.enqueueSeed(channelPubkey, seed), seed, { trackActivity: false }) },
-              onRecovered: record => { current(); return this.pendingDecryption.recovered(record) },
-              onFailure: (record, error) => { current(); return this.pendingDecryption.failed(record, error) }
+              onRecovered: async record => {
+                current()
+                await callbacks.onRecovered?.(record)
+                return this.pendingDecryption.recovered(record)
+              },
+              onFailure: async (record, error) => {
+                current()
+                if (await callbacks.onFailure?.(record, error) === false) return
+                return this.pendingDecryption.failed(record, error)
+              }
             })
           } catch (error) {
             if (this.channels.get(channelPubkey) === channel && this.desiredChannels.has(channelPubkey)) throw error
           } finally { this.decryptionScheduler.finish(channelPubkey) }
-        }))
+        }
+
+        const records = await this.pendingDecryption.records({ force })
+        const probes = new Map()
+        for (const record of records) {
+          const channelPubkey = record.channelPubkey
+          if (!this.channels.has(channelPubkey) || !this.desiredChannels.has(channelPubkey)) continue
+          const missingGroup = pendingMissingContentKeyGroup(record)
+          if (missingGroup && !probes.has(missingGroup)) probes.set(missingGroup, record)
+        }
+
+        const unavailableGroups = new Set()
+        const probed = new Set()
+        let probeError
+        for (const [groupKey, candidate] of probes) {
+          signal.throwIfAborted()
+          const current = await this.pendingDecryption.current(candidate, { force })
+          if (!current || pendingMissingContentKeyGroup(current) !== groupKey) continue
+          probed.add(current.id)
+          let missing = false
+          await replay(current.channelPubkey, [current], {
+            onFailure: async (_record, error) => {
+              const failedGroup = pendingMissingContentKeyGroup({
+                code: error.code,
+                receiverPubkey: error.receiverPubkey,
+                ownContentPubkey: error.ownContentPubkey,
+                hasOwnContentKey: error.hasOwnContentKey
+              })
+              if (failedGroup === groupKey) missing = true
+              if (isDeferredDecryptionError(error)) {
+                await this.pendingDecryption.failed(current, error)
+                return false
+              }
+              probeError ||= error
+              return false
+            }
+          })
+          if (missing) unavailableGroups.add(groupKey)
+        }
+
+        const remaining = []
+        for (const record of records) {
+          if (!this.channels.has(record.channelPubkey) || !this.desiredChannels.has(record.channelPubkey)) continue
+          if (probed.has(record.id)) continue
+          const groupKey = pendingContentKeyGroup(record)
+          if (groupKey && unavailableGroups.has(groupKey)) continue
+          remaining.push(record)
+        }
+        const groups = new Map()
+        for (const record of remaining) {
+          if (!groups.has(record.channelPubkey)) groups.set(record.channelPubkey, [])
+          groups.get(record.channelPubkey).push(record)
+        }
+        const results = await Promise.allSettled([...groups].map(([channelPubkey, channelRecords]) =>
+          replay(channelPubkey, channelRecords)))
         const failed = results.find(result => result.status === 'rejected')
         if (failed) throw failed.reason
+        if (probeError) throw probeError
         job.started = false
       } while (job.again)
     }

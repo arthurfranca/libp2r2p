@@ -101,6 +101,12 @@ suite pass; report independently scoped problems separately.
   admission/priority methods retain intent before construction/peer preparation.
   Startup/key requests coalesce before snapshots; later requests aggregate one
   follow-up. No polling of failed packets, no automatic force or DB migration.
+- Within one pending-decryption retry pass, one FIFO probe may represent all
+  records with the same `(receiverPubkey, ownContentPubkey)` across channels.
+  Skip the rest only after an exact `CONTENT_KEY_NOT_FOUND` with
+  `hasOwnContentKey === false`; the skip is pass-local and removes nothing.
+  `INVALID_MAC`, proof, parsing and operational errors never suppress a key
+  group. `peerContentPubkey` alone must not define a group.
 - Confirmed content-key announcements use rememberContentKeyEvent. Preserve
   timestamp/lowest-ID ordering and prevent stale query results from escaping to
   either the cache or its callers. Diagnostics contain only selected public

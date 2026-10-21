@@ -9,6 +9,13 @@ the account messenger while available. Call after committed content-key changes;
 ordinary availability recovery already requests a pass. Ciphertext stays in the
 separate bounded FIFO until admitted to the normal inbox, evicted or explicitly
 cleared. This does not retry application storage/permission failures as crypto.
+Within one pass, records whose last failure proved the same
+`(receiverPubkey, ownContentPubkey)` is missing share one FIFO probe across all
+channels. An unchanged `CONTENT_KEY_NOT_FOUND` skips only that group's remaining
+records for the pass; none are removed or suspended. If the probe advances past
+the key lookup, including with `INVALID_MAC`, or fails with another error, all
+other records in the group are still attempted. Missing-key suppression never
+survives into another pass.
 
 Construction accepts `pendingDecryptionReady` (default `true`). Pass `false` to
 hold pending queue reads/replay until `setPendingDecryptionReady(true)` releases

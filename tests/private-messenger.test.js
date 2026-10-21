@@ -302,6 +302,131 @@ test('startup admission protects queue reads while live reception and sending re
   assert.equal(replayed, 1)
 })
 
+test('missing content-key probes deduplicate account-wide groups per retry pass', async () => {
+  const owner = '41'.repeat(32)
+  const channels = {
+    a: '51'.repeat(32),
+    b: '52'.repeat(32),
+    c: '53'.repeat(32)
+  }
+  const keyX = '61'.repeat(32)
+  const keyY = '62'.repeat(32)
+  const missingKeys = new Set([keyX, keyY])
+  const malformed = new Set()
+  const attempts = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _privateChannel: {
+      fetchHistory: async () => [],
+      replayDeferredDecryptions: async ({ records, _runRecord, onRecovered, onFailure }) => {
+        for (const record of records) {
+          await _runRecord(record, async () => {
+            attempts.push(record.packet.outer.id)
+            if (missingKeys.has(record.ownContentPubkey)) {
+              await onFailure(record, Object.assign(new Error('CONTENT_KEY_NOT_FOUND'), {
+                code: 'CONTENT_KEY_NOT_FOUND',
+                receiverPubkey: owner,
+                ownContentPubkey: record.ownContentPubkey,
+                peerContentPubkey: record.peerContentPubkey,
+                hasOwnContentKey: false
+              }))
+              return
+            }
+            if (malformed.has(record.packet.outer.id)) {
+              await onFailure(record, Object.assign(new Error('invalid MAC'), {
+                code: 'INVALID_MAC',
+                receiverPubkey: owner,
+                ownContentPubkey: record.ownContentPubkey,
+                hasOwnContentKey: true
+              }))
+              return
+            }
+            await onRecovered(record)
+          })
+        }
+      }
+    }
+  }).init({
+    userSigner: signer(owner),
+    channels: Object.values(channels).map(pubkey => ({ pubkey, signer: signer(pubkey), relays: ['wss://relay.example'] }))
+  })
+  const defer = (id, channelPubkey, ownContentPubkey, peerContentPubkey = '71'.repeat(32)) => messenger.deferDecryption({
+    error: Object.assign(new Error('CONTENT_KEY_NOT_FOUND'), {
+      code: 'CONTENT_KEY_NOT_FOUND',
+      receiverPubkey: owner,
+      ownContentPubkey,
+      peerContentPubkey,
+      hasOwnContentKey: false
+    }),
+    record: { format: 'outer_v1', channelPubkey, outer: { id, content: 'ciphertext' } }
+  })
+
+  await defer('x-a', channels.a, keyX)
+  await defer('x-b', channels.b, keyX, '72'.repeat(32))
+  await defer('y-c', channels.c, keyY)
+  await defer('ungrouped', channels.a, 'short-key')
+  await messenger.retryPendingDecryptions()
+
+  assert.deepEqual(attempts, ['x-a', 'y-c', 'ungrouped'])
+  assert.deepEqual((await messenger.pendingDecryption.records()).map(record => record.packet.outer.id), ['x-a', 'x-b', 'y-c'])
+
+  attempts.length = 0
+  missingKeys.delete(keyX)
+  malformed.add('x-a')
+  await messenger.retryPendingDecryptions()
+  assert.deepEqual(attempts, ['x-a', 'y-c', 'x-b'])
+  assert.deepEqual((await messenger.pendingDecryption.records()).map(record => record.packet.outer.id), ['x-a', 'y-c'])
+
+  attempts.length = 0
+  malformed.delete('x-a')
+  await messenger.retryPendingDecryptions()
+  assert.deepEqual(attempts, ['y-c', 'x-a'])
+  assert.deepEqual((await messenger.pendingDecryption.records()).map(record => record.packet.outer.id), ['y-c'])
+  await messenger.close()
+})
+
+test('a non-deferred probe error never suppresses the rest of its content-key group', async () => {
+  const owner = '42'.repeat(32)
+  const channelPubkey = '54'.repeat(32)
+  const ownContentPubkey = '63'.repeat(32)
+  const attempts = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _privateChannel: {
+      fetchHistory: async () => [],
+      replayDeferredDecryptions: async ({ records, _runRecord, onRecovered, onFailure }) => {
+        for (const record of records) {
+          await _runRecord(record, async () => {
+            attempts.push(record.packet.outer.id)
+            if (record.packet.outer.id === 'invalid-proof') {
+              await onFailure(record, Object.assign(new Error('INVALID_IYKC_PROOF'), { code: 'INVALID_IYKC_PROOF' }))
+            } else {
+              await onRecovered(record)
+            }
+          })
+        }
+      }
+    }
+  }).init({ userSigner: signer(owner), channels: [{ pubkey: channelPubkey, signer: signer(channelPubkey), relays: ['wss://relay.example'] }] })
+  for (const id of ['invalid-proof', 'valid-copy']) {
+    await messenger.deferDecryption({
+      error: Object.assign(new Error('CONTENT_KEY_NOT_FOUND'), {
+        code: 'CONTENT_KEY_NOT_FOUND',
+        receiverPubkey: owner,
+        ownContentPubkey,
+        peerContentPubkey: '72'.repeat(32),
+        hasOwnContentKey: false
+      }),
+      record: { format: 'outer_v1', channelPubkey, outer: { id, content: 'ciphertext' } }
+    })
+  }
+
+  await assert.rejects(messenger.retryPendingDecryptions(), { code: 'INVALID_IYKC_PROOF' })
+  assert.deepEqual(attempts, ['invalid-proof', 'valid-copy'])
+  assert.deepEqual((await messenger.pendingDecryption.records()).map(record => record.packet.outer.id), ['invalid-proof'])
+  await messenger.close()
+})
+
 test('seeder replies defer one encrypted row and keep admitting following rows', async () => {
   const messenger = await new PrivateMessenger({ _privateMessage: fakePrivateMessage() }).init({
     userSigner: signer('seed-receiver'), channels: [{ signer: signer('channel'), relays: ['wss://fixture.example'] }]

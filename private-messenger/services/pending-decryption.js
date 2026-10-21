@@ -6,6 +6,8 @@ import { isDeferredDecryptionError } from '../../private-channel/helpers/decrypt
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
+const HEX64 = /^[0-9a-f]{64}$/i
+const CONTENT_KEY_FIELDS = ['receiverPubkey', 'ownContentPubkey', 'peerContentPubkey']
 export const PENDING_DECRYPTION_MAX_BYTES = 16 * 1024 * 1024
 
 function storedBytes (item) {
@@ -28,6 +30,34 @@ function packetSnapshot (packet) {
     return copy
   }
   return { format: packet.format, channelPubkey: packet.channelPubkey, outer: event(packet.outer), ...(packet.router ? { router: event(packet.router, true) } : {}) }
+}
+
+function errorMetadata (error) {
+  const metadata = {}
+  for (const key of CONTENT_KEY_FIELDS) {
+    const value = error?.[key]
+    if (typeof value === 'string' && HEX64.test(value)) metadata[key] = value.toLowerCase()
+  }
+  if (typeof error?.hasOwnContentKey === 'boolean') metadata.hasOwnContentKey = error.hasOwnContentKey
+  return metadata
+}
+
+function replaceErrorMetadata (item, error) {
+  const next = { ...item, code: error?.code }
+  for (const key of [...CONTENT_KEY_FIELDS, 'hasOwnContentKey']) delete next[key]
+  return Object.assign(next, errorMetadata(error))
+}
+
+export function pendingContentKeyGroup (item) {
+  const receiver = item?.receiverPubkey
+  const own = item?.ownContentPubkey
+  if (typeof receiver !== 'string' || typeof own !== 'string' || !HEX64.test(receiver) || !HEX64.test(own)) return ''
+  return `${receiver.toLowerCase()}:${own.toLowerCase()}`
+}
+
+export function pendingMissingContentKeyGroup (item) {
+  if (item?.code !== 'CONTENT_KEY_NOT_FOUND' || item?.hasOwnContentKey !== false) return ''
+  return pendingContentKeyGroup(item)
 }
 
 // Stable across live, history and synthesized recovery wrappers.
@@ -72,8 +102,19 @@ export async function createPendingDecryption ({ prefix, indexedDB, maxBytes = P
       record = packetSnapshot(record)
       return serial(async () => {
         const id = packetId(record)
-        if (await queue.someBy('byId', id)) return true
-        const item = { id, channelPubkey: record.channelPubkey, packet: structuredClone(record), code: error.code, macAttempts: error.code === 'INVALID_MAC' ? 1 : 0 }
+        const previous = await queue.getBy('byId', id)
+        if (previous) {
+          const updated = replaceErrorMetadata(previous, error)
+          if (JSON.stringify(updated) !== JSON.stringify(previous)) await queue.putBy('byId', updated, { existingOnly: true })
+          return true
+        }
+        const item = {
+          id,
+          channelPubkey: record.channelPubkey,
+          packet: structuredClone(record),
+          macAttempts: error.code === 'INVALID_MAC' ? 1 : 0,
+          ...replaceErrorMetadata({}, error)
+        }
         const requiredBytes = storedBytes(item)
         if (requiredBytes > maxBytes) {
           notify('discarded', { reason: 'oversized', channelPubkey: item.channelPubkey, id }); return true
@@ -115,7 +156,10 @@ export async function createPendingDecryption ({ prefix, indexedDB, maxBytes = P
         if (!isDeferredDecryptionError(error)) throw error
         const current = await queue.getBy('byId', item.id)
         if (!current) return
-        const updated = { ...current, code: error.code, macAttempts: current.macAttempts + (error.code === 'INVALID_MAC' ? 1 : 0) }
+        const updated = {
+          ...replaceErrorMetadata(current, error),
+          macAttempts: current.macAttempts + (error.code === 'INVALID_MAC' ? 1 : 0)
+        }
         await queue.putBy('byId', updated, { existingOnly: true })
         if (updated.macAttempts >= 3 && item.macAttempts < 3) notify('suspended', { id: item.id, code: error.code, channelPubkey: item.channelPubkey })
       })

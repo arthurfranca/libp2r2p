@@ -1278,3 +1278,9 @@ circuit: explicit bans/refusals open immediately, repeated transport failures
 open after three attempts, and a fully quarantined route reports
 `RELAY_CIRCUIT_OPEN` with `retryAt` before another envelope is prepared. Reads and
 receive routing are unaffected. See [session relay fallback](private-messenger/session/README.md#relay-fallback).
+
+The 0.11.31 pending-decryption retry groups records by
+`(receiverPubkey, ownContentPubkey)` for one pass. A FIFO probe may skip the
+remaining records only when the local signer confirms `CONTENT_KEY_NOT_FOUND`
+with `hasOwnContentKey: false`. MAC, proof, parsing and operational failures are
+never generalized to the group, and every deferred record remains persisted.
