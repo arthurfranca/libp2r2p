@@ -1284,3 +1284,9 @@ The 0.11.31 pending-decryption retry groups records by
 remaining records only when the local signer confirms `CONTENT_KEY_NOT_FOUND`
 with `hasOwnContentKey: false`. MAC, proof, parsing and operational failures are
 never generalized to the group, and every deferred record remains persisted.
+
+The 0.11.32 local recovery-seed queue serializes incoming and outgoing writes
+within one PrivateMessenger. Duplicate `bySeedKey` races retry up to five times:
+NYM rows remain idempotent and router rows re-read the winning timestamps before
+replacement. External event-store seed adapters retain their independent batched
+writes.

@@ -108,6 +108,7 @@ export {
 const DEFAULT_OFFLINE_RECOVERY_SECONDS = 7 * 24 * 60 * 60
 const MAX_OFFLINE_RECOVERY_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1000)
 const RECOVERY_STORAGE_BATCH_SIZE = 100
+const SEED_QUEUE_UPSERT_ATTEMPTS = 5
 const STORAGE_POLICY_BROADCAST_CHANNEL = 'libp2r2p:private-messenger:storage-policy'
 const DEFAULT_OFFLINE_SKEW_SECONDS = 30
 const DEFAULT_RELOAD_GAP_DELAY_MS = 500
@@ -374,6 +375,7 @@ export class PrivateMessenger {
     this.watchRevisionByChannel = new Map()
     this.presenceTimers = new Map()
     this.presenceJobs = new Map()
+    this.seedQueueOperationTail = Promise.resolve()
     this.stopRelayListWatcher = null
     this.relayListWatcherPubkey = ''
     this.relayListRefreshPromise = null
@@ -684,6 +686,13 @@ export class PrivateMessenger {
 
   queueIncoming (operation) {
     return this.runQueueOperation(operation)
+  }
+
+  runSeedQueueOperation (operation) {
+    if (this.closePromise) return Promise.reject(new Error('PRIVATE_MESSENGER_CLOSED'))
+    const run = this.seedQueueOperationTail.then(operation)
+    this.seedQueueOperationTail = run.catch(() => {})
+    return run
   }
 
   debug (action, detail = {}) {
@@ -2140,8 +2149,8 @@ export class PrivateMessenger {
 
   async enqueueSeed (channelPubkey, seed) {
     if (!this.offlineRecoverySecondsFor(channelPubkey)) return
-    const receivedAt = nowSeconds()
     if (this.seedStorage) {
+      const receivedAt = nowSeconds()
       const rows = seed.recordType === NYM_CARRIER_SEED_RECORD_TYPE || seed.carriers?.length
         ? [{ recordType: NYM_CARRIER_SEED_RECORD_TYPE, carriers: compactSeedNymCarriers(seed.carriers) }]
         : compactSeedRouterRows(seed)
@@ -2155,22 +2164,37 @@ export class PrivateMessenger {
       }
       return
     }
+    return this.runSeedQueueOperation(() => this.enqueueQueueSeed(channelPubkey, seed))
+  }
+
+  async enqueueQueueSeed (channelPubkey, seed) {
+    this.assertOpen()
+    if (!this.channels.has(channelPubkey) || !this.offlineRecoverySecondsFor(channelPubkey)) return
+    const receivedAt = nowSeconds()
     if (seed.recordType === NYM_CARRIER_SEED_RECORD_TYPE || seed.carriers?.length) {
       const carriers = compactSeedNymCarriers(seed.carriers)
       const recordTime = nymCarrierRecordTime({ carriers }) || seed.outer?.created_at || receivedAt
       const key = nymCarrierSeedKey({ channelPubkey, carriers })
       const seedKey = key ? `nym:${key}` : ''
-      if (seedKey && await this.seedQueue.someBy('bySeedKey', seedKey)) return
-      await this.seedQueue.enqueue({
-        type: 'seed',
-        recordType: NYM_CARRIER_SEED_RECORD_TYPE,
-        channelPubkey,
-        receivedAt,
-        carriers,
-        meta: { channelPubkey: seed.channelPubkey },
-        [SEED_KEY]: seedKey || undefined,
-        [SEED_TIME]: recordTime
-      })
+      for (let attempt = 0; attempt < SEED_QUEUE_UPSERT_ATTEMPTS; attempt++) {
+        if (seedKey && await this.seedQueue.someBy('bySeedKey', seedKey)) break
+        try {
+          await this.seedQueue.enqueue({
+            type: 'seed',
+            recordType: NYM_CARRIER_SEED_RECORD_TYPE,
+            channelPubkey,
+            receivedAt,
+            carriers,
+            meta: { channelPubkey: seed.channelPubkey },
+            [SEED_KEY]: seedKey || undefined,
+            [SEED_TIME]: recordTime
+          })
+          break
+        } catch (error) {
+          if (error?.name !== 'ConstraintError') throw error
+          if (attempt === SEED_QUEUE_UPSERT_ATTEMPTS - 1) throw error
+        }
+      }
       await this.pruneStoredSeeds(channelPubkey)
       return
     }
@@ -2180,21 +2204,29 @@ export class PrivateMessenger {
       const rowTime = row.lastSeenAt || row.router?.created_at || receivedAt
       const rowKey = routerSeedRowKey({ ...row, channelPubkey })
       const seedKey = `router:${rowKey}`
-      const [previous] = await this.seedQueue.removeBy('bySeedKey', seedKey)
-      const firstSeenAt = Math.min(previous?.firstSeenAt ?? rowTime, row.firstSeenAt ?? rowTime)
-      const lastSeenAt = Math.max(previous?.lastSeenAt ?? rowTime, row.lastSeenAt ?? rowTime)
-      await this.seedQueue.enqueue({
-        ...row,
-        type: 'seed',
-        recordType: ROUTER_SEED_RECORD_TYPE,
-        channelPubkey,
-        receivedAt,
-        firstSeenAt,
-        lastSeenAt,
-        meta: { channelPubkey: seed.channelPubkey },
-        [SEED_KEY]: seedKey,
-        [SEED_TIME]: lastSeenAt || rowTime
-      })
+      for (let attempt = 0; attempt < SEED_QUEUE_UPSERT_ATTEMPTS; attempt++) {
+        const [previous] = await this.seedQueue.removeBy('bySeedKey', seedKey)
+        const firstSeenAt = Math.min(previous?.firstSeenAt ?? rowTime, row.firstSeenAt ?? rowTime)
+        const lastSeenAt = Math.max(previous?.lastSeenAt ?? rowTime, row.lastSeenAt ?? rowTime)
+        try {
+          await this.seedQueue.enqueue({
+            ...row,
+            type: 'seed',
+            recordType: ROUTER_SEED_RECORD_TYPE,
+            channelPubkey,
+            receivedAt,
+            firstSeenAt,
+            lastSeenAt,
+            meta: { channelPubkey: seed.channelPubkey },
+            [SEED_KEY]: seedKey,
+            [SEED_TIME]: lastSeenAt || rowTime
+          })
+          break
+        } catch (error) {
+          if (error?.name !== 'ConstraintError') throw error
+          if (attempt === SEED_QUEUE_UPSERT_ATTEMPTS - 1) throw error
+        }
+      }
     }
     await this.pruneStoredSeeds(channelPubkey)
   }

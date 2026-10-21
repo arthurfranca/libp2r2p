@@ -1976,6 +1976,155 @@ test('seeder channels store router seeds separately, consume messages, and answe
   assert.equal((await takeMessage(messenger)), null)
 })
 
+test('local seed queue serializes concurrent incoming and outgoing NYM writes', async () => {
+  const pm = fakePrivateMessage()
+  const now = Math.floor(Date.now() / 1000)
+  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'], mode: 'seeder' }]
+  })
+  const seed = {
+    recordType: NYM_CARRIER_SEED_RECORD_TYPE,
+    channelPubkey: 'channel',
+    carriers: [{
+      id: 'carrier-id',
+      kind: ROUTER_KIND,
+      pubkey: 'carrier-pubkey',
+      created_at: now,
+      tags: [],
+      content: ''
+    }]
+  }
+
+  await Promise.all([
+    pm.watchCalls[0].onSeed(seed),
+    messenger.outgoingSeedHandler('channel')(seed)
+  ])
+
+  const storedSeeds = []
+  for await (const item of messenger.seedQueue.storedItems()) storedSeeds.push(item)
+  assert.equal(storedSeeds.filter(item => item.recordType === NYM_CARRIER_SEED_RECORD_TYPE).length, 1)
+})
+
+test('local router seed updates preserve timestamp bounds across concurrent writes', async () => {
+  const pm = fakePrivateMessage()
+  const now = Math.floor(Date.now() / 1000)
+  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'], mode: 'seeder' }]
+  })
+  const createSeed = (createdAt, row) => ({
+    channelPubkey: 'channel',
+    router: {
+      kind: ROUTER_KIND,
+      pubkey: 'router',
+      created_at: createdAt,
+      tags: [['f', 'alice'], ['c', '0', '1']],
+      content: jsonlContent(payloadRow(), row)
+    },
+    innerEventIdsByRowIndex: { 1: 'same-inner-id' }
+  })
+
+  await Promise.all([
+    messenger.enqueueSeed('channel', createSeed(now, JSON.stringify(['user', 'old-ciphertext']))),
+    messenger.enqueueSeed('channel', createSeed(now + 20, JSON.stringify(['user', 'new-ciphertext'])))
+  ])
+
+  const storedSeeds = []
+  for await (const item of messenger.seedQueue.storedItems()) storedSeeds.push(item)
+  assert.equal(storedSeeds.filter(item => item.recordType === ROUTER_SEED_RECORD_TYPE).length, 1)
+  assert.equal(storedSeeds[0].firstSeenAt, now)
+  assert.equal(storedSeeds[0].lastSeenAt, now + 20)
+  assert.equal(storedSeeds[0].row, JSON.stringify(['user', 'new-ciphertext']))
+})
+
+test('local seed queue retries ConstraintError across messenger instances', async () => {
+  const indexedDB = new IDBFactory()
+  const now = Math.floor(Date.now() / 1000)
+  const makeMessenger = () => new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _indexedDB: indexedDB
+  }).init({
+    userSigner: signer('same-user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'], mode: 'seeder' }]
+  })
+  const first = await makeMessenger()
+  const second = await makeMessenger()
+  const arrival = Promise.withResolvers()
+  let waiting = 2
+  for (const messenger of [first, second]) {
+    const enqueue = messenger.seedQueue.enqueue.bind(messenger.seedQueue)
+    let attempts = 0
+    messenger.seedQueue.enqueue = async record => {
+      if (attempts++ === 0) {
+        if (--waiting === 0) arrival.resolve()
+        await arrival.promise
+      }
+      return enqueue(record)
+    }
+  }
+  const seed = {
+    channelPubkey: 'channel',
+    router: {
+      kind: ROUTER_KIND,
+      pubkey: 'router',
+      created_at: now,
+      tags: [['f', 'alice'], ['c', '0', '1']],
+      content: jsonlContent(payloadRow(), JSON.stringify(['user', 'ciphertext']))
+    },
+    innerEventIdsByRowIndex: { 1: 'shared-inner-id' }
+  }
+
+  await Promise.all([first.enqueueSeed('channel', seed), second.enqueueSeed('channel', seed)])
+
+  const storedSeeds = []
+  for await (const item of first.seedQueue.storedItems()) storedSeeds.push(item)
+  assert.equal(storedSeeds.filter(item => item.recordType === ROUTER_SEED_RECORD_TYPE).length, 1)
+})
+
+test('local seed queue bounds duplicate retries and remains usable after failures', async () => {
+  const pm = fakePrivateMessage()
+  const now = Math.floor(Date.now() / 1000)
+  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'], mode: 'seeder' }]
+  })
+  const enqueue = messenger.seedQueue.enqueue.bind(messenger.seedQueue)
+  let conflicts = 0
+  messenger.seedQueue.enqueue = async record => {
+    if (conflicts++ < 5) throw Object.assign(new Error('duplicate seed'), { name: 'ConstraintError' })
+    return enqueue(record)
+  }
+  const seed = {
+    channelPubkey: 'channel',
+    router: {
+      kind: ROUTER_KIND,
+      pubkey: 'router',
+      created_at: now,
+      tags: [['f', 'alice'], ['c', '0', '1']],
+      content: jsonlContent(payloadRow(), JSON.stringify(['user', 'ciphertext']))
+    },
+    innerEventIdsByRowIndex: { 1: 'retry-bound-id' }
+  }
+
+  await assert.rejects(messenger.enqueueSeed('channel', seed), { name: 'ConstraintError' })
+  await messenger.enqueueSeed('channel', seed)
+  const storedSeeds = []
+  for await (const item of messenger.seedQueue.storedItems()) storedSeeds.push(item)
+  assert.equal(storedSeeds.filter(item => item.recordType === ROUTER_SEED_RECORD_TYPE).length, 1)
+
+  const operational = Object.assign(new Error('quota exceeded'), { name: 'QuotaExceededError' })
+  messenger.seedQueue.enqueue = async () => { throw operational }
+  const otherSeed = {
+    ...seed,
+    router: { ...seed.router, pubkey: 'other-router' },
+    innerEventIdsByRowIndex: { 1: 'operational-id' }
+  }
+  await assert.rejects(messenger.enqueueSeed('channel', otherSeed), error => error === operational)
+  messenger.seedQueue.enqueue = enqueue
+  await messenger.enqueueSeed('channel', otherSeed)
+})
+
 test('router seed rows dedupe by proven inner id without content-key pubkey', async () => {
   const pm = fakePrivateMessage()
   const now = Math.floor(Date.now() / 1000)

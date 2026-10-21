@@ -118,6 +118,12 @@ suite pass; report independently scoped problems separately.
   capacity policy and reservation-token invalidation. Indexed methods are
   extensions beyond the common Web Storage queue API; keep parity tests scoped
   to that common API.
+- The default local recovery-seed queue serializes incoming and outgoing
+  `enqueueSeed()` operations per PrivateMessenger. Treat a bounded
+  `ConstraintError` as an idempotent duplicate: NYM rows remain first-write-wins,
+  while router retries re-read the winner and merge first/last-seen timestamps.
+  Other storage errors propagate, and external `seedStorage` adapters remain
+  outside the local queue tail.
 
 - Rumors preserve an explicit author distinct from the transport sender. Keep
   `senderPubkey` and `provenance` outside the event through live and recovery
