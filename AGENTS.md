@@ -187,6 +187,10 @@ NIP-46 against the real pool with controlled transport and injected controls.
   with empty content and unversioned d namespaces. Preserve ciphertext/tag order,
   validate snapshot hashes and escape original CRDT-like values. Revocations use
   private kind 5, not a custom state field. Never renew expiry on sync/retry.
+- Batch recovery storage operations in bounded groups of at most 100. Use one
+  type AND-filter plus coordinate OR-filters for existence, preserve input order,
+  and still decode/validate every returned immutable snapshot. Keep serial
+  fallbacks for external adapters without batched methods.
 - Day candidates use D and literal '*', then exact snapshot overlap. Do not filter
   wrapper created_at as if it were the recovery time. No cross-snapshot hull merge.
 - Keep sync transport seeds out of the event store being synchronized. Never

@@ -6,6 +6,9 @@ import { encodeRecord, decodeRecord, selector, days, PREFIX } from './helpers/co
 export { encodeRecord as encodeRecoveryRecord, decodeRecord as decodeRecoveryRecord } from './helpers/codec.js'
 
 const nowSeconds = () => Math.floor(Date.now() / 1000)
+const RECOVERY_BATCH_SIZE = 100
+const chunks = values => Array.from({ length: Math.ceil(values.length / RECOVERY_BATCH_SIZE) }, (_, index) =>
+  values.slice(index * RECOVERY_BATCH_SIZE, (index + 1) * RECOVERY_BATCH_SIZE))
 function assertOptions (eventStore, signer) {
   if (!eventStore?.query || !eventStore?.addPersonalCopy || !signer?.getPublicKey || !signer?.obfuscate || !signer?.nip44v3?.decrypt) throw new ValidationError('INVALID_EVENT_STORE_OPTIONS')
 }
@@ -49,6 +52,11 @@ export function createPersonalCopyRecoveryStorage ({ eventStore, signer, now = n
     const [owner, context] = await ready()
     return { kinds: [1006], authors: [owner], '#k': ['30078'], '#c': [context], '#v': ['0', '1'], '&o': [await mirror('t', `${PREFIX}${type}`)] }
   }
+  async function exactFilterFor (type) {
+    check()
+    const [owner] = await ready()
+    return { kinds: [1006], authors: [owner], '&o': [await mirror('t', `${PREFIX}${type}`)] }
+  }
   async function read (wrapper) {
     check()
     // Query the store before every use; only decryption of an immutable wrapper
@@ -65,9 +73,13 @@ export function createPersonalCopyRecoveryStorage ({ eventStore, signer, now = n
     return { ...decoded, wrapper }
   }
   async function * records (type, query = {}) {
-    const filter = await filterFor(type)
-    if (query.recordId) filter['&o'].push(await mirror('d', query.recordId))
-    else if (query.fileChannelPubkey && query.receiverPubkey) {
+    const exact = typeof query.recordId === 'string' || Array.isArray(query.recordIds)
+    const filter = exact ? await exactFilterFor(type) : await filterFor(type)
+    if (query.recordId) filter['#o'] = [await mirror('d', query.recordId)]
+    else if (Array.isArray(query.recordIds)) {
+      if (!query.recordIds.length) return
+      filter['#o'] = await Promise.all([...new Set(query.recordIds)].map(recordId => mirror('d', recordId)))
+    } else if (query.fileChannelPubkey && query.receiverPubkey) {
       const indices = type === 'seed' ? query.indices : [undefined]
       if (indices?.length) filter['#o'] = await Promise.all(indices.map(chunkIndex => mirror('s', selector(type, { ...query, chunkIndex }))))
     } else if (query.channelPubkey) {
@@ -92,24 +104,44 @@ export function createPersonalCopyRecoveryStorage ({ eventStore, signer, now = n
     }
   }
   function store (type) {
-    return {
-      async put (row) {
-        check()
+    async function putMany (rows) {
+      check()
+      if (!Array.isArray(rows)) throw new ValidationError('INVALID_RECOVERY_RECORDS')
+      const encoded = rows.map(row => {
+        if (row.expiresAt <= now()) return null
         const event = encodeRecord(type, row)
-        if (row.expiresAt <= now()) return
-        const recordId = event.tags[0][1]
-        const existing = records(type, { recordId, includeExpired: true })
-        try { const first = await existing.next(); if (!first.done) return first.value.row } finally { await existing.return() }
-        const saved = committed(await eventStore.addPersonalCopy(event, { context: '' }))
+        return { event, recordId: event.tags[0][1], row }
+      })
+      const unique = new Map(encoded.filter(Boolean).map(record => [record.recordId, record]))
+      const stored = new Map()
+      for (const recordIds of chunks([...unique.keys()])) {
+        for await (const { row } of records(type, { recordIds, includeExpired: true })) stored.set(row.recordId, row)
+      }
+      for (const [recordId, record] of unique) {
+        if (stored.has(recordId)) continue
+        const saved = committed(await eventStore.addPersonalCopy(record.event, { context: '' }))
         // A pending kind-5 tombstone can reject the insertion; do not cache it.
-        if (saved.result.stored === false && saved.result.code === 'blocked') return
-        return { ...row, recordId }
-      },
+        if (saved.result.stored === false && saved.result.code === 'blocked') stored.set(recordId, undefined)
+        else stored.set(recordId, { ...record.row, recordId })
+      }
+      return encoded.map(record => record ? stored.get(record.recordId) : undefined)
+    }
+    async function hasMany (rows) {
+      check()
+      if (!Array.isArray(rows)) throw new ValidationError('INVALID_RECOVERY_RECORDS')
+      const recordIds = rows.map(row => row.recordId || encodeRecord(type, row).tags[0][1])
+      const present = new Set()
+      for (const batch of chunks([...new Set(recordIds)])) {
+        for await (const { row } of records(type, { recordIds: batch, includeExpired: true })) present.add(row.recordId)
+      }
+      return recordIds.map(recordId => present.has(recordId))
+    }
+    return {
+      async put (row) { return (await putMany([row]))[0] },
+      putMany,
       async * iterate (query = {}) { for await (const { row } of records(type, query)) yield row },
-      async has (row) {
-        const iterator = records(type, { recordId: row.recordId || encodeRecord(type, row).tags[0][1] })
-        try { return !(await iterator.next()).done } finally { await iterator.return() }
-      },
+      async has (row) { return (await hasMany([row]))[0] },
+      hasMany,
       async removeLocal (query = {}) {
         for await (const { wrapper } of records(type, { ...query, includeExpired: true })) await eventStore.remove([['e', wrapper.id]])
       },

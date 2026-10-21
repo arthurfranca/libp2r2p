@@ -26,7 +26,7 @@ test('daily candidates include every crossed day and switch to literal wildcard 
   assert.deepEqual(encodeRecoveryRecord('seed', { ...seed, firstSeenAt: 0, lastSeenAt: 86400 * 32, expiresAt: 86400 * 50 }).tags.filter(t => t[0] === 'D'), [['D', '*']])
 })
 function fixture () {
-  const rows = new Map(), deleted = new Set(), calls = []
+  const rows = new Map(), deleted = new Set(), calls = [], queries = []
   const signer = { getPublicKey: async () => a, obfuscate: async (value, kind, scope) => `${scope}|${value}`, nip44v3: { decrypt: async (owner, kind, scope, text) => new TextEncoder().encode(text).buffer } }
   const eventStore = {
     async addPersonalCopy (event) {
@@ -43,12 +43,13 @@ function fixture () {
       return { event: wrapper, result: { ok: true, stored: true } }
     },
     async query (filter) {
+      queries.push(filter)
       const matches = [...rows.values()].filter(e => (filter.until === undefined || e.created_at <= filter.until) && !filter['!ids']?.includes(e.id) && Object.entries(filter).every(([key, values]) => !['#', '&'].includes(key[0]) || (key[0] === '#' ? values.some(v => e.tags.some(t => t[0] === key.slice(1) && t[1] === v)) : values.every(v => e.tags.some(t => t[0] === key.slice(1) && t[1] === v)))))
       return { results: matches.sort((x, y) => y.created_at - x.created_at || x.id.localeCompare(y.id)).slice(0, filter.limit) }
     },
     async remove (targets) { for (const [, id] of targets) rows.delete(id) }
   }
-  return { rows, calls, signer, eventStore }
+  return { rows, calls, queries, signer, eventStore }
 }
 test('paired adapters see new grants, deduplicate writes, revoke and reject replay', async () => {
   const f = fixture()
@@ -71,6 +72,37 @@ test('paged same-second seeds are all returned; day prefilter retains wildcard r
   const list = []; for await (const row of storage.seeds.iterate({ channelPubkey: a, receiverPubkey: c, since: 100, until: 200 })) list.push(row)
   assert.equal(list.length, 260)
   assert.equal(new Set(list.map(r => r.recordId)).size, 260)
+  storage.close()
+})
+
+test('batched recovery checks use OR mirrors and preserve immutable write results', async () => {
+  const f = fixture(), storage = createPersonalCopyRecoveryStorage({ ...f, now: () => 200 })
+  const rows = Array.from({ length: 205 }, (_, index) =>
+    ({ ...seed, payloadRow: JSON.stringify([`batched-${index}`]) }))
+
+  const inserted = await storage.seeds.putMany(rows)
+  assert.equal(inserted.length, rows.length)
+  assert.equal(f.calls.length, rows.length)
+  assert.equal(f.queries.length, 3)
+  assert.ok(f.queries.every(query => Array.isArray(query['#o']) && query['#o'].length <= 100))
+  assert.ok(f.queries.every(query => query['&o'].length === 1))
+  assert.ok(f.queries.every(query => !query['#k'] && !query['#c'] && !query['#v']))
+
+  const beforeWrites = f.calls.length
+  const repeated = await storage.seeds.putMany(rows)
+  assert.equal(f.calls.length, beforeWrites)
+  assert.equal(f.queries.length, 6)
+  assert.deepEqual(repeated.map(row => row.recordId), inserted.map(row => row.recordId))
+
+  const present = await storage.seeds.hasMany(rows)
+  assert.equal(f.queries.length, 9)
+  assert.equal(present.length, rows.length)
+  assert.ok(present.every(Boolean))
+
+  const duplicate = await storage.seeds.putMany([rows[0], rows[0]])
+  assert.equal(f.calls.length, beforeWrites)
+  assert.equal(duplicate[0].recordId, duplicate[1].recordId)
+  assert.equal((await storage.seeds.putMany([{ ...rows[0], expiresAt: 200 }]))[0], undefined)
   storage.close()
 })
 

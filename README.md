@@ -1264,3 +1264,9 @@ and range, plus report and relay classifications; arbitrary relay text is not
 logged. Native report causes remain available privately to recovery retry
 policy. Required publication coverage, first-ACK semantics and range recovery
 behavior are unchanged.
+
+The 0.11.29 event-store recovery adapter batches immutable seed existence checks
+and writes in groups of at most 100. Batched checks combine one recovery-type
+AND filter with coordinate OR filters, preserve input order and continue to
+decode and validate every returned snapshot. Custom adapters without batched
+methods retain the sequential fallback.

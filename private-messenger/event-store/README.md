@@ -18,10 +18,16 @@ without decrypting the archive; the store may also purge expired wrappers itself
 
 ## Contracts and ownership
 
-- Seeds: `put(record)`, `iterate(query)`, `has(record)`, `removeLocal(query)`,
-  `prune({ now })`, and `revoke(records)`.
+- Seeds: `put(record)`, `putMany(records)`, `iterate(query)`, `has(record)`,
+  `hasMany(records)`, `removeLocal(query)`, `prune({ now })`, and
+  `revoke(records)`.
 - Authorizations: the same operations plus `find(query)`, choosing the newest
   valid share, then the shorter expiry and lexicographically smaller record ID.
+- Batched methods preserve input order and process at most 100 coordinates per
+  query. Identical inputs share one immutable result; expired inputs return
+  `undefined` without a query or write. Batched checks use the recovery type
+  as an AND filter and the record coordinates as an OR filter, then still decode
+  and validate every returned snapshot.
 - `iterate` is an async generator. Queries can name `recordId`, `channelPubkey`,
   `receiverPubkey`, `since`/`until`, or the file tuple `controlChannelPubkey`,
   `fileChannelPubkey`, `receiverPubkey`, and `indices`. `signal` cancels reads.

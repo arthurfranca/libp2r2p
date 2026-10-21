@@ -1942,6 +1942,68 @@ test('missing-message asks without stored seeds do not send empty replies', asyn
   assert.equal(pm.sent.some(sent => sent.method === 'reply' && sent.options.code === MISSING_MESSAGES_REPLY_CODE), false)
 })
 
+test('event-store seed adapters batch writes and stored-answer checks', async () => {
+  const pm = fakePrivateMessage()
+  const now = Math.floor(Date.now() / 1000)
+  let stored = []
+  const writes = [], checks = []
+  const seedStorage = {
+    async putMany (rows) { writes.push(rows); stored = rows },
+    async put () { assert.fail('putMany should be preferred') },
+    async * iterate () { for (const row of stored) yield row },
+    async hasMany (rows) { checks.push(rows); return rows.map(() => true) },
+    async removeLocal () {},
+    async prune () {},
+    async revoke () {}
+  }
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    seedStorage
+  }).init({
+    userSigner: signer('seeder'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'], mode: 'seeder' }]
+  })
+  const userRow = JSON.stringify(['user', 'ciphertext'])
+  await messenger.enqueueSeed('channel', {
+    recordType: ROUTER_SEED_RECORD_TYPE,
+    channelPubkey: 'channel',
+    receiverPubkey: 'user',
+    router: {
+      kind: 26300,
+      pubkey: 'router',
+      created_at: now,
+      tags: [['f', 'alice'], ['c', '0', '1']],
+      content: jsonlContent(payloadRow(), userRow)
+    },
+    firstSeenAt: now,
+    lastSeenAt: now
+  })
+  assert.equal(writes.length, 1)
+  assert.equal(writes[0].length, 1)
+
+  await pm.watchCalls[0].onAsk({
+    event: {
+      id: 'question-id',
+      kind: ASK_KIND,
+      pubkey: 'user',
+      created_at: now,
+      tags: [['r', 'seeder'], ['h', MISSING_MESSAGES_ASK_CODE]],
+      content: JSON.stringify({ since: now - 5, until: now + 5 })
+    },
+    outer: { id: 'ask-outer-id', created_at: now },
+    meta: { channelPubkey: 'channel' },
+    payload: { code: MISSING_MESSAGES_ASK_CODE, payload: { since: now - 5, until: now + 5 } },
+    question: { id: 'question-id' }
+  })
+
+  assert.equal(checks.length, 1)
+  assert.equal(checks[0].length, 1)
+  const reply = pm.sent.find(sent => sent.method === 'reply' && sent.options.code === MISSING_MESSAGES_REPLY_CODE)
+  assert.equal(reply.options.payload.isLast, true)
+  assert.equal(reply.options.payload.jsonl.trim().split('\n').length, 1)
+  await messenger.close()
+})
+
 test('recovery asks online seeders for the relay-uncovered left edge', async () => {
   const pm = fakePrivateMessage()
   const fetches = []

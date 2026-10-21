@@ -106,6 +106,7 @@ export {
 
 const DEFAULT_OFFLINE_RECOVERY_SECONDS = 7 * 24 * 60 * 60
 const MAX_OFFLINE_RECOVERY_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1000)
+const RECOVERY_STORAGE_BATCH_SIZE = 100
 const STORAGE_POLICY_BROADCAST_CHANNEL = 'libp2r2p:private-messenger:storage-policy'
 const DEFAULT_OFFLINE_SKEW_SECONDS = 30
 const DEFAULT_RELOAD_GAP_DELAY_MS = 500
@@ -2148,9 +2149,13 @@ export class PrivateMessenger {
       const rows = seed.recordType === NYM_CARRIER_SEED_RECORD_TYPE || seed.carriers?.length
         ? [{ recordType: NYM_CARRIER_SEED_RECORD_TYPE, carriers: compactSeedNymCarriers(seed.carriers) }]
         : compactSeedRouterRows(seed)
-      for (const row of rows) {
+      const records = rows.map(row => {
         const time = seedRecordTime(row) || receivedAt
-        await this.seedStorage.put({ ...row, channelPubkey, receivedAt, expiresAt: time + this.offlineRecoverySecondsFor(channelPubkey) })
+        return { ...row, channelPubkey, receivedAt, expiresAt: time + this.offlineRecoverySecondsFor(channelPubkey) }
+      })
+      if (typeof this.seedStorage.putMany === 'function') await this.seedStorage.putMany(records)
+      else {
+        for (const row of records) await this.seedStorage.put(row)
       }
       return
     }
@@ -2799,6 +2804,16 @@ export class PrivateMessenger {
     if (this.offlineRecoverySecondsFor(channelPubkey)) {
       const seen = new Set()
       const key = seed => seed.router ? routerSeedRowKey(seed) : nymCarrierSeedKey(seed)
+      const sendStored = async seeds => {
+        let present
+        if (typeof this.seedStorage?.hasMany === 'function') present = await this.seedStorage.hasMany(seeds)
+        else {
+          present = []
+          for (const seed of seeds) present.push(await this.seedStorage.has(seed))
+        }
+        if (!Array.isArray(present) || present.length !== seeds.length) throw new ValidationError('INVALID_RECOVERY_STORAGE_RESULT')
+        for (let index = 0; index < seeds.length; index++) if (present[index]) await packer.update(seeds[index])
+      }
       const pending = this._pendingSeedRecords({ channelPubkey, receiverPubkey: message.event?.pubkey, since, until })
       for (const seed of pending) {
         if (seed.channelPubkey !== channelPubkey || (seed.receiverPubkey && seed.receiverPubkey !== message.event?.pubkey) || seed.expiresAt <= nowSeconds()) continue
@@ -2806,11 +2821,17 @@ export class PrivateMessenger {
         if (until !== undefined && (seed.firstSeenAt || seed.router.created_at) > until) continue
         seen.add(key(seed)); await packer.update(seed)
       }
+      const stored = []
       for await (const seed of this.seedStorage ? this.seedStorage.iterate({ channelPubkey, receiverPubkey: message.event?.pubkey, since, until }) : this.seedQueue.storedItemsBy('byChannel', channelPubkey)) {
         if (seen.has(key(seed)) || seedRecordTime(seed) < nowSeconds() - this.offlineRecoverySecondsFor(channelPubkey)) continue
-        if (this.seedStorage && !await this.seedStorage.has(seed)) continue
-        await packer.update(seed)
+        if (!this.seedStorage) {
+          await packer.update(seed)
+          continue
+        }
+        stored.push(seed)
+        if (stored.length === RECOVERY_STORAGE_BATCH_SIZE) await sendStored(stored.splice(0))
       }
+      if (stored.length) await sendStored(stored)
     }
     await packer.finalize()
   }
