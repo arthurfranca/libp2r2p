@@ -7,8 +7,19 @@ export { encodeRecord as encodeRecoveryRecord, decodeRecord as decodeRecoveryRec
 
 const nowSeconds = () => Math.floor(Date.now() / 1000)
 const RECOVERY_BATCH_SIZE = 100
+const mutationTails = new WeakMap()
 const chunks = values => Array.from({ length: Math.ceil(values.length / RECOVERY_BATCH_SIZE) }, (_, index) =>
   values.slice(index * RECOVERY_BATCH_SIZE, (index + 1) * RECOVERY_BATCH_SIZE))
+function serializeMutation (eventStore, operation) {
+  const previous = mutationTails.get(eventStore) ?? Promise.resolve()
+  const run = previous.catch(() => {}).then(operation)
+  const tail = run.catch(() => {})
+  mutationTails.set(eventStore, tail)
+  tail.then(() => {
+    if (mutationTails.get(eventStore) === tail) mutationTails.delete(eventStore)
+  })
+  return run
+}
 function assertOptions (eventStore, signer) {
   if (!eventStore?.query || !eventStore?.addPersonalCopy || !signer?.getPublicKey || !signer?.obfuscate || !signer?.nip44v3?.decrypt) throw new ValidationError('INVALID_EVENT_STORE_OPTIONS')
 }
@@ -103,8 +114,27 @@ export function createPersonalCopyRecoveryStorage ({ eventStore, signer, now = n
       yield { row, wrapper }
     }
   }
+  async function * existingRecordIds (type, values, { includeExpired = false } = {}) {
+    const ids = [...new Set(values)]
+    if (!ids.length) return
+    const filter = await exactFilterFor(type)
+    const mirrorsById = new Map(await Promise.all(ids.map(async recordId => [await mirror('d', recordId), recordId])))
+    filter['#o'] = [...mirrorsById.keys()]
+    for await (const wrapper of pages(eventStore, filter)) {
+      const expiry = Number(wrapper.tags?.find(tag => Array.isArray(tag) && tag[0] === 'expiration')?.[1])
+      if (!includeExpired && (!Number.isSafeInteger(expiry) || expiry <= now())) continue
+      for (const tag of wrapper.tags || []) {
+        if (!Array.isArray(tag) || tag[0] !== 'o') continue
+        const recordId = mirrorsById.get(tag[1])
+        if (recordId) yield recordId
+      }
+    }
+  }
   function store (type) {
     async function putMany (rows) {
+      return serializeMutation(eventStore, () => putManyNow(rows))
+    }
+    async function putManyNow (rows) {
       check()
       if (!Array.isArray(rows)) throw new ValidationError('INVALID_RECOVERY_RECORDS')
       const encoded = rows.map(row => {
@@ -115,11 +145,14 @@ export function createPersonalCopyRecoveryStorage ({ eventStore, signer, now = n
       const unique = new Map(encoded.filter(Boolean).map(record => [record.recordId, record]))
       const stored = new Map()
       for (const recordIds of chunks([...unique.keys()])) {
-        for await (const { row } of records(type, { recordIds, includeExpired: true })) stored.set(row.recordId, row)
+        for await (const recordId of existingRecordIds(type, recordIds, { includeExpired: true })) {
+          const record = unique.get(recordId)
+          if (record) stored.set(recordId, { ...record.row, recordId })
+        }
       }
       for (const [recordId, record] of unique) {
         if (stored.has(recordId)) continue
-        const saved = committed(await eventStore.addPersonalCopy(record.event, { context: '' }))
+        const saved = committed(await eventStore.addPersonalCopy(record.event, { context: '', recovery: true }))
         // A pending kind-5 tombstone can reject the insertion; do not cache it.
         if (saved.result.stored === false && saved.result.code === 'blocked') stored.set(recordId, undefined)
         else stored.set(recordId, { ...record.row, recordId })
@@ -132,7 +165,7 @@ export function createPersonalCopyRecoveryStorage ({ eventStore, signer, now = n
       const recordIds = rows.map(row => row.recordId || encodeRecord(type, row).tags[0][1])
       const present = new Set()
       for (const batch of chunks([...new Set(recordIds)])) {
-        for await (const { row } of records(type, { recordIds: batch })) present.add(row.recordId)
+        for await (const recordId of existingRecordIds(type, batch)) present.add(recordId)
       }
       return recordIds.map(recordId => present.has(recordId))
     }
@@ -154,20 +187,22 @@ export function createPersonalCopyRecoveryStorage ({ eventStore, signer, now = n
         }
       },
       async revoke (rows) {
-        check()
-        const [owner] = await ready()
-        for (let i = 0; i < rows.length; i += 100) {
-          const group = rows.slice(i, i + 100).filter(row => row.expiresAt > now())
-          if (!group.length) continue
-          const tags = []; let createdAt = now(), expiresAt = 0
-          for (const row of group) {
-            const recordId = row.recordId || encodeRecord(type, row).tags[0][1]
-            for await (const { wrapper } of records(type, { recordId })) createdAt = Math.max(createdAt, wrapper.created_at)
-            tags.push(['a', `30078:${owner}:${recordId}`]); expiresAt = Math.max(expiresAt, row.expiresAt)
+        return serializeMutation(eventStore, async () => {
+          check()
+          const [owner] = await ready()
+          for (let i = 0; i < rows.length; i += 100) {
+            const group = rows.slice(i, i + 100).filter(row => row.expiresAt > now())
+            if (!group.length) continue
+            const tags = []; let createdAt = now(), expiresAt = 0
+            for (const row of group) {
+              const recordId = row.recordId || encodeRecord(type, row).tags[0][1]
+              for await (const { wrapper } of records(type, { recordId })) createdAt = Math.max(createdAt, wrapper.created_at)
+              tags.push(['a', `30078:${owner}:${recordId}`]); expiresAt = Math.max(expiresAt, row.expiresAt)
+            }
+            if (expiresAt <= createdAt) continue
+            committed(await eventStore.addPersonalCopy({ kind: 5, created_at: createdAt, tags: [...tags, ['k', '30078'], ['expiration', String(expiresAt)]], content: '' }, { context: '', recovery: true }))
           }
-          if (expiresAt <= createdAt) continue
-          committed(await eventStore.addPersonalCopy({ kind: 5, created_at: createdAt, tags: [...tags, ['k', '30078'], ['expiration', String(expiresAt)]], content: '' }, { context: '' }))
-        }
+        })
       }
     }
   }

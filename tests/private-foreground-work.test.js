@@ -36,3 +36,26 @@ test('foreground activity observation tracks overlapping work and supports unsub
   release(); release(); other(); stop(); gate.enter(); gate.close()
   assert.deepEqual(states, [false, true, true, true, false])
 })
+
+test('foreground bounded waits yield at quiet time or after their deadline', async () => {
+  const gate = createForegroundWork()
+  const release = gate.enter()
+  const idle = gate.waitUntilIdle({ maxWaitMs: 1000 })
+  release()
+  assert.equal(await idle, true)
+
+  const held = gate.enter()
+  const started = performance.now()
+  assert.equal(await gate.waitUntilIdle({ maxWaitMs: 20 }), false)
+  assert.ok(performance.now() - started >= 15)
+  held()
+
+  const abort = new AbortController()
+  const blocker = gate.enter()
+  const waiting = gate.waitUntilIdle({ signal: abort.signal })
+  abort.abort(new DOMException('cancelled', 'AbortError'))
+  await assert.rejects(waiting, { name: 'AbortError' })
+  blocker()
+  assert.equal(await gate.waitUntilIdle(), true)
+  gate.close()
+})

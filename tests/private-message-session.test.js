@@ -67,6 +67,60 @@ test('session can disable content-key lookup', async t => {
   assert.equal(f.messengerOptions().useContentKeys, false)
 })
 
+test('recovery archive waits for active foreground persistence', async t => {
+  const localStarted = Promise.withResolvers()
+  const releaseLocal = Promise.withResolvers()
+  const archived = Promise.withResolvers()
+  let archiveCalled = false
+  const content = Buffer.from(`${JSON.stringify(['payload'])}\n${JSON.stringify([peer, 'ciphertext'])}\n`).toString('base64')
+  const seed = {
+    channelPubkey: peer,
+    publication: {
+      channelPubkey: peer,
+      events: [{ id: 'publication-id' }],
+      seeds: [{
+        channelPubkey: peer,
+        router: {
+          kind: 26300,
+          pubkey: 'c'.repeat(64),
+          created_at: 10,
+          tags: [['f', owner], ['c', '0', '1']],
+          content
+        },
+        innerEventIdsByRowIndex: { 1: getEventHash(event) }
+      }]
+    },
+    target: {},
+    retentionSeconds: 60
+  }
+  const recoveryStorage = {
+    seeds: {
+      async putMany (rows) { archiveCalled = true; archived.resolve(rows) },
+      async hasMany (rows) { return rows.map(() => false) },
+      async has () { return false },
+      async * iterate () {}
+    },
+    authorizations: { async * iterate () {} }
+  }
+  const f = await fixture(t, {
+    save: async () => { localStarted.resolve(); await releaseLocal.promise; return { result: { ok: true } } },
+    publish: async options => {
+      await options.onPreparedSeed(seed)
+      return { delivery: { reports: [{ success: true }] } }
+    },
+    recoveryStorage
+  })
+  f.messenger().offlineRecoverySecondsFor = () => 60
+
+  await f.session.enqueue({ peer, event })
+  await localStarted.promise
+  await new Promise(resolve => setTimeout(resolve, 30))
+  assert.equal(archiveCalled, false)
+  releaseLocal.resolve()
+  const rows = await archived.promise
+  assert.equal(rows.length, 1)
+})
+
 test('session prefetches content keys for the owner and current peers', async t => {
   const calls = []
   const proof = { iykcPubkey: 'c'.repeat(64), iykcProof: `${1}:${'a'.repeat(128)}` }

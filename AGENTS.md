@@ -124,6 +124,12 @@ suite pass; report independently scoped problems separately.
   while router retries re-read the winner and merge first/last-seen timestamps.
   Other storage errors propagate, and external `seedStorage` adapters remain
   outside the local queue tail.
+- Recovery storage mutations share one tail per event store. Existence checks
+  use the immutable wrapper record ID mirrors without decrypting snapshots;
+  `iterate`, `find` and other readers that need rows still decrypt normally.
+  Session archival waits for foreground quiet for at most five seconds before
+  executing one recovery batch, then re-evaluates. The journal and pending rows
+  remain durable while archival is delayed.
 
 - Rumors preserve an explicit author distinct from the transport sender. Keep
   `senderPubkey` and `provenance` outside the event through live and recovery
@@ -372,9 +378,10 @@ NIP-46 against the real pool with controlled transport and injected controls.
   a waiting presence must release its admission and foreground observer.
   `onPreparedSeed` receives the signed publication and existing router/jsonl
   data. Direct messengers persist seeds; sessions commit the encrypted outbox
-  checkpoint, then archive independently. Pending rows participate in recovery
-  reads. Replay the same signed fragments and bind them to the inner event,
-  channel and recipients. Never remove an entry before archival and its writes.
+  checkpoint, then archive independently after the bounded foreground window.
+  Pending rows participate in recovery reads. Replay the same signed fragments
+  and bind them to the inner event, channel and recipients. Never remove an entry
+  before archival and its writes.
 - Sessions separate account generations from peer revisions and create one
   messenger. Prepare at most four peers, at most three without foreground demand;
   `preparePeer` prioritizes navigation/send/download. Deduplicate signer work,

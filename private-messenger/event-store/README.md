@@ -27,8 +27,13 @@ without decrypting the archive; the store may also purge expired wrappers itself
   query. Identical inputs share one immutable result. `putMany` returns
   `undefined` for an expired input without querying or writing; `hasMany` returns
   `false` for expired snapshots. Batched checks use the recovery type as an AND
-  filter and the record coordinates as an OR filter, then still decode and
-  validate every returned snapshot.
+  filter and the record coordinates as an OR filter. Existence checks compare the
+  immutable wrapper `o` mirrors to the requested record IDs and do not decrypt or
+  decode snapshots. Duplicate `putMany` inputs return their supplied immutable row.
+- Mutating recovery stores share one operation tail per event store, so seed and
+  grant writes cannot overlap for the same store. Writes pass the internal
+  `recovery: true` scheduling hint to `addPersonalCopy`; row-returning reads keep
+  normal decrypt-and-validate behavior.
 - `iterate` is an async generator. Queries can name `recordId`, `channelPubkey`,
   `receiverPubkey`, `since`/`until`, or the file tuple `controlChannelPubkey`,
   `fileChannelPubkey`, `receiverPubkey`, and `indices`. `signal` cancels reads.

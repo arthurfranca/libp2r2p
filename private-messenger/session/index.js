@@ -28,6 +28,7 @@ const unavailableSend = /PRIVATE_MESSENGER_PAUSED|CHAT_UNAVAILABLE|MESSENGER_UNA
 const isUnavailableSend = error => unavailableSend.test(`${error?.code || ''} ${error?.message || ''}`)
 const SEND_RETRY_MIN_MS = 1000
 const SEND_RETRY_MAX_MS = 30000
+const ARCHIVE_FOREGROUND_WAIT_MS = 5000
 // A paused or unavailable messenger must keep the outbox entry retryable
 // instead of surfacing a send failure the user has to retry by hand.
 const unavailableError = (error, signal) => Object.assign(new Error(error?.message || 'CHAT_UNAVAILABLE'), {
@@ -59,7 +60,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     onError(error)
   }
   const userSigner = messengerSigner(signer)
-  const foreground = createForegroundWork()
+  const foreground = createForegroundWork({ setTimer: _setTimeout, clearTimer: _clearTimeout })
   messageStorage ||= createEventStoreMessageStorage({ eventStore })
   chunkStorage ||= eventStore ? createEventStoreChunkStorage({ eventStore }) : undefined
   const peers = new Set()
@@ -165,6 +166,16 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const journal = createPublicationJournal({
     entries, store: () => storage, onError: reportError, debug, setTimer: _setTimeout, clearTimer: _clearTimeout, random: _random,
     archive: async (entry, rows) => {
+      const waitedAt = Date.now()
+      let idle
+      try {
+        idle = await foreground.waitUntilIdle({ maxWaitMs: ARCHIVE_FOREGROUND_WAIT_MS })
+      } catch (error) {
+        if (closed) return
+        throw error
+      }
+      if (closed) return
+      debug(entry, 'recovery-archive-window', waitedAt, { foregroundIdle: idle, rowCount: rows.length })
       if (recoveryStorage?.seeds) {
         if (typeof recoveryStorage.seeds.putMany === 'function') await recoveryStorage.seeds.putMany(rows)
         else for (const row of rows) await recoveryStorage.seeds.put(row)

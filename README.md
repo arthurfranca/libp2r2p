@@ -1290,3 +1290,8 @@ within one PrivateMessenger. Duplicate `bySeedKey` races retry up to five times:
 NYM rows remain idempotent and router rows re-read the winning timestamps before
 replacement. External event-store seed adapters retain their independent batched
 writes.
+
+The 0.11.33 recovery adapter checks immutable wrapper mirrors without decrypting
+snapshots and serializes recovery mutations per event store. Session archives
+wait for foreground quiet for up to five seconds, execute one batch, then
+re-evaluate so pending recovery cannot monopolize local persistence.

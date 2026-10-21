@@ -130,6 +130,8 @@ reevaluate a local failure without clearing another owner's storage pause.
 
 `enqueue({ peer, event, context, requiredFiles, deletion })` preserves prepared
 identities. Local message commits and remote stages have independent checkpoints.
+Recovery archival waits up to five seconds for foreground work, then runs one
+durable batch and re-evaluates; postponement never drops packet rows.
 It sends original/thumbnail chunks before announcements, yields for small messages,
 and never interprets relay rejection text as signer permission denial. Inbox ACK
 follows durable storage; failed storage nacks and pauses ingestion. Hearsay cannot

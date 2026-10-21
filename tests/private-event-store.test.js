@@ -26,11 +26,13 @@ test('daily candidates include every crossed day and switch to literal wildcard 
   assert.deepEqual(encodeRecoveryRecord('seed', { ...seed, firstSeenAt: 0, lastSeenAt: 86400 * 32, expiresAt: 86400 * 50 }).tags.filter(t => t[0] === 'D'), [['D', '*']])
 })
 function fixture () {
-  const rows = new Map(), deleted = new Set(), calls = [], queries = []
-  const signer = { getPublicKey: async () => a, obfuscate: async (value, kind, scope) => `${scope}|${value}`, nip44v3: { decrypt: async (owner, kind, scope, text) => new TextEncoder().encode(text).buffer } }
+  const rows = new Map(), deleted = new Set(), calls = [], queries = [], writes = []
+  let decryptCalls = 0
+  const signer = { getPublicKey: async () => a, obfuscate: async (value, kind, scope) => `${scope}|${value}`, nip44v3: { decrypt: async (owner, kind, scope, text) => { decryptCalls++; return new TextEncoder().encode(text).buffer } } }
   const eventStore = {
-    async addPersonalCopy (event) {
+    async addPersonalCopy (event, options) {
       calls.push(event)
+      writes.push(options)
       if (event.kind === 5) {
         for (const tag of event.tags.filter(t => t[0] === 'a')) { const key = tag[1].slice(`30078:${a}:`.length); deleted.add(key); rows.delete(key) }
         return { result: { ok: true } }
@@ -49,7 +51,7 @@ function fixture () {
     },
     async remove (targets) { for (const [, id] of targets) rows.delete(id) }
   }
-  return { rows, calls, queries, signer, eventStore }
+  return { rows, calls, queries, writes, signer, eventStore, decryptCalls: () => decryptCalls }
 }
 test('paired adapters see new grants, deduplicate writes, revoke and reject replay', async () => {
   const f = fixture()
@@ -106,6 +108,32 @@ test('batched recovery checks use OR mirrors and preserve immutable write result
   const expired = createPersonalCopyRecoveryStorage({ ...f, now: () => seed.expiresAt })
   assert.deepEqual(await expired.seeds.hasMany(rows.slice(0, 3)), [false, false, false])
   expired.close()
+  storage.close()
+})
+
+test('existence checks avoid decrypting immutable wrappers and serialize shared-store writes', async () => {
+  const f = fixture(), storage = createPersonalCopyRecoveryStorage({ ...f, now: () => 200 })
+  await storage.seeds.put(seed)
+  assert.equal(f.decryptCalls(), 0)
+  assert.equal(f.writes[0].recovery, true)
+  const before = f.decryptCalls()
+  assert.deepEqual(await storage.seeds.hasMany([seed]), [true])
+  const repeated = await storage.seeds.putMany([seed])
+  assert.equal(f.decryptCalls(), before)
+  assert.equal(repeated[0].recordId, encodeRecoveryRecord('seed', seed).tags[0][1])
+
+  let active = 0, peak = 0
+  const addPersonalCopy = f.eventStore.addPersonalCopy
+  f.eventStore.addPersonalCopy = async (...args) => {
+    active++; peak = Math.max(peak, active)
+    await new Promise(resolve => setImmediate(resolve))
+    try { return await addPersonalCopy(...args) } finally { active-- }
+  }
+  await Promise.all([
+    storage.seeds.putMany([{ ...seed, payloadRow: '["one"]' }]),
+    storage.seeds.putMany([{ ...seed, payloadRow: '["two"]' }])
+  ])
+  assert.equal(peak, 1)
   storage.close()
 })
 
