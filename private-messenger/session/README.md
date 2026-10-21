@@ -270,6 +270,10 @@ event/peer identifiers and elapsed milliseconds for admission, local processing,
 channel preparation, publication acceptance and cleanup. Callback failures never
 change delivery. Connect only in development; never log events or crypto buffers.
 Custom outbox factories also receive this optional callback for storage timings.
+Recovery archive completion also reports `publicationId`, one aggregate
+`recovery-archive-result` per `putMany`, and sanitized row/unique/existing/
+inserted/blocked/expired/stored/skipped counts. A single-row batch may include
+its opaque `seedRecordId`.
 
 ## Durable prepared publications
 

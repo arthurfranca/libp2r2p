@@ -212,6 +212,12 @@ NIP-46 against the real pool with controlled transport and injected controls.
   submit each publication's rows through one `putMany` call. `withPendingSeeds`
   merges pending rows into both `has` and `hasMany`, preserving input order and
   duplicates; expired rows are not present.
+- Recovery paged reads pass the internal `recovery: true` hint so launchers may
+  admit them as background; the hint may only lower priority and old launchers
+  remain compatible. Development diagnostics report one sanitized
+  `recovery-archive-result` per `putMany`, correlating publication ID and
+  row/unique/existing/inserted/blocked/expired/stored/skipped counts without
+  ciphertext or record payloads.
 - Day candidates use D and literal '*', then exact snapshot overlap. Do not filter
   wrapper created_at as if it were the recovery time. No cross-snapshot hull merge.
 - Keep sync transport seeds out of the event store being synchronized. Never

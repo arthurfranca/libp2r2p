@@ -127,15 +127,32 @@ test('an archive failure preserves confirmation and retry never republishes the 
 
 test('the session archives each publication through one batched seed write', async t => {
   const writes = []
+  const diagnostics = []
   const f = await fixture(t, {
-    putMany: async rows => { writes.push(rows) },
-    archive: async () => assert.fail('serial put should be used only as fallback')
+    putMany: async rows => {
+      writes.push(rows)
+      return rows
+    },
+    archive: async () => assert.fail('serial put should be used only as fallback'),
+    onDebug: entry => diagnostics.push(entry)
   })
   const id = await f.session.enqueue({ peer, event: text('batched archive') })
   await until(() => !f.rows.has(id))
   assert.equal(writes.length, 1)
   assert.equal(writes[0].length, 1)
   assert.equal(writes[0][0].channelPubkey, peer)
+  const result = diagnostics.filter(entry => entry.stage === 'recovery-archive-result')
+  assert.equal(result.length, 1)
+  assert.equal(result[0].publicationId, '1'.padStart(64, '0'))
+  assert.equal(result[0].seedRecordId, writes[0][0].recordId)
+  assert.deepEqual({
+    rowCount: result[0].rowCount,
+    uniqueCount: result[0].uniqueCount,
+    storedCount: result[0].storedCount,
+    skippedCount: result[0].skippedCount
+  }, { rowCount: 1, uniqueCount: 1, storedCount: 1, skippedCount: 0 })
+  assert.equal('content' in result[0], false)
+  assert.equal('event' in result[0], false)
 })
 
 test('cancel after transmission retains recovery until archival finishes without publishing again', async t => {

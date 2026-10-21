@@ -26,7 +26,7 @@ test('daily candidates include every crossed day and switch to literal wildcard 
   assert.deepEqual(encodeRecoveryRecord('seed', { ...seed, firstSeenAt: 0, lastSeenAt: 86400 * 32, expiresAt: 86400 * 50 }).tags.filter(t => t[0] === 'D'), [['D', '*']])
 })
 function fixture () {
-  const rows = new Map(), deleted = new Set(), calls = [], queries = [], writes = []
+  const rows = new Map(), deleted = new Set(), calls = [], queries = [], queryOptions = [], writes = []
   let decryptCalls = 0
   const signer = { getPublicKey: async () => a, obfuscate: async (value, kind, scope) => `${scope}|${value}`, nip44v3: { decrypt: async (owner, kind, scope, text) => { decryptCalls++; return new TextEncoder().encode(text).buffer } } }
   const eventStore = {
@@ -44,14 +44,15 @@ function fixture () {
       rows.set(key, wrapper)
       return { event: wrapper, result: { ok: true, stored: true } }
     },
-    async query (filter) {
+    async query (filter, options) {
       queries.push(filter)
+      queryOptions.push(options)
       const matches = [...rows.values()].filter(e => (filter.until === undefined || e.created_at <= filter.until) && !filter['!ids']?.includes(e.id) && Object.entries(filter).every(([key, values]) => !['#', '&'].includes(key[0]) || (key[0] === '#' ? values.some(v => e.tags.some(t => t[0] === key.slice(1) && t[1] === v)) : values.every(v => e.tags.some(t => t[0] === key.slice(1) && t[1] === v)))))
       return { results: matches.sort((x, y) => y.created_at - x.created_at || x.id.localeCompare(y.id)).slice(0, filter.limit) }
     },
     async remove (targets) { for (const [, id] of targets) rows.delete(id) }
   }
-  return { rows, calls, queries, writes, signer, eventStore, decryptCalls: () => decryptCalls }
+  return { rows, calls, queries, queryOptions, writes, signer, eventStore, decryptCalls: () => decryptCalls }
 }
 test('paired adapters see new grants, deduplicate writes, revoke and reject replay', async () => {
   const f = fixture()
@@ -81,20 +82,32 @@ test('batched recovery checks use OR mirrors and preserve immutable write result
   const f = fixture(), storage = createPersonalCopyRecoveryStorage({ ...f, now: () => 200 })
   const rows = Array.from({ length: 205 }, (_, index) =>
     ({ ...seed, payloadRow: JSON.stringify([`batched-${index}`]) }))
+  const diagnostics = []
 
-  const inserted = await storage.seeds.putMany(rows)
+  const inserted = await storage.seeds.putMany(rows, { onDiagnostic: value => diagnostics.push(value) })
   assert.equal(inserted.length, rows.length)
   assert.equal(f.calls.length, rows.length)
   assert.equal(f.queries.length, 3)
   assert.ok(f.queries.every(query => Array.isArray(query['#o']) && query['#o'].length <= 100))
   assert.ok(f.queries.every(query => query['&o'].length === 1))
   assert.ok(f.queries.every(query => !query['#k'] && !query['#c'] && !query['#v']))
+  assert.ok(f.queryOptions.every(options => options?.recovery === true))
+  assert.deepEqual({
+    rowCount: diagnostics[0].rowCount,
+    uniqueCount: diagnostics[0].uniqueCount,
+    existingCount: diagnostics[0].existingCount,
+    insertedCount: diagnostics[0].insertedCount,
+    skippedCount: diagnostics[0].skippedCount
+  }, { rowCount: 205, uniqueCount: 205, existingCount: 0, insertedCount: 205, skippedCount: 0 })
 
   const beforeWrites = f.calls.length
-  const repeated = await storage.seeds.putMany(rows)
+  const repeated = await storage.seeds.putMany(rows, { onDiagnostic: value => diagnostics.push(value) })
   assert.equal(f.calls.length, beforeWrites)
   assert.equal(f.queries.length, 6)
   assert.deepEqual(repeated.map(row => row.recordId), inserted.map(row => row.recordId))
+  assert.equal(diagnostics[1].existingCount, 205)
+  assert.equal(diagnostics[1].insertedCount, 0)
+  assert.equal(diagnostics[1].skippedCount, 205)
 
   const present = await storage.seeds.hasMany(rows)
   assert.equal(f.queries.length, 9)

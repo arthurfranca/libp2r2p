@@ -30,10 +30,18 @@ without decrypting the archive; the store may also purge expired wrappers itself
   filter and the record coordinates as an OR filter. Existence checks compare the
   immutable wrapper `o` mirrors to the requested record IDs and do not decrypt or
   decode snapshots. Duplicate `putMany` inputs return their supplied immutable row.
+- Recovery pages pass the optional internal `{ recovery: true }` query hint.
+  Launchers may use it to admit the readonly transaction as background without
+  granting an app elevated priority. Stores that do not recognize the hint keep
+  the previous query behavior.
+- `putMany(rows, { onDiagnostic })` accepts an optional development callback. One
+  sanitized report identifies row, unique, existing, inserted, blocked, expired,
+  stored and skipped counts after each batch. It never includes ciphertext,
+  decoded rows, record payloads or signer material.
 - Mutating recovery stores share one operation tail per event store, so seed and
-  grant writes cannot overlap for the same store. Writes pass the internal
-  `recovery: true` scheduling hint to `addPersonalCopy`; row-returning reads keep
-  normal decrypt-and-validate behavior.
+  grant writes cannot overlap for the same store. Writes and paged reads pass the
+  internal `recovery: true` scheduling hint to the corresponding event-store
+  methods; row-returning reads keep normal decrypt-and-validate behavior.
 - `iterate` is an async generator. Queries can name `recordId`, `channelPubkey`,
   `receiverPubkey`, `since`/`until`, or the file tuple `controlChannelPubkey`,
   `fileChannelPubkey`, `receiverPubkey`, and `indices`. `signal` cancels reads.

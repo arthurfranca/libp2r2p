@@ -175,14 +175,39 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         throw error
       }
       if (closed) return
+      const archiveStartedAt = Date.now()
       debug(entry, 'recovery-archive-window', waitedAt, { foregroundIdle: idle, rowCount: rows.length })
+      let archived
+      let diagnosticReported = false
+      const onDiagnostic = details => {
+        diagnosticReported = true
+        debug(entry, 'recovery-archive-result', archiveStartedAt, {
+          publicationId: entry.prepared.publication.events[0].id,
+          ...details
+        })
+      }
       if (recoveryStorage?.seeds) {
-        if (typeof recoveryStorage.seeds.putMany === 'function') await recoveryStorage.seeds.putMany(rows)
-        else for (const row of rows) await recoveryStorage.seeds.put(row)
+        if (typeof recoveryStorage.seeds.putMany === 'function') archived = await recoveryStorage.seeds.putMany(rows, { onDiagnostic })
+        else {
+          archived = []
+          for (const row of rows) archived.push(await recoveryStorage.seeds.put(row))
+        }
       } else if (entry.prepared.target.file) {
         for (const seed of entry.prepared.publication.seeds) await fileTransfers.archiveSeed(entry.prepared.target.file, seed)
       } else {
         for (const seed of entry.prepared.publication.seeds) await messenger.enqueueSeed(seed.channelPubkey, seed)
+      }
+      if (!diagnosticReported) {
+        const results = Array.isArray(archived) ? archived : []
+        const storedCount = results.filter(Boolean).length
+        debug(entry, 'recovery-archive-result', archiveStartedAt, {
+          publicationId: entry.prepared.publication.events[0].id,
+          rowCount: rows.length,
+          uniqueCount: new Set(rows.map(row => row.recordId).filter(Boolean)).size,
+          storedCount,
+          skippedCount: results.length ? results.length - storedCount : undefined,
+          ...(rows.length === 1 && rows[0].recordId ? { seedRecordId: rows[0].recordId } : {})
+        })
       }
     },
     changed: entry => {

@@ -1295,3 +1295,9 @@ The 0.11.33 recovery adapter checks immutable wrapper mirrors without decrypting
 snapshots and serializes recovery mutations per event store. Session archives
 wait for foreground quiet for up to five seconds, execute one batch, then
 re-evaluate so pending recovery cannot monopolize local persistence.
+
+The 0.11.34 recovery adapter marks paged event-store reads with the internal
+`recovery: true` hint so a compatible launcher can prioritize foreground writes
+over new background read transactions. `putMany` also accepts an optional
+development diagnostic callback with aggregate existing/inserted/skipped counts;
+it never exposes ciphertext or record payloads.

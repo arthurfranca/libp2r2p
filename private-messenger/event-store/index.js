@@ -7,6 +7,7 @@ export { encodeRecord as encodeRecoveryRecord, decodeRecord as decodeRecoveryRec
 
 const nowSeconds = () => Math.floor(Date.now() / 1000)
 const RECOVERY_BATCH_SIZE = 100
+const RECOVERY_QUERY_OPTIONS = Object.freeze({ recovery: true })
 const mutationTails = new WeakMap()
 const chunks = values => Array.from({ length: Math.ceil(values.length / RECOVERY_BATCH_SIZE) }, (_, index) =>
   values.slice(index * RECOVERY_BATCH_SIZE, (index + 1) * RECOVERY_BATCH_SIZE))
@@ -32,7 +33,10 @@ async function * pages (eventStore, filter, signal) {
   let until = filter.until, excluded = []
   while (true) {
     signal?.throwIfAborted()
-    const { results } = await eventStore.query({ ...filter, ...(until === undefined ? {} : { until }), ...(excluded.length ? { '!ids': excluded } : {}), limit: 128, search: 'sort:desc' })
+    const { results } = await eventStore.query(
+      { ...filter, ...(until === undefined ? {} : { until }), ...(excluded.length ? { '!ids': excluded } : {}), limit: 128, search: 'sort:desc' },
+      RECOVERY_QUERY_OPTIONS
+    )
     if (!results.length) return
     for (const event of results) { signal?.throwIfAborted(); yield event }
     const boundary = results.at(-1).created_at
@@ -131,10 +135,10 @@ export function createPersonalCopyRecoveryStorage ({ eventStore, signer, now = n
     }
   }
   function store (type) {
-    async function putMany (rows) {
-      return serializeMutation(eventStore, () => putManyNow(rows))
+    async function putMany (rows, options = {}) {
+      return serializeMutation(eventStore, () => putManyNow(rows, options))
     }
-    async function putManyNow (rows) {
+    async function putManyNow (rows, { onDiagnostic } = {}) {
       check()
       if (!Array.isArray(rows)) throw new ValidationError('INVALID_RECOVERY_RECORDS')
       const encoded = rows.map(row => {
@@ -150,13 +154,35 @@ export function createPersonalCopyRecoveryStorage ({ eventStore, signer, now = n
           if (record) stored.set(recordId, { ...record.row, recordId })
         }
       }
+      const existingCount = stored.size
+      let insertedCount = 0
+      let blockedCount = 0
       for (const [recordId, record] of unique) {
         if (stored.has(recordId)) continue
         const saved = committed(await eventStore.addPersonalCopy(record.event, { context: '', recovery: true }))
         // A pending kind-5 tombstone can reject the insertion; do not cache it.
-        if (saved.result.stored === false && saved.result.code === 'blocked') stored.set(recordId, undefined)
-        else stored.set(recordId, { ...record.row, recordId })
+        if (saved.result.stored === false && saved.result.code === 'blocked') {
+          stored.set(recordId, undefined)
+          blockedCount++
+        } else {
+          stored.set(recordId, { ...record.row, recordId })
+          insertedCount++
+        }
       }
+      const expiredCount = encoded.filter(record => record === null).length
+      try {
+        onDiagnostic?.({
+          type,
+          rowCount: rows.length,
+          uniqueCount: unique.size,
+          existingCount,
+          insertedCount,
+          blockedCount,
+          expiredCount,
+          storedCount: existingCount + insertedCount,
+          skippedCount: existingCount + blockedCount + expiredCount
+        })
+      } catch {}
       return encoded.map(record => record ? stored.get(record.recordId) : undefined)
     }
     async function hasMany (rows) {
