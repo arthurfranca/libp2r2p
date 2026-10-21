@@ -2,7 +2,7 @@ import { isReplaceableRelayFailure } from '../../relay/helpers/failure.js'
 
 // Each invocation owns one already signed outer event and its encrypted subset.
 // Lanes share coverage and the tried set; only started reports outlive the race.
-export function publishWithEarlyFallback ({ event, receivers, first, mirrors, tried, nextPrimary, nextFallback, sendEvent, isOnline, isCurrent, signal, pauseSignal, remember, delay, attemptStartedAt, monotonicNow = () => performance.now(), now, setTimer, clearTimer }) {
+export function publishWithEarlyFallback ({ event, receivers, first, mirrors, tried, nextPrimary, nextFallback, sendEvent, isOnline, isCurrent, signal, pauseSignal, remember, rememberSuccess = () => {}, delay, attemptStartedAt, monotonicNow = () => performance.now(), now, setTimer, clearTimer }) {
   const pending = new Set(receivers)
   const summaries = []
   const transportSignal = signal && pauseSignal ? AbortSignal.any([signal, pauseSignal]) : signal || pauseSignal
@@ -65,6 +65,7 @@ export function publishWithEarlyFallback ({ event, receivers, first, mirrors, tr
     const settled = Promise.resolve(result.promise).catch(reason => ({ fulfilled: 0, errors: [{ reason }] }))
     slot.resolve(settled)
     settled.then(async report => {
+      rememberSuccess(report.succeededRelays || [])
       const failed = (report.errors || []).filter(item => isReplaceableRelayFailure(item.reason))
       // Late redundant failures can inform later sends after this race wins.
       if (failed.length && (result.success || (done && !pending.size)) && !transportSignal?.aborted && isCurrent()) {

@@ -487,6 +487,32 @@ test('private messenger watches channels and queues received leecher rumors', as
   assert.deepEqual(raw.payload, ['raw-payload', 'not-a-private-message-code'])
 })
 
+test('an open publication circuit rejects asks before envelope preparation', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm, _now: () => 1000 }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  messenger.publicationRelayHealth.recordFailure(
+    'wss://relay.example',
+    Object.assign(new Error('banned: policy'), { category: 'relay' }),
+    1000
+  )
+  assert.equal(messenger.publicationRelayHealth.isExcluded('wss://relay.example'), true)
+  await assert.rejects(messenger.resolveSendRouting({
+    channel: messenger.channels.get('channel'),
+    receiverPubkeys: ['seeder']
+  }), { code: 'RELAY_CIRCUIT_OPEN' })
+
+  await assert.rejects(messenger.ask({
+    channelPubkey: 'channel',
+    receiverPubkey: 'seeder',
+    code: MISSING_MESSAGES_ASK_CODE,
+    payload: { since: 1, until: 1 }
+  }), { code: 'RELAY_CIRCUIT_OPEN', retryAt: 301000 })
+  assert.equal(pm.sent.length, 0)
+})
+
 test('private messenger validates and applies offline recovery defaults and channel overrides', async () => {
   for (const invalid of [-1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER]) {
     assert.throws(
@@ -3365,7 +3391,6 @@ test('nym recipient maps derive fallback coverage without a separate receiverPub
   await messenger.broadcastNymRumor({ relayToReceivers, rumor: { kind: 9, created_at: 1, tags: [], content: 'nym group' } })
   assert.equal(pm.sent[0].options.relayToReceivers, relayToReceivers)
   assert.equal(typeof pm.sent[0].options._publish, 'function')
-  assert.ok(messenger.sendRelayExclusions.has('channel:alice,bob'))
 })
 
 test('paged recovery persists partial deliveries but retains the whole interval across restart', async t => {

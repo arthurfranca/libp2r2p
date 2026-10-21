@@ -7,6 +7,7 @@ import {
   sanitizePublicationError
 } from '../private-messenger/helpers/publication.js'
 import { recoveryRetryDelay } from '../private-messenger/helpers/recovery-retry.js'
+import { relayCircuitError } from '../private-messenger/helpers/send-routing.js'
 
 test('publication failures retain classified reports without logging arbitrary relay text', async t => {
   t.mock.method(Date, 'now', () => 1000)
@@ -105,4 +106,21 @@ test('publication diagnostics classify permanent and interrupted recovery report
     reason: 'NO_DELIVERY_REPORTS',
     reports: []
   })], 1000), null)
+
+  const circuit = sanitizePublicationError(relayCircuitError(9000), {
+    operation: 'seeder-recovery-ask',
+    channelPubkey: 'channel',
+    seederPubkey: 'seeder'
+  })
+  assert.equal(recoveryRetryDelay([circuit], 1000), 8000)
+  assert.deepEqual(publicationFailureDiagnostic(circuit), {
+    operation: 'seeder-recovery-ask',
+    channelPubkey: 'channel',
+    seederPubkey: 'seeder',
+    code: 'RELAY_CIRCUIT_OPEN',
+    category: 'timeout',
+    retryAt: 9000,
+    retryWhenAvailable: true,
+    reports: []
+  })
 })

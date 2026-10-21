@@ -103,6 +103,9 @@ test('batched recovery checks use OR mirrors and preserve immutable write result
   assert.equal(f.calls.length, beforeWrites)
   assert.equal(duplicate[0].recordId, duplicate[1].recordId)
   assert.equal((await storage.seeds.putMany([{ ...rows[0], expiresAt: 200 }]))[0], undefined)
+  const expired = createPersonalCopyRecoveryStorage({ ...f, now: () => seed.expiresAt })
+  assert.deepEqual(await expired.seeds.hasMany(rows.slice(0, 3)), [false, false, false])
+  expired.close()
   storage.close()
 })
 

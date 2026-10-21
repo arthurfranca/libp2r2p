@@ -132,7 +132,7 @@ export function createPersonalCopyRecoveryStorage ({ eventStore, signer, now = n
       const recordIds = rows.map(row => row.recordId || encodeRecord(type, row).tags[0][1])
       const present = new Set()
       for (const batch of chunks([...new Set(recordIds)])) {
-        for await (const { row } of records(type, { recordIds: batch, includeExpired: true })) present.add(row.recordId)
+        for await (const { row } of records(type, { recordIds: batch })) present.add(row.recordId)
       }
       return recordIds.map(recordId => present.has(recordId))
     }

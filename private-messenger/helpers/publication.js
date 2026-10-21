@@ -68,6 +68,9 @@ export function sanitizePublicationError (error, context = {}) {
     ...(safeToken(source.reason) ? { reason: source.reason } : {}),
     ...(safeToken(source.eventId) ? { eventId: source.eventId } : {}),
     ...(Number.isSafeInteger(source.eventKind) ? { eventKind: source.eventKind } : {}),
+    ...(safeToken(source.category) ? { category: source.category } : {}),
+    ...(Number.isSafeInteger(source.retryAt) ? { retryAt: source.retryAt } : {}),
+    ...(Number.isSafeInteger(source.retryAfterMs) ? { retryAfterMs: source.retryAfterMs } : {}),
     ...(source.retryWhenAvailable === true ? { retryWhenAvailable: true } : {}),
     ...(source.retryWhenOnline === true ? { retryWhenOnline: true } : {}),
     reports: reports.map(sanitizedReport)
@@ -85,7 +88,8 @@ export function publicationFailureDiagnostic (error) {
     if (safeToken(value) && contextFields.includes(key)) result[key] = value
     else if (Number.isSafeInteger(value) && contextNumbers.includes(key)) result[key] = value
   }
-  for (const key of ['code', 'reason', 'eventId']) if (safeToken(error?.[key])) result[key] = error[key]
+  for (const key of ['code', 'reason', 'eventId', 'category']) if (safeToken(error?.[key])) result[key] = error[key]
+  for (const key of ['retryAt', 'retryAfterMs']) if (Number.isSafeInteger(error?.[key])) result[key] = error[key]
   for (const key of ['retryWhenAvailable', 'retryWhenOnline']) if (error?.[key] === true) result[key] = true
   result.reports = (Array.isArray(error?.reports) ? error.reports : []).map(sanitizedReport)
   return result

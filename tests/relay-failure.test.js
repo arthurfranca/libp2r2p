@@ -8,11 +8,12 @@ test('retry and replacement use native categories and leading protocol prefixes'
     assert.equal(isRetryableRelayFailure(error), true)
     assert.equal(isReplaceableRelayFailure(error), true)
   }
-  for (const prefix of ['rate-limited', 'error', 'blocked', 'restricted', 'auth-required', 'pow']) {
+  for (const prefix of ['rate-limited', 'error', 'banned', 'blocked', 'restricted', 'auth-required', 'pow']) {
     const error = Object.assign(new Error(`${prefix}: detail`), { category: 'relay' })
     assert.equal(isRetryableRelayFailure(error), ['rate-limited', 'error'].includes(prefix))
     assert.equal(isReplaceableRelayFailure(error), true)
   }
+  assert.equal(isReplaceableRelayFailure(Object.assign(new Error('relay rejected'), { code: 'banned:', category: 'relay' })), true)
   for (const error of [null, new Error('invalid: event'), new Error('unknown'), new Error('prose says rate-limited: busy'),
     Object.assign(new Error('blocked: locally'), { category: 'signer' }),
     Object.assign(new Error('error: signer denied'), { name: 'Nip42AuthenticationError' })]) {

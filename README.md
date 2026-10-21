@@ -1270,3 +1270,11 @@ and writes in groups of at most 100. Batched checks combine one recovery-type
 AND filter with coordinate OR filters, preserve input order and continue to
 decode and validate every returned snapshot. Custom adapters without batched
 methods retain the sequential fallback.
+
+The 0.11.30 session archives each publication's recovery rows through one
+`putMany` call and treats pending journal rows as present in batched `hasMany`
+checks. Publication routing also keeps a runtime-only, per-messenger relay health
+circuit: explicit bans/refusals open immediately, repeated transport failures
+open after three attempts, and a fully quarantined route reports
+`RELAY_CIRCUIT_OPEN` with `retryAt` before another envelope is prepared. Reads and
+receive routing are unaffected. See [session relay fallback](private-messenger/session/README.md#relay-fallback).

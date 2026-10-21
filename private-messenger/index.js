@@ -49,7 +49,8 @@ import { isOnline, onOnline } from '../network/index.js'
 import { isRetryableRelayFailure, isReplaceableRelayFailure } from '../relay/index.js'
 import { createPauseRecovery, isRecoverableStorageFailure } from './helpers/pause-recovery.js'
 import { backgroundSigner } from './helpers/background-signer.js'
-import { createSendRelayRouting, normalizeFallbackRelays, normalizeFallbackDelay } from './helpers/send-routing.js'
+import { createPublicationRelayHealth } from './helpers/publication-relay-health.js'
+import { createSendRelayRouting, normalizeFallbackRelays, normalizeFallbackDelay, relayCircuitError } from './helpers/send-routing.js'
 import { incompleteFetchError } from '../private-channel/helpers/fetch-error.js'
 import { recoveryRetryDelay, isPermanentRecoveryError } from './helpers/recovery-retry.js'
 import { assertMessagePublished, publicationFailureDiagnostic, sanitizePublicationError } from './helpers/publication.js'
@@ -319,9 +320,10 @@ export class PrivateMessenger {
     this._subscribeRelayListUpdates = _subscribeRelayListUpdates
     this._isOnline = _isOnline
     this._waitForForeground = _waitForForeground
-    this.sendRelayExclusions = new Map()
+    this.publicationRelayHealth = createPublicationRelayHealth({ now: _now })
     this.sendRoutingLifetime = new AbortController()
     this.sendRoutingPause = new AbortController()
+    this._now = _now
     this._setTimeout = _setTimeout
     this._clearTimeout = _clearTimeout
     this._setInterval = _setInterval
@@ -800,7 +802,6 @@ export class PrivateMessenger {
       this.stopPresencePublisher(pubkey)
     }
     for (const pubkey of removedPubkeys) this.channels.delete(pubkey)
-    for (const [key, value] of this.sendRelayExclusions) if (removedPubkeys.includes(value.channelPubkey)) this.sendRelayExclusions.delete(key)
     for (const channel of changed) this.channels.set(channel.pubkey, channel)
 
     // Incremental registration must not prune persisted channels whose signers
@@ -894,22 +895,16 @@ export class PrivateMessenger {
   async resolveSendRouting ({ channel, receiverPubkeys, relays, relayToReceivers, signal, attemptStartedAt, onDebug }) {
     if (attemptStartedAt !== undefined && (!Number.isFinite(attemptStartedAt) || attemptStartedAt < 0)) throw new ValidationError('INVALID_ATTEMPT_STARTED_AT')
     const recoveryRelays = await this.recoveryMirrorRelays(channel.pubkey)
-    if (relayToReceivers && !this.fallbackRelays.length) return { relayToReceivers, recoveryRelays }
     const fixed = relayToReceivers ? null : relays?.length ? uniq(relays) : channel.sendRelays.length ? channel.sendRelays : channel.relays.length ? channel.relays : null
-    if (fixed && !this.fallbackRelays.length) return { relays: fixed, recoveryRelays }
     const recipients = uniq(receiverPubkeys?.length ? receiverPubkeys : relayMapReceivers(relayToReceivers))
     const relaysByPubkey = fixed || relayToReceivers ? undefined : await this._getRelaysByPubkey(recipients)
-    const key = `${channel.pubkey}:${[...recipients].sort().join(',')}`
-    if (!this.sendRelayExclusions.has(key)) {
-      if (this.sendRelayExclusions.size >= 256) this.sendRelayExclusions.delete(this.sendRelayExclusions.keys().next().value)
-      this.sendRelayExclusions.set(key, { channelPubkey: channel.pubkey, exclusions: new Map() })
-    }
     const routing = createSendRelayRouting({
       peers: fixed && !recipients.length ? [this.userPubkey] : recipients, relaysByPubkey, recoveryRelays, primaryRelays: fixed?.map(normalizeRelayUrl), primaryRelayToReceivers: relayToReceivers, fallbackRelays: this.fallbackRelays,
       signal: signal ? AbortSignal.any([this.sendRoutingLifetime.signal, signal]) : this.sendRoutingLifetime.signal,
-      exclusions: this.sendRelayExclusions.get(key).exclusions,
+      exclusions: new Map(),
+      relayHealth: this.publicationRelayHealth,
       fallbackDelayMs: this.fallbackDelayMs, attemptStartedAt, pauseSignal: this.sendRoutingPause.signal,
-      setTimer: this._setTimeout, clearTimer: this._clearTimeout,
+      setTimer: this._setTimeout, clearTimer: this._clearTimeout, now: this._now,
       pickRelays: this._pickRelaysForPubkeys,
       publish: this._privateChannel.publish || privateChannel.publish,
       publishNymEvent: this._privateChannel.publishNymEvent || privateChannel.publishNymEvent,
@@ -922,10 +917,11 @@ export class PrivateMessenger {
       isOnline: this._isOnline,
       isCurrent: () => !this.closePromise && !this.pauseReasons.size && this.channels.has(channel.pubkey)
     })
+    if (routing.circuitOpen) throw relayCircuitError(routing.retryAt)
     if (!relayMapRelays(routing.relayToReceivers).length) throw new ValidationError('NO_RELAYS')
     // Fixed lists address the original receiver set as a whole, preserving the
     // existing encryption grouping instead of inventing per-recipient routes.
-    if (fixed) return { relays: fixed, recoveryRelays: routing.recoveryRelays, _publish: routing._publish }
+    if (fixed) return { relays: relayMapRelays(routing.relayToReceivers), recoveryRelays: routing.recoveryRelays, _publish: routing._publish }
     return routing
   }
 
@@ -3384,7 +3380,7 @@ export class PrivateMessenger {
     if (this.closePromise) return this.closePromise
     const initSettledPromise = this.initSettledPromise
     this.sendRoutingLifetime.abort()
-    this.sendRelayExclusions.clear()
+    this.publicationRelayHealth.clear()
     this.pendingStorageWrites.clear()
     for (const task of this.pauseRecoveries.values()) task.stop()
     for (const task of this.watchRecoveries.values()) task.stop()

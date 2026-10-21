@@ -130,6 +130,19 @@ export function pendingSeedMatches (row, query) {
 }
 
 export function withPendingSeeds (storage, pending) {
+  async function hasMany (rows) {
+    const pendingIds = new Set(pending().map(row => row.recordId).filter(Boolean))
+    const unresolved = rows.filter(row => !row.recordId || !pendingIds.has(row.recordId))
+    let persisted
+    if (typeof storage.hasMany === 'function') persisted = await storage.hasMany(unresolved)
+    else {
+      persisted = []
+      for (const row of unresolved) persisted.push(await storage.has(row))
+    }
+    if (!Array.isArray(persisted) || persisted.length !== unresolved.length) throw new Error('INVALID_RECOVERY_STORAGE_RESULT')
+    let index = 0
+    return rows.map(row => Boolean(row.recordId && pendingIds.has(row.recordId)) || Boolean(persisted[index++]))
+  }
   return {
     ...storage,
     async * iterate (query = {}) {
@@ -138,6 +151,7 @@ export function withPendingSeeds (storage, pending) {
       for (const row of pending()) if (pendingSeedMatches(row, query)) { seen.add(row.recordId); yield row }
       for await (const row of storage.iterate(query)) if (!seen.has(row.recordId)) yield row
     },
-    has: row => pending().some(value => value.recordId === row.recordId) || storage.has(row)
+    hasMany,
+    async has (row) { return (await hasMany([row]))[0] }
   }
 }

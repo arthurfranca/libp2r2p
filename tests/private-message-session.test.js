@@ -225,6 +225,28 @@ test('offline fallback stays pending without send-error feedback until availabil
   assert.equal(f.sendErrors.length, 0)
 })
 
+test('a publication circuit keeps the send pending until its absolute retry deadline', async t => {
+  t.mock.method(Date, 'now', () => 1000)
+  const timers = []
+  const f = await fixture(t, {
+    _setTimeout: (fn, delay) => { const timer = { fn, delay, cancelled: false }; timers.push(timer); return timer },
+    _clearTimeout: timer => { timer.cancelled = true },
+    publish: async () => {
+      throw Object.assign(new Error('RELAY_CIRCUIT_OPEN'), {
+        code: 'RELAY_CIRCUIT_OPEN',
+        category: 'timeout',
+        retryAt: 6000,
+        retryWhenAvailable: true
+      })
+    }
+  })
+  const id = await f.session.enqueue({ peer, event })
+  await until(() => f.errors.some(error => error.code === 'RELAY_CIRCUIT_OPEN'))
+  assert.equal(f.records.get(id).status, 'pending')
+  assert.equal(f.sendErrors.length, 0)
+  assert.ok(timers.some(timer => !timer.cancelled && timer.delay >= 5000))
+})
+
 test('a paused messenger parks the send and wakes on state release without a retry timer', async t => {
   const timers = []
   let publications = 0

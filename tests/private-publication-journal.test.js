@@ -19,13 +19,13 @@ function packet (id) {
   const seed = { channelPubkey: peer, router: { kind: 26300, pubkey: id, created_at: Math.floor(Date.now() / 1000), tags: [['f', owner]] }, jsonl: `${JSON.stringify(['payload'])}\n${JSON.stringify([peer, 'encrypted key'])}\n` }
   return { channelPubkey: peer, receiverPubkeys: [peer], events: [{ id }], seeds: [seed] }
 }
-async function fixture (t, { rows = new Map(), put = async () => {}, archive = async () => {}, transport = async () => {}, initial = [], ...sessionOptions } = {}) {
+async function fixture (t, { rows = new Map(), put = async () => {}, putMany, archive = async () => {}, transport = async () => {}, initial = [], ...sessionOptions } = {}) {
   const states = [], errors = [], sent = [], local = [], snapshots = initial
   for (const entry of initial) rows.set(entry.id, structuredClone(entry))
   let sequence = 1, options
   const session = createPrivateMessageSession({
     owner, signer: { withSharedKey: () => ({ getPublicKey: async () => peer }) },
-    recoveryStorage: { seeds: { put: archive, async * iterate () {}, has: async () => false } },
+    recoveryStorage: { seeds: { put: archive, ...(putMany ? { putMany } : {}), async * iterate () {}, has: async () => false } },
     messageStorage: { save: async event => { local.push(event); return { result: { ok: true } } } },
     openOutbox: async () => ({
       list: async () => snapshots.map(value => structuredClone(value)),
@@ -125,6 +125,19 @@ test('an archive failure preserves confirmation and retry never republishes the 
   assert.ok(f.states.filter(entries => entries.some(entry => entry.id === id && entry.status === 'saved')).length)
 })
 
+test('the session archives each publication through one batched seed write', async t => {
+  const writes = []
+  const f = await fixture(t, {
+    putMany: async rows => { writes.push(rows) },
+    archive: async () => assert.fail('serial put should be used only as fallback')
+  })
+  const id = await f.session.enqueue({ peer, event: text('batched archive') })
+  await until(() => !f.rows.has(id))
+  assert.equal(writes.length, 1)
+  assert.equal(writes[0].length, 1)
+  assert.equal(writes[0][0].channelPubkey, peer)
+})
+
 test('cancel after transmission retains recovery until archival finishes without publishing again', async t => {
   const ack = Promise.withResolvers(), archive = Promise.withResolvers()
   t.after(() => { ack.resolve(); archive.resolve() })
@@ -183,10 +196,20 @@ test('a watchtower upload yields its slot while one chunk awaits archival and ot
 })
 
 test('pending durable seeds are readable during an archive write and deduplicate stored rows', async () => {
-  const row = { recordId: 'record', channelPubkey: peer, receiverPubkey: peer }
-  const storage = withPendingSeeds({ async * iterate () { yield row }, has: async () => false }, () => [row])
-  assert.equal(await storage.has(row), true)
-  assert.deepEqual(await Array.fromAsync(storage.iterate({ channelPubkey: peer })), [row])
+  const pending = { recordId: 'pending', channelPubkey: peer, receiverPubkey: peer }
+  const stored = { recordId: 'stored', channelPubkey: peer, receiverPubkey: peer }
+  const missing = { recordId: 'missing', channelPubkey: peer, receiverPubkey: peer }
+  const storage = withPendingSeeds({
+    async * iterate () { yield stored },
+    hasMany: async rows => rows.map(row => row.recordId === 'stored')
+  }, () => [pending])
+  assert.equal(await storage.has(pending), true)
+  assert.equal(await storage.has(stored), true)
+  assert.deepEqual(await storage.hasMany([pending, stored, pending, missing]), [true, true, true, false])
+  assert.deepEqual(await Array.fromAsync(storage.iterate({ channelPubkey: peer })), [pending, stored])
+
+  const serial = withPendingSeeds({ async * iterate () {}, has: async row => row.recordId === 'stored' }, () => [pending])
+  assert.deepEqual(await serial.hasMany([pending, stored, missing]), [true, true, false])
 })
 
 test('an actual 0.11.24 upload resumes at its next chunk without resaving local copies', async t => {

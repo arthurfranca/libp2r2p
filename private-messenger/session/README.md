@@ -183,8 +183,8 @@ tag or deletion capability is recreated. Confirmed connectivity, exclusions and
 connection cooldowns remain authoritative; a waiting primary is not penalized
 merely because fallback started. Late native failures may inform later sends.
 
-On `blocked`, `restricted`, `auth-required`, `pow`, `rate-limited`, or `error`
-rejections, or connection/transport/timeout failures, replacement requires
+On `banned`, `blocked`, `restricted`, `auth-required`, `pow`, `rate-limited`, or
+`error` rejections, or connection/transport/timeout failures, replacement requires
 `isOnline` to confirm connectivity. Invalid messages, local signer/authentication
 failures and unknown error text retain their original diagnosis.
 
@@ -204,10 +204,18 @@ members, every pending member must be covered before the outer event succeeds;
 a partial ACK cannot hide another member's failure. Remaining primary routes are
 exhausted before configured fallbacks with the default null delay or explicit
 routes. Redundant acknowledgements may update
-future routing preferences without delaying a successfully covered send. Preferences are channel/recipient-scoped, in-memory,
-expire after five minutes, and never alter receive subscriptions. A fresh attempt
-can recheck an exhausted list. Additional fallback relays come only from the
-caller configuration; absent NIP-65 lists retain the existing discovery defaults.
+future routing preferences without delaying a successfully covered send.
+Publication health is shared by the messenger instance and never alters receive
+subscriptions. Explicit bans/refusals open that relay immediately; connection,
+transport and timeout failures open it after three consecutive attempts.
+Cooldown starts at five minutes, doubles after failed half-open probes and caps
+at 30 minutes. A success resets only that relay. When every route available to a
+pending recipient is cooling down, publication returns
+`RELAY_CIRCUIT_OPEN` with `retryAt` before preparing another encrypted envelope;
+the range or outbox item remains pending and is retried no earlier than that
+deadline. Health is bounded, runtime-only and cleared on close. Additional
+fallback relays come only from the caller configuration; absent NIP-65 lists
+retain the existing discovery defaults.
 
 When offline/interrupted with alternatives remaining, reports carry
 `retryWhenAvailable: true`. The outbox remains pending and emits no `onSendError`.
@@ -268,9 +276,11 @@ The existing `onPreparedSeed` callback now also supplies `publication`. The
 session commits that minimal journal before transmitting; direct messengers
 retain their local seed-store durability. Only after that commit can relay
 publication proceed. One independent serial worker converts recovery seeds into
-their configured archive. Pending durable rows participate in recovery reads
-immediately, including during a blocked archive write. No new seeds are enabled
-for modes which did not previously retain them.
+their configured archive. Event-store adapters receive all rows for a publication
+through one `putMany` call; serial `put` remains the external-adapter fallback.
+Pending durable rows participate in recovery reads and batched `hasMany` checks
+immediately, including during a blocked archive write. Expired rows are absent.
+No new seeds are enabled for modes which did not previously retain them.
 
 First acceptance of every required envelope emits saved independently of archive
 or cleanup. ACK progress checkpoints serialize with other entry writes. A crash

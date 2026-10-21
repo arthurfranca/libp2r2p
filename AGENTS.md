@@ -190,7 +190,10 @@ NIP-46 against the real pool with controlled transport and injected controls.
 - Batch recovery storage operations in bounded groups of at most 100. Use one
   type AND-filter plus coordinate OR-filters for existence, preserve input order,
   and still decode/validate every returned immutable snapshot. Keep serial
-  fallbacks for external adapters without batched methods.
+  fallbacks for external adapters without batched methods. Session archival must
+  submit each publication's rows through one `putMany` call. `withPendingSeeds`
+  merges pending rows into both `has` and `hasMany`, preserving input order and
+  duplicates; expired rows are not present.
 - Day candidates use D and literal '*', then exact snapshot overlap. Do not filter
   wrapper created_at as if it were the recovery time. No cross-snapshot hull merge.
 - Keep sync transport seeds out of the event store being synchronized. Never
@@ -232,10 +235,17 @@ NIP-46 against the real pool with controlled transport and injected controls.
   subscription, released on cancel/close/unavailability. Retry only those waiting
   entries and never override signer availability; account recovery still uses
   `setAvailable(true)`.
-- Relay exclusions live only in memory, expire after five minutes, and are scoped
-  by channel/recipient (at most 256 scopes). Removing channels or closing clears
-  them. Track attempted relays per outer event independently of this shared state.
-  Aggregate native diagnostics from all attempts and retain the first-ACK path.
+- Publication relay health lives only in memory and is global to one
+  `PrivateMessenger` instance (at most 256 relays). It never disables reads.
+  `banned`, `blocked`, `restricted`, `auth-required` and `pow` open immediately;
+  connection/transport/timeouts open after three consecutive failures. Cooldown
+  starts at five minutes, doubles after failed half-open probes and caps at 30
+  minutes. Mixed relay reports must exclude only refused routes while retrying
+  eligible alternatives. When no route can serve a pending peer, return
+  `RELAY_CIRCUIT_OPEN` with `retryAt` before preparing another envelope. Keep an
+  open circuit as pending, never as publication or coverage success. Track relays
+  already attempted per outer event separately and close clears all health.
+- Aggregate native diagnostics from all attempts and retain the first-ACK path.
 - Outbox cancellation and close abort fallback work for messages and file chunks.
   Shared publication diagnostics live in private-messenger/helpers/publication.js.
 

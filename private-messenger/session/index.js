@@ -153,6 +153,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   let repump
   let draining
   let redrain = false
+  const sendRetryAt = new Map()
   const idleWaiters = new Set()
   const settled = () => { if (!sending && !localSaving && !enqueuing && !draining && !cleanups.size) { for (const resolve of idleWaiters) resolve(); idleWaiters.clear() } }
   const localComplete = entry => entry.localSaved.every(Boolean)
@@ -164,7 +165,10 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const journal = createPublicationJournal({
     entries, store: () => storage, onError: reportError, debug, setTimer: _setTimeout, clearTimer: _clearTimeout, random: _random,
     archive: async (entry, rows) => {
-      if (recoveryStorage?.seeds) { for (const row of rows) await recoveryStorage.seeds.put(row) } else if (entry.prepared.target.file) {
+      if (recoveryStorage?.seeds) {
+        if (typeof recoveryStorage.seeds.putMany === 'function') await recoveryStorage.seeds.putMany(rows)
+        else for (const row of rows) await recoveryStorage.seeds.put(row)
+      } else if (entry.prepared.target.file) {
         for (const seed of entry.prepared.publication.seeds) await fileTransfers.archiveSeed(entry.prepared.target.file, seed)
       } else {
         for (const seed of entry.prepared.publication.seeds) await messenger.enqueueSeed(seed.channelPubkey, seed)
@@ -450,7 +454,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     if (cleanups.has(entry.id)) return cleanups.get(entry.id)
     const startedAt = Date.now()
     const work = Promise.resolve().then(async () => { await journal.flush(entry); await storage.remove(entry.id) }).then(() => {
-      entries.delete(entry.id); localRetries.delete(entry.id); attemptStarts.delete(entry.id)
+      entries.delete(entry.id); localRetries.delete(entry.id); attemptStarts.delete(entry.id); sendRetryAt.delete(entry.id)
       debug(entry, 'outbox-cleanup', startedAt)
       emit()
     }).catch(error => {
@@ -594,6 +598,8 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         // The failed wire event may be a quote or file chunk. Report the
         // owning outbox item separately, without mutating the native error.
         if (error.retryWhenOnline) offlineSends.add(entry.id)
+        if (Number.isSafeInteger(error.retryAt)) sendRetryAt.set(entry.id, error.retryAt)
+        else sendRetryAt.delete(entry.id)
         if (entry.failed && (error.retryWhenAvailable || (entry.deliveryConfirmed && entry.retryable)) && !pausedSends.has(entry.id)) scheduleSendRetry()
         if (!closed && !entry.deletion && !cancelled.has(entry.id) && !entry.deliveryConfirmed && !error.retryWhenAvailable) onSendError(error, { id: entry.id, peer: entry.peer })
       }
@@ -614,14 +620,28 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const pendingRetryable = entry => Boolean(!cancelled.has(entry.id) && ((entry.localFailed && entry.localRetryable) || (entry.failed && (entry.retryable || entry.status === 'pending'))))
   function scheduleSendRetry () {
     if (closed || !available || sendRetryTimer) return
-    const delay = Math.min(SEND_RETRY_MAX_MS, sendRetryDelay * (0.8 + _random() * 0.4))
+    let nextRetryAt = 0
+    let unconstrained = false
+    for (const entry of entries.values()) {
+      if (!pendingRetryable(entry)) continue
+      const retryAt = sendRetryAt.get(entry.id)
+      if (!Number.isSafeInteger(retryAt)) { unconstrained = true; continue }
+      if (!nextRetryAt || retryAt < nextRetryAt) nextRetryAt = retryAt
+    }
+    if (unconstrained) nextRetryAt = 0
+    const backoff = Math.min(SEND_RETRY_MAX_MS, sendRetryDelay * (0.8 + _random() * 0.4))
+    const delay = Math.max(backoff, nextRetryAt ? nextRetryAt - Date.now() : 0)
     sendRetryDelay = Math.min(SEND_RETRY_MAX_MS, sendRetryDelay * 2)
     sendRetryTimer = _setTimeout(() => {
       sendRetryTimer = undefined
       if (closed || !available) return
+      const now = Date.now()
       let retried = false
       for (const entry of entries.values()) {
         if (!pendingRetryable(entry)) continue
+        const retryAt = sendRetryAt.get(entry.id)
+        if (Number.isSafeInteger(retryAt) && retryAt > now) continue
+        sendRetryAt.delete(entry.id)
         if (entry.localFailed && entry.localRetryable) { localRetries.add(entry.id); retried = true }
         if (pausedSends.has(entry.id) || !entry.failed || !(entry.retryable || entry.status === 'pending')) continue
         entry.failed = false
@@ -630,6 +650,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         retried = true
       }
       if (retried) { emit(); pump() }
+      if ([...entries.values()].some(entry => pendingRetryable(entry) && Number.isSafeInteger(sendRetryAt.get(entry.id)))) scheduleSendRetry()
     }, delay)
     sendRetryTimer.unref?.()
   }
@@ -921,7 +942,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     },
     close () {
       return (closeWork ??= (async () => {
-        closed = true; available = false; lifecycle++; localRetries.clear()
+        closed = true; available = false; lifecycle++; localRetries.clear(); sendRetryAt.clear()
         stopOnlineRetry(); offlineSends.clear(); networkUrgency.clear(); activeDownloads.clear(); pendingPriorityRanges.clear()
         clearSendRetry(); inboxRecovery.stop(); preparation.close(); foreground.close(); pausedSends.clear()
         for (const controller of sendControllers.values()) controller.abort()

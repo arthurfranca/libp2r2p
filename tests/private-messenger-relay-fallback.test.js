@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { RelayPool, pickRelaysForPubkeys } from '../relay/index.js'
 import { createSendRelayRouting, isReplaceableRelayFailure } from '../private-messenger/helpers/send-routing.js'
+import { createPublicationRelayHealth } from '../private-messenger/helpers/publication-relay-health.js'
 import * as privateChannel from '../private-channel/index.js'
 import TestSigner from './helpers/test-signer.js'
 import { finalizeEvent } from '../event/index.js'
@@ -11,7 +12,10 @@ const event = finalizeEvent({ kind: 26300, created_at: 1, tags: [['p', 'b'.repea
 const tick = () => new Promise(resolve => setImmediate(resolve))
 function fixture (t, { reasons = {}, online = true, fallbackRelays = [], primaryRelays, peers, relaysByPubkey, primaryRelayToReceivers, realPublish = false, recoveryRelays, fallbackDelayMs = null } = {}) {
   const state = { reasons, online, probes: 0, current: true, held: new Set(), pending: [], now: 1000 }
-  const sends = []; const batches = []; const exclusions = new Map()
+  const sends = []
+  const batches = []
+  const health = createPublicationRelayHealth({ now: () => state.now })
+  let exclusions = new Map()
   const pool = new RelayPool({
     WebSocket: class {
       constructor (url) {
@@ -35,15 +39,18 @@ function fixture (t, { reasons = {}, online = true, fallbackRelays = [], primary
   t.after(() => pool.disconnectAll())
   const publisher = options => options._publish(options.event, [...options.relayToReceivers.keys(), ...options.recoveryRelays].filter((url, i, list) => list.indexOf(url) === i))
   const controller = new AbortController()
-  const routing = () => createSendRelayRouting({
-    peer: 'peer', peers, fallbackRelays, fallbackDelayMs, primaryRelays, primaryRelayToReceivers, relaysByPubkey: relaysByPubkey || { peer: { read: urls, write: ['wss://write-only.example'] } },
-    exclusions, pickRelays: pickRelaysForPubkeys, recoveryRelays: recoveryRelays || [...urls.slice(0, 2), ...fallbackRelays],
-    publish: realPublish ? privateChannel.publish : publisher, publishNymEvent: realPublish ? privateChannel.publishNymEvent : publisher,
-    sendEvent: (event, relays, options) => { batches.push([...relays]); return pool.sendEvent(event, relays, { ...options, timeout: 2000 }) },
-    isOnline: async () => { state.probes++; return state.online },
-    isCurrent: () => state.current, signal: controller.signal, now: () => state.now
-  })
-  return { state, sends, batches, exclusions, controller, routing, publish: route => route._publish({ event, ...route }) }
+  const routing = () => {
+    exclusions = new Map()
+    return createSendRelayRouting({
+      peer: 'peer', peers, fallbackRelays, fallbackDelayMs, primaryRelays, primaryRelayToReceivers, relaysByPubkey: relaysByPubkey || { peer: { read: urls, write: ['wss://write-only.example'] } },
+      exclusions, relayHealth: health, pickRelays: pickRelaysForPubkeys, recoveryRelays: recoveryRelays || [...urls.slice(0, 2), ...fallbackRelays],
+      publish: realPublish ? privateChannel.publish : publisher, publishNymEvent: realPublish ? privateChannel.publishNymEvent : publisher,
+      sendEvent: (event, relays, options) => { batches.push([...relays]); return pool.sendEvent(event, relays, { ...options, timeout: 2000 }) },
+      isOnline: async () => { state.probes++; return state.online },
+      isCurrent: () => state.current, signal: controller.signal, now: () => state.now
+    })
+  }
+  return { state, sends, batches, health, get exclusions () { return exclusions }, controller, routing, publish: route => route._publish({ event, ...route }) }
 }
 
 test('policy rejection rotates two read relays at a time and preserves the exact signed event', async t => {
@@ -61,7 +68,7 @@ test('policy rejection rotates two read relays at a time and preserves the exact
   assert.deepEqual(f.batches.at(-1), urls.slice(2, 4))
 })
 
-test('exhaustion includes every read relay, emits one final report and permits a fresh retry', async t => {
+test('exhaustion includes every read relay and waits for the publication circuit', async t => {
   const f = fixture(t, { reasons: Object.fromEntries(urls.map(url => [url, 'blocked: policy'])) })
   const result = await f.publish(f.routing())
   assert.equal(result.success, false)
@@ -71,7 +78,11 @@ test('exhaustion includes every read relay, emits one final report and permits a
   assert.equal(report.fulfilled, 0)
   assert.deepEqual(report.errors.map(error => error.relay), urls)
   assert.ok(report.errors.every(error => error.reason.category === 'relay'))
+  const cooling = f.routing()
+  assert.equal(cooling.circuitOpen, true)
+  assert.ok(cooling.retryAt > f.state.now)
   f.state.reasons = {}
+  f.state.now += 5 * 60 * 1000
   assert.equal((await f.publish(f.routing())).success, true)
   assert.deepEqual(f.batches.at(-1), urls.slice(0, 2))
 })
@@ -102,7 +113,7 @@ test('offline, invalid messages, local authorization and unknown errors never ro
   assert.equal(deferred.retryWhenAvailable, true)
   assert.equal(deferred.retryWhenOnline, true)
   assert.equal(f.batches.length, 1)
-  assert.equal(f.exclusions.size, 0)
+  assert.equal(f.health.isExcluded(urls[0]), true)
   for (const reason of [new Error('PERMISSION_DENIED'), Object.assign(new Error('blocked: local permission'), { name: 'Nip42AuthenticationError' }), Object.assign(new Error('blocked: unrelated'), { category: 'validation' })]) assert.equal(isReplaceableRelayFailure(reason), false)
   assert.equal(isReplaceableRelayFailure(Object.assign(new Error('PUBLISH_TIMEOUT'), { category: 'timeout' })), true)
 })
@@ -121,7 +132,7 @@ test('cancellation stops retries while a session pause keeps the send retryable'
     assert.equal(result.retryWhenAvailable, !abort)
     assert.equal(result.retryWhenOnline, !abort)
     assert.equal(f.batches.length, 1)
-    assert.equal(f.exclusions.size, 0)
+    assert.equal(f.health.isExcluded(urls[0]), !abort, `abort=${abort}`)
   }
 })
 
@@ -133,6 +144,19 @@ test('failed relay preferences expire and other fragments reuse the replacement 
   assert.deepEqual(f.batches, [urls.slice(0, 2), urls.slice(2, 4), urls.slice(2, 4)])
   f.state.now += 5 * 60 * 1000
   assert.deepEqual([...f.routing().relayToReceivers.keys()], urls.slice(0, 2))
+})
+
+test('banned and repeatedly transient relays share one publication circuit policy', async t => {
+  const f = fixture(t, { reasons: { [urls[0]]: 'banned: policy', [urls[1]]: 'error: transient' } })
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = await f.publish(f.routing())
+    assert.equal(result.success, true)
+    await result.promise
+    await tick()
+  }
+  assert.equal(f.health.isExcluded(urls[0]), true)
+  assert.equal(f.health.isExcluded(urls[1]), true)
+  assert.deepEqual([...f.routing().relayToReceivers.keys()], urls.slice(2, 4))
 })
 
 test('configured fallback waits for every primary relay and retains the encrypted event unchanged', async t => {
@@ -160,9 +184,11 @@ test('configured fallbacks also exhaust in pairs, deduplicate primary relays and
   const report = await result.promise
   assert.equal(report.total, all.length)
   assert.deepEqual(report.errors.map(error => error.relay), all)
+  assert.equal(f.routing().circuitOpen, true)
   f.state.reasons = {}
+  f.state.now += 5 * 60 * 1000
   await f.publish(f.routing())
-  assert.deepEqual(f.batches.at(-1), urls.slice(0, 2), 'an explicit retry rechecks an exhausted list')
+  assert.deepEqual(f.batches.at(-1), urls.slice(0, 2), 'the relays are retried after their cooldown')
 })
 
 test('a primary acknowledgement never publishes a redundant copy to configured fallback relays', async t => {
@@ -292,7 +318,9 @@ test('multi-recipient routing retains final native errors and rechecks exhausted
   assert.equal(report.total, primaries.length + fallback.length)
   assert.equal(report.errors.length, report.total)
   assert.ok(report.errors.every(error => error.reason.category === 'relay'))
+  assert.equal(f.routing().circuitOpen, true)
   f.state.reasons = {}
+  f.state.now += 5 * 60 * 1000
   const [retried] = await publishGroup(f)
   assert.equal(retried.success, true)
   assert.deepEqual(f.batches.at(-1), shared)
@@ -361,7 +389,9 @@ test('an exhausted member can retry even when another member succeeded and no fa
   const f = groupFixture(t, { fallbackRelays: [], recoveryRelays: [], reasons: blocked([...shared, ...bobRelays]) })
   const [failed] = await publishGroup(f)
   assert.equal(failed.success, false)
+  assert.equal(f.routing().circuitOpen, true)
   f.state.reasons = {}
+  f.state.now += 5 * 60 * 1000
   const [retried] = await publishGroup(f)
   assert.equal(retried.success, true)
   assert.deepEqual(f.batches.at(-1), shared)
