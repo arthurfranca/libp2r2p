@@ -67,6 +67,12 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const channels = new Map()
   const entries = new Map()
   const cancelled = new Set()
+  // Self entries can persist locally while their encrypted checkpoint is in
+  // flight, but they are not visible to consumers until that checkpoint wins.
+  const unadmitted = new WeakSet()
+  const admissionFailed = new WeakSet()
+  const localWorks = new WeakMap()
+  const localErrors = new WeakMap()
   const attemptStarts = new Map()
   const networkUrgency = new Map()
   const sendControllers = new Map()
@@ -106,14 +112,14 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       for (const entry of entries.values()) {
         if (entry.peer !== owner && entry.failed && entry.status === 'pending') pausedSends.add(entry.id)
       }
-      if (![...entries.values()].some(entry => (entry.localFailed && entry.localRetryable) || (pendingRetryable(entry) && !pausedSends.has(entry.id)))) clearSendRetry()
+      if (![...entries.values()].some(entry => !unadmitted.has(entry) && ((entry.localFailed && entry.localRetryable) || (pendingRetryable(entry) && !pausedSends.has(entry.id))))) clearSendRetry()
       watchOfflineSends()
       return
     }
     clearSendRetry()
     for (const id of pausedSends) { const entry = entries.get(id); if (entry) { entry.failed = false; attemptStarts.set(entry.id, performance.now()) } }
     pausedSends.clear()
-    if ([...entries.values()].some(entry => entry.localFailed && entry.localRetryable)) scheduleSendRetry()
+    if ([...entries.values()].some(entry => !unadmitted.has(entry) && entry.localFailed && entry.localRetryable)) scheduleSendRetry()
     watchOfflineSends()
     // The callback can run inside construction/resume, before configure settles.
     queueMicrotask(() => pump())
@@ -158,8 +164,8 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const idleWaiters = new Set()
   const settled = () => { if (!sending && !localSaving && !enqueuing && !draining && !cleanups.size) { for (const resolve of idleWaiters) resolve(); idleWaiters.clear() } }
   const localComplete = entry => entry.localSaved.every(Boolean)
-  const completed = entry => localComplete(entry) && (entry.peer === owner || entry.deliveryConfirmed)
-  const emit = () => onOutbox([...entries.values()].filter(entry => !entry.deletion && !entry.cancelled).map(entry => ({
+  const completed = entry => !unadmitted.has(entry) && localComplete(entry) && (entry.peer === owner || entry.deliveryConfirmed)
+  const emit = () => onOutbox([...entries.values()].filter(entry => !unadmitted.has(entry) && !entry.deletion && !entry.cancelled).map(entry => ({
     ...entry,
     localPersistence: { state: localComplete(entry) ? 'saved' : entry.localFailed ? 'failed' : 'pending', retryable: Boolean(entry.localFailed && entry.localRetryable && !localRetries.has(entry.id)) }
   })))
@@ -484,6 +490,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     await assertMessagePublished(report, event)
   }
   async function cleanupEntry (entry) {
+    if (unadmitted.has(entry)) return
     if (entry.prepared) { journal.wake(); return }
     if (!entry.cancelled && !completed(entry)) return
     if (entry.failed && entry.status === 'saved') return
@@ -503,10 +510,11 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     return work
   }
   async function saveEntry (entry) {
-    if (entry.peer === owner) { entry.status = 'pending'; emit() }
+    if (entry.peer === owner && !unadmitted.has(entry)) { entry.status = 'pending'; emit() }
     const releaseForeground = foreground.enter()
     const active = async () => {
-      if (storage.has && !await storage.has(entry.id)) { cancelled.add(entry.id); sendControllers.get(entry.id)?.abort() }
+      if (admissionFailed.has(entry)) throw new Error('CHAT_UNAVAILABLE')
+      if (!unadmitted.has(entry) && storage.has && !await storage.has(entry.id)) { cancelled.add(entry.id); sendControllers.get(entry.id)?.abort() }
       if (closed || !available || cancelled.has(entry.id) || (entry.peer !== owner && !peers.has(entry.peer))) throw new Error('CHAT_UNAVAILABLE')
     }
     const startedAt = Date.now()
@@ -524,12 +532,18 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       }
       entry.localFailed = false
       debug(entry, 'local-stored', startedAt)
+      if (unadmitted.has(entry)) return
       if (entry.peer === owner) entry.status = 'saved'
       emit()
       if (completed(entry)) cleanupEntry(entry)
       else await journal.write(entry)
     } catch (error) {
+      if (admissionFailed.has(entry)) return
       if (cancelled.has(entry.id)) { sendControllers.get(entry.id)?.abort(); entry.cancelled = true; cleanupEntry(entry) } else if (!closed && available) {
+        if (unadmitted.has(entry)) {
+          entry.localFailed = true; entry.localRetryable = retryable(error); localErrors.set(entry, error)
+          return
+        }
         entry.localFailed = true; entry.localRetryable = retryable(error)
         if (entry.peer === owner) { entry.status = 'error'; entry.retryable = entry.localRetryable }
         await journal.write(entry).catch(reportError)
@@ -653,7 +667,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     clearSendRetry()
     sendRetryDelay = SEND_RETRY_MIN_MS
   }
-  const pendingRetryable = entry => Boolean(!cancelled.has(entry.id) && ((entry.localFailed && entry.localRetryable) || (entry.failed && (entry.retryable || entry.status === 'pending'))))
+  const pendingRetryable = entry => Boolean(!unadmitted.has(entry) && !cancelled.has(entry.id) && ((entry.localFailed && entry.localRetryable) || (entry.failed && (entry.retryable || entry.status === 'pending'))))
   function scheduleSendRetry () {
     if (closed || !available || sendRetryTimer) return
     let nextRetryAt = 0
@@ -741,14 +755,21 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         relocal = false
         for (const entry of entries.values()) {
           if (closed || !available) break
+          if (admissionFailed.has(entry)) continue
           if ((entry.localFailed && !localRetries.has(entry.id)) || cancelled.has(entry.id) || (entry.peer !== owner && !peers.has(entry.peer))) continue
-          if (localComplete(entry) && !entry.localFailed) { if (entry.status === 'saved') cleanupEntry(entry); continue }
-          await saveEntry(entry)
+          if (localComplete(entry) && !entry.localFailed) {
+            if (!unadmitted.has(entry) && entry.peer === owner && entry.status !== 'saved') await saveEntry(entry)
+            else if (entry.status === 'saved') cleanupEntry(entry)
+            continue
+          }
+          const work = saveEntry(entry)
+          localWorks.set(entry, work)
+          try { await work } finally { localWorks.delete(entry) }
           pumpRemote()
         }
       } while (relocal)
     } finally {
-      if ([...entries.values()].some(entry => (entry.localFailed && entry.localRetryable) || (entry.status === 'saved' && entry.failed && entry.retryable))) scheduleSendRetry()
+      if ([...entries.values()].some(entry => !unadmitted.has(entry) && ((entry.localFailed && entry.localRetryable) || (entry.status === 'saved' && entry.failed && entry.retryable)))) scheduleSendRetry()
       localSaving = false; for (const resolve of localIdleWaiters) resolve(); localIdleWaiters.clear(); settled()
     }
   }
@@ -761,7 +782,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         repump = false
         for (const entry of entries.values()) {
           if (closed || !available) break
-          if (entry.prepared?.accepted) { journal.wake(); continue }
+          if (unadmitted.has(entry) || entry.prepared?.accepted) { if (entry.prepared?.accepted) journal.wake(); continue }
           if (entry.peer === owner || entry.status === 'saved' || !peers.has(entry.peer) || entry.failed || cancelled.has(entry.id)) continue
           if (!preparation.get(entry.peer) && !preparation.error(entry.peer)) {
             preparation.request(entry.peer).catch(() => {})
@@ -779,6 +800,12 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     }
   }
   async function pump () { await Promise.all([pumpLocal(), pumpRemote()]) }
+  async function discardUnadmitted (entry) {
+    admissionFailed.add(entry)
+    unadmitted.delete(entry)
+    if (entries.get(entry.id) === entry) entries.delete(entry.id)
+    await localWorks.get(entry)
+  }
   const intentId = file => getEventHash({ kind: 0, pubkey: owner, created_at: 0, tags: [], content: `${file.peer}:${file.root}` })
   async function download (file, options = {}) {
     if (file.peer === owner) return file
@@ -904,7 +931,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       journal.setAvailable(true)
       pumpLocal()
       for (const entry of entries.values()) {
-        if (entry.localRetryable) localRetries.add(entry.id)
+        if (!unadmitted.has(entry) && entry.localRetryable) localRetries.add(entry.id)
         if (entry.failed && (entry.retryable || entry.status === 'pending')) { entry.failed = false; attemptStarts.set(entry.id, performance.now()) }
       }
       if (storageBlocked) inboxRecovery.start({ immediate: true })
@@ -926,17 +953,45 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         const files = events.filter(value => value.kind === 1063).map(value => ({ ...decodeFileMetadata(value), optional: !requiredFiles.includes(getEventHash(value)) })).filter(file => file.service === 'irfs').flatMap(file => [file, ...(file.thumbnail?.root ? [{ ...file.thumbnail, optional: file.optional }] : [])])
         const entry = { id, peer, event: { ...main, id }, events, files, index: 0, fileIndex: 0, chunkIndex: 0, localSaved: context.map(() => true).concat(false), status: 'pending', deliveryConfirmed: false, deletion }
         const startedAt = Date.now()
+        const earlyLocal = peer === owner
+        if (earlyLocal) {
+          queuedAt.set(entry, Date.now())
+          unadmitted.add(entry)
+          entries.set(id, entry)
+          pumpLocal()
+        }
         debug(entry, 'outbox-start')
-        await storage.put(entry)
+        try {
+          await storage.put(entry)
+        } catch (error) {
+          if (earlyLocal) await discardUnadmitted(entry)
+          throw error
+        }
         debug(entry, 'outbox-stored', startedAt)
         queuedAt.set(entry, Date.now())
         if (attemptStartedAt !== undefined) attemptStarts.set(id, attemptStartedAt)
-        if (cancelled.has(id)) { await storage.remove(id); throw new Error('CHAT_UNAVAILABLE') }
+        if (cancelled.has(id)) {
+          if (earlyLocal) await discardUnadmitted(entry)
+          await storage.remove(id)
+          throw new Error('CHAT_UNAVAILABLE')
+        }
         // An accepted durable intent survives shutdown/locking for replay. Only
         // explicit cancellation removes it; no late callback or work is admitted.
-        if (closed) return id
-        entries.set(id, entry)
+        if (closed) {
+          if (earlyLocal) await discardUnadmitted(entry)
+          return id
+        }
+        if (earlyLocal) unadmitted.delete(entry)
+        else entries.set(id, entry)
         if (peer !== owner && available && lifecycle === urgencyLifecycle) networkUrgency.set(id, urgencyUntil)
+        if (earlyLocal && entry.localFailed) {
+          entry.status = 'error'; entry.retryable = entry.localRetryable
+          const error = localErrors.get(entry)
+          if (error) {
+            reportError(error)
+            if (!entry.deletion) onSendError(error, { id: entry.id, peer: entry.peer })
+          }
+        }
         watchOfflineSends(); emit(); pump()
         if (available && peer !== owner) preparePeer(peer).catch(() => {})
         return id
@@ -946,7 +1001,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       if (storageBlocked) inboxRecovery.start({ immediate: true })
       await ready()
       const entry = entries.get(id)
-      if (!entry) return
+      if (!entry || unadmitted.has(entry)) return
       journal.retry()
       if (entry.deliveryConfirmed) {
         // This action belongs to local recovery, never a fresh network attempt.

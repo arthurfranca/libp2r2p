@@ -606,6 +606,196 @@ test('local self commit does not await messenger construction', async t => {
   gate.resolve()
 })
 
+test('self local persistence overlaps the encrypted checkpoint without exposing an unadmitted entry', async t => {
+  const checkpointStarted = Promise.withResolvers()
+  const releaseCheckpoint = Promise.withResolvers()
+  const localStarted = Promise.withResolvers()
+  const states = []
+  const rows = new Map()
+  t.after(() => releaseCheckpoint.resolve())
+  const f = await fixture(t, {
+    save: async () => { localStarted.resolve(); return { result: { ok: true } } },
+    onOutbox: entries => states.push(structuredClone(entries)),
+    openOutbox: async () => ({
+      list: async () => [],
+      put: async entry => {
+        checkpointStarted.resolve()
+        await releaseCheckpoint.promise
+        rows.set(entry.id, structuredClone(entry))
+      },
+      remove: async id => rows.delete(id),
+      close () {}
+    })
+  })
+  const id = getEventHash({ ...event, pubkey: owner })
+  const enqueued = f.session.enqueue({ peer: owner, event })
+  await Promise.all([checkpointStarted.promise, localStarted.promise])
+  assert.equal(states.some(entries => entries.some(entry => entry.id === id)), false)
+  assert.equal(rows.has(id), false)
+  releaseCheckpoint.resolve()
+  assert.equal(await enqueued, id)
+  await until(() => states.some(entries => entries.some(entry => entry.id === id && entry.status === 'saved')))
+  await until(() => !rows.has(id))
+  assert.equal(f.errors.length, 0)
+  assert.equal(f.sendErrors.length, 0)
+})
+
+test('concurrent self admissions use one serial local processor', async t => {
+  let active = 0
+  let maximum = 0
+  const committed = []
+  const f = await fixture(t, {
+    save: async value => {
+      active++
+      maximum = Math.max(maximum, active)
+      await new Promise(resolve => setTimeout(resolve, 2))
+      committed.push(getEventHash(value))
+      active--
+      return { result: { ok: true } }
+    }
+  })
+  const first = f.session.enqueue({ peer: owner, event })
+  const second = f.session.enqueue({ peer: owner, event: { ...event, created_at: 2, content: 'second' } })
+  const ids = await Promise.all([first, second])
+  await until(() => committed.length === 2 && [...f.records.values()].every(entry => !ids.includes(entry.id)))
+  assert.equal(maximum, 1)
+  assert.equal(new Set(committed).size, 2)
+})
+
+test('remote local persistence still waits for the encrypted checkpoint', async t => {
+  const checkpointStarted = Promise.withResolvers()
+  const releaseCheckpoint = Promise.withResolvers()
+  let saves = 0
+  t.after(() => releaseCheckpoint.resolve())
+  const f = await fixture(t, {
+    save: async () => { saves++; return { result: { ok: true } } },
+    openOutbox: async () => ({
+      list: async () => [],
+      put: async () => {
+        checkpointStarted.resolve()
+        await releaseCheckpoint.promise
+      },
+      remove: async () => {},
+      close () {}
+    })
+  })
+  const enqueued = f.session.enqueue({ peer, event })
+  await checkpointStarted.promise
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(saves, 0)
+  releaseCheckpoint.resolve()
+  await enqueued
+  await until(() => saves === 1)
+})
+
+test('a failed self checkpoint drops the unadmitted entry and retry reuses its identity', async t => {
+  const localStarted = Promise.withResolvers()
+  const states = []
+  const committed = new Set()
+  const rows = new Map()
+  let puts = 0
+  const f = await fixture(t, {
+    save: async value => {
+      localStarted.resolve()
+      committed.add(getEventHash(value))
+      return { result: { ok: true } }
+    },
+    onOutbox: entries => states.push(structuredClone(entries)),
+    openOutbox: async () => ({
+      list: async () => [],
+      put: async entry => {
+        if (++puts === 1) {
+          await localStarted.promise
+          throw new Error('checkpoint unavailable')
+        }
+        rows.set(entry.id, structuredClone(entry))
+      },
+      remove: async id => rows.delete(id),
+      close () {}
+    })
+  })
+  const id = getEventHash({ ...event, pubkey: owner })
+  await assert.rejects(f.session.enqueue({ peer: owner, event }), /checkpoint unavailable/)
+  assert.equal(committed.has(id), true)
+  assert.equal(states.some(entries => entries.some(entry => entry.id === id)), false)
+  assert.equal(await f.session.enqueue({ peer: owner, event }), id)
+  await until(() => states.some(entries => entries.some(entry => entry.id === id && entry.status === 'saved')))
+  assert.equal(committed.size, 1)
+  assert.equal(f.sendErrors.length, 0)
+})
+
+test('cancel fences a self local save racing an unadmitted checkpoint', async t => {
+  const checkpointStarted = Promise.withResolvers()
+  const releaseCheckpoint = Promise.withResolvers()
+  const localStarted = Promise.withResolvers()
+  const states = []
+  let saves = 0
+  t.after(() => releaseCheckpoint.resolve())
+  const f = await fixture(t, {
+    save: async () => {
+      saves++
+      localStarted.resolve()
+      await releaseCheckpoint.promise
+      return { result: { ok: true } }
+    },
+    onOutbox: entries => states.push(structuredClone(entries)),
+    openOutbox: async () => ({
+      list: async () => [],
+      put: async () => {
+        checkpointStarted.resolve()
+        await releaseCheckpoint.promise
+      },
+      remove: async () => {},
+      close () {}
+    })
+  })
+  const id = getEventHash({ ...event, pubkey: owner })
+  const enqueued = f.session.enqueue({ peer: owner, event })
+  await Promise.all([checkpointStarted.promise, localStarted.promise])
+  const cancelled = f.session.cancel(id)
+  releaseCheckpoint.resolve()
+  await cancelled
+  await assert.rejects(enqueued, /CHAT_UNAVAILABLE/)
+  assert.equal(saves, 1)
+  assert.equal(states.some(entries => entries.some(entry => entry.id === id)), false)
+})
+
+test('self local failure discovered during admission remains retryable', async t => {
+  const states = []
+  const localFailed = Promise.withResolvers()
+  let attempts = 0
+  const f = await fixture(t, {
+    save: async () => {
+      attempts++
+      if (attempts === 1) {
+        localFailed.resolve()
+        throw Object.assign(new Error('storage unavailable'), { code: 'STORAGE_UNAVAILABLE' })
+      }
+      return { result: { ok: true } }
+    },
+    onOutbox: entries => states.push(structuredClone(entries)),
+    openOutbox: async () => {
+      const rows = new Map()
+      return {
+        list: async () => [],
+        put: async entry => {
+          await localFailed.promise
+          rows.set(entry.id, structuredClone(entry))
+        },
+        remove: async id => rows.delete(id),
+        close () {}
+      }
+    }
+  })
+  const id = await f.session.enqueue({ peer: owner, event })
+  await until(() => states.some(entries => entries.some(entry => entry.id === id && entry.status === 'error')))
+  await f.session.retry(id)
+  await until(() => states.some(entries => entries.some(entry => entry.id === id && entry.status === 'saved')))
+  assert.equal(attempts, 2)
+  assert.equal(f.errors.length, 1)
+  assert.equal(f.sendErrors.length, 1)
+})
+
 test('close waits for an initial outbox write and preserves the intent without late admission', async t => {
   const write = Promise.withResolvers(); let writing = false; let closed = false; let saves = 0; let retained = false
   const f = await fixture(t, {
@@ -620,7 +810,7 @@ test('close waits for an initial outbox write and preserves the intent without l
   write.resolve()
   assert.equal(await enqueue, getEventHash(event))
   await closing
-  assert.equal(saves, 0)
+  assert.equal(saves, 1)
   assert.equal(retained, true)
   assert.equal(closed, true)
 })

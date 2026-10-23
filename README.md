@@ -1301,3 +1301,9 @@ The 0.11.34 recovery adapter marks paged event-store reads with the internal
 over new background read transactions. `putMany` also accepts an optional
 development diagnostic callback with aggregate existing/inserted/skipped counts;
 it never exposes ciphertext or record payloads.
+
+The 0.11.35 session lets self-chat local persistence and its initial encrypted
+outbox checkpoint run concurrently. The entry remains hidden and ineligible for
+saved/publication/cleanup until admission; remote entries keep checkpoint-first
+ordering. A failed local commit after admission remains retryable through the
+existing outbox path.

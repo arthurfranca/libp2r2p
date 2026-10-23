@@ -439,6 +439,10 @@ never infer ACK from local progress. Retain confirmed entries until local save,
 archive and cleanup finish. localPersistence is a copied summary without errors.
 Confirmed retries never republish or renew network urgency. Coalesce queued
 existing-only writes without weakening their preparation barrier or cancellation.
+Self entries are the sole pre-admission exception: they may start the serial
+local processor alongside the encrypted checkpoint, but stay absent from
+outbox snapshots and ineligible for saved status, publication or cleanup until
+the checkpoint wins. Remote entries always retain checkpoint-first admission.
 
 ## Recovery publication diagnostics (0.11.28)
 

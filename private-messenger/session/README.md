@@ -251,13 +251,19 @@ creates a fresh publication lifetime, without treating the pause as a user abort
 ## Independent local persistence and publication
 
 One encrypted outbox feeds two independent serial processors. Local persistence
-never waits for peer preparation or an in-flight publication. After the initial encrypted intent commits, remote preparation and publication
-never wait for event-store persistence. Only the exact prepared-envelope
-checkpoint gates transmission. Text continues passing uploads between chunks;
-its local stage need not have completed. Both stages use the admitted inner ID.
+never waits for peer preparation or an in-flight publication. Remote entries
+join those processors only after their initial encrypted intent commits, while
+self entries may start local persistence alongside that checkpoint. An
+in-flight self entry remains internal until admission: it is absent from
+`onOutbox`, cannot publish or clean up, and cannot report saved. Remote
+preparation and publication never wait for event-store persistence. Only the
+exact prepared-envelope checkpoint gates transmission. Text continues passing
+uploads between chunks; its local stage need not have completed. Both stages use
+the admitted inner ID.
 
-Self entries emit `status: 'saved'` as soon as local persistence succeeds. They
-do not write a redundant localSaved checkpoint before removal. Remote entries
+Self entries emit `status: 'saved'` once local persistence succeeds and the
+initial encrypted checkpoint admits the entry. They do not write a redundant
+localSaved checkpoint before removal. Remote entries
 emit that status after the first valid relay ACK for every required publication,
 without waiting for redundant relays. Outbox cleanup runs independently; failures
 retain saved status and retry only removal with the session backoff, never
