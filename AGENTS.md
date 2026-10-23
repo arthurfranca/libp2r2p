@@ -19,6 +19,11 @@ internal files directly through `package.json`; add or adjust an export-folder
 Keep the `exports` object in `package.json` sorted, with `.` first.
 Do not keep backwards-compatible alias exports unless explicitly requested.
 
+`CONTACT_LIST = 13300` is a replaceable, project-specific kind for private
+personal-copy contact overrides. `FOLLOW_SET = 30000` remains the addressable
+kind for custom follow sets. Consumers must not publish the private contact
+list directly and must exclude it from public account-event ingestion.
+
 ## Validation APIs
 
 Boolean predicates must use an interrogative prefix such as `is`, `has`,

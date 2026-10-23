@@ -28,6 +28,7 @@ export const COMMENT = 1111
 export const VOICE_MESSAGE = 1222
 export const VOICE_MESSAGE_REPLY = 1244
 export const LIVE_CHAT_MESSAGE = 1311
+export const CONTACT_LIST = 13300
 export const PROBLEM_TRACKER = 1971
 export const REPORT = 1984
 export const LABEL = 1985
@@ -169,6 +170,7 @@ export const eventKinds = /* @__PURE__ */ Object.freeze({
   VOICE_MESSAGE,
   VOICE_MESSAGE_REPLY,
   LIVE_CHAT_MESSAGE,
+  CONTACT_LIST,
   PROBLEM_TRACKER,
   REPORT,
   LABEL,

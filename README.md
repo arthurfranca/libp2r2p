@@ -1307,3 +1307,7 @@ outbox checkpoint run concurrently. The entry remains hidden and ineligible for
 saved/publication/cleanup until admission; remote entries keep checkpoint-first
 ordering. A failed local commit after admission remains retryable through the
 existing outbox path.
+
+The 0.11.36 kind registry adds `CONTACT_LIST = 13300` as a replaceable,
+project-specific contact list used only inside private personal copies.
+`FOLLOW_SET = 30000` remains the addressable NIP-02-style custom follow set.

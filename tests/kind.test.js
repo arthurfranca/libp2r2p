@@ -3,6 +3,7 @@ import { test } from 'node:test'
 
 import {
   classifyKind,
+  CONTACT_LIST,
   CONTENT_KEY_ANNOUNCEMENT,
   eventKinds,
   isAddressableKind,
@@ -29,6 +30,9 @@ test('kind helpers follow the exact NIP-01 ranges', () => {
 test('named kind exports and the aggregate retain project-specific kinds', () => {
   assert.equal(PERSONAL_COPY, 1006)
   assert.equal(eventKinds.PERSONAL_COPY, PERSONAL_COPY)
+  assert.equal(CONTACT_LIST, 13300)
+  assert.equal(eventKinds.CONTACT_LIST, CONTACT_LIST)
+  assert.deepEqual(classifyKind(CONTACT_LIST), ['replaceable'])
   assert.equal(CONTENT_KEY_ANNOUNCEMENT, 18716)
   assert.equal(eventKinds.CONTENT_KEY_ANNOUNCEMENT, CONTENT_KEY_ANNOUNCEMENT)
   assert.deepEqual(classifyKind(CONTENT_KEY_ANNOUNCEMENT), ['replaceable'])
