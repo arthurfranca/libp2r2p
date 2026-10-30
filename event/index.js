@@ -1,43 +1,89 @@
-import { schnorr, secp256k1 } from '@noble/curves/secp256k1.js'
-import { sha256 } from '@noble/hashes/sha2.js'
-
-import { bytesToBase16, base16ToBytes } from '../base16/index.js'
+import { base16ToBytes, bytesToBase16 } from '../base16/index.js'
 import { ValidationError } from '../error/index.js'
 import {
-  isAddressableKind,
-  isEphemeralKind,
-  isRegularKind,
-  isReplaceableKind
-} from '../kind/index.js'
+  configureEventCrypto,
+  getReadyEventCryptoBackend,
+  initializeEventCrypto,
+  markEventCryptoUnavailable,
+  scheduleEventCryptoInitialization
+} from '../helpers/secp256k1-wasm/backend.js'
+import {
+  copyTags,
+  eventValidationError as eventValidationErrorWithJavaScript,
+  finalizeEvent as finalizeEventWithJavaScript,
+  getEventHash as getEventHashWithJavaScript,
+  validateSecretKey
+} from './helpers/core.js'
 import {
   assertSerializableEvent,
   isSerializableEvent,
-  serializeEvent,
   serializableEventError
 } from './helpers/serialize.js'
 
+export {
+  classifyEvent,
+  isAddressableEvent,
+  isEphemeralEvent,
+  isRegularEvent,
+  isReplaceableEvent
+} from './helpers/core.js'
+export { assertSerializableEvent, isSerializableEvent }
+export { configureEventCrypto, initializeEventCrypto }
+
 const HEX_32 = /^[0-9a-f]{64}$/
 const HEX_64 = /^[0-9a-f]{128}$/
-const textEncoder = new TextEncoder()
 
-function copyTags (tags) {
-  return Array.isArray(tags) ? tags.map(tag => Array.isArray(tag) ? tag.slice() : tag) : tags
+function useWasmOrFallback (operation, fallback) {
+  scheduleEventCryptoInitialization()
+  const backend = getReadyEventCryptoBackend()
+  if (!backend) return fallback()
+  try {
+    return operation(backend)
+  } catch {
+    markEventCryptoUnavailable()
+    return fallback()
+  }
 }
 
-export { assertSerializableEvent, isSerializableEvent }
-
 export function getEventHash (event) {
-  return bytesToBase16(sha256(textEncoder.encode(serializeEvent(event))))
+  assertSerializableEvent(event)
+  return useWasmOrFallback(
+    backend => bytesToBase16(backend.hashEvent(event)),
+    () => getEventHashWithJavaScript(event)
+  )
 }
 
 export function finalizeEvent (template, secretKey) {
-  if (!(secretKey instanceof Uint8Array) || secretKey.length !== 32 || !secp256k1.utils.isValidSecretKey(secretKey)) {
-    throw new ValidationError('INVALID_SECRET_KEY')
+  validateSecretKey(secretKey)
+  const event = {
+    ...template,
+    tags: copyTags(template?.tags),
+    pubkey: '0'.repeat(64)
   }
-  const pubkey = bytesToBase16(schnorr.getPublicKey(secretKey))
-  const event = { ...template, tags: copyTags(template?.tags), pubkey }
-  const id = getEventHash(event)
-  return { ...event, id, sig: bytesToBase16(schnorr.sign(base16ToBytes(id), secretKey)) }
+  assertSerializableEvent(event)
+  return useWasmOrFallback(
+    backend => {
+      const entropy = crypto.getRandomValues(new Uint8Array(32))
+      let id
+      const { publicKey, signature } = backend.signEventHash(
+        secretKey,
+        publicKeyBytes => {
+          event.pubkey = bytesToBase16(publicKeyBytes)
+          const hash = backend.hashEvent(event)
+          id = bytesToBase16(hash)
+          return hash
+        },
+        entropy
+      )
+      return {
+        ...event,
+        pubkey: bytesToBase16(publicKey),
+        id,
+        sig: bytesToBase16(signature)
+      }
+    },
+    () => finalizeEventWithJavaScript(template, secretKey)
+  )
 }
 
 function eventValidationError (event) {
@@ -45,16 +91,25 @@ function eventValidationError (event) {
   if (structureError) return structureError
   if (typeof event.id !== 'string' || !HEX_32.test(event.id)) return 'INVALID_EVENT_ID'
   if (typeof event.sig !== 'string' || !HEX_64.test(event.sig)) return 'INVALID_EVENT_SIGNATURE'
+
+  scheduleEventCryptoInitialization()
+  const backend = getReadyEventCryptoBackend()
+  if (!backend) return eventValidationErrorWithJavaScript(event)
   try {
-    const id = getEventHash(event)
+    const id = bytesToBase16(backend.hashEvent(event))
     if (id !== event.id) return 'EVENT_ID_MISMATCH'
-    if (!schnorr.verify(base16ToBytes(event.sig), base16ToBytes(id), base16ToBytes(event.pubkey))) {
+    if (!backend.verifyHash(
+      base16ToBytes(event.sig),
+      base16ToBytes(id),
+      base16ToBytes(event.pubkey)
+    )) {
       return 'INVALID_EVENT_SIGNATURE'
     }
+    return null
   } catch {
-    return 'INVALID_EVENT_SIGNATURE'
+    markEventCryptoUnavailable()
+    return eventValidationErrorWithJavaScript(event)
   }
-  return null
 }
 
 export function isValidEvent (event) {
@@ -65,52 +120,4 @@ export function assertValidEvent (event) {
   const code = eventValidationError(event)
   if (code) throw new ValidationError(code)
   return event
-}
-
-function hasTagDefinedClassification (event, classification) {
-  if (!event || typeof event !== 'object' || !Array.isArray(event.tags)) return false
-
-  if (classification === 'ephemeral') {
-    if (!Number.isSafeInteger(event.created_at) || event.created_at < 0) return false
-    const timestamp = String(event.created_at)
-    return event.tags.some(tag => Array.isArray(tag) && tag[0] === 'expiration' && tag[1] === timestamp)
-  }
-
-  const dTag = event.tags.find(tag => Array.isArray(tag) && tag[0] === 'd')
-  if (typeof dTag?.[1] !== 'string') return false
-  if (classification === 'replaceable') return dTag[1] === ''
-  if (classification === 'addressable') return dTag[1] !== ''
-  return false
-}
-
-export function classifyEvent (event, { includeLegacyKindRanges = true } = {}) {
-  if (!event || typeof event !== 'object') return []
-  const options = { includeLegacyKindRanges }
-  return [
-    ['regular', isRegularEvent],
-    ['replaceable', isReplaceableEvent],
-    ['ephemeral', isEphemeralEvent],
-    ['addressable', isAddressableEvent]
-  ].filter(([, predicate]) => predicate(event, options)).map(([classification]) => classification)
-}
-
-export function isRegularEvent (event, options) {
-  if (!event || typeof event !== 'object') return false
-  return (options?.includeLegacyKindRanges !== false && isRegularKind(event.kind)) ||
-    (!isReplaceableEvent(event, options) && !isAddressableEvent(event, options))
-}
-
-export function isReplaceableEvent (event, options) {
-  return (options?.includeLegacyKindRanges !== false && isReplaceableKind(event?.kind)) ||
-    hasTagDefinedClassification(event, 'replaceable')
-}
-
-export function isEphemeralEvent (event, options) {
-  return (options?.includeLegacyKindRanges !== false && isEphemeralKind(event?.kind)) ||
-    hasTagDefinedClassification(event, 'ephemeral')
-}
-
-export function isAddressableEvent (event, options) {
-  return (options?.includeLegacyKindRanges !== false && isAddressableKind(event?.kind)) ||
-    hasTagDefinedClassification(event, 'addressable')
 }

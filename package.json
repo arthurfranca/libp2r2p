@@ -1,6 +1,6 @@
 {
   "name": "libp2r2p",
-  "version": "0.11.36",
+  "version": "0.12.0",
   "description": "Peer-to-relay-to-peer",
   "keywords": [
     "p2r2p",
@@ -46,10 +46,13 @@
     "private-messenger",
     "relay",
     "temporary-storage",
+    "THIRD_PARTY_NOTICES.md",
     "url",
     "web-storage-queue"
   ],
   "scripts": {
+    "benchmark:event": "node --expose-gc benchmark/event-crypto.js",
+    "build:wasm": "node wasm/build.js",
     "test": "node --test --experimental-test-module-mocks 'tests/**/*.test.js'",
     "test:files": "node --test --experimental-test-module-mocks",
     "test:only": "node --test --test-only --experimental-test-module-mocks 'tests/**/*.test.js'"
@@ -67,10 +70,12 @@
     "./ecdh": "./ecdh/index.js",
     "./error": "./error/index.js",
     "./event": "./event/index.js",
+    "./event/js": "./event/js/index.js",
     "./idb": "./idb/index.js",
     "./idb-queue": "./idb-queue/index.js",
     "./irfs": "./irfs/index.js",
     "./key": "./key/index.js",
+    "./key/js": "./key/js/index.js",
     "./kind": "./kind/index.js",
     "./network": "./network/index.js",
     "./nip04": "./nip04/index.js",
@@ -105,6 +110,7 @@
   },
   "devDependencies": {
     "eslint": "^9.39.5",
+    "esbuild": "^0.28.2",
     "fake-indexeddb": "6.2.5",
     "globals": "^17.8.0",
     "neostandard": "^0.13.0"

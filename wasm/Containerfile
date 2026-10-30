@@ -1,0 +1,47 @@
+FROM docker.io/emscripten/emsdk@sha256:fb7864e398acfda863dfcea78b8bc8adad359fa60c6a0bbeb845931de64aa68a
+
+RUN apt-get update \
+  && apt-get install -y autoconf libtool build-essential
+
+COPY vendor/libsecp256k1 /app
+
+WORKDIR /app
+
+# libsecp256k1 keeps SHA-256 internal. The binding needs incremental access,
+# so expose these three functions without changing their implementation.
+RUN sed -i 's/static \(void secp256k1_sha256_\(initialize\|write\|finalize\)\)/\1/' src/hash_impl.h
+RUN sed -i 's/static \(void secp256k1_sha256_\(initialize\|write\|finalize\)\)/extern \1/' src/hash.h
+RUN sed -i 's/static \(void secp256k1_hash_ctx_init\)/\1/' src/hash_impl.h
+RUN sed -i 's/static \(void secp256k1_hash_ctx_init\)/extern \1/' src/hash.h
+
+RUN echo '{"type":"commonjs"}' > package.json
+RUN ./autogen.sh
+
+RUN emconfigure ./configure \
+  --enable-module-schnorrsig=yes \
+  --enable-module-extrakeys=yes \
+  --with-ecmult-window=4 \
+  --disable-shared \
+  CFLAGS="-fdata-sections -ffunction-sections -O2" \
+  LDFLAGS="-Wl,--gc-sections"
+
+RUN emmake make FORMAT=wasm
+RUN emmake make src/precompute_ecmult-precompute_ecmult FORMAT=wasm
+
+RUN mkdir -p /app/out
+
+RUN emcc \
+  src/precompute_ecmult-precompute_ecmult.o \
+  src/libsecp256k1_precomputed_la-precomputed_ecmult.o \
+  src/libsecp256k1_precomputed_la-precomputed_ecmult_gen.o \
+  src/libsecp256k1_la-secp256k1.o \
+  -O3 \
+  -s WASM=1 \
+  -s TOTAL_MEMORY=256kb \
+  -s EXPORTED_FUNCTIONS='[ "_malloc", "_free", "_secp256k1_context_create", "_secp256k1_keypair_create", "_secp256k1_keypair_xonly_pub", "_secp256k1_xonly_pubkey_parse", "_secp256k1_xonly_pubkey_serialize", "_secp256k1_schnorrsig_sign32", "_secp256k1_schnorrsig_verify", "_secp256k1_hash_ctx_init", "_secp256k1_sha256_initialize", "_secp256k1_sha256_write", "_secp256k1_sha256_finalize" ]' \
+  -s MINIMAL_RUNTIME=1 \
+  -s NO_EXIT_RUNTIME=1 \
+  --emit-minification-map=/app/out/secp256k1.symbols \
+  -o /app/out/secp256k1.js
+
+CMD ["cp", "-r", "/app/out/.", "/out/"]

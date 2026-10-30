@@ -3,7 +3,11 @@ import globals from 'globals'
 
 export default [
   ...neostandard({
-    ignores: [...resolveIgnoresFromGitignore(), 'dist']
+    ignores: [
+      ...resolveIgnoresFromGitignore(),
+      'dist',
+      'helpers/secp256k1-wasm/generated.js'
+    ]
   }), {
     files: ['**/*.js'],
     languageOptions: {

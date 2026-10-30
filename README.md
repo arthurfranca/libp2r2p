@@ -765,6 +765,54 @@ import {
 } from 'libp2r2p/url'
 ```
 
+Event hashing, signing, verification and public-key derivation use a bundled
+libsecp256k1 WebAssembly backend after it becomes ready. Initialization is lazy:
+the first operation uses JavaScript and starts the WASM compiler in the
+background, so existing synchronous calls do not change. To use WASM for the
+first operation, await the optional initializer:
+
+```js
+import {
+  finalizeEvent,
+  initializeEventCrypto
+} from 'libp2r2p/event'
+
+const backend = await initializeEventCrypto() // 'wasm' or 'javascript'
+const event = finalizeEvent(template, secretKey)
+```
+
+Inaccessible WebAssembly, CSP restrictions and backend failures fall back to
+JavaScript. Disable the backend for the current JavaScript realm with
+`configureEventCrypto({ wasm: false })`. This runtime option does not reduce the
+bundle. Applications that want to exclude the WASM artifact entirely should use
+the JS-only event and key entrypoints:
+
+```js
+import { finalizeEvent, isValidEvent } from 'libp2r2p/event/js'
+import { getPublicKey } from 'libp2r2p/key/js'
+```
+
+`generateSecretKey()` always uses JavaScript and does not initialize WASM.
+Maintainers can rebuild the checked-in WASM module with `npm run build:wasm`;
+see the
+[WASM build guide](https://github.com/arthurfranca/libp2r2p/blob/main/wasm/README.md).
+Run the non-gating comparison against the JavaScript backend with
+`npm run benchmark:event` (implemented by `benchmark/event-crypto.js`).
+
+Median speedup after explicit WASM initialization, measured with Node.js 24 on
+an AMD Ryzen 5 5600G:
+
+| Operation | 8 KiB | 256 KiB | 1 MiB |
+| --- | ---: | ---: | ---: |
+| `isValidEvent` | 5.83× | 2.58× | 1.94× |
+| `finalizeEvent` | 13.64× | 3.11× | 2.06× |
+| `getEventHash` | 1.27× | 1.60× | 1.59× |
+| `getPublicKey` | 3.61× | — | — |
+
+These numbers compare complete public operations against the same methods from
+`event/js` and `key/js`. They are an indicative local measurement, not a CI
+performance gate.
+
 Blossom server normalization accepts root `http:` origins for local
 development. Public Blossom validation additionally requires `https:` and a
 public host, and rejects credentials, paths, query strings and fragments.

@@ -11,11 +11,22 @@ test('new public Nostr subpaths expose only the used surface', async () => {
     ],
     event: [
       'assertSerializableEvent', 'assertValidEvent', 'classifyEvent',
+      'configureEventCrypto', 'finalizeEvent', 'getEventHash', 'initializeEventCrypto',
+      'isAddressableEvent', 'isEphemeralEvent', 'isRegularEvent',
+      'isReplaceableEvent', 'isSerializableEvent', 'isValidEvent'
+    ],
+    'event/js': [
+      'assertSerializableEvent', 'assertValidEvent', 'classifyEvent',
       'finalizeEvent', 'getEventHash', 'isAddressableEvent', 'isEphemeralEvent',
       'isRegularEvent', 'isReplaceableEvent', 'isSerializableEvent', 'isValidEvent'
     ],
     error: ['ValidationError'],
     key: [
+      'generateKeypair', 'generateSecretKey', 'getPublicKey', 'keypairFromSeckey',
+      'npubFromPubkey', 'nsecFromHex', 'parseProfileEvent', 'profileEventTemplate',
+      'pubkeyFromNpub', 'signProfileEvent', 'signRelayListEvent'
+    ],
+    'key/js': [
       'generateKeypair', 'generateSecretKey', 'getPublicKey', 'keypairFromSeckey',
       'npubFromPubkey', 'nsecFromHex', 'parseProfileEvent', 'profileEventTemplate',
       'pubkeyFromNpub', 'signProfileEvent', 'signRelayListEvent'
@@ -63,6 +74,8 @@ test('new public Nostr subpaths expose only the used surface', async () => {
 
   const root = await import('libp2r2p')
   assert.equal(root.error.ValidationError, (await import('libp2r2p/error')).ValidationError)
+  assert.equal(root.event.configureEventCrypto, (await import('libp2r2p/event')).configureEventCrypto)
+  assert.equal(root.event.initializeEventCrypto, (await import('libp2r2p/event')).initializeEventCrypto)
   assert.equal(root.nip27.compactWhitespace, (await import('libp2r2p/nip27')).compactWhitespace)
 })
 
