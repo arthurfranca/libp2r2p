@@ -4,6 +4,7 @@ import { createFileCache } from './helpers/cache.js'
 export { createFileCache, DEFAULT_FILE_CACHE_BYTES } from './helpers/cache.js'
 import { createFileCatalog } from './helpers/catalog.js'
 import { assertMessagePublished } from '../helpers/publication.js'
+import { normalizePreparedPublications } from '../../private-channel/helpers/prepared.js'
 import { ValidationError } from '../../error/index.js'
 import { IRFS_CHUNK_BYTES, decodeIrfsChunk } from '../../irfs/index.js'
 import { createQueue } from '../../idb-queue/index.js'
@@ -151,9 +152,10 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
   function sendOptions (file, routes) {
     return { senderSigner: messenger.userSigner, imkcSigner: messenger.contentKeySigner, privateChannelSigner: file.signer, ...routes, temporaryStorageArea: messenger.temporaryStorageArea, expirationSeconds: messenger.eventExpirationSecondsFor(file.controlChannelPubkey), _getIykcProofs: messenger.contentKeyLookup() }
   }
-  async function publishChunk (descriptor, event, { signal, attemptStartedAt, onPreparedSeed, preparedPublication, onDebug } = {}) {
+  async function publishChunk (descriptor, event, { signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug } = {}) {
     const file = await register(descriptor)
     usable(file)
+    const prepared = normalizePreparedPublications({ preparedPublication, preparedPublications })
     const decoded = checked(file, event)
     await catalog.ready
     if (ownsStorage) {
@@ -162,7 +164,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     }
     let result
     try {
-      const options = { ...sendOptions(file, await routing(file, file.peerPubkey, signal, attemptStartedAt, onDebug)), receiverPubkeys: [file.peerPubkey], fileChunkIndex: decoded.index, preparedPublication, ...(onPreparedSeed ? { onPreparedSeed } : messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? { onPreparedSeed: seed => saveSeed(file, seed) } : {}) }
+      const options = { ...sendOptions(file, await routing(file, file.peerPubkey, signal, attemptStartedAt, onDebug)), receiverPubkeys: [file.peerPubkey], fileChunkIndex: decoded.index, preparedPublications: prepared.length ? prepared : undefined, ...(onPreparedSeed ? { onPreparedSeed } : messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? { onPreparedSeed: seed => saveSeed(file, seed) } : {}) }
       result = event.sig ? await _messages.broadcastEvent({ ...options, event }) : await _messages.broadcastRumor({ ...options, rumor: event })
       await assertMessagePublished(result, result?.rumor || result?.event || { ...event, pubkey: event.pubkey || messenger.userPubkey })
     } catch (error) { await uploadLeases.get(file.root)?.(); uploadLeases.delete(file.root); throw error }

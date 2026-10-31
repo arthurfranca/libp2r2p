@@ -640,13 +640,11 @@ test('prepared replay retains its original deletion capability', async () => {
   }
   const options = { senderSigner: signer(pubkeyFixture(3)), receiverPubkeys: ['alice'], rumor: { kind: 9, tags: [], created_at: 1700000000, content: 'repeat' }, _publish, onPreparedSeed: seed => { prepared = structuredClone(seed.publication) } }
   const original = await broadcastRumor(options)
-  const replay = await broadcastRumor({ ...options, preparedPublication: prepared })
-  assert.equal(replay.delivery.deletionSeckey, original.delivery.deletionSeckey)
-  assert.equal(calls[1].preparedPublications.length, 1)
   const pluralReplay = await broadcastRumor({ ...options, preparedPublications: [prepared] })
   assert.equal(pluralReplay.delivery.deletionSeckey, original.delivery.deletionSeckey)
-  await assert.rejects(broadcastRumor({ ...options, preparedPublication: prepared, preparedPublications: [prepared] }), { code: 'CONFLICTING_PREPARED_PUBLICATIONS' })
-  await assert.rejects(broadcastRumor({ ...options, preparedPublication: { ...prepared, deletionCapability: {} } }), /INVALID_PREPARED_PUBLICATION/)
+  assert.equal(calls[1].preparedPublications.length, 1)
+  await assert.rejects(broadcastRumor({ ...options, preparedPublication: prepared }), { code: 'LEGACY_PREPARED_PUBLICATION' })
+  await assert.rejects(broadcastRumor({ ...options, preparedPublications: [{ ...prepared, deletionCapability: {} }] }), /INVALID_PREPARED_PUBLICATION/)
 })
 
 test('yell replays prepared publications with the original inner timestamp', async () => {

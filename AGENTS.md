@@ -93,10 +93,12 @@ suite pass; report independently scoped problems separately.
   partial coverage. Nym methods intentionally retain one carrier union.
 - `preparedPublications` is the canonical prepared-envelope input: one entry per
   recipient group, with exact events, seeds and receivers. `preparedPublication`
-  is accepted only as a legacy single-group boundary adapter for existing
-  session/outbox snapshots. Supplying both forms is invalid; internal publisher
-  code uses only arrays. Replay targets pending peers without recreating
-  cryptography, IDs or tags.
+  is no longer a public argument and must fail with
+  `LEGACY_PREPARED_PUBLICATION`. Existing encrypted outbox snapshots using
+  `prepared.publication` are normalized to a one-item
+  `prepared.publications` array and persisted before processing. Internal
+  publisher code uses only arrays. Replay targets pending peers without
+  recreating cryptography, IDs or tags.
 
 - Version 0.11.22 migrates only the known message-queue three-field provenance
   index, atomically preserving rows/order/accounting. Keep generic queue schema

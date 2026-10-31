@@ -1237,12 +1237,13 @@ one recipient group with its own encrypted `events`, recovery `seeds`, and
 `receiverPubkeys`. A later send can pass the array plus only the pending
 recipients; matching groups are replayed with their original IDs, bytes and
 signatures, and routed only for the pending peers. The legacy
-`preparedPublication` field remains accepted as a one-element array at the API
-boundary for existing session/outbox snapshots. Supplying both forms is
-invalid. `yell` callers must reuse the original `createdAt` when replaying so
-the inner rumor identity matches; `broadcastRumor` and `broadcastEvent` already
-carry their original inner event. Nym broadcasts intentionally remain a single
-carrier union.
+`preparedPublication` public argument is rejected with
+`LEGACY_PREPARED_PUBLICATION`; existing encrypted outbox snapshots containing
+`prepared.publication` are migrated internally to
+`prepared.publications` before processing. `yell` callers must reuse the
+original `createdAt` when replaying so the inner rumor identity matches;
+`broadcastRumor` and `broadcastEvent` already carry their original inner event.
+Nym broadcasts intentionally remain a single carrier union.
 
 
 ### Relay backpressure and bounded synchronization (0.11.7)

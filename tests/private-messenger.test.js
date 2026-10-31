@@ -1530,7 +1530,7 @@ test('private messenger forwards canonical prepared publications and derives pen
     rumor: { kind: 9, created_at: 1700000001, tags: [], content: 'retry' },
     preparedPublication: prepared[0],
     preparedPublications: prepared
-  }), { code: 'CONFLICTING_PREPARED_PUBLICATIONS' })
+  }), { code: 'LEGACY_PREPARED_PUBLICATION' })
 })
 
 test('private messenger uses channel sendRelays after per-call routing overrides', async () => {

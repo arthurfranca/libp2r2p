@@ -24,7 +24,7 @@ export function createPublicationJournal ({ entries, store, archive, changed, on
   function rows (entry) {
     const packet = entry.prepared
     if (!packet?.recover) return []
-    return packet.publication.seeds.flatMap(seed => compactSeedRouterRows(seed).map(row => {
+    return packet.publications.flatMap(publication => publication.seeds.flatMap(seed => compactSeedRouterRows(seed).map(row => {
       const descriptor = packet.target.file
       const value = {
         ...row, channelPubkey: seed.channelPubkey, receivedAt: packet.receivedAt,
@@ -32,15 +32,15 @@ export function createPublicationJournal ({ entries, store, archive, changed, on
         ...(descriptor
           ? {
               root: descriptor.root, controlChannelPubkey: descriptor.controlChannelPubkey,
-              fileChannelPubkey: packet.publication.channelPubkey, peerPubkey: descriptor.peerPubkey,
+              fileChannelPubkey: publication.channelPubkey, peerPubkey: descriptor.peerPubkey,
               chunkIndex: packet.target.chunkIndex,
-              key: `${descriptor.controlChannelPubkey}:${packet.publication.channelPubkey}:${row.receiverPubkey}:${packet.target.chunkIndex}`
+              key: `${descriptor.controlChannelPubkey}:${publication.channelPubkey}:${row.receiverPubkey}:${packet.target.chunkIndex}`
             }
           : {})
       }
       value.recordId = encodeRecord('seed', value).tags[0][1]
       return value
-    }))
+    })))
   }
   function retryLater () {
     if (stopped || !enabled || timer || !failed.size) return
@@ -60,7 +60,7 @@ export function createPublicationJournal ({ entries, store, archive, changed, on
         try {
           if (!durable.has(packet)) { await write(entry); durable.add(packet) }
           if (!packet.archived) {
-            debug(entry, 'recovery-archive-start', queued.get(packet), { publicationId: packet.publication.events[0].id })
+            debug(entry, 'recovery-archive-start', queued.get(packet), { publicationId: packet.publications[0].events[0].id })
             if (packet.recover) await archive(entry, rows(entry))
             packet.archived = true
             debug(entry, 'recovery-archived', started)
@@ -89,9 +89,20 @@ export function createPublicationJournal ({ entries, store, archive, changed, on
     adopt (entry) { if (entry.prepared) { durable.add(entry.prepared); queued.set(entry.prepared, Date.now()) } },
     async stage (entry, seed, target, retentionSeconds) {
       const started = Date.now()
-      if (entry.prepared && entry.prepared.publication.events[0].id !== seed.publication.events[0].id) throw new Error('PUBLICATION_ARCHIVE_PENDING')
-      entry.prepared ||= { publication: structuredClone(seed.publication), target, receivedAt: Math.floor(Date.now() / 1000), retentionSeconds, recover: retentionSeconds > 0, accepted: false, archived: retentionSeconds <= 0 }
-      if (durable.has(entry.prepared)) return
+      const publication = structuredClone(seed.publication)
+      entry.prepared ||= { publications: [], target, receivedAt: Math.floor(Date.now() / 1000), retentionSeconds, recover: retentionSeconds > 0, accepted: false, archived: retentionSeconds <= 0 }
+      if (entry.prepared.publications.some(existing => existing.innerEventId !== publication.innerEventId)) {
+        throw new Error('PUBLICATION_ARCHIVE_PENDING')
+      }
+      const receiverKey = (publication.receiverPubkeys || []).slice().sort().join(',')
+      const eventKey = publication.events.map(event => event.id).join(',')
+      const added = !entry.prepared.publications.some(existing =>
+        existing.innerEventId === publication.innerEventId &&
+        (existing.receiverPubkeys || []).slice().sort().join(',') === receiverKey &&
+        existing.events.map(event => event.id).join(',') === eventKey
+      )
+      if (added) entry.prepared.publications.push(publication)
+      if (!added && durable.has(entry.prepared)) return
       queued.set(entry.prepared, Date.now())
       await write(entry)
       durable.add(entry.prepared)

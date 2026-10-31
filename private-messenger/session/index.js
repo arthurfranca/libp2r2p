@@ -16,6 +16,7 @@ import { assertMessagePublished } from '../helpers/publication.js'
 import { normalizeFallbackRelays, normalizeFallbackDelay } from '../helpers/send-routing.js'
 import { createPublicationJournal, withPendingSeeds } from './helpers/publication-journal.js'
 import { createPauseRecovery, isRecoverableStorageFailure } from '../helpers/pause-recovery.js'
+import { normalizePreparedState } from './helpers/prepared-state.js'
 
 export function wireEvent (value, owner) {
   const event = { kind: value.kind, created_at: value.created_at, tags: structuredClone(value.tags), content: value.content, pubkey: value.pubkey || owner }
@@ -164,6 +165,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const idleWaiters = new Set()
   const settled = () => { if (!sending && !localSaving && !enqueuing && !draining && !cleanups.size) { for (const resolve of idleWaiters) resolve(); idleWaiters.clear() } }
   const localComplete = entry => entry.localSaved.every(Boolean)
+  const preparedPublicationId = entry => entry.prepared?.publications?.[0]?.events?.[0]?.id
   const completed = entry => !unadmitted.has(entry) && localComplete(entry) && (entry.peer === owner || entry.deliveryConfirmed)
   const emit = () => onOutbox([...entries.values()].filter(entry => !unadmitted.has(entry) && !entry.deletion && !entry.cancelled).map(entry => ({
     ...entry,
@@ -188,7 +190,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       const onDiagnostic = details => {
         diagnosticReported = true
         debug(entry, 'recovery-archive-result', archiveStartedAt, {
-          publicationId: entry.prepared.publication.events[0].id,
+          publicationId: preparedPublicationId(entry),
           ...details
         })
       }
@@ -199,15 +201,19 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
           for (const row of rows) archived.push(await recoveryStorage.seeds.put(row))
         }
       } else if (entry.prepared.target.file) {
-        for (const seed of entry.prepared.publication.seeds) await fileTransfers.archiveSeed(entry.prepared.target.file, seed)
+        for (const publication of entry.prepared.publications) {
+          for (const seed of publication.seeds) await fileTransfers.archiveSeed(entry.prepared.target.file, seed)
+        }
       } else {
-        for (const seed of entry.prepared.publication.seeds) await messenger.enqueueSeed(seed.channelPubkey, seed)
+        for (const publication of entry.prepared.publications) {
+          for (const seed of publication.seeds) await messenger.enqueueSeed(seed.channelPubkey, seed)
+        }
       }
       if (!diagnosticReported) {
         const results = Array.isArray(archived) ? archived : []
         const storedCount = results.filter(Boolean).length
         debug(entry, 'recovery-archive-result', archiveStartedAt, {
-          publicationId: entry.prepared.publication.events[0].id,
+          publicationId: preparedPublicationId(entry),
           rowCount: rows.length,
           uniqueCount: new Set(rows.map(row => row.recordId).filter(Boolean)).size,
           storedCount,
@@ -226,6 +232,9 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   const ready = () => (initialized ??= (async () => {
     storage = await openOutbox({ owner, signer, onDebug })
     for (const entry of await storage.list()) {
+      if (normalizePreparedState(entry.prepared).migrated) {
+        await storage.put(structuredClone(entry), { existing: true })
+      }
       // Old encrypted entries retain progress and enter this same pipeline.
       const legacyLocalFailure = entry.deliveryConfirmed === undefined && entry.failed && !entry.localSaved.every(Boolean)
       if (legacyLocalFailure) {
@@ -471,7 +480,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     const options = {
       channelPubkey, receiverPubkeys: [peer], signal, attemptStartedAt: attemptStarts.get(entry.id),
       onDebug: onDebug ? value => debug(entry, value.stage, undefined, value) : undefined,
-      preparedPublication: entry.prepared?.publication,
+      preparedPublications: entry.prepared?.publications,
       onPreparedSeed: async seed => {
         debug(entry, 'envelope-prepared', preparationStartedAt, { publicationId: seed.publication.events[0].id })
         await journal.stage(entry, seed, { index: entry.index }, retention)
@@ -592,7 +601,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
           const recover = mode === 'watchtower' ? messenger.offlineRecoverySecondsFor?.(descriptor.controlChannelPubkey) ?? 0 : 0
           const target = { file: descriptor, fileIndex: entry.fileIndex, chunkIndex: entry.chunkIndex }
           await fileTransfers.publishChunk(descriptor, wireEvent(chunk, owner), {
-            signal: controller.signal, attemptStartedAt: chunkStartedAt, onDebug: onDebug ? value => debug(entry, value.stage, undefined, value) : undefined, preparedPublication: entry.prepared?.publication,
+            signal: controller.signal, attemptStartedAt: chunkStartedAt, onDebug: onDebug ? value => debug(entry, value.stage, undefined, value) : undefined, preparedPublications: entry.prepared?.publications,
             onPreparedSeed: async seed => { await journal.stage(entry, seed, target, recover); controller.signal.throwIfAborted() }
           })
           entry.chunkIndex++

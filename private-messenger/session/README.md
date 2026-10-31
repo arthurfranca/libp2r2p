@@ -321,6 +321,12 @@ relay confirmation separately from `localSaved`. Old entries normalize from
 saved delivery status, never from local progress; their event/file indices and
 prepared envelopes remain unchanged. No database migration is needed.
 
+Prepared envelopes are stored as the `prepared.publications` array. Older
+snapshots containing `prepared.publication` are converted to a one-item array
+and rewritten through the same encrypted outbox queue before publication or
+archive work resumes. The singular key is never written by current versions and
+is not accepted as a public replay argument.
+
 `onOutbox` adds `localPersistence: { state, retryable }`, where state is pending,
 saved or failed. It is a presentation summary with no native error objects.
 A saved remote entry may still have pending/failed local work. Keep it visible

@@ -38,7 +38,7 @@ async function fixture (t, { rows = new Map(), put = async () => {}, putMany, ar
       return createSessionMessenger(value, {
         offlineRecoverySecondsFor: () => 3600,
         broadcastRumor: async call => {
-          const publication = call.preparedPublication || packet((sequence++).toString(16).padStart(64, '0'))
+          const publication = call.preparedPublications?.[0] || packet((sequence++).toString(16).padStart(64, '0'))
           await call.onPreparedSeed({ ...publication.seeds[0], publication })
           sent.push(publication.events[0].id)
           await transport(call)
@@ -97,6 +97,75 @@ test('reload after ACK archives only, while an unconfirmed checkpoint republishe
     assert.deepEqual(f.sent, accepted ? [] : ['f'.repeat(64)])
     await f.session.close()
   }
+})
+
+test('legacy prepared publication snapshots migrate and replay their exact envelope', async t => {
+  const event = text('legacy prepared snapshot')
+  const id = getEventHash(event)
+  const publication = packet('f'.repeat(64))
+  const entry = {
+    id,
+    peer,
+    event: { ...event, id },
+    events: [event],
+    files: [],
+    localSaved: [true],
+    index: 0,
+    fileIndex: 0,
+    chunkIndex: 0,
+    status: 'pending',
+    prepared: {
+      publication,
+      recover: false,
+      retentionSeconds: 0,
+      receivedAt: event.created_at,
+      target: { index: 0 },
+      accepted: false,
+      archived: true
+    }
+  }
+  const writes = []
+  const f = await fixture(t, {
+    initial: [entry],
+    put: async value => { writes.push(structuredClone(value)) }
+  })
+
+  await until(() => f.sent.length === 1)
+  assert.deepEqual(f.sent, ['f'.repeat(64)])
+  const migrated = writes.find(value => value.prepared)
+  assert.ok(migrated)
+  assert.equal('publication' in migrated.prepared, false)
+  assert.deepEqual(migrated.prepared.publications, [publication])
+})
+
+test('the publication journal accumulates prepared groups from the same inner event', async () => {
+  const { createPublicationJournal } = await import('../private-messenger/session/helpers/publication-journal.js')
+  const entry = { id: 'grouped', localSaved: [false], index: 0 }
+  const writes = []
+  const journal = createPublicationJournal({
+    entries: new Map([[entry.id, entry]]),
+    store: () => ({ put: async value => { writes.push(structuredClone(value)) } }),
+    archive: async () => {},
+    changed: () => {},
+    onError: assert.fail,
+    debug: () => {}
+  })
+  const one = packet('1'.repeat(64))
+  one.innerEventId = 'inner'
+  const two = structuredClone(one)
+  two.receiverPubkeys = ['carol']
+  two.events[0].id = '2'.repeat(64)
+  two.seeds[0].jsonl = `${JSON.stringify(['payload'])}\n${JSON.stringify(['carol', 'encrypted key'])}\n`
+
+  await journal.stage(entry, { publication: one }, { index: 0 }, 0)
+  await journal.stage(entry, { publication: two }, { index: 0 }, 0)
+  assert.deepEqual(entry.prepared.publications, [one, two])
+
+  const other = packet('3'.repeat(64))
+  other.innerEventId = 'other'
+  await assert.rejects(journal.stage(entry, { publication: other }, { index: 0 }, 0), /PUBLICATION_ARCHIVE_PENDING/)
+  assert.equal(writes.length, 2)
+  await journal.close()
 })
 
 test('actual 0.11.24 snapshots retain identity and progress in the current pipeline', async t => {
@@ -194,7 +263,7 @@ test('a watchtower upload yields its slot while one chunk awaits archival and ot
     FileTransfer: () => ({
       observe () {}, authorizeSeeding: async () => {}, publishChunk: async (_, value, options) => {
         const index = uploads.length
-        const publication = options.preparedPublication || packet((index + 100).toString(16).padStart(64, '0'))
+        const publication = options.preparedPublications?.[0] || packet((index + 100).toString(16).padStart(64, '0'))
         publication.seeds[0].router.tags.push(['i', String(index)])
         await options.onPreparedSeed({ ...publication.seeds[0], publication })
         uploads.push(index)
@@ -274,7 +343,7 @@ test('queued journal checkpoints coalesce but the exact prepared publication rem
   assert.equal(writes.length, 2)
   assert.equal(staged, false)
   assert.deepEqual(writes[1].localSaved, [true])
-  assert.equal(writes[1].prepared.publication.events[0].id, 'exact-envelope')
+  assert.equal(writes[1].prepared.publications[0].events[0].id, 'exact-envelope')
   second.resolve(); await Promise.all([progress, checkpoint])
   assert.equal(staged, true)
   await journal.close()

@@ -1828,12 +1828,11 @@ test('a checkpoint holds every signed fragment and replays identical envelopes w
       return typeof value === 'function' ? value.bind(target) : value
     }
   })
-  const replay = await wrapEvent({ ...options, senderSigner: cannotEncrypt, privateChannelSigner: cannotEncrypt, preparedPublication: publication })
-  assert.deepEqual(replay, original)
   const pluralReplay = await wrapEvent({ ...options, senderSigner: cannotEncrypt, privateChannelSigner: cannotEncrypt, preparedPublications: [publication] })
   assert.deepEqual(pluralReplay, original)
-  await assert.rejects(wrapEvent({ ...options, preparedPublication: publication, preparedPublications: [publication] }), { code: 'CONFLICTING_PREPARED_PUBLICATIONS' })
-  await assert.rejects(wrapEvent({ ...options, event: eventFixture('a different message'), preparedPublication: publication }), { code: 'INVALID_PREPARED_PUBLICATION' })
+  await assert.rejects(wrapEvent({ ...options, preparedPublication: publication }), { code: 'LEGACY_PREPARED_PUBLICATION' })
+  await assert.rejects(wrapEvent({ ...options, preparedPublications: [] }), { code: 'INVALID_PREPARED_PUBLICATIONS' })
+  await assert.rejects(wrapEvent({ ...options, event: eventFixture('a different message'), preparedPublications: [publication] }), { code: 'INVALID_PREPARED_PUBLICATION' })
 })
 
 test('wrapEvents cleans temporary chunks when the stream is stopped early', async () => {
