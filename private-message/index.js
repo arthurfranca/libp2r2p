@@ -4,6 +4,7 @@ import { ValidationError } from '../error/index.js'
 import { generateKeypair, keypairFromSeckey } from '../key/index.js'
 import * as privateChannel from '../private-channel/index.js'
 import { normalizeRumor, deliveryInfo } from '../private-channel/helpers/rumor.js'
+import { normalizePreparedPublications } from '../private-channel/helpers/prepared.js'
 
 export const ASK_KIND = 7329
 export const REPLY_KIND = 7330
@@ -41,17 +42,25 @@ function normalizeDeletionPubkey (deletionPubkey) {
   return deletionPubkey.toLowerCase()
 }
 
-function resolveDeletionCapability ({ deletionPubkey, deletionSeckey, autoDeletionCapability = true, preparedPublication }) {
+function resolveDeletionCapability ({ deletionPubkey, deletionSeckey, autoDeletionCapability = true, preparedPublications = [] }) {
   if (deletionSeckey !== undefined) throw new ValidationError('DELETION_SECKEY_NOT_ACCEPTED')
   if (typeof autoDeletionCapability !== 'boolean') throw new ValidationError('AUTO_DELETION_CAPABILITY_BOOLEAN_REQUIRED')
 
   const normalizedDeletionPubkey = normalizeDeletionPubkey(deletionPubkey)
-  if (preparedPublication) {
-    const capability = preparedPublication.deletionCapability
-    if (!capability || (capability.deletionPubkey !== undefined && normalizeDeletionPubkey(capability.deletionPubkey) !== capability.deletionPubkey) ||
-        (normalizedDeletionPubkey && normalizedDeletionPubkey !== capability.deletionPubkey) ||
-        (capability.deletionSeckey !== undefined && keypairFromSeckey(capability.deletionSeckey).pubkey !== capability.deletionPubkey) ||
-        preparedPublication.events?.some(event => event.tags.find(tag => tag[0] === 's')?.[1] !== capability.deletionPubkey)) throw new ValidationError('INVALID_PREPARED_PUBLICATION')
+  if (preparedPublications.length) {
+    const capability = preparedPublications[0].deletionCapability
+    if (!capability) throw new ValidationError('INVALID_PREPARED_PUBLICATION')
+    for (const publication of preparedPublications) {
+      const current = publication.deletionCapability
+      if (!current || (current.deletionPubkey !== capability.deletionPubkey) ||
+          (current.deletionSeckey !== capability.deletionSeckey) ||
+          (current.deletionPubkey !== undefined && normalizeDeletionPubkey(current.deletionPubkey) !== current.deletionPubkey) ||
+          (normalizedDeletionPubkey && normalizedDeletionPubkey !== capability.deletionPubkey) ||
+          (capability.deletionSeckey !== undefined && keypairFromSeckey(capability.deletionSeckey).pubkey !== capability.deletionPubkey) ||
+          publication.events?.some(event => event.tags.find(tag => tag[0] === 's')?.[1] !== capability.deletionPubkey)) {
+        throw new ValidationError('INVALID_PREPARED_PUBLICATION')
+      }
+    }
     return { ...capability }
   }
   if (normalizedDeletionPubkey) return { deletionPubkey: normalizedDeletionPubkey }
@@ -668,11 +677,11 @@ async function sendPrivateMessage ({
   _getIykcProofs,
   fileChunkIndex,
   onPreparedSeed,
-  preparedPublication,
+  preparedPublications,
   _publish = privateChannel.publish
 }) {
   if (!privateChannelSigner?.getPublicKey) throw new ValidationError('PRIVATE_CHANNEL_WRITER_REQUIRED')
-  return _publish({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed, preparedPublication, _getIykcProofs })
+  return _publish({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed, preparedPublications: preparedPublications?.length ? preparedPublications : undefined, _getIykcProofs })
 }
 
 async function sendNymMessage ({
@@ -841,21 +850,29 @@ export async function yell ({
   deletionSeckey,
   autoDeletionCapability = true,
   fileChunkIndex,
+  createdAt,
   onPreparedSeed,
+  preparedPublication,
+  preparedPublications,
   _publish = privateChannel.publish
 }) {
-  const receivers = uniq(receiverPubkeys)
+  const prepared = normalizePreparedPublications({ preparedPublication, preparedPublications })
+  const receivers = uniq(receiverPubkeys?.length
+    ? receiverPubkeys
+    : prepared.flatMap(publication => publication.receiverPubkeys || []))
   if (!receivers.length) throw new ValidationError('NO_RECEIVERS')
+  const rumor = makeMessageRumor({
+    kind: TELL_KIND,
+    tags: [],
+    message: message || { code, payload, error, content }
+  })
+  if (createdAt !== undefined) rumor.created_at = createdAt
   const { event, wireEvent } = await makeOutgoingRumor({
     senderSigner,
-    rumor: makeMessageRumor({
-      kind: TELL_KIND,
-      tags: [],
-      message: message || { code, payload, error, content }
-    })
+    rumor
   })
-  const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
-  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed, _getIykcProofs, _publish })
+  const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability, preparedPublications: prepared })
+  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublications: prepared, _getIykcProofs, _publish })
   return withDelivery({ yell: event }, reports, deletion.deletionSeckey)
 }
 
@@ -878,13 +895,15 @@ export async function broadcastRumor ({
   fileChunkIndex,
   onPreparedSeed,
   preparedPublication,
+  preparedPublications,
   _publish = privateChannel.publish
 }) {
   const receivers = uniq(receiverPubkeys)
   if (!receivers.length) throw new ValidationError('NO_RECEIVERS')
+  const prepared = normalizePreparedPublications({ preparedPublication, preparedPublications })
   const { event, wireEvent } = await makeOutgoingRumor({ senderSigner, rumor })
-  const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability, preparedPublication })
-  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublication, _getIykcProofs, _publish })
+  const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability, preparedPublications: prepared })
+  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublications: prepared, _getIykcProofs, _publish })
   return withDelivery({ rumor: event }, reports, deletion.deletionSeckey)
 }
 
@@ -907,13 +926,15 @@ export async function broadcastEvent ({
   fileChunkIndex,
   onPreparedSeed,
   preparedPublication,
+  preparedPublications,
   _publish = privateChannel.publish
 }) {
   const receivers = uniq(receiverPubkeys)
   if (!receivers.length) throw new ValidationError('NO_RECEIVERS')
+  const prepared = normalizePreparedPublications({ preparedPublication, preparedPublications })
   const wireEvent = assertValidSignedEvent({ ...event, tags: cloneTags(event?.tags) })
-  const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability, preparedPublication })
-  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublication, _getIykcProofs, _publish })
+  const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability, preparedPublications: prepared })
+  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublications: prepared, _getIykcProofs, _publish })
   return withDelivery({ event: wireEvent }, reports, deletion.deletionSeckey)
 }
 

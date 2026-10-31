@@ -86,6 +86,18 @@ suite pass; report independently scoped problems separately.
 
 ## Private messaging lifecycle
 
+- Multi-recipient delivery reports identify one outer event and its encrypted
+  receiver subset through `outerEventId` and `receiverPubkeys`. Aggregate
+  coverage per recipient across every chunk/group; fixed relays share one
+  subset, while NIP-65 and explicit `relayToReceivers` routing may expose
+  partial coverage. Nym methods intentionally retain one carrier union.
+- `preparedPublications` is the canonical prepared-envelope input: one entry per
+  recipient group, with exact events, seeds and receivers. `preparedPublication`
+  is accepted only as a legacy single-group boundary adapter for existing
+  session/outbox snapshots. Supplying both forms is invalid; internal publisher
+  code uses only arrays. Replay targets pending peers without recreating
+  cryptography, IDs or tags.
+
 - Version 0.11.22 migrates only the known message-queue three-field provenance
   index, atomically preserving rows/order/accounting. Keep generic queue schema
   rejection strict. Pending decryption uses its own 16 MiB FIFO ciphertext queue,

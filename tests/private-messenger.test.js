@@ -1497,6 +1497,42 @@ test('private messenger prefers explicit relay receiver maps over channel relays
   assert.equal(pm.sent[0].options.relayToReceivers, relayToReceivers)
 })
 
+test('private messenger forwards canonical prepared publications and derives pending receivers', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://channel.example'] }]
+  })
+  const prepared = [{
+    innerEventId: 'inner',
+    channelPubkey: 'channel',
+    receiverPubkeys: ['alice'],
+    events: [],
+    seeds: []
+  }]
+
+  await messenger.yell({
+    payload: 'retry',
+    createdAt: 1700000000,
+    preparedPublications: prepared
+  })
+  await messenger.broadcastRumor({
+    rumor: { kind: 9, created_at: 1700000001, tags: [], content: 'retry' },
+    preparedPublications: prepared
+  })
+
+  assert.deepEqual(pm.sent[0].options.receiverPubkeys, ['alice'])
+  assert.equal(pm.sent[0].options.createdAt, 1700000000)
+  assert.equal(pm.sent[0].options.preparedPublications, prepared)
+  assert.deepEqual(pm.sent[1].options.receiverPubkeys, ['alice'])
+  assert.equal(pm.sent[1].options.preparedPublications, prepared)
+  await assert.rejects(messenger.broadcastRumor({
+    rumor: { kind: 9, created_at: 1700000001, tags: [], content: 'retry' },
+    preparedPublication: prepared[0],
+    preparedPublications: prepared
+  }), { code: 'CONFLICTING_PREPARED_PUBLICATIONS' })
+})
+
 test('private messenger uses channel sendRelays after per-call routing overrides', async () => {
   const pm = fakePrivateMessage()
   const messenger = await new PrivateMessenger({ _privateMessage: pm, fallbackRelays: ['wss://fallback.example'] }).init({

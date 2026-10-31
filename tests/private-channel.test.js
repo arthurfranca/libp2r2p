@@ -533,7 +533,18 @@ test('publish splits relay-targeted routers by receiver subset with separate rou
     ['s', 'd'.repeat(64)],
     ['s', 'd'.repeat(64)]
   ])
-  assert.deepEqual(reports, [{ success: true }, { success: true }])
+  assert.deepEqual(reports, [
+    {
+      success: true,
+      outerEventId: published[0].outer.id,
+      receiverPubkeys: [bobPubkey, carolPubkey]
+    },
+    {
+      success: true,
+      outerEventId: published[1].outer.id,
+      receiverPubkeys: [carolPubkey, davePubkey]
+    }
+  ])
   assert.deepEqual(published[0].relays, ['wss://one.example', 'wss://two.example', 'wss://seed.example'])
   assert.deepEqual(published[1].relays, ['wss://three.example', 'wss://seed.example', 'wss://one.example'])
 
@@ -561,6 +572,100 @@ test('publish splits relay-targeted routers by receiver subset with separate rou
   assert.ok(temporaryWrites.includes(TEMPORARY_STORAGE_KEYS_KEY))
   assert.equal(globalThis.localStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
   assert.equal(globalThis.sessionStorage.getItem(TEMPORARY_STORAGE_KEYS_KEY), null)
+})
+
+test('fixed-relay publication reports the shared receiver coverage', async () => {
+  const alice = signer()
+  const bob = signer()
+  const carol = signer()
+  const bobPubkey = await bob.getPublicKey()
+  const carolPubkey = await carol.getPublicKey()
+  let outerEventId
+
+  const reports = await publish({
+    senderSigner: alice,
+    receivers: [bobPubkey, carolPubkey],
+    relays: ['wss://fixed.example'],
+    event: eventFixture('fixed coverage'),
+    _getIykcProofs: noContentKeys,
+    _publish: async outer => {
+      outerEventId = outer.id
+      return { success: true, total: 1 }
+    }
+  })
+
+  assert.deepEqual(reports, [{
+    success: true,
+    total: 1,
+    outerEventId,
+    receiverPubkeys: [bobPubkey, carolPubkey]
+  }])
+})
+
+test('prepared publications replay only failed peers with exact grouped envelopes', async () => {
+  const alice = signer()
+  const bob = signer()
+  const carol = signer()
+  const dave = signer()
+  const bobPubkey = await bob.getPublicKey()
+  const carolPubkey = await carol.getPublicKey()
+  const davePubkey = await dave.getPublicKey()
+  const event = eventFixture('x'.repeat(getJsonlChunkByteSize() * 2))
+  const prepared = new Map()
+  const initial = []
+
+  await publish({
+    senderSigner: alice,
+    receivers: [bobPubkey, carolPubkey, davePubkey],
+    relayToReceivers: new Map([
+      ['wss://one.example', [bobPubkey, carolPubkey]],
+      ['wss://two.example', [carolPubkey, davePubkey]]
+    ]),
+    event,
+    _getIykcProofs: noContentKeys,
+    onPreparedSeed: seed => {
+      const key = seed.publication.receiverPubkeys.slice().sort().join(',')
+      prepared.set(key, structuredClone(seed.publication))
+    },
+    _publish: async (outer, relays) => {
+      initial.push({ outer, relays })
+      return { success: true }
+    }
+  })
+
+  const shared = prepared.get([bobPubkey, carolPubkey].sort().join(','))
+  assert.ok(shared)
+  const replayed = []
+  const noCrypto = new Proxy(alice, {
+    get (target, key) {
+      if (['signEvent', 'nip44v3Encrypt', 'nip44EncryptDoubleDH'].includes(key)) {
+        return () => assert.fail('Prepared replay must not recreate cryptography')
+      }
+      const value = Reflect.get(target, key, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    }
+  })
+
+  const reports = await publish({
+    senderSigner: noCrypto,
+    privateChannelSigner: noCrypto,
+    receivers: [bobPubkey],
+    relayToReceivers: new Map([['wss://bob-retry.example', [bobPubkey]]]),
+    event,
+    _getIykcProofs: noContentKeys,
+    preparedPublications: [...prepared.values()],
+    _publish: async (outer, relays, options) => {
+      replayed.push({ outer, relays, options })
+      return { success: false }
+    }
+  })
+
+  assert.equal(replayed.length, shared.events.length)
+  assert.ok(replayed.every(entry => shared.events.some(original => original.id === entry.outer.id)))
+  assert.ok(replayed.every(entry => JSON.stringify(entry.relays) === JSON.stringify(['wss://bob-retry.example'])))
+  assert.ok(replayed.every(entry => JSON.stringify(entry.options.receiverPubkeys) === JSON.stringify([bobPubkey])))
+  assert.ok(reports.every(report => report.receiverPubkeys.length === 1 && report.receiverPubkeys[0] === bobPubkey))
+  assert.ok(reports.every((report, index) => report.outerEventId === replayed[index].outer.id))
 })
 
 test('publish sends wrapped events through RelayPool.sendEvent', async () => {
@@ -1725,6 +1830,9 @@ test('a checkpoint holds every signed fragment and replays identical envelopes w
   })
   const replay = await wrapEvent({ ...options, senderSigner: cannotEncrypt, privateChannelSigner: cannotEncrypt, preparedPublication: publication })
   assert.deepEqual(replay, original)
+  const pluralReplay = await wrapEvent({ ...options, senderSigner: cannotEncrypt, privateChannelSigner: cannotEncrypt, preparedPublications: [publication] })
+  assert.deepEqual(pluralReplay, original)
+  await assert.rejects(wrapEvent({ ...options, preparedPublication: publication, preparedPublications: [publication] }), { code: 'CONFLICTING_PREPARED_PUBLICATIONS' })
   await assert.rejects(wrapEvent({ ...options, event: eventFixture('a different message'), preparedPublication: publication }), { code: 'INVALID_PREPARED_PUBLICATION' })
 })
 

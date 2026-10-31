@@ -358,6 +358,13 @@ By default, each high-level private-message send creates one fresh deletion
 keypair for its logical message. Every outer kind `3560` event produced for that
 send, including router chunks, recipient subsets, and nym carriers, carries the
 same public key in its `s` tag. The result always contains `delivery.reports`.
+Each routed report also identifies its exact outer event in `outerEventId` and
+the encrypted recipient subset in `receiverPubkeys`. The same recipient can
+appear in multiple reports when a message spans chunks or recipient groups; it
+is fully covered only when every report containing it succeeds. Fixed relay
+lists publish one shared recipient set, while explicit `relayToReceivers` maps
+and automatic NIP-65 routing can produce partial recipient coverage. Nym uses
+one carrier union and does not expose per-recipient partial delivery.
 When libp2r2p generated the keypair, it also contains
 `delivery.deletionSeckey`; the public key can be derived from that secret.
 
@@ -1223,6 +1230,19 @@ attempts and final failure notifications. Sends attempted while the messenger is
 paused or otherwise unavailable now stay pending in the outbox and retry on a
 bounded session backoff (1–30 seconds, 20% jitter) instead of surfacing a
 user-facing send error.
+
+Multi-recipient callers that persist exact envelopes use the canonical
+`preparedPublications` array supplied through `onPreparedSeed`. Each element is
+one recipient group with its own encrypted `events`, recovery `seeds`, and
+`receiverPubkeys`. A later send can pass the array plus only the pending
+recipients; matching groups are replayed with their original IDs, bytes and
+signatures, and routed only for the pending peers. The legacy
+`preparedPublication` field remains accepted as a one-element array at the API
+boundary for existing session/outbox snapshots. Supplying both forms is
+invalid. `yell` callers must reuse the original `createdAt` when replaying so
+the inner rumor identity matches; `broadcastRumor` and `broadcastEvent` already
+carry their original inner event. Nym broadcasts intentionally remain a single
+carrier union.
 
 
 ### Relay backpressure and bounded synchronization (0.11.7)

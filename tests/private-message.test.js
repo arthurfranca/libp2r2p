@@ -630,8 +630,10 @@ test('unwatch cancels a watch still resolving its receiver identity', async () =
 
 test('prepared replay retains its original deletion capability', async () => {
   let prepared
+  const calls = []
   const _publish = async options => {
-    const publication = options.preparedPublication || { events: [{ tags: [['s', options.deletionPubkey]] }] }
+    calls.push(options)
+    const publication = options.preparedPublications?.[0] || { events: [{ tags: [['s', options.deletionPubkey]] }] }
     await options.onPreparedSeed({ publication })
     assert.equal(options.deletionPubkey, publication.deletionCapability.deletionPubkey)
     return [{ success: true }]
@@ -640,5 +642,42 @@ test('prepared replay retains its original deletion capability', async () => {
   const original = await broadcastRumor(options)
   const replay = await broadcastRumor({ ...options, preparedPublication: prepared })
   assert.equal(replay.delivery.deletionSeckey, original.delivery.deletionSeckey)
+  assert.equal(calls[1].preparedPublications.length, 1)
+  const pluralReplay = await broadcastRumor({ ...options, preparedPublications: [prepared] })
+  assert.equal(pluralReplay.delivery.deletionSeckey, original.delivery.deletionSeckey)
+  await assert.rejects(broadcastRumor({ ...options, preparedPublication: prepared, preparedPublications: [prepared] }), { code: 'CONFLICTING_PREPARED_PUBLICATIONS' })
   await assert.rejects(broadcastRumor({ ...options, preparedPublication: { ...prepared, deletionCapability: {} } }), /INVALID_PREPARED_PUBLICATION/)
+})
+
+test('yell replays prepared publications with the original inner timestamp', async () => {
+  const sender = signer(pubkeyFixture(3))
+  const receiver = pubkeyFixture(4)
+  let prepared
+  const published = []
+  const options = {
+    senderSigner: sender,
+    receiverPubkeys: [receiver],
+    payload: 'same yell',
+    createdAt: 1700000000,
+    onPreparedSeed: seed => { prepared = structuredClone(seed.publication) },
+    _publish: async request => {
+      published.push(request)
+      await request.onPreparedSeed?.({
+        publication: request.preparedPublications?.[0] || {
+          events: [{ tags: [['s', request.deletionPubkey]] }],
+          receiverPubkeys: [receiver]
+        }
+      })
+      return [{ success: true }]
+    }
+  }
+  const original = await yell(options)
+  const replay = await yell({
+    ...options,
+    onPreparedSeed: undefined,
+    preparedPublications: [prepared]
+  })
+
+  assert.equal(replay.yell.id, original.yell.id)
+  assert.deepEqual(published[1].preparedPublications, [prepared])
 })

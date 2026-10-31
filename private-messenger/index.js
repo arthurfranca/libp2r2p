@@ -56,6 +56,7 @@ import { recoveryRetryDelay, isPermanentRecoveryError } from './helpers/recovery
 import { assertMessagePublished, publicationFailureDiagnostic, sanitizePublicationError } from './helpers/publication.js'
 import { normalizeRelayUrl } from '../url/index.js'
 import { deliveryInfo } from '../private-channel/helpers/rumor.js'
+import { normalizePreparedPublications } from '../private-channel/helpers/prepared.js'
 import { migrateMessageQueue } from './services/migrate-message-queue.js'
 import { createPendingDecryption, pendingContentKeyGroup, pendingMissingContentKeyGroup } from './services/pending-decryption.js'
 import { createDecryptionScheduler } from './services/decryption-scheduler.js'
@@ -2415,18 +2416,22 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async yell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey }) {
+  async yell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey, createdAt, onPreparedSeed, preparedPublication, preparedPublications }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
-      const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers })
-      this.debugSend('yell', channelPubkey, { code, receiverPubkeys })
+      const prepared = normalizePreparedPublications({ preparedPublication, preparedPublications })
+      const receivers = uniq(receiverPubkeys?.length
+        ? receiverPubkeys
+        : prepared.flatMap(publication => publication.receiverPubkeys || []))
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: receivers, relays, relayToReceivers })
+      this.debugSend('yell', channelPubkey, { code, receiverPubkeys: receivers })
       return await this._privateMessage.yell({
         senderSigner: this.userSigner,
         imkcSigner: this.contentKeySigner,
         privateChannelSigner: channel.signer,
         privateChannelReaderPubkey: channel.readerPubkey,
-        receiverPubkeys,
+        receiverPubkeys: receivers,
         ...routing,
         expirationSeconds: this.eventExpirationSecondsFor(channel),
         temporaryStorageArea: this.temporaryStorageArea,
@@ -2437,24 +2442,30 @@ export class PrivateMessenger {
         payload,
         error,
         content,
-        onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
+        createdAt,
+        onPreparedSeed: onPreparedSeed || this.outgoingSeedHandler(channelPubkey),
+        preparedPublications: prepared.length ? prepared : undefined,
         _getIykcProofs: this.contentKeyLookup()
       })
     } finally { releaseActivity() }
   }
 
-  async broadcastRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, onDebug }) {
+  async broadcastRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
-      const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers, signal, attemptStartedAt, onDebug })
-      this.debugSend('broadcastRumor', channelPubkey, { receiverPubkeys })
+      const prepared = normalizePreparedPublications({ preparedPublication, preparedPublications })
+      const receivers = uniq(receiverPubkeys?.length
+        ? receiverPubkeys
+        : prepared.flatMap(publication => publication.receiverPubkeys || []))
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: receivers, relays, relayToReceivers, signal, attemptStartedAt, onDebug })
+      this.debugSend('broadcastRumor', channelPubkey, { receiverPubkeys: receivers })
       return await this._privateMessage.broadcastRumor({
         senderSigner: this.userSigner,
         imkcSigner: this.contentKeySigner,
         privateChannelSigner: channel.signer,
         privateChannelReaderPubkey: channel.readerPubkey,
-        receiverPubkeys,
+        receiverPubkeys: receivers,
         ...routing,
         expirationSeconds: this.eventExpirationSecondsFor(channel),
         temporaryStorageArea: this.temporaryStorageArea,
@@ -2462,24 +2473,28 @@ export class PrivateMessenger {
         autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
         rumor,
         onPreparedSeed: onPreparedSeed || this.outgoingSeedHandler(channelPubkey),
-        preparedPublication,
+        preparedPublications: prepared.length ? prepared : undefined,
         _getIykcProofs: this.contentKeyLookup()
       })
     } finally { releaseActivity() }
   }
 
-  async broadcastEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, onDebug }) {
+  async broadcastEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
-      const routing = await this.resolveSendRouting({ channel, receiverPubkeys, relays, relayToReceivers, signal, attemptStartedAt, onDebug })
-      this.debugSend('broadcastEvent', channelPubkey, { receiverPubkeys })
+      const prepared = normalizePreparedPublications({ preparedPublication, preparedPublications })
+      const receivers = uniq(receiverPubkeys?.length
+        ? receiverPubkeys
+        : prepared.flatMap(publication => publication.receiverPubkeys || []))
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: receivers, relays, relayToReceivers, signal, attemptStartedAt, onDebug })
+      this.debugSend('broadcastEvent', channelPubkey, { receiverPubkeys: receivers })
       return await this._privateMessage.broadcastEvent({
         senderSigner: this.userSigner,
         imkcSigner: this.contentKeySigner,
         privateChannelSigner: channel.signer,
         privateChannelReaderPubkey: channel.readerPubkey,
-        receiverPubkeys,
+        receiverPubkeys: receivers,
         ...routing,
         expirationSeconds: this.eventExpirationSecondsFor(channel),
         temporaryStorageArea: this.temporaryStorageArea,
@@ -2487,7 +2502,7 @@ export class PrivateMessenger {
         autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
         event,
         onPreparedSeed: onPreparedSeed || this.outgoingSeedHandler(channelPubkey),
-        preparedPublication,
+        preparedPublications: prepared.length ? prepared : undefined,
         _getIykcProofs: this.contentKeyLookup()
       })
     } finally { releaseActivity() }
