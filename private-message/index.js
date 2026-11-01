@@ -72,9 +72,9 @@ function resolveDeletionCapability ({ deletionPubkey, deletionSeckey, autoDeleti
 
 function preparedSeedHandler (onPreparedSeed, deletion) {
   if (!onPreparedSeed) return undefined
-  return seed => {
+  return (seed, options) => {
     seed.publication.deletionCapability = deletion
-    return onPreparedSeed(seed)
+    return onPreparedSeed(seed, options)
   }
 }
 

@@ -1188,6 +1188,10 @@ complete per-relay report without delaying the first-success return. Connection
 establishment retains its separate 3-second deadline. PrivateMessenger inherits
 this publication policy, including seeder/recovery messages. A timeout indicates
 missing acknowledgement and cannot prove that the recipient did not receive it.
+Its optional `getRetryEvent({ event, report })` accepts one replacement signed
+event after every relay terminally rejected the original with
+`auth-required:`/`restricted:`. The replacement and its retry share the original
+deadline; mixed failures and ambiguous timeouts never invoke it.
 
 ## Private file channels (0.11)
 
@@ -1216,10 +1220,30 @@ including an optional `onSendError` callback identifying the failed outbox messa
 Private messages, including multi-recipient channels, retry NIP-65 read relays
 in pairs per recipient when
 selected relays reject publication or become unreachable while connectivity is
-confirmed. The exact encrypted outer events are reused. Optional `fallbackRelays` on
+confirmed. The exact encrypted outer events are reused, except that a 3560
+publication rejected in full by age-related AUTH policy may be re-enveloped once:
+ciphertext, router, chunks, seeds, recipients and deletion capability remain
+unchanged while every outer is re-signed with one fresh `created_at` and a
+refreshed `expiration`. The durable replacement is written before retry and is
+never refreshed a second time. Optional `fallbackRelays` on
 `createPrivateMessenger` and `createPrivateMessageSession` are tried after the
 primary destinations by default, including explicit per-call `relays`, channel `sendRelays`
 and channel/global `relays`, as well as explicit `relayToReceivers` maps.
+
+This bounded re-envelope is preferred over NIP-42 authentication with the
+channel key because NIP-42 state belongs to the connection, not to one outer
+event. The `44b-relay` currently permits only one authenticated identity per
+connection and resets subscriptions when that identity changes. Even relays
+that support multiple identities per connection must bound them. A user with
+many contacts has one derived channel key per conversation, so authenticating
+each channel would either require one authenticated connection per channel or
+reconnect/resubscribe while switching identities, consuming connection,
+subscription and recovery budgets. It would also create a connection-scoped linkage
+between the connection and a channel key. The 3560 wrapper is disposable and
+privacy-oriented; relays are expected to impose freshness limits instead of
+correlating it with an authenticated session. A modern 3560 is normally
+accepted without AUTH, so refreshing an age-rejected outer should remain rare.
+
 Retries preserve each encrypted recipient subset; success requires accepted
 publication covering every recipient in that subset. Receive routing adds them from the start for live
 messages, history and files while preserving automatic NIP-65 updates. Successful sends keep first-ACK

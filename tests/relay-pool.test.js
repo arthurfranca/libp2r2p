@@ -1,5 +1,7 @@
 import { describe, it, beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
+import { finalizeEvent } from '../event/index.js'
+import { generateSecretKey } from '../key/index.js'
 
 // ─── Fake Relay infrastructure ────────────────────────────────────────────────
 
@@ -1961,6 +1963,105 @@ describe('RelayPool.sendEvent', () => {
     assert.equal(publishCount, 1)
     assert.equal(relayRegistry.get('wss://r1').sentMessages?.length ?? 0, 0)
     assert.equal(full.errors[0].reason.message, 'auth-required: sign in first')
+  })
+
+  it('retries one signed replacement after all relays return definitive AUTH rejection', async () => {
+    const secretKey = generateSecretKey()
+    const original = finalizeEvent({ kind: 3560, created_at: 1, tags: [], content: 'same ciphertext' }, secretKey)
+    const replacement = finalizeEvent({ kind: 3560, created_at: 2, tags: [], content: 'same ciphertext' }, secretKey)
+    let publishCount = 0
+    publishOverrides.set('wss://r1', () => {
+      publishCount++
+      if (publishCount === 1) throw new Error('auth-required: old envelope')
+    })
+    let retryRequests = 0
+    const relayResults = []
+    const early = await nostr.sendEvent(original, ['wss://r1'], {
+      onRelayResult: result => relayResults.push(result),
+      getRetryEvent: async ({ event, report }) => {
+        retryRequests++
+        assert.equal(event.id, original.id)
+        assert.equal(report.errors[0].reason.message, 'auth-required: old envelope')
+        return replacement
+      }
+    })
+    const full = await early.promise
+
+    assert.equal(publishCount, 2)
+    assert.equal(retryRequests, 1)
+    assert.equal(early.success, true)
+    assert.equal(early.retriedEvent.id, replacement.id)
+    assert.deepEqual(full.succeededRelays, ['wss://r1'])
+    assert.deepEqual(relayResults, [{ relay: 'wss://r1', success: true, outcome: 'published' }])
+  })
+
+  it('does not attempt a third publish or rewrap after mixed/non-definitive failures', async () => {
+    const secretKey = generateSecretKey()
+    const original = finalizeEvent({ kind: 3560, created_at: 1, tags: [], content: 'private' }, secretKey)
+    const replacement = finalizeEvent({ kind: 3560, created_at: 2, tags: [], content: 'private' }, secretKey)
+    let publishCount = 0
+    publishOverrides.set('wss://r1', () => {
+      publishCount++
+      throw new Error('auth-required: still old')
+    })
+    let retryRequests = 0
+    const early = await nostr.sendEvent(original, ['wss://r1'], {
+      getRetryEvent: () => {
+        retryRequests++
+        return replacement
+      }
+    })
+    const full = await early.promise
+    assert.equal(publishCount, 2)
+    assert.equal(retryRequests, 1)
+    assert.equal(early.success, false)
+    assert.match(full.errors[0].reason.message, /^auth-required:/)
+
+    publishCount = 0
+    retryRequests = 0
+    publishOverrides.set('wss://r1', () => { throw new Error('auth-required: old') })
+    publishOverrides.set('wss://r2', () => { throw new Error('error: unavailable') })
+    const mixed = await nostr.sendEvent(original, ['wss://r1', 'wss://r2'], {
+      getRetryEvent: () => {
+        retryRequests++
+        return replacement
+      }
+    })
+    await mixed.promise
+    assert.equal(retryRequests, 0)
+    assert.equal(publishCount, 0)
+  })
+
+  it('fails closed when the replacement event cannot be prepared', async () => {
+    const secretKey = generateSecretKey()
+    const original = finalizeEvent({ kind: 3560, created_at: 1, tags: [], content: 'private' }, secretKey)
+    publishOverrides.set('wss://r1', () => { throw new Error('auth-required: old') })
+    await assert.rejects(nostr.sendEvent(original, ['wss://r1'], {
+      getRetryEvent: () => { throw new Error('storage unavailable') }
+    }), {
+      code: 'RETRY_EVENT_PREPARATION_FAILED',
+      message: 'RETRY_EVENT_PREPARATION_FAILED'
+    })
+  })
+
+  it('keeps reporting every final relay result when a retry callback is present but unused', async () => {
+    const secretKey = generateSecretKey()
+    const original = finalizeEvent({ kind: 3560, created_at: 1, tags: [], content: 'private' }, secretKey)
+    publishOverrides.set('wss://r2', () => { throw new Error('restricted: not this identity') })
+    let retries = 0
+    const results = []
+    const early = await nostr.sendEvent(original, ['wss://r1', 'wss://r2'], {
+      getRetryEvent: () => { retries++; return original },
+      onRelayResult: result => results.push(result)
+    })
+    await early.promise
+    await tick()
+    assert.equal(early.success, true)
+    assert.equal(retries, 0)
+    assert.deepEqual(results.map(result => [result.relay, result.success]).sort(), [
+      ['wss://r1', true],
+      ['wss://r2', false]
+    ].sort())
   })
 
   it('authenticates once after restricted so the current caller can retry', async () => {

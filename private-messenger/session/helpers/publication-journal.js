@@ -87,26 +87,43 @@ export function createPublicationJournal ({ entries, store, archive, changed, on
     write,
     async flush (entry) { while (writes.has(entry.id)) await writes.get(entry.id) },
     adopt (entry) { if (entry.prepared) { durable.add(entry.prepared); queued.set(entry.prepared, Date.now()) } },
-    async stage (entry, seed, target, retentionSeconds) {
+    async stage (entry, seed, target, retentionSeconds, { replace = false } = {}) {
       const started = Date.now()
       const publication = structuredClone(seed.publication)
+      const targetKey = JSON.stringify(target)
       entry.prepared ||= { publications: [], target, receivedAt: Math.floor(Date.now() / 1000), retentionSeconds, recover: retentionSeconds > 0, accepted: false, archived: retentionSeconds <= 0 }
+      if (replace && targetKey !== JSON.stringify(entry.prepared.target)) throw new Error('PUBLICATION_ARCHIVE_TARGET_MISMATCH')
       if (entry.prepared.publications.some(existing => existing.innerEventId !== publication.innerEventId)) {
         throw new Error('PUBLICATION_ARCHIVE_PENDING')
       }
       const receiverKey = (publication.receiverPubkeys || []).slice().sort().join(',')
       const eventKey = publication.events.map(event => event.id).join(',')
-      const added = !entry.prepared.publications.some(existing =>
-        existing.innerEventId === publication.innerEventId &&
-        (existing.receiverPubkeys || []).slice().sort().join(',') === receiverKey &&
+      const matchingIndexes = entry.prepared.publications
+        .map((existing, index) => ({ existing, index }))
+        .filter(({ existing }) => existing.innerEventId === publication.innerEventId &&
+          (existing.receiverPubkeys || []).slice().sort().join(',') === receiverKey)
+      const existingIndex = matchingIndexes[0]?.index ?? -1
+      const existing = matchingIndexes[0]?.existing
+      const duplicate = Boolean(existing) &&
         existing.events.map(event => event.id).join(',') === eventKey
-      )
-      if (added) entry.prepared.publications.push(publication)
-      if (!added && durable.has(entry.prepared)) return
+      const matches = existingIndex >= 0
+      if (replace) {
+        if (!matches) throw new Error('PUBLICATION_ARCHIVE_REPLACE_MISSING')
+        entry.prepared.publications = entry.prepared.publications
+          .filter((_publication, index) => index !== existingIndex)
+          .filter(candidate =>
+            candidate.innerEventId !== publication.innerEventId ||
+            (candidate.receiverPubkeys || []).slice().sort().join(',') !== receiverKey
+          )
+        entry.prepared.publications.splice(existingIndex, 0, publication)
+      } else {
+        if (!duplicate) entry.prepared.publications.push(publication)
+        if (duplicate && durable.has(entry.prepared)) return
+      }
       queued.set(entry.prepared, Date.now())
       await write(entry)
       durable.add(entry.prepared)
-      debug(entry, 'publication-checkpoint', started, { publicationId: seed.publication.events[0].id })
+      debug(entry, replace ? 'publication-refresh' : 'publication-checkpoint', started, { publicationId: seed.publication.events[0].id })
       for (const row of rows(entry)) debug(entry, 'recovery-pending', undefined, { seedRecordId: row.recordId, publicationId: seed.publication.events[0].id })
       wake()
     },

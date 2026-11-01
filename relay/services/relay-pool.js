@@ -8,6 +8,7 @@ import { maybeUnref } from '../helpers/timer.js'
 import { categorizeRelayError, relayTimeoutError } from '../helpers/error.js'
 import { ReadRetry, isRetryableReadFailure, needsConnectivityCheck, waitUntil } from '../helpers/read-retry.js'
 import { normalizeRelayUrl } from '../../url/index.js'
+import { isValidEvent } from '../../event/index.js'
 import { RelayConnection } from './relay-connection.js'
 
 const CONNECTION_TIMEOUT_MS = 3000
@@ -69,7 +70,15 @@ function notifyRelayResult (onRelayResult, result) {
 }
 
 function requiresNip42Auth (reason) {
-  return reason.message.startsWith('auth-required:') || reason.message.startsWith('restricted:')
+  const message = reason?.message || reason?.code || ''
+  return message.startsWith('auth-required:') || message.startsWith('restricted:')
+}
+
+function isDefinitiveAuthRejection (report) {
+  return report?.success === false &&
+    Array.isArray(report.errors) &&
+    report.errors.length > 0 &&
+    report.errors.every(({ reason }) => requiresNip42Auth(reason))
 }
 
 function countResponseError () {
@@ -1199,15 +1208,19 @@ export class RelayPool {
   // { relay, success, outcome, reason? } result per relay as it settles; outcome
   // is published, duplicate, muted, failed, or timed-out. getAuthEvent is used
   // only after auth-required or restricted publish failures, then retries once.
+  // getRetryEvent may return one fresh signed event after every relay rejected
+  // the original with auth-required/restricted; it shares the operation deadline.
   // Await `promise` for the complete report, including every relay outcome.
   async sendEvent (event, relays, {
     timeout = SEND_TIMEOUT_MS,
     timeoutUntilFirstFulfillment = null,
     getAuthEvent,
+    getRetryEvent,
     onRelayResult,
     signal
   } = {}) {
     if (signal != null && (typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) throw new ValidationError('INVALID_RELAY_SIGNAL')
+    if (getRetryEvent != null && typeof getRetryEvent !== 'function') throw new ValidationError('INVALID_RETRY_EVENT_CALLBACK')
     const urls = normalizedRelayUrls(relays)
     if (!urls.length) {
       const promise = Promise.resolve(publishSummary([], urls, {
@@ -1216,69 +1229,121 @@ export class RelayPool {
       return { total: 0, success: false, promise }
     }
 
-    const eventToSend = event.meta ? { ...event } : event
-    if (eventToSend.meta) delete eventToSend.meta
+    const deadline = timeout === null ? null : Date.now() + timeout
+    const remainingTimeout = () => deadline === null ? null : Math.max(0, deadline - Date.now())
+    const sendAttempt = async (eventToSend, { notify = true } = {}) => {
+      const attemptTimeout = remainingTimeout()
+      const eventForAttempt = eventToSend.meta ? { ...eventToSend } : eventToSend
+      if (eventForAttempt.meta) delete eventForAttempt.meta
+      const sendControllers = urls.map(() => new AbortController())
+      const sendDeferreds = urls.map(() => Promise.withResolvers())
+      const sendPromises = sendDeferreds.map(({ promise }) => promise)
+      const bufferedResults = []
+      const delivery = { notify }
 
-    const sendControllers = urls.map(() => new AbortController())
-    const sendDeferreds = urls.map(() => Promise.withResolvers())
-    const sendPromises = sendDeferreds.map(({ promise }) => promise)
-
-    // Starts before connection work so every relay shares one real deadline.
-    const settlement = createPublishSettlements(sendPromises, timeout, {
-      onSettled: (settlement, index) => {
-        sendControllers[index].abort(settlement.reason)
-        if (settlement.reason?.category === 'timeout' && !settlement.reason.cause) {
-          const relay = this.#relays.get(normalizeRelayUrl(urls[index]))
-          if (relay?.lastTransportError) settlement.reason.cause = relay.lastTransportError
-        }
-        notifyRelayResult(onRelayResult, relayResultForSettlement(urls[index], settlement))
-      }
-    })
-
-    // Resolves after every relay settles (or reaches the operation timeout) as
-    // { success, total, fulfilled, succeededRelays, errors },
-    // where errors contains { relay, reason } entries for failed relays.
-    const cancel = () => settlement.cancel(signal.reason)
-    if (signal?.aborted) cancel()
-    else signal?.addEventListener('abort', cancel, { once: true })
-    const promise = settlement.promise
-      .finally(() => signal?.removeEventListener('abort', cancel))
-      .then(settlements => publishSummary(settlements, urls, {
-        includeSucceededRelays: true
-      }))
-
-    urls.forEach((url, index) => {
-      const deferred = sendDeferreds[index]
-      ;(async () => {
-        try {
-          const operationSignal = sendControllers[index].signal
-          if (operationSignal.aborted) throw operationSignal.reason
-          const relay = await this.#getRelay(url)
-          if (operationSignal.aborted) throw operationSignal.reason
-          return await this.#publishEvent(relay, eventToSend, getAuthEvent, operationSignal)
-        } catch (err) {
-          const reason = err instanceof Error ? err : new Error(String(err))
-          if (reason instanceof Nip42AuthenticationError) throw reason
-          if (reason.message.startsWith('duplicate:')) return 'duplicate'
-          if (reason.message.startsWith('mute:')) {
-            console.info([url, reason.message].filter(Boolean).join(' - '))
-            return 'muted'
+      // Starts before connection work so every relay shares one real deadline.
+      const settlement = createPublishSettlements(sendPromises, attemptTimeout, {
+        onSettled: (settlement, index) => {
+          sendControllers[index].abort(settlement.reason)
+          if (settlement.reason?.category === 'timeout' && !settlement.reason.cause) {
+            const relay = this.#relays.get(normalizeRelayUrl(urls[index]))
+            if (relay?.lastTransportError) settlement.reason.cause = relay.lastTransportError
           }
-          throw reason
+          const result = relayResultForSettlement(urls[index], settlement)
+          if (delivery.notify) notifyRelayResult(onRelayResult, result)
+          else bufferedResults.push(result)
         }
-      })().then(deferred.resolve, deferred.reject)
-    })
+      })
 
-    const success = await firstFulfillment(sendPromises, timeoutUntilFirstFulfillment, {
-      fallback: promise.then(report => report.success)
-    })
-    if (!success) settlement.timeout()
+      // Resolves after every relay settles (or reaches the operation timeout) as
+      // { success, total, fulfilled, succeededRelays, errors },
+      // where errors contains { relay, reason } entries for failed relays.
+      const cancel = () => settlement.cancel(signal.reason)
+      if (signal?.aborted) cancel()
+      else signal?.addEventListener('abort', cancel, { once: true })
+      const promise = settlement.promise
+        .finally(() => signal?.removeEventListener('abort', cancel))
+        .then(settlements => publishSummary(settlements, urls, {
+          includeSucceededRelays: true
+        }))
 
-    return {
-      total: urls.length,
-      success,
-      promise
+      urls.forEach((url, index) => {
+        const deferred = sendDeferreds[index]
+        ;(async () => {
+          try {
+            const operationSignal = sendControllers[index].signal
+            if (operationSignal.aborted) throw operationSignal.reason
+            const relay = await this.#getRelay(url)
+            if (operationSignal.aborted) throw operationSignal.reason
+            return await this.#publishEvent(relay, eventForAttempt, getAuthEvent, operationSignal)
+          } catch (err) {
+            const reason = err instanceof Error ? err : new Error(String(err))
+            if (reason instanceof Nip42AuthenticationError) throw reason
+            if (reason.message.startsWith('duplicate:')) return 'duplicate'
+            if (reason.message.startsWith('mute:')) {
+              console.info([url, reason.message].filter(Boolean).join(' - '))
+              return 'muted'
+            }
+            throw reason
+          }
+        })().then(deferred.resolve, deferred.reject)
+      })
+
+      const earlyTimeout = timeoutUntilFirstFulfillment === null || attemptTimeout === null
+        ? timeoutUntilFirstFulfillment
+        : Math.min(timeoutUntilFirstFulfillment, attemptTimeout)
+      const success = await firstFulfillment(sendPromises, earlyTimeout, {
+        fallback: promise.then(report => report.success)
+      })
+      if (!success) settlement.timeout()
+
+      const result = {
+        total: urls.length,
+        success,
+        promise
+      }
+      Object.defineProperty(result, 'flushRelayResults', {
+        value: () => {
+          delivery.notify = true
+          for (const result of bufferedResults.splice(0)) notifyRelayResult(onRelayResult, result)
+        }
+      })
+      return result
     }
+
+    const first = await sendAttempt(event, { notify: !getRetryEvent })
+    if (first.success || !getRetryEvent) {
+      first.flushRelayResults()
+      return first
+    }
+    let report
+    try {
+      report = await first.promise
+    } catch {
+      first.flushRelayResults()
+      return first
+    }
+    if (!isDefinitiveAuthRejection(report) || (deadline !== null && Date.now() >= deadline)) {
+      first.flushRelayResults()
+      return first
+    }
+    let retryEvent
+    try {
+      retryEvent = await getRetryEvent({ event, report })
+    } catch (cause) {
+      throw Object.assign(new Error('RETRY_EVENT_PREPARATION_FAILED', { cause }), {
+        code: 'RETRY_EVENT_PREPARATION_FAILED',
+        cause
+      })
+    }
+    if ((deadline !== null && Date.now() >= deadline) ||
+        !isValidEvent(retryEvent) || retryEvent.id === event.id || retryEvent.kind !== event.kind) {
+      first.flushRelayResults()
+      return first
+    }
+    const retried = await sendAttempt(retryEvent, { notify: true })
+    Object.defineProperty(retried, 'retriedEvent', { value: retryEvent })
+    return retried
   }
 }
 

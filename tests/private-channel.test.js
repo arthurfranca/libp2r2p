@@ -668,6 +668,162 @@ test('prepared publications replay only failed peers with exact grouped envelope
   assert.ok(reports.every((report, index) => report.outerEventId === replayed[index].outer.id))
 })
 
+test('AUTH rejection refreshes a prepared publication once without recreating cryptography', async t => {
+  const nowMs = 1_700_000_000_000
+  t.mock.timers.enable({ apis: ['Date'], now: nowMs })
+  const alice = signer()
+  const bob = signer()
+  const bobPubkey = await bob.getPublicKey()
+  const event = eventFixture('x'.repeat(getJsonlChunkByteSize() * 2))
+  let original
+  const staged = []
+
+  await publish({
+    senderSigner: alice,
+    privateChannelSigner: alice,
+    receivers: [bobPubkey],
+    relays: ['wss://initial.example'],
+    event,
+    expirationSeconds: EXPIRATION_SECONDS,
+    _getIykcProofs: noContentKeys,
+    onPreparedSeed: (seed, options) => {
+      original = structuredClone(seed.publication)
+      staged.push({ publication: structuredClone(seed.publication), options })
+    },
+    _publish: async () => ({ success: true, total: 1, promise: Promise.resolve({ success: true }) })
+  })
+
+  assert.ok(original.events.length > 1)
+  const originalEvents = structuredClone(original.events)
+  const originalSeeds = structuredClone(original.seeds)
+  original.deletionCapability = { deletionPubkey: 'd'.repeat(64) }
+  t.mock.timers.setTime(nowMs + 3600_000)
+  let replacement
+  const attempted = []
+  const refreshedAt = Math.floor(Date.now() / 1000)
+
+  const reports = await publish({
+    senderSigner: alice,
+    privateChannelSigner: alice,
+    receivers: [bobPubkey],
+    relays: ['wss://retry.example'],
+    event,
+    expirationSeconds: EXPIRATION_SECONDS,
+    preparedPublications: [original],
+    _getIykcProofs: noContentKeys,
+    onPreparedSeed: (seed, options) => {
+      staged.push({ publication: structuredClone(seed.publication), options })
+    },
+    _publish: async (outer, relays, options) => {
+      attempted.push({ outer, relays, options })
+      if (attempted.length === 1) {
+        replacement = await options.getRetryEvent({
+          event: outer,
+          report: { success: false, errors: [{ reason: new Error('auth-required: old envelope') }] }
+        })
+      }
+      return { success: true, total: 1, promise: Promise.resolve({ success: true }) }
+    }
+  })
+
+  assert.equal(attempted.length, original.events.length)
+  assert.ok(replacement)
+  assert.equal(replacement.created_at, refreshedAt)
+  assert.equal(replacement.content, originalEvents[0].content)
+  assert.equal(replacement.kind, PRIVATE_BROADCAST_KIND)
+  assert.notEqual(replacement.id, originalEvents[0].id)
+  const refreshedStates = staged.filter(entry => entry.options?.replace === true)
+  assert.equal(refreshedStates.length, 1)
+  const refreshed = refreshedStates[0].publication
+  assert.equal(refreshed.outerRefreshAttempted, true)
+  assert.deepEqual(refreshed.deletionCapability, original.deletionCapability)
+  assert.deepEqual(refreshed.seeds, originalSeeds)
+  assert.equal(refreshed.events.length, originalEvents.length)
+  for (let index = 0; index < refreshed.events.length; index++) {
+    const next = refreshed.events[index]
+    const previous = originalEvents[index]
+    assert.equal(next.created_at, refreshedAt)
+    assert.equal(next.content, previous.content)
+    assert.notEqual(next.id, previous.id)
+    assert.deepEqual(next.tags, [
+      ['s', ...(previous.tags.find(tag => tag[0] === 's')?.slice(1) || [])],
+      ['expiration', String(refreshedAt + EXPIRATION_SECONDS)]
+    ].filter(tag => tag[0] !== 's' || tag.length > 1))
+    if (index > 0) assert.equal(attempted[index].outer.id, next.id)
+  }
+  assert.deepEqual(reports.map(report => report.outerEventId), refreshed.events.map(event => event.id))
+
+  const noSecondRefresh = []
+  await publish({
+    senderSigner: alice,
+    privateChannelSigner: alice,
+    receivers: [bobPubkey],
+    relays: ['wss://reload.example'],
+    event,
+    preparedPublications: [refreshed],
+    _publish: async (outer, relays, options) => {
+      noSecondRefresh.push(options.getRetryEvent)
+      return { success: false, total: 1, promise: Promise.resolve({ success: false }) }
+    }
+  })
+  assert.ok(noSecondRefresh.every(callback => callback === undefined))
+
+  let attemptsWithFailedPersistence = 0
+  await assert.rejects(publish({
+    senderSigner: alice,
+    privateChannelSigner: alice,
+    receivers: [bobPubkey],
+    relays: ['wss://persistence-failure.example'],
+    event,
+    preparedPublications: [original],
+    onPreparedSeed: (_seed, options) => {
+      if (options?.replace) throw new Error('storage unavailable')
+    },
+    _publish: async (outer, relays, options) => {
+      attemptsWithFailedPersistence++
+      await options.getRetryEvent({
+        event: outer,
+        report: { success: false, errors: [{ reason: new Error('auth-required: old') }] }
+      })
+      return { success: true, total: 1, promise: Promise.resolve({ success: true }) }
+    }
+  }), /storage unavailable/)
+  assert.equal(attemptsWithFailedPersistence, 1)
+})
+
+test('Nym publishes refresh their outer envelope without changing carrier identity', async t => {
+  const nowMs = 1_700_000_000_000
+  t.mock.timers.enable({ apis: ['Date'], now: nowMs })
+  const nym = signer()
+  const channel = signer()
+  let original
+  let replacement
+
+  const reports = await publishNymEvent({
+    nymSigner: nym,
+    privateChannelSigner: channel,
+    event: eventFixture('nym refresh'),
+    relays: ['wss://retry.example'],
+    expirationSeconds: EXPIRATION_SECONDS,
+    _publish: async (outer, relays, options) => {
+      original = outer
+      t.mock.timers.setTime(nowMs + 3600_000)
+      replacement = await options.getRetryEvent({
+        event: outer,
+        report: { success: false, errors: [{ reason: new Error('restricted: old envelope') }] }
+      })
+      return { success: true, total: 1, promise: Promise.resolve({ success: true }) }
+    }
+  })
+
+  assert.ok(replacement)
+  assert.notEqual(replacement.id, original.id)
+  assert.equal(replacement.content, original.content)
+  assert.equal(replacement.pubkey, original.pubkey)
+  assert.equal(replacement.created_at, Math.floor(Date.now() / 1000))
+  assert.equal(reports.length, 1)
+})
+
 test('publish sends wrapped events through RelayPool.sendEvent', async () => {
   const originalSendEvent = relayPool.sendEvent
   const published = []

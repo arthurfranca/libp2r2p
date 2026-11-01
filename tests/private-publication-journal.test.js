@@ -168,6 +168,72 @@ test('the publication journal accumulates prepared groups from the same inner ev
   await journal.close()
 })
 
+test('the publication journal replaces an old outer generation before replay', async () => {
+  const { createPublicationJournal } = await import('../private-messenger/session/helpers/publication-journal.js')
+  const entry = { id: 'refresh', localSaved: [false], index: 0 }
+  const writes = []
+  const journal = createPublicationJournal({
+    entries: new Map([[entry.id, entry]]),
+    store: () => ({ put: async value => { writes.push(structuredClone(value)) } }),
+    archive: async () => {},
+    changed: () => {},
+    onError: assert.fail,
+    debug: () => {}
+  })
+  const oldPublication = packet('1'.repeat(64))
+  oldPublication.innerEventId = 'inner'
+  const refreshed = structuredClone(oldPublication)
+  refreshed.events = [{ id: '2'.repeat(64), kind: 3560, created_at: 2, tags: [], content: 'same' }]
+  refreshed.outerRefreshAttempted = true
+
+  await journal.stage(entry, { publication: oldPublication }, { index: 0 }, 0)
+  const supersededDuplicate = structuredClone(oldPublication)
+  supersededDuplicate.events = [{ id: '3'.repeat(64), kind: 3560, created_at: 1, tags: [], content: 'same' }]
+  await journal.stage(entry, { publication: supersededDuplicate }, { index: 0 }, 0)
+  await journal.stage(entry, { publication: refreshed }, { index: 0 }, 0, { replace: true })
+
+  assert.deepEqual(entry.prepared.publications, [refreshed])
+  assert.deepEqual(writes.at(-1).prepared.publications, [refreshed])
+  await assert.rejects(
+    journal.stage(entry, { publication: { ...refreshed, events: [{ id: '3'.repeat(64) }] } }, { index: 1 }, 0, { replace: true }),
+    /PUBLICATION_ARCHIVE_TARGET_MISMATCH/
+  )
+  await journal.close()
+})
+
+test('session callbacks replace the durable outer generation instead of appending it', async t => {
+  const writes = []
+  let firstCheckpoint
+  const f = await fixture(t, {
+    put: async value => {
+      const snapshot = structuredClone(value)
+      writes.push(snapshot)
+      if (!firstCheckpoint && snapshot.prepared?.publications?.length) firstCheckpoint = snapshot
+    },
+    transport: async call => {
+      const original = firstCheckpoint?.prepared?.publications?.[0]
+      assert.ok(original)
+      const refreshed = structuredClone(original)
+      refreshed.events = [{
+        ...original.events[0],
+        id: '9'.repeat(64),
+        created_at: original.events[0].created_at + 600
+      }]
+      refreshed.outerRefreshAttempted = true
+      await call.onPreparedSeed({
+        ...refreshed.seeds[0],
+        publication: refreshed
+      }, { replace: true })
+    }
+  })
+  const id = await f.session.enqueue({ peer, event: text('replace durable publication') })
+  await until(() => f.states.some(values => values.some(value => value.id === id && value.status === 'saved')))
+  const refreshedWrite = writes.find(value => value.prepared?.publications?.[0]?.outerRefreshAttempted === true)
+  assert.ok(refreshedWrite)
+  assert.equal(refreshedWrite.prepared.publications.length, 1)
+  assert.equal(refreshedWrite.prepared.publications[0].events[0].id, '9'.repeat(64))
+})
+
 test('actual 0.11.24 snapshots retain identity and progress in the current pipeline', async t => {
   for (const stage of ['initial', 'partial']) {
     const entry = JSON.parse(await readFile(new URL(`./fixtures/private-outbox/0.11.24-${stage}.json`, import.meta.url)))

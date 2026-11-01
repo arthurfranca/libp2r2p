@@ -289,9 +289,15 @@ recipient/channel and inner-event identities, event/chunk position, retention
 and accepted/archived flags. Old entries without it retain `localSaved`, index
 and file/chunk progress and enter the same preparation path; there is no database
 migration or alternate publisher. Replays validate signatures and identity and
-reuse the exact envelopes without repeating cryptography or extending expiry.
+reuse the exact envelopes without repeating cryptography or extending expiry,
+except for one 3560 age-auth refresh. That refresh reuses router/ciphertext and
+seeds but re-signs the whole publication with a new shared `created_at` and
+recomputed `expiration`, writes the replacement generation before retrying, and
+sets `outerRefreshAttempted` so reload cannot repeat it.
 
-The existing `onPreparedSeed` callback now also supplies `publication`. The
+The existing `onPreparedSeed` callback now also supplies `publication`, plus an
+optional `{ replace: true }` second argument when a refreshed publication must
+replace the same inner-event/receiver group in place. The
 session commits that minimal journal before transmitting; direct messengers
 retain their local seed-store durability. Only after that commit can relay
 publication proceed. One independent serial worker converts recovery seeds into

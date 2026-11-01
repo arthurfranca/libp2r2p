@@ -123,6 +123,7 @@ export function createSendRelayRouting ({ peer, peers = [peer], relaysByPubkey, 
       }
       const result = await publishWithEarlyFallback({
         event, receivers, first: first.length ? { receivers, relays: first } : null, mirrors, tried,
+        getRetryEvent: context.getRetryEvent,
         nextPrimary: pending => pick(pending, false), nextFallback: pending => pick(pending, true),
         sendEvent, isOnline, isCurrent, signal, pauseSignal, remember, rememberSuccess,
         delay: fallbackDelayMs, attemptStartedAt, monotonicNow, now, setTimer, clearTimer
@@ -158,7 +159,7 @@ export function createSendRelayRouting ({ peer, peers = [peer], relaysByPubkey, 
       for (const relay of relays) tried.add(normalized(relay))
       // Every relay in this batch serves the same pending recipient subset.
       // One ACK covers that subset, never unrelated members of the ciphertext.
-      result = await sendEvent(event, relays, { signal: transportSignal })
+      result = await sendEvent(event, relays, { signal: transportSignal, getRetryEvent: context.getRetryEvent })
       const settled = Promise.resolve(result.promise)
       summaries.push(settled)
       settled.then(report => rememberSuccess(report?.succeededRelays || [])).catch(() => {})

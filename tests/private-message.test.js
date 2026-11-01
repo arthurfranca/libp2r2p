@@ -647,6 +647,24 @@ test('prepared replay retains its original deletion capability', async () => {
   await assert.rejects(broadcastRumor({ ...options, preparedPublications: [{ ...prepared, deletionCapability: {} }] }), /INVALID_PREPARED_PUBLICATION/)
 })
 
+test('prepared seed callbacks forward the replacement flag', async () => {
+  let callbackOptions
+  const _publish = async options => {
+    await options.onPreparedSeed({
+      publication: { events: [{ tags: [['s', options.deletionPubkey]] }] }
+    }, { replace: true })
+    return [{ success: true }]
+  }
+  await broadcastRumor({
+    senderSigner: signer(pubkeyFixture(3)),
+    receiverPubkeys: ['alice'],
+    rumor: { kind: 9, tags: [], created_at: 1700000000, content: 'replace' },
+    _publish,
+    onPreparedSeed: (_seed, options) => { callbackOptions = options }
+  })
+  assert.deepEqual(callbackOptions, { replace: true })
+})
+
 test('yell replays prepared publications with the original inner timestamp', async () => {
   const sender = signer(pubkeyFixture(3))
   const receiver = pubkeyFixture(4)

@@ -99,6 +99,22 @@ suite pass; report independently scoped problems separately.
   `prepared.publications` array and persisted before processing. Internal
   publisher code uses only arrays. Replay targets pending peers without
   recreating cryptography, IDs or tags.
+- A prepared 3560 publication may be re-enveloped once when its first outer was
+  definitively rejected by every target with `auth-required:`/`restricted:`.
+  Preserve ciphertext, router, chunks, seeds, receivers and deletion capability;
+  re-sign every outer with one fresh `created_at`, refresh existing expiration
+  from the original retention, and persist the replacement generation before
+  retrying on the same routes. `outerRefreshAttempted` makes the exception durable
+  across reload. Never apply it to mixed/ambiguous failures, partial acceptance,
+  recovery reads or a second rejection.
+- Do not replace the bounded 3560 outer refresh with NIP-42 channel-key
+  authentication. Authentication is connection-scoped, while a user has many
+  derived channel keys. The 44b-relay currently permits one identity per
+  connection and resets subscriptions when it changes; multi-identity relays
+  must still cap identities. Per-channel auth would therefore multiply
+  authenticated connections or churn identity/subscriptions and link the
+  privacy-oriented disposable wrapper to a connection. Keep auth out of the
+  normal modern-3560 path and reserve the one outer refresh for rare age refusals.
 
 - Version 0.11.22 migrates only the known message-queue three-field provenance
   index, atomically preserving rows/order/accounting. Keep generic queue schema
@@ -252,7 +268,8 @@ NIP-46 against the real pool with controlled transport and injected controls.
   this callback. Apps decide which user attempts and routes warrant feedback.
 
 - Automatic NIP-65 sends retry a finite candidate snapshot in pairs per recipient,
-  preserving the exact signed outer event. Configured `fallbackRelays`
+  preserving the exact signed outer event except for the bounded 3560 age-auth
+  refresh above. Configured `fallbackRelays`
   follow primary exhaustion by default and also support explicit per-call `relays`, channel
   `sendRelays` and channel/global `relays`, preserving explicit initial fanout and
   receiver sets. Automatic multi-recipient routing and explicit `relayToReceivers`
@@ -404,9 +421,9 @@ NIP-46 against the real pool with controlled transport and injected controls.
   `onPreparedSeed` receives the signed publication and existing router/jsonl
   data. Direct messengers persist seeds; sessions commit the encrypted outbox
   checkpoint, then archive independently after the bounded foreground window.
-  Pending rows participate in recovery reads. Replay the same signed fragments
-  and bind them to the inner event, channel and recipients. Never remove an entry
-  before archival and its writes.
+  Pending rows participate in recovery reads. Replay the same signed fragments,
+  except the bounded 3560 age-auth refresh, and bind them to the inner event,
+  channel and recipients. Never remove an entry before archival and its writes.
 - Sessions separate account generations from peer revisions and create one
   messenger. Prepare at most four peers, at most three without foreground demand;
   `preparePeer` prioritizes navigation/send/download. Deduplicate signer work,

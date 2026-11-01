@@ -481,9 +481,9 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       channelPubkey, receiverPubkeys: [peer], signal, attemptStartedAt: attemptStarts.get(entry.id),
       onDebug: onDebug ? value => debug(entry, value.stage, undefined, value) : undefined,
       preparedPublications: entry.prepared?.publications,
-      onPreparedSeed: async seed => {
+      onPreparedSeed: async (seed, { replace = false } = {}) => {
         debug(entry, 'envelope-prepared', preparationStartedAt, { publicationId: seed.publication.events[0].id })
-        await journal.stage(entry, seed, { index: entry.index }, retention)
+        await journal.stage(entry, seed, { index: entry.index }, retention, { replace })
         signal.throwIfAborted()
       }
     }
@@ -602,7 +602,10 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
           const target = { file: descriptor, fileIndex: entry.fileIndex, chunkIndex: entry.chunkIndex }
           await fileTransfers.publishChunk(descriptor, wireEvent(chunk, owner), {
             signal: controller.signal, attemptStartedAt: chunkStartedAt, onDebug: onDebug ? value => debug(entry, value.stage, undefined, value) : undefined, preparedPublications: entry.prepared?.publications,
-            onPreparedSeed: async seed => { await journal.stage(entry, seed, target, recover); controller.signal.throwIfAborted() }
+            onPreparedSeed: async (seed, { replace = false } = {}) => {
+              await journal.stage(entry, seed, target, recover, { replace })
+              controller.signal.throwIfAborted()
+            }
           })
           entry.chunkIndex++
           const completed = entry.files.slice(0, entry.fileIndex).reduce((sum, value) => sum + value.size, 0) + Math.min(file.size, entry.chunkIndex * IRFS_CHUNK_BYTES)

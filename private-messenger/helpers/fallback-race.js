@@ -2,7 +2,7 @@ import { isReplaceableRelayFailure } from '../../relay/helpers/failure.js'
 
 // Each invocation owns one already signed outer event and its encrypted subset.
 // Lanes share coverage and the tried set; only started reports outlive the race.
-export function publishWithEarlyFallback ({ event, receivers, first, mirrors, tried, nextPrimary, nextFallback, sendEvent, isOnline, isCurrent, signal, pauseSignal, remember, rememberSuccess = () => {}, delay, attemptStartedAt, monotonicNow = () => performance.now(), now, setTimer, clearTimer }) {
+export function publishWithEarlyFallback ({ event, receivers, first, mirrors, tried, getRetryEvent, nextPrimary, nextFallback, sendEvent, isOnline, isCurrent, signal, pauseSignal, remember, rememberSuccess = () => {}, delay, attemptStartedAt, monotonicNow = () => performance.now(), now, setTimer, clearTimer }) {
   const pending = new Set(receivers)
   const summaries = []
   const transportSignal = signal && pauseSignal ? AbortSignal.any([signal, pauseSignal]) : signal || pauseSignal
@@ -33,6 +33,13 @@ export function publishWithEarlyFallback ({ event, receivers, first, mirrors, tr
       ...(interruptedWork && !signal?.aborted ? { retryWhenAvailable: true, ...(offline ? { retryWhenOnline: true } : {}) } : {})
     })
   }
+  const fail = error => {
+    if (done) return
+    done = true
+    clearTimer(timer); timer = null
+    transportSignal?.removeEventListener('abort', interrupted)
+    outcome.reject(error)
+  }
   const check = () => {
     if (done) return
     if (!pending.size) finish(true)
@@ -59,7 +66,11 @@ export function publishWithEarlyFallback ({ event, receivers, first, mirrors, tr
     const slot = Promise.withResolvers()
     summaries.push(slot.promise)
     let result
-    try { result = await sendEvent(event, relays, { signal: transportSignal }) } catch (reason) {
+    try { result = await sendEvent(event, relays, { signal: transportSignal, getRetryEvent }) } catch (reason) {
+      if (reason?.code === 'RETRY_EVENT_PREPARATION_FAILED') {
+        fail(reason)
+        return
+      }
       result = { success: false, promise: Promise.resolve({ fulfilled: 0, errors: [{ reason }] }) }
     }
     const settled = Promise.resolve(result.promise).catch(reason => ({ fulfilled: 0, errors: [{ reason }] }))

@@ -68,6 +68,49 @@ test('policy rejection rotates two read relays at a time and preserves the exact
   assert.deepEqual(f.batches.at(-1), urls.slice(2, 4))
 })
 
+test('a successful replacement is the only outcome observed by relay health', async () => {
+  const relay = 'wss://refresh.example'
+  const health = createPublicationRelayHealth({ now: () => 1000 })
+  let retryRequests = 0
+  let replacement = false
+  const routing = createSendRelayRouting({
+    peer: 'peer',
+    peers: ['peer'],
+    relaysByPubkey: { peer: { read: [relay], write: [] } },
+    recoveryRelays: [],
+    exclusions: new Map(),
+    relayHealth: health,
+    pickRelays: pickRelaysForPubkeys,
+    publish: options => options._publish(options.event, [relay], { getRetryEvent: async () => event }),
+    publishNymEvent: options => options._publish(options.event, [relay], { getRetryEvent: async () => event }),
+    sendEvent: async (value, relays, options) => {
+      if (!replacement) {
+        const retried = await options.getRetryEvent({
+          event: value,
+          report: { success: false, errors: [{ relay, reason: new Error('auth-required: old') }] }
+        })
+        replacement = Boolean(retried)
+      }
+      retryRequests++
+      return { success: true, total: relays.length, promise: Promise.resolve({ success: true, errors: [] }) }
+    },
+    isOnline: async () => true,
+    isCurrent: () => true,
+    now: () => 1000
+  })
+  const result = await routing._publish({
+    event,
+    senderSigner: null,
+    privateChannelSigner: null,
+    receiverPubkeys: ['peer'],
+    relays: [relay]
+  })
+  await result.promise
+  assert.equal(retryRequests, 1)
+  assert.equal(replacement, true)
+  assert.equal(health.isExcluded(relay), false)
+})
+
 test('exhaustion includes every read relay and waits for the publication circuit', async t => {
   const f = fixture(t, { reasons: Object.fromEntries(urls.map(url => [url, 'blocked: policy'])) })
   const result = await f.publish(f.routing())
