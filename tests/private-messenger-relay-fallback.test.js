@@ -369,20 +369,39 @@ test('multi-recipient routing retains final native errors and rechecks exhausted
   assert.deepEqual(f.batches.at(-1), shared)
 })
 
-test('offline, cancellation and invalid events do not start group fallback publication', async t => {
-  for (const mode of ['offline', 'cancelled', 'invalid']) {
+test('offline and cancellation do not start group fallback publication', async t => {
+  for (const mode of ['offline', 'cancelled']) {
     const f = groupFixture(t, { reasons: blocked([...shared, ...bobRelays, ...carolRelays]), online: mode !== 'offline' })
-    if (mode === 'invalid') f.state.reasons = Object.fromEntries(shared.map(relay => [relay, 'invalid: bad event']))
     f.state.held = new Set(shared)
     const work = publishGroup(f)
     await Promise.race([work.then(() => assert.fail('publication completed before controlled ACKs')), (async () => { while (f.state.pending.length < 2) await tick() })()])
     if (mode === 'cancelled') f.controller.abort()
     f.state.pending.splice(0).forEach(settle => settle())
     const [report] = await work
-    assert.equal(report.success, false)
+    assert.equal(report.success, false, mode)
     assert.deepEqual(f.batches, [shared])
     assert.equal(Boolean(report.retryWhenAvailable), mode === 'offline')
   }
+})
+
+test('invalid group publication is re-enveloped exactly once before fallback selection', async t => {
+  const f = groupFixture(t, { reasons: blocked([...shared, ...bobRelays, ...carolRelays]) })
+  f.state.reasons = Object.fromEntries(shared.map(relay => [relay, 'invalid: private-channel envelope is too old']))
+  f.state.held = new Set(shared)
+  const work = publishGroup(f)
+
+  await (async () => { while (f.state.pending.length < 2) await tick() })()
+  const originalIds = f.sends.map(send => send.event.id)
+  f.state.pending.splice(0).forEach(settle => settle())
+  await (async () => { while (f.state.pending.length < 2) await tick() })()
+  f.state.pending.splice(0).forEach(settle => settle())
+
+  const [report] = await work
+  assert.equal(report.success, false)
+  assert.deepEqual(f.batches, [shared])
+  const retriedIds = f.sends.slice(originalIds.length).map(send => send.event.id)
+  assert.equal(retriedIds.length, originalIds.length)
+  assert.ok(retriedIds.every((id, index) => id !== originalIds[index]))
 })
 
 test('nym carriers with explicit recipient maps use fallbacks without changing the signed carrier', async t => {

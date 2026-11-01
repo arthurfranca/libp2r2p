@@ -1190,7 +1190,7 @@ this publication policy, including seeder/recovery messages. A timeout indicates
 missing acknowledgement and cannot prove that the recipient did not receive it.
 Its optional `getRetryEvent({ event, report })` accepts one replacement signed
 event after every relay terminally rejected the original with
-`auth-required:`/`restricted:`. The replacement and its retry share the original
+`auth-required:`/`restricted:`/`invalid:`. The replacement and its retry share the original
 deadline; mixed failures and ambiguous timeouts never invoke it.
 
 ## Private file channels (0.11)
@@ -1225,7 +1225,9 @@ publication rejected in full by age-related AUTH policy may be re-enveloped once
 ciphertext, router, chunks, seeds, recipients and deletion capability remain
 unchanged while every outer is re-signed with one fresh `created_at` and a
 refreshed `expiration`. The durable replacement is written before retry and is
-never refreshed a second time. Optional `fallbackRelays` on
+never refreshed a second time. A relay may use `invalid:` rather than
+`auth-required:` for a stale 3560 wrapper; `invalid:` triggers this refresh but
+never attempts NIP-42. Optional `fallbackRelays` on
 `createPrivateMessenger` and `createPrivateMessageSession` are tried after the
 primary destinations by default, including explicit per-call `relays`, channel `sendRelays`
 and channel/global `relays`, as well as explicit `relayToReceivers` maps.

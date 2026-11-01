@@ -100,7 +100,8 @@ suite pass; report independently scoped problems separately.
   publisher code uses only arrays. Replay targets pending peers without
   recreating cryptography, IDs or tags.
 - A prepared 3560 publication may be re-enveloped once when its first outer was
-  definitively rejected by every target with `auth-required:`/`restricted:`.
+  definitively rejected by every target with
+  `auth-required:`/`restricted:`/`invalid:`.
   Preserve ciphertext, router, chunks, seeds, receivers and deletion capability;
   re-sign every outer with one fresh `created_at`, refresh existing expiration
   from the original retention, and persist the replacement generation before
@@ -115,6 +116,8 @@ suite pass; report independently scoped problems separately.
   authenticated connections or churn identity/subscriptions and link the
   privacy-oriented disposable wrapper to a connection. Keep auth out of the
   normal modern-3560 path and reserve the one outer refresh for rare age refusals.
+  `invalid:` participates only in this outer-refresh decision, never in
+  `getAuthEvent` or generic NIP-42 retry handling.
 
 - Version 0.11.22 migrates only the known message-queue three-field provenance
   index, atomically preserving rows/order/accounting. Keep generic queue schema

@@ -1995,6 +1995,36 @@ describe('RelayPool.sendEvent', () => {
     assert.deepEqual(relayResults, [{ relay: 'wss://r1', success: true, outcome: 'published' }])
   })
 
+  it('treats definitive invalid rejection as an outer refresh without attempting NIP-42', async () => {
+    const secretKey = generateSecretKey()
+    const original = finalizeEvent({ kind: 3560, created_at: 1, tags: [], content: 'same ciphertext' }, secretKey)
+    const replacement = finalizeEvent({ kind: 3560, created_at: 2, tags: [], content: 'same ciphertext' }, secretKey)
+    let publishCount = 0
+    publishOverrides.set('wss://r1', () => {
+      publishCount++
+      if (publishCount === 1) throw new Error('invalid: private-channel envelope is too old')
+    })
+    let authRequests = 0
+    let retryRequests = 0
+    const early = await nostr.sendEvent(original, ['wss://r1'], {
+      getAuthEvent: () => {
+        authRequests++
+        return { id: 'unexpected-auth' }
+      },
+      getRetryEvent: async ({ report }) => {
+        retryRequests++
+        assert.equal(report.errors[0].reason.message, 'invalid: private-channel envelope is too old')
+        return replacement
+      }
+    })
+
+    assert.equal(early.success, true)
+    assert.equal(publishCount, 2)
+    assert.equal(authRequests, 0)
+    assert.equal(retryRequests, 1)
+    assert.equal(early.retriedEvent.id, replacement.id)
+  })
+
   it('does not attempt a third publish or rewrap after mixed/non-definitive failures', async () => {
     const secretKey = generateSecretKey()
     const original = finalizeEvent({ kind: 3560, created_at: 1, tags: [], content: 'private' }, secretKey)

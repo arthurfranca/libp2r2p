@@ -74,11 +74,15 @@ function requiresNip42Auth (reason) {
   return message.startsWith('auth-required:') || message.startsWith('restricted:')
 }
 
-function isDefinitiveAuthRejection (report) {
+function requiresOuterRefresh (reason) {
+  return requiresNip42Auth(reason) || (reason?.message || reason?.code || '').startsWith('invalid:')
+}
+
+function isDefinitiveOuterRejection (report) {
   return report?.success === false &&
     Array.isArray(report.errors) &&
     report.errors.length > 0 &&
-    report.errors.every(({ reason }) => requiresNip42Auth(reason))
+    report.errors.every(({ reason }) => requiresOuterRefresh(reason))
 }
 
 function countResponseError () {
@@ -1209,7 +1213,7 @@ export class RelayPool {
   // is published, duplicate, muted, failed, or timed-out. getAuthEvent is used
   // only after auth-required or restricted publish failures, then retries once.
   // getRetryEvent may return one fresh signed event after every relay rejected
-  // the original with auth-required/restricted; it shares the operation deadline.
+  // the original with auth-required/restricted/invalid; it shares the operation deadline.
   // Await `promise` for the complete report, including every relay outcome.
   async sendEvent (event, relays, {
     timeout = SEND_TIMEOUT_MS,
@@ -1323,7 +1327,7 @@ export class RelayPool {
       first.flushRelayResults()
       return first
     }
-    if (!isDefinitiveAuthRejection(report) || (deadline !== null && Date.now() >= deadline)) {
+    if (!isDefinitiveOuterRejection(report) || (deadline !== null && Date.now() >= deadline)) {
       first.flushRelayResults()
       return first
     }

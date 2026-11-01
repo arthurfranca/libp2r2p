@@ -293,7 +293,9 @@ reuse the exact envelopes without repeating cryptography or extending expiry,
 except for one 3560 age-auth refresh. That refresh reuses router/ciphertext and
 seeds but re-signs the whole publication with a new shared `created_at` and
 recomputed `expiration`, writes the replacement generation before retrying, and
-sets `outerRefreshAttempted` so reload cannot repeat it.
+sets `outerRefreshAttempted` so reload cannot repeat it. A relay may report a
+stale wrapper as `invalid:`; that prefix permits this refresh but does not
+attempt NIP-42 authentication.
 
 The existing `onPreparedSeed` callback now also supplies `publication`, plus an
 optional `{ replace: true }` second argument when a refreshed publication must
