@@ -79,6 +79,32 @@ test('ciphertext pending queue survives restart, deduplicates, caps MAC attempts
   await pending.close()
 })
 
+test('pending diagnostics expose one sample and the outer timestamp without ciphertext', async () => {
+  const indexedDB = new IDBFactory()
+  const reports = []
+  const pending = await createPendingDecryption({ prefix: 'diagnostics', indexedDB, report: value => reports.push(value) })
+  const failure = (id, createdAt) => ({
+    error: new ValidationError('INVALID_MAC'),
+    record: {
+      format: 'outer_v1',
+      channelPubkey: 'channel',
+      outer: { id, kind: 3560, created_at: createdAt, content: 'ciphertext-must-not-leak' }
+    }
+  })
+
+  await pending.save(failure('first', 100))
+  await pending.save(failure('second', 200))
+  await pending.close()
+
+  const deferred = reports.filter(value => value.action === 'deferred')
+  assert.deepEqual(deferred.map(value => value.outerCreatedAt), [100, 200])
+  const summary = reports.find(value => value.action === 'summary')
+  assert.equal(summary.counts['deferred:INVALID_MAC'].count, 2)
+  assert.equal(summary.counts['deferred:INVALID_MAC'].sample.outerCreatedAt, 200)
+  assert.equal(Object.hasOwn(summary.counts['deferred:INVALID_MAC'], 'example'), false)
+  assert.equal(JSON.stringify(reports).includes('ciphertext-must-not-leak'), false)
+})
+
 test('pending records retain only validated content-key coordinates and replace them on failure', async () => {
   const indexedDB = new IDBFactory()
   const pending = await createPendingDecryption({ prefix: 'content-key-metadata', indexedDB })

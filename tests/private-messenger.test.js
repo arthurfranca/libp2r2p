@@ -302,6 +302,39 @@ test('startup admission protects queue reads while live reception and sending re
   assert.equal(replayed, 1)
 })
 
+test('a forced pending retry can recover records suspended by repeated MAC failures', async () => {
+  let replays = 0
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _privateChannel: {
+      fetchHistory: async () => [],
+      replayDeferredDecryptions: async ({ records, _runRecord, onRecovered }) => {
+        if (records.length) replays++
+        for (const record of records) await _runRecord(record, () => onRecovered(record))
+      }
+    }
+  }).init({ userSigner: signer('retry-owner'), channels: [{ signer: signer('channel'), relays: ['wss://fixture.example'] }] })
+  await messenger.pendingDecryption.save({
+    error: new ValidationError('INVALID_MAC'),
+    record: {
+      format: 'outer_v1',
+      channelPubkey: 'channel',
+      outer: { id: 'suspended-packet', kind: 3560, created_at: 123, content: 'ciphertext' }
+    }
+  })
+  let [record] = await messenger.pendingDecryption.records()
+  await messenger.pendingDecryption.failed(record, new ValidationError('INVALID_MAC'))
+  ;[record] = await messenger.pendingDecryption.records()
+  await messenger.pendingDecryption.failed(record, new ValidationError('INVALID_MAC'))
+  assert.deepEqual(await messenger.pendingDecryption.records(), [])
+
+  await messenger.retryPendingDecryptions()
+  assert.equal(replays, 0)
+  await messenger.retryPendingDecryptions({ force: true })
+  assert.equal(replays, 1)
+  assert.deepEqual(await messenger.pendingDecryption.records({ force: true }), [])
+})
+
 test('missing content-key probes deduplicate account-wide groups per retry pass', async () => {
   const owner = '41'.repeat(32)
   const channels = {

@@ -264,6 +264,8 @@ requests, uses an origin/identity Web Lock when available, and stops on pause or
 close. Missing-key retries have no polling timer. MAC failures permit three total
 attempts, persisted across reloads; exhausted packets remain until FIFO eviction.
 `retryPendingDecryptions({ force: true })` explicitly retries exhausted packets.
+Callers should request it when a committed content-key revision provides new
+evidence, while startup, resume and routine reconciliation retain normal retries.
 Success enters the normal acknowledged inbox before removing the pending item.
 The session coordinator forwards this API.
 

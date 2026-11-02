@@ -48,6 +48,11 @@ function replaceErrorMetadata (item, error) {
   return Object.assign(next, errorMetadata(error))
 }
 
+function createdAtMetadata (item) {
+  const value = item?.packet?.outer?.created_at ?? item?.outer?.created_at
+  return Number.isSafeInteger(value) ? { outerCreatedAt: value } : {}
+}
+
 export function pendingContentKeyGroup (item) {
   const receiver = item?.receiverPubkey
   const own = item?.ownContentPubkey
@@ -92,7 +97,7 @@ export async function createPendingDecryption ({ prefix, indexedDB, maxBytes = P
   const notify = (action, detail) => {
     report({ action, ...detail })
     const key = `${action}:${detail.code || detail.reason || ''}`
-    counts[key] = { count: (counts[key]?.count || 0) + 1, example: detail }
+    counts[key] = { count: (counts[key]?.count || 0) + 1, sample: detail }
     if (!timer) { timer = setTimeout(flush, 1000); timer.unref?.() }
   }
   return {
@@ -129,7 +134,16 @@ export async function createPendingDecryption ({ prefix, indexedDB, maxBytes = P
         if (evictedBytes) notify('discarded', { reason: 'capacity', bytes: evictedBytes })
         const coordinates = Object.fromEntries(['eventId', 'eventKind', 'senderPubkey', 'receiverPubkey', 'ownContentPubkey', 'peerContentPubkey', 'hasOwnContentKey']
           .filter(key => ['string', 'boolean', 'number'].includes(typeof error[key])).map(key => [key, error[key]]))
-        notify('deferred', { ...coordinates, code: error.code, stage: error.stage, id, channelPubkey: item.channelPubkey, capacityBytesBefore: before.usedBytes, capacityBytesAfter: after.usedBytes })
+        notify('deferred', {
+          ...coordinates,
+          ...createdAtMetadata(record),
+          code: error.code,
+          stage: error.stage,
+          id,
+          channelPubkey: item.channelPubkey,
+          capacityBytesBefore: before.usedBytes,
+          capacityBytesAfter: after.usedBytes
+        })
         return true
       })
     },
@@ -148,7 +162,7 @@ export async function createPendingDecryption ({ prefix, indexedDB, maxBytes = P
     recovered (item) {
       return serial(async () => {
         await queue.removeBy('byId', item.id)
-        notify('recovered', { id: item.id, channelPubkey: item.channelPubkey })
+        notify('recovered', { id: item.id, channelPubkey: item.channelPubkey, ...createdAtMetadata(item) })
       })
     },
     failed (item, error) {
@@ -161,7 +175,9 @@ export async function createPendingDecryption ({ prefix, indexedDB, maxBytes = P
           macAttempts: current.macAttempts + (error.code === 'INVALID_MAC' ? 1 : 0)
         }
         await queue.putBy('byId', updated, { existingOnly: true })
-        if (updated.macAttempts >= 3 && item.macAttempts < 3) notify('suspended', { id: item.id, code: error.code, channelPubkey: item.channelPubkey })
+        if (updated.macAttempts >= 3 && item.macAttempts < 3) {
+          notify('suspended', { id: item.id, code: error.code, channelPubkey: item.channelPubkey, ...createdAtMetadata(updated) })
+        }
       })
     },
     clearChannel: channel => serial(() => queue.removeBy('byChannel', channel)),
