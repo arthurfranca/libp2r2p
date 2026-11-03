@@ -104,3 +104,21 @@ test('both queue types require a prefix and predicate callbacks', async () => {
     await assert.rejects(idbQueue[method](), /QUEUE_PREDICATE_REQUIRED/)
   }
 })
+
+test('idb reject capacity exposes safe diagnostics', async () => {
+  const queue = await createIdbQueue({
+    prefix: 'idb-capacity',
+    indexedDB: new IDBFactory(),
+    maxBytes: 220,
+    evictionPolicy: 'reject'
+  })
+
+  await call(queue, 'push', { value: 'a'.repeat(120) })
+  await assert.rejects(call(queue, 'push', { value: 'b'.repeat(120) }), error => {
+    assert.equal(error.code, 'QUEUE_CAPACITY_EXCEEDED')
+    assert.ok(error.requiredBytes > 0)
+    assert.ok(error.usedBytes > 0)
+    assert.equal(error.maxBytes, 220)
+    return true
+  })
+})

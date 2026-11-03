@@ -168,7 +168,13 @@ test('reject capacity preserves pending records across failed writes and reopen'
   const factory = new IDBFactory()
   const q = await queueFor(factory, 'reliable', { maxBytes: 220, evictionPolicy: 'reject' })
   await q.push({ value: 'a'.repeat(120) })
-  await assert.rejects(q.push({ value: 'b'.repeat(120) }), /QUEUE_CAPACITY_EXCEEDED/)
+  await assert.rejects(q.push({ value: 'b'.repeat(120) }), error => {
+    assert.equal(error.code, 'QUEUE_CAPACITY_EXCEEDED')
+    assert.ok(error.requiredBytes > 0)
+    assert.ok(error.usedBytes > 0)
+    assert.equal(error.maxBytes, 220)
+    return true
+  })
   await assert.rejects(q.push({ value: 'c'.repeat(300) }), /QUEUE_ITEM_TOO_LARGE/)
   await q.close()
   const reopened = await queueFor(factory, 'reliable', { maxBytes: 80, evictionPolicy: 'reject' })

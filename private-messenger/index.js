@@ -133,6 +133,30 @@ const SEED_QUEUE_INDEXES = {
   byChannelTime: ['channelPubkey', SEED_TIME],
   byTime: SEED_TIME
 }
+
+function isQueueCapacityError (error) {
+  return error?.code === 'QUEUE_CAPACITY_EXCEEDED' || error?.message === 'QUEUE_CAPACITY_EXCEEDED'
+}
+
+async function annotateQueueCapacityError (error, queue, getCapacity) {
+  if (!isQueueCapacityError(error)) return error
+  let capacity = {}
+  try {
+    capacity = await getCapacity?.() || {}
+  } catch {
+    // Preserve the original queue failure even if a follow-up snapshot fails.
+  }
+  const value = key => Number.isSafeInteger(error?.[key])
+    ? error[key]
+    : Number.isSafeInteger(capacity?.[key]) ? capacity[key] : undefined
+  return Object.assign(error, {
+    code: 'QUEUE_CAPACITY_EXCEEDED',
+    queue,
+    ...(value('requiredBytes') == null ? {} : { requiredBytes: value('requiredBytes') }),
+    ...(value('usedBytes') == null ? {} : { usedBytes: value('usedBytes') }),
+    ...(value('maxBytes') == null ? {} : { maxBytes: value('maxBytes') })
+  })
+}
 const encoder = new TextEncoder()
 const noContentKeys = async () => ({})
 
@@ -1788,7 +1812,10 @@ export class PrivateMessenger {
   }
 
   pausedError () {
-    return Object.assign(new Error('PRIVATE_MESSENGER_PAUSED'), { pauseReasons: this.readStatus().pauseReasons })
+    return Object.assign(new Error('PRIVATE_MESSENGER_PAUSED'), {
+      code: 'PRIVATE_MESSENGER_PAUSED',
+      pauseReasons: this.readStatus().pauseReasons
+    })
   }
 
   recoveryTask (attempt, { network = false, retryable = isRecoverableStorageFailure } = {}) {
@@ -2124,15 +2151,20 @@ export class PrivateMessenger {
       }
       this.recordInterruption([channelPubkey], message.outer?.created_at || message.event?.created_at || nowSeconds())
       // Do not await stop from inside its own transport callback.
-      const atCapacity = err.message === 'QUEUE_CAPACITY_EXCEEDED'
+      const atCapacity = isQueueCapacityError(err)
       if (!atCapacity && isRecoverableStorageFailure(err)) this.pendingStorageWrites.set(JSON.stringify(dedupeKey || [channelPubkey, type]), { record, dedupeKey, at: message.outer?.created_at || message.event?.created_at })
-      ;(atCapacity ? this.pause('capacity') : isRecoverableStorageFailure(err) ? this.pauseInternally('storage') : this.pause('storage')).catch(error => this.onError?.(error))
       if (atCapacity) {
+        await annotateQueueCapacityError(err, 'inbox', () => this.queue.getCapacity())
+        const pause = this.pause('capacity')
+        Object.assign(err, { pauseReasons: this.readStatus().pauseReasons })
+        pause.catch(error => this.onError?.(error))
         this.capacityRequiredBytes = Math.max(this.capacityRequiredBytes, err.requiredBytes || 0)
         if (!this.capacityTimer) {
           this.capacityTimer = setInterval(() => this.checkCapacity().catch(error => this.onError?.(error)), 1000)
           this.capacityTimer.unref?.()
         }
+      } else {
+        ;(isRecoverableStorageFailure(err) ? this.pauseInternally('storage') : this.pause('storage')).catch(error => this.onError?.(error))
       }
       await this.flushStateWrites()
       throw err
@@ -2165,7 +2197,12 @@ export class PrivateMessenger {
       }
       return
     }
-    return this.runSeedQueueOperation(() => this.enqueueQueueSeed(channelPubkey, seed))
+    try {
+      return await this.runSeedQueueOperation(() => this.enqueueQueueSeed(channelPubkey, seed))
+    } catch (error) {
+      await annotateQueueCapacityError(error, 'seeds', () => this.seedQueue?.getCapacity?.())
+      throw error
+    }
   }
 
   async enqueueQueueSeed (channelPubkey, seed) {

@@ -128,6 +128,10 @@ suite pass; report independently scoped problems separately.
   attempts persist across visits; force is explicit. A successful retry admits
   the normal inbox before deleting ciphertext. Pause/close fence late results.
   Keep unknown/storage/permission errors operational, with unchanged ACK/NACK.
+- `PRIVATE_MESSENGER_PAUSED` carries its stable code and a copied pauseReasons
+  array. `QUEUE_CAPACITY_EXCEEDED` carries the queue kind (`inbox` or `seeds`)
+  plus requiredBytes, usedBytes and maxBytes. Keep these additive diagnostics
+  numeric/categorical and free of messages, ciphertext, filters or identities.
 - Pending decryption admission is owned by `decryption-scheduler`: startup gate,
   250 ms channel quiet time, five-second maximum deferral, one overdue packet or
   at most four consecutive preferred records, and a task yield between records.

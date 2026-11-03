@@ -296,6 +296,11 @@ Web Lock when available; waits hold neither that lock nor the normal inbox/IDB
 queues. Fragment assembly survives scheduling boundaries. Pause/close cancel
 waits; channel removal fences its queued and in-flight results.
 
+`PRIVATE_MESSENGER_PAUSED` errors include the stable `code` and a copied
+`pauseReasons` array. `QUEUE_CAPACITY_EXCEEDED` errors identify the affected
+`inbox` or `seeds` queue and include bounded `requiredBytes`, `usedBytes` and
+`maxBytes` diagnostics. These fields contain no messages or ciphertext.
+
 Private-channel consumers may opt in
 with `onDecryptionFailure({ error, record })`, returning true only after durable
 handling, and replay records with `replayDeferredDecryptions`. Without the hook,

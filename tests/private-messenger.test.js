@@ -2075,6 +2075,37 @@ test('local seed queue serializes concurrent incoming and outgoing NYM writes', 
   assert.equal(storedSeeds.filter(item => item.recordType === NYM_CARRIER_SEED_RECORD_TYPE).length, 1)
 })
 
+test('seed queue capacity errors identify the seed queue without exposing records', async () => {
+  const messenger = await new PrivateMessenger({ _privateMessage: fakePrivateMessage() }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'], mode: 'seeder' }]
+  })
+  const now = Math.floor(Date.now() / 1000)
+  const queueError = Object.assign(new Error('QUEUE_CAPACITY_EXCEEDED'), {
+    code: 'QUEUE_CAPACITY_EXCEEDED',
+    requiredBytes: 120,
+    maxBytes: 100
+  })
+  messenger.seedQueue.enqueue = async () => { throw queueError }
+
+  await assert.rejects(messenger.enqueueSeed('channel', {
+    channelPubkey: 'channel',
+    router: {
+      kind: ROUTER_KIND,
+      pubkey: 'router',
+      created_at: now,
+      tags: [['f', 'alice'], ['c', '0', '1']],
+      content: jsonlContent(payloadRow(), JSON.stringify(['user', 'ciphertext']))
+    }
+  }), error => {
+    assert.equal(error, queueError)
+    assert.equal(error.queue, 'seeds')
+    assert.equal(error.requiredBytes, 120)
+    assert.equal(error.maxBytes, 100)
+    return true
+  })
+})
+
 test('local router seed updates preserve timestamp bounds across concurrent writes', async () => {
   const pm = fakePrivateMessage()
   const now = Math.floor(Date.now() / 1000)
@@ -2969,7 +3000,15 @@ test('capacity pauses ingestion without eviction and ack resumes durable recover
     const now = Math.floor(Date.now() / 1000)
     const message = id => ({ event: { kind: 9, id, pubkey: 'peer', tags: [], created_at: now, content: 'a'.repeat(250) }, outer: { created_at: now }, senderPubkey: 'peer' })
     await pm.watchCalls[0].onMessage(message('one'))
-    await assert.rejects(pm.watchCalls[0].onMessage(message('two')), /QUEUE_CAPACITY_EXCEEDED/)
+    await assert.rejects(pm.watchCalls[0].onMessage(message('two')), error => {
+      assert.equal(error.code, 'QUEUE_CAPACITY_EXCEEDED')
+      assert.equal(error.queue, 'inbox')
+      assert.equal(error.maxBytes, 850)
+      assert.ok(error.requiredBytes > 0)
+      assert.ok(error.usedBytes > 0)
+      assert.deepEqual(error.pauseReasons, ['capacity'])
+      return true
+    })
     assert.equal(messenger.pauseReasons.has('capacity'), true)
     assert.ok(messenger.readState().channels.channel.openOfflineStart)
     const first = await messenger.nextMessage()

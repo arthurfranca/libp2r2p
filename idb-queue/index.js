@@ -54,6 +54,15 @@ function byteLength (value) {
   return encoder.encode(String(value)).length
 }
 
+function capacityError (requiredBytes, usedBytes, maxBytes) {
+  return Object.assign(new Error('QUEUE_CAPACITY_EXCEEDED'), {
+    code: 'QUEUE_CAPACITY_EXCEEDED',
+    requiredBytes,
+    usedBytes,
+    maxBytes
+  })
+}
+
 function normalizeEvictionPolicy (policy) {
   if (policy === 'opposite-end' || policy === undefined || policy === null) return 'opposite-end'
   if (policy === 'reject') return 'reject'
@@ -471,7 +480,7 @@ export async function createQueue ({
     if (requiredBytes > sessionMaxBytes) throw new Error('QUEUE_ITEM_TOO_LARGE')
     if (configuredEvictionPolicy === 'reject') {
       if (state.usedBytes + requiredBytes > sessionMaxBytes) {
-        throw Object.assign(new Error('QUEUE_CAPACITY_EXCEEDED'), { requiredBytes, maxBytes: sessionMaxBytes })
+        throw capacityError(requiredBytes, state.usedBytes, sessionMaxBytes)
       }
       return
     }
@@ -480,7 +489,7 @@ export async function createQueue ({
     while (state.usedBytes + requiredBytes > targetBytes) {
       if (!await evictOne(tx, state, options)) break
     }
-    if (state.usedBytes + requiredBytes > sessionMaxBytes) throw new Error('QUEUE_CAPACITY_EXCEEDED')
+    if (state.usedBytes + requiredBytes > sessionMaxBytes) throw capacityError(requiredBytes, state.usedBytes, sessionMaxBytes)
   }
 
   async function evictToBytes (tx, state, targetBytes, options = {}) {

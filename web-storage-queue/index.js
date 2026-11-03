@@ -38,6 +38,15 @@ export function createQueue ({
     return encoder.encode(String(value)).length
   }
 
+  function capacityError (requiredBytes, usedBytes, maxBytes) {
+    return Object.assign(new Error('QUEUE_CAPACITY_EXCEEDED'), {
+      code: 'QUEUE_CAPACITY_EXCEEDED',
+      requiredBytes,
+      usedBytes,
+      maxBytes
+    })
+  }
+
   function hasByteLimit () {
     return Number.isFinite(sessionMaxBytes)
   }
@@ -222,7 +231,7 @@ export function createQueue ({
         : evictOneFromHead(state, options)
       if (!evicted) break
     }
-    if (state.usedBytes + requiredBytes > sessionMaxBytes) throw new Error('QUEUE_CAPACITY_EXCEEDED')
+    if (state.usedBytes + requiredBytes > sessionMaxBytes) throw capacityError(requiredBytes, state.usedBytes, sessionMaxBytes)
     return state
   }
 
@@ -291,7 +300,7 @@ export function createQueue ({
     if (hasByteLimit() && stored.byteSize > sessionMaxBytes) throw new Error('QUEUE_ITEM_TOO_LARGE')
     if (delta > 0) {
       if (options.evict === false) {
-        if (hasByteLimit() && state.usedBytes + delta > sessionMaxBytes) throw new Error('QUEUE_CAPACITY_EXCEEDED')
+        if (hasByteLimit() && state.usedBytes + delta > sessionMaxBytes) throw capacityError(delta, state.usedBytes, sessionMaxBytes)
       } else {
         evictToFit(state, delta, options)
       }
