@@ -132,6 +132,10 @@ suite pass; report independently scoped problems separately.
   array. `QUEUE_CAPACITY_EXCEEDED` carries the queue kind (`inbox` or `seeds`)
   plus requiredBytes, usedBytes and maxBytes. Keep these additive diagnostics
   numeric/categorical and free of messages, ciphertext, filters or identities.
+- The durable inbox starts capacity pressure at 70% of its effective limit and
+  resumes at 50%. Emit one `PRIVATE_MESSENGER_CAPACITY_PRESSURE` per episode with
+  used/high-water/resume/max bytes and aggregate type/age buckets; never evict
+  pending rows or expose channel identities.
 - Pending decryption admission is owned by `decryption-scheduler`: startup gate,
   250 ms channel quiet time, five-second maximum deferral, one overdue packet or
   at most four consecutive preferred records, and a task yield between records.
@@ -412,6 +416,9 @@ NIP-46 against the real pool with controlled transport and injected controls.
   saves use `session-storage`, retry the actual reservation, and release after ACK.
   Account loss/close stop jobs and stale continuations. Unchanged channels, peers
   and availability must not recreate healthy watches.
+- Pausing aborts watches and recovery controllers with `pausedError()`.
+  Pause-induced cancellation preserves pending ranges but emits no `onError`, does
+  not finalize coverage and does not start seeder asks.
 
 ## Local messaging readiness
 

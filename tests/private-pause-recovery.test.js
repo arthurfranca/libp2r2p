@@ -84,6 +84,33 @@ test('status snapshots are isolated and paused sends wake without a backoff or h
   assert.equal(f.status.at(-1).closed, true)
 })
 
+test('pausing during recovery aborts with the pause reason without reporting a failure', async t => {
+  const f = await fixture(t)
+  f.messenger.offlineRecoverySecondsFor = () => 7 * 24 * 60 * 60
+  const started = Promise.withResolvers()
+  let abortReason
+  f.messenger._privateChannel = {
+    fetchHistory: options => new Promise((resolve, reject) => {
+      started.resolve()
+      options.signal.addEventListener('abort', () => {
+        abortReason = options.signal.reason
+        reject(options.signal.reason)
+      }, { once: true })
+    })
+  }
+  const now = Math.floor(Date.now() / 1000)
+  f.messenger.addOfflineRange(channel, now - 10, now)
+  const recovery = f.messenger.recoverOfflineRanges([channel])
+  await started.promise
+  await f.messenger.pause('vault')
+
+  assert.deepEqual(await recovery, [])
+  assert.equal(abortReason?.code, 'PRIVATE_MESSENGER_PAUSED')
+  assert.deepEqual(abortReason?.pauseReasons, ['vault'])
+  assert.deepEqual(f.errors, [])
+  assert.ok(f.messenger.readState().channels[channel].offlineRanges.length)
+})
+
 test('session-storage retries the actual reservation and keeps independent pauses', async t => {
   let failing = true; let saves = 0
   const f = await fixture(t, { save: async event => { if (event.pubkey === peer) { saves++; if (failing) throw new Error('TEMPORARY_STORAGE_FAILURE') }; return { result: { ok: true } } } })

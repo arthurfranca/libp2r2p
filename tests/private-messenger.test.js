@@ -3023,6 +3023,118 @@ test('capacity pauses ingestion without eviction and ack resumes durable recover
   } finally { await messenger.close() }
 })
 
+test('inbox pressure pauses at high water, reports sanitized aggregates and resumes at low water', async () => {
+  const pm = fakePrivateMessage()
+  let recovered = 0
+  const errors = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    messageQueueMaxBytes: 5000,
+    onError: error => errors.push(error),
+    _privateChannel: { fetchHistory: async () => { recovered++; return [] } }
+  }).init({
+    userSigner: signer('owner'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  try {
+    const now = Math.floor(Date.now() / 1000)
+    let pressure
+    for (let index = 0; index < 20 && !pressure; index++) {
+      const id = `${index}`.padStart(64, '0')
+      try {
+        await pm.watchCalls[0].onMessage({
+          event: { kind: 9, id, pubkey: 'peer', tags: [], created_at: now, content: `private-${index}-${'a'.repeat(500)}` },
+          outer: { created_at: now },
+          senderPubkey: 'peer'
+        })
+      } catch (error) {
+        pressure = error
+      }
+    }
+
+    assert.equal(pressure?.code, 'PRIVATE_MESSENGER_CAPACITY_PRESSURE')
+    assert.equal(pressure.queue, 'inbox')
+    assert.ok(pressure.usedBytes >= pressure.highWaterBytes)
+    assert.equal(pressure.highWaterBytes, 3500)
+    assert.equal(pressure.resumeAtBytes, 2500)
+    assert.equal(pressure.maxBytes, 5000)
+    assert.deepEqual(pressure.pauseReasons, ['capacity'])
+    assert.ok(pressure.summary.count > 0)
+    assert.equal(pressure.summary.channelCount, 1)
+    assert.ok(pressure.summary.buckets.every(bucket => !Object.hasOwn(bucket, 'channelPubkey')))
+    const serialized = JSON.stringify(pressure)
+    assert.equal(serialized.includes('private-'), false)
+    assert.equal(serialized.includes('peer'), false)
+    assert.equal(messenger.pauseReasons.has('capacity'), true)
+    await assert.rejects(pm.watchCalls[0].onMessage({
+      event: { kind: 9, id: 'f'.repeat(64), pubkey: 'peer', tags: [], created_at: now, content: 'later' },
+      outer: { created_at: now },
+      senderPubkey: 'peer'
+    }), error => error.code === 'PRIVATE_MESSENGER_PAUSED')
+    assert.equal(errors.length, 1)
+
+    let capacity = await messenger.queue.getCapacity()
+    while (capacity.usedBytes > pressure.resumeAtBytes) {
+      const delivery = await messenger.nextMessage()
+      assert.ok(delivery)
+      await delivery.ack()
+      if (messenger.capacityCheck) await messenger.capacityCheck
+      capacity = await messenger.queue.getCapacity()
+      if (capacity.usedBytes > pressure.resumeAtBytes) {
+        assert.equal(messenger.pauseReasons.has('capacity'), true)
+      }
+    }
+    if (messenger.capacityCheck) await messenger.capacityCheck
+    assert.equal(messenger.pauseReasons.has('capacity'), false)
+    assert.equal(recovered, 1)
+    assert.equal(errors.length, 1)
+    assert.equal(errors[0].code, 'PRIVATE_MESSENGER_CAPACITY_PRESSURE')
+  } finally { await messenger.close() }
+})
+
+test('an existing inbox above high water pauses before starting remote background work', async () => {
+  const indexedDB = globalThis.indexedDB
+  const userSigner = signer('owner')
+  const channel = { signer: signer('channel'), relays: ['wss://relay.example'] }
+  const first = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _privateChannel: { fetchHistory: async () => [] },
+    messageQueueMaxBytes: 5000,
+    _indexedDB: indexedDB
+  }).init({ userSigner, channels: [channel] })
+  const now = Math.floor(Date.now() / 1000)
+  for (let index = 0; index < 10; index++) {
+    await first.queue.enqueue({
+      type: 'message',
+      channelPubkey: 'channel',
+      receivedAt: now,
+      event: { kind: 9, id: `${index}`.padStart(64, '0'), pubkey: 'peer', tags: [], created_at: now, content: 'a'.repeat(500) },
+      senderPubkey: 'peer',
+      provenance: 'direct',
+      outer: { created_at: now }
+    })
+    const { usedBytes, maxBytes } = await first.queue.getCapacity()
+    if (usedBytes >= Math.floor(maxBytes * 0.7)) break
+  }
+  await first.close()
+
+  const pm = fakePrivateMessage()
+  const errors = []
+  const second = await new PrivateMessenger({
+    _privateMessage: pm,
+    _privateChannel: { fetchHistory: async () => [] },
+    messageQueueMaxBytes: 5000,
+    _indexedDB: indexedDB,
+    onError: error => errors.push(error)
+  }).init({ userSigner, channels: [channel] })
+  try {
+    assert.equal(second.pauseReasons.has('capacity'), true)
+    assert.equal(pm.watchCalls.length, 0)
+    assert.equal(errors.length, 1)
+    assert.equal(errors[0].code, 'PRIVATE_MESSENGER_CAPACITY_PRESSURE')
+  } finally { await second.close() }
+})
+
 test('failed recovery ingestion retains its range and does not advance lastSeenAt', async () => {
   const pm = fakePrivateMessage()
   const now = Math.floor(Date.now() / 1000)

@@ -118,6 +118,8 @@ const DEFAULT_SEEDER_ONLINE_SECONDS = 20 * 60
 const DEFAULT_MAX_DYNAMIC_RECOVERY_SEEDERS = 8
 const DEFAULT_MESSAGE_QUEUE_MAX_BYTES = 16 * 1024 * 1024 // 16 MiB
 const DEFAULT_SEED_QUEUE_MAX_BYTES = 64 * 1024 * 1024 // 64 MiB
+const MESSAGE_QUEUE_HIGH_WATER_RATIO = 0.7
+const MESSAGE_QUEUE_LOW_WATER_RATIO = 0.5
 const SEED_KEY = '__p2r2pSeedKey'
 const SEED_TIME = '__p2r2pSeedTime'
 const MESSAGE_QUEUE_INDEXES = {
@@ -136,6 +138,33 @@ const SEED_QUEUE_INDEXES = {
 
 function isQueueCapacityError (error) {
   return error?.code === 'QUEUE_CAPACITY_EXCEEDED' || error?.message === 'QUEUE_CAPACITY_EXCEEDED'
+}
+
+function isPausedError (error) {
+  return error?.code === 'PRIVATE_MESSENGER_PAUSED' || error?.message === 'PRIVATE_MESSENGER_PAUSED'
+}
+
+function isCapacityPressureError (error) {
+  return error?.code === 'PRIVATE_MESSENGER_CAPACITY_PRESSURE'
+}
+
+function isExpectedRecoveryPause (error, controller) {
+  return isPausedError(error) || isCapacityPressureError(error) ||
+    isPausedError(controller?.signal?.reason) || isCapacityPressureError(controller?.signal?.reason)
+}
+
+function inboxCapacityLimits (maxBytes) {
+  if (maxBytes === Infinity) {
+    return { highWaterBytes: Infinity, resumeAtBytes: 0, maxBytes: Infinity }
+  }
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    return { highWaterBytes: 0, resumeAtBytes: 0, maxBytes: 0 }
+  }
+  return {
+    highWaterBytes: Math.max(1, Math.floor(maxBytes * MESSAGE_QUEUE_HIGH_WATER_RATIO)),
+    resumeAtBytes: Math.max(1, Math.floor(maxBytes * MESSAGE_QUEUE_LOW_WATER_RATIO)),
+    maxBytes
+  }
 }
 
 async function annotateQueueCapacityError (error, queue, getCapacity) {
@@ -394,6 +423,7 @@ export class PrivateMessenger {
     this.capacityTimer = null
     this.capacityCheck = null
     this.capacityRequiredBytes = 0
+    this.capacityResumeAtBytes = 0
     this.reloadGapTimers = new Map()
     this.liveInterruptions = new Map()
     this.liveRecoveryTimers = new Map()
@@ -491,6 +521,11 @@ export class PrivateMessenger {
         indexedDB: this._indexedDB
       })
       this.assertOpen()
+      const initialCapacity = await this.queue.getCapacity()
+      if (initialCapacity.usedBytes >= inboxCapacityLimits(initialCapacity.maxBytes).highWaterBytes) {
+        const pressure = await this.beginCapacityPressure(initialCapacity)
+        try { this.onError?.(pressure) } catch {}
+      }
       this.startStorageMaintenance()
       this.state = { channels: await this.stateStore.load() }
       await this.update({ userSigner, contentKeySigner, nymSigner: this.nymSigner, channels, relays, mode })
@@ -704,7 +739,9 @@ export class PrivateMessenger {
     this.touchStorageActivity().catch(err => this.onError?.(err))
     const run = this.queueOperationTail.then(operation)
     this.queueOperationTail = run.catch(err => {
-      try { this.onError?.(err) } catch {}
+      if (!isPausedError(err)) {
+        try { this.onError?.(err) } catch {}
+      }
     })
     return run
   }
@@ -1275,7 +1312,9 @@ export class PrivateMessenger {
           receivedChunkTtlMs: this.receivedChunkTtlMsFor(channel),
           receivedChunkIndexedDB: this._indexedDB,
           onSubscriptionState: state => this.handleSubscriptionState(pubkey, state),
-          onError: err => this.onError?.(err)
+          onError: err => {
+            if (!isExpectedRecoveryPause(err)) this.onError?.(err)
+          }
         })
       } catch (error) {
         if (signal?.aborted) continue
@@ -1688,6 +1727,7 @@ export class PrivateMessenger {
   }
 
   async finalizeRecoveryRange ({ channelPubkey, range, record }) {
+    if (this.pauseReasons.size) throw this.pausedError()
     if (!await this.checkRecoveryOnline()) return { complete: false, failures: [], offline: true }
     const uncovered = subtractRanges({ start: range.start, end: range.end }, record.covered)
     const oldest = record.oldestCreatedAt
@@ -1699,6 +1739,7 @@ export class PrivateMessenger {
     const seedRanges = mergeRanges([...uncovered, ...leftEdge])
     const failures = []
     for (const seedRange of seedRanges) {
+      if (this.pauseReasons.size) throw this.pausedError()
       const attempt = await this.#askSeedersForMissingRangeAttempt(channelPubkey, seedRange.start, seedRange.end)
       failures.push(...attempt.failures.map(failure => failure.error))
     }
@@ -1762,10 +1803,10 @@ export class PrivateMessenger {
     this.writeState(state)
   }
 
-  stopWatches (channels = [...this.stopByChannel.keys()]) {
+  stopWatches (channels = [...this.stopByChannel.keys()], { reason } = {}) {
     const closing = []
     for (const pubkey of channels) {
-      this.channelBackground.get(pubkey)?.controller.abort()
+      this.channelBackground.get(pubkey)?.controller.abort(reason)
       this.channelBackground.delete(pubkey)
       this.cancelReloadGap(pubkey)
       this.cancelLiveRecovery(pubkey)
@@ -1906,11 +1947,12 @@ export class PrivateMessenger {
     this.decryptionRetry?.controller.abort(this.pausedError())
     this.pauseRevisions.set(reason, (this.pauseRevisions.get(reason) || 0) + 1)
     this.sendRoutingPause.abort(this.pausedError())
+    const pausedError = this.pausedError()
     this.notifyStatus()
     for (const extension of this.extensions) extension.pause?.()
     this.recordInterruption(this.desiredChannels)
-    for (const controller of this.recoveryControllers) controller.abort()
-    return Promise.all([this.stopWatches([...this.desiredChannels]), this.flushStateWrites()])
+    for (const controller of this.recoveryControllers) controller.abort(pausedError)
+    return Promise.all([this.stopWatches([...this.desiredChannels], { reason: pausedError }), this.flushStateWrites()])
   }
 
   async resume (reason, { waitForBackground = false } = {}) {
@@ -1931,6 +1973,7 @@ export class PrivateMessenger {
       clearInterval(this.capacityTimer)
       this.capacityTimer = null
       this.capacityRequiredBytes = 0
+      this.capacityResumeAtBytes = 0
     }
     if (this.pauseReasons.size) return
     const channels = [...this.desiredChannels]
@@ -2128,6 +2171,11 @@ export class PrivateMessenger {
       this.debug('dedupe', debugMessageInfo(type, channelPubkey, message))
       return
     }
+    if (this.pauseReasons.has('capacity')) throw this.pausedError()
+    const capacity = await this.queue.getCapacity()
+    if (capacity.usedBytes >= inboxCapacityLimits(capacity.maxBytes).highWaterBytes) {
+      throw await this.beginCapacityPressure(capacity)
+    }
     const record = {
       type,
       channelPubkey,
@@ -2155,14 +2203,11 @@ export class PrivateMessenger {
       if (!atCapacity && isRecoverableStorageFailure(err)) this.pendingStorageWrites.set(JSON.stringify(dedupeKey || [channelPubkey, type]), { record, dedupeKey, at: message.outer?.created_at || message.event?.created_at })
       if (atCapacity) {
         await annotateQueueCapacityError(err, 'inbox', () => this.queue.getCapacity())
-        const pause = this.pause('capacity')
+        this.applyCapacityRecoveryTarget(err)
+        const pause = this.pauseReasons.has('capacity') ? null : this.pause('capacity')
         Object.assign(err, { pauseReasons: this.readStatus().pauseReasons })
-        pause.catch(error => this.onError?.(error))
-        this.capacityRequiredBytes = Math.max(this.capacityRequiredBytes, err.requiredBytes || 0)
-        if (!this.capacityTimer) {
-          this.capacityTimer = setInterval(() => this.checkCapacity().catch(error => this.onError?.(error)), 1000)
-          this.capacityTimer.unref?.()
-        }
+        pause?.catch(error => this.onError?.(error))
+        this.startCapacityMonitor()
       } else {
         ;(isRecoverableStorageFailure(err) ? this.pauseInternally('storage') : this.pause('storage')).catch(error => this.onError?.(error))
       }
@@ -2274,11 +2319,90 @@ export class PrivateMessenger {
     const work = (async () => {
       if (this.closePromise || !this.pauseReasons.has('capacity')) return
       const { usedBytes, maxBytes } = await this.queue.getCapacity()
-      if (!this.closePromise && usedBytes + this.capacityRequiredBytes <= maxBytes) await this.resume('capacity')
+      const resumeAtBytes = this.capacityResumeAtBytes ||
+        Math.min(
+          inboxCapacityLimits(maxBytes).resumeAtBytes,
+          Math.max(0, maxBytes - this.capacityRequiredBytes)
+        )
+      if (!this.closePromise && usedBytes <= resumeAtBytes) await this.resume('capacity')
     })()
     this.capacityCheck = work
     work.then(() => { this.capacityCheck = null }, () => { this.capacityCheck = null })
     return work
+  }
+
+  applyCapacityRecoveryTarget (capacity) {
+    const limits = inboxCapacityLimits(capacity?.maxBytes)
+    const requiredBytes = Number.isSafeInteger(capacity?.requiredBytes) && capacity.requiredBytes >= 0
+      ? capacity.requiredBytes
+      : 0
+    this.capacityRequiredBytes = Math.max(this.capacityRequiredBytes, requiredBytes)
+    this.capacityResumeAtBytes = Math.min(
+      limits.resumeAtBytes,
+      Math.max(0, limits.maxBytes - requiredBytes)
+    )
+  }
+
+  startCapacityMonitor () {
+    if (this.capacityTimer) return
+    this.capacityTimer = setInterval(() => this.checkCapacity().catch(error => this.onError?.(error)), 1000)
+    this.capacityTimer.unref?.()
+  }
+
+  async inboxCapacitySummary () {
+    const buckets = new Map()
+    const channels = new Set()
+    const now = nowSeconds()
+    let count = 0
+    let bytes = 0
+    for await (const item of this.queue.storedItems()) {
+      const type = ['message', 'ask', 'reply', 'tell', 'yell', 'nym'].includes(item?.type) ? item.type : 'other'
+      const receivedAt = Number.isSafeInteger(item?.receivedAt) && item.receivedAt >= 0 ? item.receivedAt : null
+      const ageSeconds = receivedAt == null ? null : Math.max(0, now - receivedAt)
+      let ageBucket = 'unknown'
+      if (ageSeconds != null) {
+        if (ageSeconds < 3600) ageBucket = '<1h'
+        else if (ageSeconds < 86400) ageBucket = '1-24h'
+        else if (ageSeconds < 7 * 86400) ageBucket = '1-7d'
+        else ageBucket = '>7d'
+      }
+      const key = `${type}:${ageBucket}`
+      const itemBytes = encoder.encode(JSON.stringify(item)).length
+      const bucket = buckets.get(key) || { type, ageBucket, count: 0, bytes: 0 }
+      bucket.count++
+      bucket.bytes += itemBytes
+      buckets.set(key, bucket)
+      if (typeof item?.channelPubkey === 'string' && item.channelPubkey) channels.add(item.channelPubkey)
+      count++
+      bytes += itemBytes
+    }
+    return {
+      count,
+      bytes,
+      channelCount: channels.size,
+      buckets: [...buckets.values()].sort((a, b) =>
+        a.type.localeCompare(b.type) || a.ageBucket.localeCompare(b.ageBucket)
+      )
+    }
+  }
+
+  async beginCapacityPressure (capacity) {
+    this.applyCapacityRecoveryTarget(capacity)
+    const pause = this.pauseReasons.has('capacity') ? null : this.pause('capacity')
+    pause?.catch(error => this.onError?.(error))
+    this.startCapacityMonitor()
+    let summary
+    try { summary = await this.inboxCapacitySummary() } catch {}
+    return Object.assign(new Error('PRIVATE_MESSENGER_CAPACITY_PRESSURE'), {
+      code: 'PRIVATE_MESSENGER_CAPACITY_PRESSURE',
+      queue: 'inbox',
+      usedBytes: capacity?.usedBytes,
+      highWaterBytes: inboxCapacityLimits(capacity?.maxBytes).highWaterBytes,
+      resumeAtBytes: this.capacityResumeAtBytes,
+      maxBytes: capacity?.maxBytes,
+      pauseReasons: this.readStatus().pauseReasons,
+      ...(summary ? { summary } : {})
+    })
   }
 
   wakeDeliveries () {
@@ -2790,7 +2914,9 @@ export class PrivateMessenger {
       if (this.closePromise || !this.channels.has(pubkey) || !this.stopByChannel.has(pubkey)) return
       if ((this.watchRevisionByChannel.get(pubkey) || 0) !== revision) return
       if (start != null) this.addOfflineRange(pubkey, Math.max(0, start - this.offlineSkewSeconds), nowSeconds())
-      try { await this.recoverOfflineRanges([pubkey]) } catch (err) { this.onError?.(err) }
+      try { await this.recoverOfflineRanges([pubkey]) } catch (err) {
+        if (!isExpectedRecoveryPause(err)) this.onError?.(err)
+      }
       if (!this.closePromise && !this.pauseReasons.size && this.desiredChannels.has(pubkey) && this.hasPendingRecovery(pubkey)) {
         this.scheduleOfflineRecovery(pubkey, { startDelayMs: 1000 })
       }
@@ -2825,6 +2951,7 @@ export class PrivateMessenger {
   }
 
   async #askSeedersForMissingRangeAttempt (channelPubkey, since, until, { seeders } = {}) {
+    if (this.pauseReasons.size) throw this.pausedError()
     if (!this.offlineRecoverySecondsFor(channelPubkey)) return { asks: [], failures: [] }
     if (!this.channels.get(channelPubkey)?.signer) return { asks: [], failures: [] }
     const candidates = seeders ?? this.recoverySeeders(channelPubkey)
@@ -2833,6 +2960,7 @@ export class PrivateMessenger {
     const asks = []
     const failures = []
     for (const seeder of candidates) {
+      if (this.pauseReasons.size) throw this.pausedError()
       try {
         const ask = await this.ask({
           channelPubkey,
@@ -3056,7 +3184,12 @@ export class PrivateMessenger {
     let hedgeTimer = null
     let secondStarted = false
     const launch = candidate => {
+      if (this.pauseReasons.size || this.closePromise) {
+        return Promise.resolve({ ok: false, relay: candidate.relay, error: this.pausedError() })
+      }
       const controller = new AbortController()
+      controller.channelPubkey = channelPubkey
+      this.recoveryControllers.add(controller)
       const promise = this._privateChannel
         .fetchHistory(this.recoveryFetchOptions({
           channelPubkey,
@@ -3068,6 +3201,7 @@ export class PrivateMessenger {
           partial: true,
           resume: { [candidate.relay]: candidate.pending }
         }))
+        .finally(() => this.recoveryControllers.delete(controller))
         .then(
           history => ({ ok: true, relay: candidate.relay, controller, history }),
           error => ({ ok: false, relay: candidate.relay, controller, error })
@@ -3087,10 +3221,12 @@ export class PrivateMessenger {
         })
         : null
       let settled = hedge ? await Promise.race([first, hedge]) : await first
+      if (this.pauseReasons.size || this.closePromise) return null
       if (!settled.ok) {
         if (secondStarted && launched.length > 1) settled = await launched[launched.length - 1].promise
         else if (candidates.length > 1) settled = await launch(candidates[1])
       }
+      if (this.pauseReasons.size || this.closePromise) return null
       if (!settled.ok) return null
       for (const entry of launched) {
         if (entry.controller === settled.controller) continue
@@ -3104,12 +3240,14 @@ export class PrivateMessenger {
 
   async askPrioritySeeders (channelPubkey, intervals) {
     if (!intervals.length) return []
+    if (this.pauseReasons.size) throw this.pausedError()
     if (!await this.checkRecoveryOnline()) return []
     const seeders = this.activeRecoverySeeders(channelPubkey)
     if (!seeders.length) return []
     const failures = []
     const claimed = []
     for (const interval of mergeRanges(intervals)) {
+      if (this.pauseReasons.size) throw this.pausedError()
       const attempt = await this.#askSeedersForMissingRangeAttempt(channelPubkey, interval.start, interval.end, { seeders })
       failures.push(...attempt.failures.map(failure => failure.error))
       if (!attempt.failures.length) claimed.push(interval)
@@ -3129,6 +3267,7 @@ export class PrivateMessenger {
     if (!priorities.length) return
     const fetchRelays = await this.resolveWatchRelays(channel)
     for (const range of ranges) {
+      if (this.pauseReasons.size || this.closePromise) throw this.pausedError()
       const record = this.recoveryRangeRecord(channelPubkey, range)
       this.reconcileRecoveryRelays(record, fetchRelays)
       const priorityIntervals = intersectRanges(
@@ -3156,6 +3295,7 @@ export class PrivateMessenger {
           else this.applyRecoveryCoverage(record, wanted)
         }
       }
+      if (this.pauseReasons.size || this.closePromise) throw this.pausedError()
       const uncovered = intersectRanges(wanted, subtractRanges({ start: range.start, end: range.end }, record.covered))
       if (uncovered.length) await this.askPrioritySeeders(channelPubkey, uncovered)
     }
@@ -3184,7 +3324,9 @@ export class PrivateMessenger {
       const processedRanges = new Set(current.offlineRanges.map(range => `${range.start}:${range.end}`))
 
       if (online) {
-        try { await this.runPriorityLane(pubkey, channel, current.offlineRanges) } catch (error) { this.onError?.(error) }
+        try { await this.runPriorityLane(pubkey, channel, current.offlineRanges) } catch (error) {
+          if (!isExpectedRecoveryPause(error)) this.onError?.(error)
+        }
       }
 
       const remaining = []
@@ -3255,12 +3397,13 @@ export class PrivateMessenger {
           if (result.complete) recoveredThrough = Math.max(recoveredThrough, range.end)
           else remaining.push(range)
         } catch (err) {
+          const expectedPause = isExpectedRecoveryPause(err, controller)
           const record = this.recoveryRanges.get(this.recoveryRangeKey(pubkey, range))
-          if (record && isPermanentRecoveryError(err)) {
+          if (!expectedPause && record && isPermanentRecoveryError(err)) {
             for (const state of record.relays.values()) state.dead = true
           }
-          if (!(controller.liveInterrupted && err === controller.signal.reason)) this.onError?.(err)
-          failures.push(err)
+          if (!expectedPause && !(controller.liveInterrupted && err === controller.signal.reason)) this.onError?.(err)
+          if (!expectedPause) failures.push(err)
           remaining.push(range)
         } finally { this.recoveryControllers.delete(controller) }
       }

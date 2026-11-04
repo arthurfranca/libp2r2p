@@ -147,6 +147,14 @@ no automatic age eviction or synchronization is performed. `close()` releases
 connections without deleting pending work. Apps can preserve existing storage by
 passing their established factories, as Zillion does.
 
+The private messenger inbox is a durable reject-on-capacity queue. Admission stops
+at 70% of its effective byte limit and resumes only after acknowledgment lowers
+usage to 50%, leaving room for an in-flight history page without evicting pending
+messages. Entering pressure emits one sanitized
+`PRIVATE_MESSENGER_CAPACITY_PRESSURE` event with byte metrics and aggregate
+type/age buckets; it never exposes IDs, pubkeys, filters, ciphertext or payloads.
+Physical `QUEUE_CAPACITY_EXCEEDED` behavior remains unchanged.
+
 External recovery factories are owned by their caller and must be closed after
 the session. Work storage opened by the session is closed by the session.
 This is a DM profile; group membership/key derivation is not implemented.
