@@ -1102,25 +1102,24 @@ Local authentication denials, invalid events and unknown errors qualify for
 neither policy. Predicates classify individual native errors; callers decide
 how to handle mixed per-relay outcomes and application-specific aggregates.
 `parseRelayRetryAdvice(reason, params, { now = Date.now() })`, exported by
-`libp2r2p/relay`, returns `{ retryAt, retryAfterMs? }` or `null`. It only interprets
+`libp2r2p/relay`, returns `{ retryAt, retryAfterMs }` or `null`. It only interprets
 leading `rate-limited:` refusals. The optional string `params` is relative
-milliseconds (e.g. "2500") or an absolute Unix timestamp in milliseconds
-prefixed with `@` (e.g. "@1791738154332"). Values must be positive safe integers
-in canonical decimal form, without signs, whitespace, fractions or leading zeros.
-Relative values produce both `retryAfterMs` and `retryAt`; absolute values produce
-only `retryAt` and retain an expired deadline without starting a new wait.
-Future waits are capped at five minutes. Missing or invalid params are ignored
-and do not instruct clients to retry immediately. Schedulers wait until
+milliseconds (e.g. "2500"). Values must be positive safe integers in canonical
+decimal form, without signs, whitespace, fractions, leading zeros or prefixes.
+Valid values produce both `retryAfterMs` and `retryAt`. Future waits are capped
+at five minutes. Missing or invalid params are ignored and do not instruct
+clients to retry immediately. Schedulers wait until
 max(local backoff deadline, retryAt), never sum the two or renew the deadline on
 online notifications.
 
 Rate limits apply only to the client message type that triggered the refusal:
 `EVENT`, `AUTH`, `REQ` and `COUNT` have independent connection cooldowns. Responses
 are correlated with pending operations; unknown IDs never create cooldowns.
-CLOSE cleanup remains immediate. The launcher can replace valid relative params
-with `@` timestamps before queueing bridge delivery because its consumers share
-its clock. No legacy timing objects are interpreted. Params never supply provenance
-or retry eligibility; native messages, causes and codes remain intact.
+CLOSE cleanup remains immediate. A launcher-owned bridge may store the absolute
+deadline internally, but it refreshes the standard relative `params` immediately
+before consumer delivery; the private `@` syntax never crosses the WebSocket wire.
+No legacy timing objects are interpreted. Params never supply provenance or retry
+eligibility; native messages, causes and codes remain intact.
 
 ## Binary encodings
 
@@ -1287,9 +1286,9 @@ Nym broadcasts intentionally remain a single carrier union.
 
 ### Relay backpressure and bounded synchronization (0.11.7)
 
-Optional decimal `params` milliseconds or `@` Unix milliseconds on relay `CLOSED`
-and rejected `OK` responses are preserved as normalized `retryAt` (and
-`retryAfterMs` for relative params) on native relay errors. Only `rate-limited:`
+Optional decimal `params` milliseconds on relay `CLOSED` and rejected `OK`
+responses are preserved as normalized `retryAt` and `retryAfterMs` on native relay
+errors. Only `rate-limited:`
 responses apply this advice; invalid values are ignored
 and delays are capped at five minutes. New operations of the refused type wait
 within their existing deadlines; active subscriptions remain live and `CLOSE`

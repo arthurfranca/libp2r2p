@@ -31,8 +31,8 @@ export function relayCloseError (event, category, cause) {
   return categorizeRelayError(error, category)
 }
 
-// Keep native diagnostics and attach only bounded timing advice. An absolute
-// deadline survives delayed delivery through a launcher-owned relay bridge.
+// Keep native diagnostics and attach only bounded timing advice. The launcher
+// bridge refreshes the standard relative value immediately before delivery.
 export function relayRejectionError (reason, params, fallback) {
   const error = categorizeRelayError(reason, 'relay', fallback)
   Object.assign(error, parseRelayRetryAdvice(error.message, params))

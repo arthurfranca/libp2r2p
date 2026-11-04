@@ -170,14 +170,15 @@ test('pool operation timeout cancels a publication waiting for relay cooldown', 
   assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 1)
 })
 
-test('delayed CLOSED uses absolute params and expired OK advice never restarts its relative wait', async t => {
+test('relative CLOSED waits from receipt and legacy absolute params are ignored', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 14000 })
   const { relay, socket } = await connected()
   t.after(() => relay.close())
   let rejection
   const first = relay.subscribe([{}], { onclose: error => { rejection = error } })
-  socket.receive(['CLOSED', first.id, 'rate-limited: busy', '@20000'])
+  socket.receive(['CLOSED', first.id, 'rate-limited: busy', '6000'])
   await tick()
+  assert.equal(rejection.retryAfterMs, 6000)
   assert.equal(rejection.retryAt, 20000)
   const next = relay.subscribe([{}])
   t.mock.timers.tick(5999)
@@ -186,7 +187,7 @@ test('delayed CLOSED uses absolute params and expired OK advice never restarts i
   assert.equal(socket.sent.at(-1)[1], next.id)
   t.mock.timers.tick(5000)
   const published = signedEvent()
-  const result = assert.rejects(relay.publish(published), error => error.retryAt === 20000 && error.retryAfterMs === undefined)
+  const result = assert.rejects(relay.publish(published), error => error.retryAt === undefined && error.retryAfterMs === undefined)
   socket.receive(['OK', published.id, false, 'rate-limited: busy', '@20000'])
   await result
   const immediate = relay.subscribe([{}])
@@ -270,14 +271,14 @@ test('pool cancellation preserves partial ACKs and original abort reasons', asyn
   assert.ok(sockets.every(socket => socket.readyState === 1))
 })
 
-test('last publication cancellation removes an EVENT deferred by absolute cooldown', async t => {
+test('last publication cancellation removes an EVENT deferred by relative cooldown', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
   const { relay, socket } = await connected()
   t.after(() => relay.close())
   const subscription = relay.subscribe([{}])
   const limited = signedEvent()
   const refused = assert.rejects(relay.publish(limited), error => error.retryAt === 20000)
-  socket.receive(['OK', limited.id, false, 'rate-limited: busy', '@20000'])
+  socket.receive(['OK', limited.id, false, 'rate-limited: busy', '10000'])
   await refused
   const controller = new AbortController()
   const deferred = signedEvent()

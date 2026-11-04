@@ -349,8 +349,9 @@ NIP-46 against the real pool with controlled transport and injected controls.
 
 - Share `parseRelayRetryAdvice` through the public relay export. Accept only
   temporal advice on leading rate-limited CLOSED/OK: canonical positive safe
-  integer `params` milliseconds, optionally prefixed with `@` for Unix milliseconds.
-  Preserve expired absolute deadlines. Never derive origin, retry eligibility or
+  integer `params` milliseconds. The `@<Unix milliseconds>` syntax is internal-only
+  and must never be accepted from or emitted to the public WebSocket wire. Convert
+  relative advice to `retryAt` locally. Never derive origin, retry eligibility or
   routing from params; do not interpret legacy timing objects. Scope connection
   cooldowns by EVENT/AUTH/REQ/COUNT after correlating pending operations.
 - Honor optional absolute/relative relay timing on rate-limited CLOSED/OK, bounded
