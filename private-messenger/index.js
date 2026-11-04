@@ -51,6 +51,7 @@ import { createPauseRecovery, isRecoverableStorageFailure } from './helpers/paus
 import { backgroundSigner } from './helpers/background-signer.js'
 import { createPublicationRelayHealth } from './helpers/publication-relay-health.js'
 import { createSendRelayRouting, normalizeFallbackRelays, normalizeFallbackDelay, relayCircuitError } from './helpers/send-routing.js'
+import { createPrivateMessengerErrorReporter } from './helpers/error-reporting.js'
 import { incompleteFetchError } from '../private-channel/helpers/fetch-error.js'
 import { recoveryRetryDelay, isPermanentRecoveryError } from './helpers/recovery-retry.js'
 import { assertMessagePublished, publicationFailureDiagnostic, sanitizePublicationError } from './helpers/publication.js'
@@ -367,7 +368,6 @@ export class PrivateMessenger {
     this._random = _random
     this.onMessageQueued = onMessageQueued
     this.onDebug = onDebug
-    this.onError = onError
     this._privateMessage = _privateMessage.createPrivateMessageSession?.() ?? _privateMessage
     this._privateChannel = _privateChannel
     this._getRelaysByPubkey = _getRelaysByPubkey
@@ -404,6 +404,11 @@ export class PrivateMessenger {
     this.stopByChannel = new Map()
     this.desiredChannels = new Set()
     this.pauseReasons = new Set()
+    this.onError = createPrivateMessengerErrorReporter({
+      report: typeof onError === 'function' ? onError : () => {},
+      now: _now,
+      status: () => this.readStatus()
+    })
     this.deliveries = new Set()
     this.deliveryReads = new Set()
     this.deliveryWaiters = new Set()
@@ -427,6 +432,7 @@ export class PrivateMessenger {
     this.reloadGapTimers = new Map()
     this.liveInterruptions = new Map()
     this.liveRecoveryTimers = new Map()
+    this.subscriptionDebugKeys = new Set()
     this.watchRevisionByChannel = new Map()
     this.presenceTimers = new Map()
     this.presenceJobs = new Map()
@@ -763,6 +769,15 @@ export class PrivateMessenger {
     } catch (err) {
       this.onError?.(err)
     }
+  }
+
+  debugOnce (key, action, detail = {}) {
+    if (this.subscriptionDebugKeys.has(key)) return
+    this.subscriptionDebugKeys.add(key)
+    if (this.subscriptionDebugKeys.size > 256) {
+      this.subscriptionDebugKeys.delete(this.subscriptionDebugKeys.values().next().value)
+    }
+    this.debug(action, detail)
   }
 
   debugSend (method, channelPubkey, detail = {}) {
@@ -1373,7 +1388,7 @@ export class PrivateMessenger {
     return this
   }
 
-  async handleSubscriptionState (pubkey, { state, relay, since, until }) {
+  async handleSubscriptionState (pubkey, { state, relay, since, until, error }) {
     if (this.closePromise || this.pauseReasons.size || !this.desiredChannels.has(pubkey)) return
     if (!this.offlineRecoverySecondsFor(pubkey)) return
     let interrupted = this.liveInterruptions.get(pubkey)
@@ -1389,6 +1404,12 @@ export class PrivateMessenger {
       }
       this.recordInterruption([pubkey], start)
       this.addOfflineRange(pubkey, Math.max(0, start - this.offlineSkewSeconds), nowSeconds())
+      const diagnosticRelay = safeDiagnosticRelay(relay)
+      this.debugOnce(`subscription-interrupted:${diagnosticRelay || ''}:${start}:${safeDiagnosticToken(error?.code) || ''}`, 'subscription-interrupted', {
+        relay: diagnosticRelay,
+        rangeStart: start,
+        ...subscriptionErrorDiagnostic(error)
+      })
       // This rejection prevents the session from reopening the shared relay.
       await this.flushStateWrites()
     } else if (state === 'ready' && interrupted?.has(relay)) {
@@ -1399,6 +1420,12 @@ export class PrivateMessenger {
       if (this.closePromise || this.pauseReasons.size || !this.desiredChannels.has(pubkey) || this.liveInterruptions.get(pubkey) !== interrupted) return
       interrupted.delete(relay)
       if (!interrupted.size) this.liveInterruptions.delete(pubkey)
+      this.debugOnce(`subscription-recovered:${safeDiagnosticRelay(relay) || ''}:${start}`, 'subscription-recovered', {
+        relay: safeDiagnosticRelay(relay),
+        rangeStart: start,
+        rangeEnd: until,
+        remainingInterruptedRelays: interrupted.size
+      })
       this.scheduleLiveRecovery(pubkey)
     }
   }
@@ -2351,6 +2378,7 @@ export class PrivateMessenger {
 
   async inboxCapacitySummary () {
     const buckets = new Map()
+    const codeBuckets = new Map()
     const channels = new Set()
     const now = nowSeconds()
     let count = 0
@@ -2372,6 +2400,14 @@ export class PrivateMessenger {
       bucket.count++
       bucket.bytes += itemBytes
       buckets.set(key, bucket)
+      const code = safeDiagnosticToken(messageCode(item))
+      if (code) {
+        const codeKey = `${type}:${code}`
+        const codeBucket = codeBuckets.get(codeKey) || { type, code, count: 0, bytes: 0 }
+        codeBucket.count++
+        codeBucket.bytes += itemBytes
+        codeBuckets.set(codeKey, codeBucket)
+      }
       if (typeof item?.channelPubkey === 'string' && item.channelPubkey) channels.add(item.channelPubkey)
       count++
       bytes += itemBytes
@@ -2382,7 +2418,14 @@ export class PrivateMessenger {
       channelCount: channels.size,
       buckets: [...buckets.values()].sort((a, b) =>
         a.type.localeCompare(b.type) || a.ageBucket.localeCompare(b.ageBucket)
-      )
+      ),
+      ...(codeBuckets.size
+        ? {
+            codes: [...codeBuckets.values()]
+              .sort((a, b) => a.type.localeCompare(b.type) || a.code.localeCompare(b.code))
+              .slice(0, 32)
+          }
+        : {})
     }
   }
 
@@ -3392,7 +3435,16 @@ export class PrivateMessenger {
             remaining.push(range)
             continue
           }
+          const recoveryStartedAt = this._now()
           const result = await this.finalizeRecoveryRange({ channelPubkey: pubkey, range, record })
+          this.debug('recovery-range-complete', {
+            rangeStart: range.start,
+            rangeEnd: range.end,
+            complete: result.complete === true,
+            failureCount: result.failures.length,
+            pendingRelayCount: [...record.relays.values()].filter(state => state.pending.length && !state.dead).length,
+            elapsedMs: Math.max(0, Math.round(this._now() - recoveryStartedAt))
+          })
           failures.push(...result.failures)
           if (result.complete) recoveredThrough = Math.max(recoveredThrough, range.end)
           else remaining.push(range)
@@ -3749,6 +3801,38 @@ function messageCode (message) {
   return isPlainObject(message.payload) && Object.prototype.hasOwnProperty.call(message.payload, 'code')
     ? message.payload.code
     : null
+}
+
+function safeDiagnosticToken (value) {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9:._-]{0,159}$/.test(value)
+    ? value
+    : undefined
+}
+
+function safeDiagnosticRelay (value) {
+  if (typeof value !== 'string') return undefined
+  try {
+    const url = new URL(value)
+    return ['ws:', 'wss:'].includes(url.protocol) ? `${url.protocol}//${url.host}` : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function subscriptionErrorDiagnostic (error) {
+  if (!error || typeof error !== 'object') return {}
+  const buffer = error.buffer && typeof error.buffer === 'object' ? error.buffer : null
+  return {
+    errorCode: safeDiagnosticToken(error.code),
+    operation: safeDiagnosticToken(error.operation),
+    phase: safeDiagnosticToken(error.phase),
+    recoverySince: Number.isSafeInteger(error.recoverySince) && error.recoverySince >= 0 ? error.recoverySince : undefined,
+    bufferStage: safeDiagnosticToken(buffer?.stage),
+    queuedEvents: Number.isSafeInteger(buffer?.queuedEvents) ? buffer.queuedEvents : undefined,
+    queuedBytes: Number.isSafeInteger(buffer?.queuedBytes) ? buffer.queuedBytes : undefined,
+    oldestQueuedMs: Number.isFinite(buffer?.oldestQueuedMs) ? buffer.oldestQueuedMs : undefined,
+    maxBytes: Number.isSafeInteger(buffer?.limits?.bytes) ? buffer.limits.bytes : undefined
+  }
 }
 
 function debugMessageInfo (type, channelPubkey, message) {

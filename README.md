@@ -578,6 +578,11 @@ records and storage failures report errors and pause with reason `storage`;
 after correcting the cause, call `resume('storage')`. Retention cleanup and
 explicit `clearQueue()`/`clearChannel()` remain destructive. The queue's budget
 bounds serialized storage, not the size of every intermediate decoded message.
+Pressure summaries may include bounded counts by inner message code alongside
+type and age. Repeated native `AbortError` cancellations collapse into a
+`PRIVATE_MESSENGER_CANCELLED` diagnostic once per 30-second window; subsequent
+reports include the suppressed count. Neither diagnostic includes payloads,
+ciphertext, filters or channel identities.
 
 ### Forwarded authors and isolated consumers
 

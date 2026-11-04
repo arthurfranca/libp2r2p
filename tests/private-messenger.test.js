@@ -1778,6 +1778,55 @@ test('private messenger debug reports send and enqueue events without payload se
   assert.equal(JSON.stringify(debugEvents).includes('received-secret'), false)
 })
 
+test('private messenger reports one safe subscription interruption and recovery per relay range', async () => {
+  const pm = fakePrivateMessage()
+  const debugEvents = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    onDebug: event => debugEvents.push(event)
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const state = {
+    state: 'interrupted',
+    relay: 'wss://relay.example/path?secret=yes',
+    since: 100,
+    error: {
+      code: 'RELAY_LIVE_BUFFER_FULL',
+      operation: 'private-channel.subscribe',
+      phase: 'live-buffer',
+      recoverySince: 90,
+      buffer: {
+        stage: 'delivery',
+        queuedEvents: 190,
+        queuedBytes: 8_376_916,
+        oldestQueuedMs: 126_207,
+        limits: { events: 1000, bytes: 8_388_608 }
+      }
+    }
+  }
+
+  await messenger.handleSubscriptionState('channel', state)
+  await messenger.handleSubscriptionState('channel', state)
+  await messenger.handleSubscriptionState('channel', { state: 'ready', relay: state.relay, since: 100, until: 200 })
+  await messenger.handleSubscriptionState('channel', { state: 'ready', relay: state.relay, since: 100, until: 200 })
+
+  const interrupted = debugEvents.filter(event => event.action === 'subscription-interrupted')
+  const recovered = debugEvents.filter(event => event.action === 'subscription-recovered')
+  assert.equal(interrupted.length, 1)
+  assert.equal(recovered.length, 1)
+  assert.equal(interrupted[0].errorCode, 'RELAY_LIVE_BUFFER_FULL')
+  assert.equal(interrupted[0].operation, 'private-channel.subscribe')
+  assert.equal(interrupted[0].relay, 'wss://relay.example')
+  assert.equal(interrupted[0].queuedEvents, 190)
+  assert.equal(interrupted[0].queuedBytes, 8_376_916)
+  assert.equal(interrupted[0].oldestQueuedMs, 126_207)
+  assert.equal(recovered[0].rangeStart, 100)
+  assert.equal(recovered[0].rangeEnd, 200)
+  assert.equal(JSON.stringify(debugEvents).includes('secret'), false)
+})
+
 test('private messenger can disable receiver content-key lookup for identity-only traffic', async () => {
   const pm = fakePrivateMessage()
   const messenger = await new PrivateMessenger({ _privateMessage: pm, useContentKeys: false }).init({
@@ -3045,7 +3094,8 @@ test('inbox pressure pauses at high water, reports sanitized aggregates and resu
         await pm.watchCalls[0].onMessage({
           event: { kind: 9, id, pubkey: 'peer', tags: [], created_at: now, content: `private-${index}-${'a'.repeat(500)}` },
           outer: { created_at: now },
-          senderPubkey: 'peer'
+          senderPubkey: 'peer',
+          payload: { code: 'nostrDbSync_push_kpkr' }
         })
       } catch (error) {
         pressure = error
@@ -3062,6 +3112,9 @@ test('inbox pressure pauses at high water, reports sanitized aggregates and resu
     assert.ok(pressure.summary.count > 0)
     assert.equal(pressure.summary.channelCount, 1)
     assert.ok(pressure.summary.buckets.every(bucket => !Object.hasOwn(bucket, 'channelPubkey')))
+    assert.deepEqual(pressure.summary.codes.map(({ type, code }) => ({ type, code })), [
+      { type: 'message', code: 'nostrDbSync_push_kpkr' }
+    ])
     const serialized = JSON.stringify(pressure)
     assert.equal(serialized.includes('private-'), false)
     assert.equal(serialized.includes('peer'), false)
@@ -3475,6 +3528,7 @@ test('priority lane fetches the requested window before older history', async ()
   const channel = '11'.repeat(32)
   const relay = 'wss://relay.example'
   const now = Math.floor(Date.now() / 1000)
+  const debugEvents = []
   await seedMessengerState({ [channel]: { offlineRanges: [{ start: now - 1000, end: now - 100 }] } })
   const fetches = []
   const partial = args => {
@@ -3493,6 +3547,7 @@ test('priority lane fetches the requested window before older history', async ()
   }
   const messenger = await new PrivateMessenger({
     _privateMessage: fakePrivateMessage(),
+    onDebug: event => debugEvents.push(event),
     _privateChannel: { fetchHistory: async args => { fetches.push(args); return partial(args) } }
   }).init({
     userSigner: signer('user'),
@@ -3520,6 +3575,10 @@ test('priority lane fetches the requested window before older history', async ()
   })
   assert.equal(overlapsPriority, false)
   assert.deepEqual(messenger.readState().channels[channel].offlineRanges, [])
+  const completed = debugEvents.filter(event => event.action === 'recovery-range-complete')
+  assert.ok(completed.length > 0)
+  assert.ok(completed.every(event => event.complete === true && event.elapsedMs >= 0))
+  assert.ok(completed.every(event => !Object.hasOwn(event, 'channelPubkey')))
 })
 
 test('priority hedge starts the next relay after the delay and aborts the loser', async () => {

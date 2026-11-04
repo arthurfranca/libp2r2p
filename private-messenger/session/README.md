@@ -152,8 +152,15 @@ at 70% of its effective byte limit and resumes only after acknowledgment lowers
 usage to 50%, leaving room for an in-flight history page without evicting pending
 messages. Entering pressure emits one sanitized
 `PRIVATE_MESSENGER_CAPACITY_PRESSURE` event with byte metrics and aggregate
-type/age buckets; it never exposes IDs, pubkeys, filters, ciphertext or payloads.
+type/age buckets plus bounded counts by inner message code; it never exposes IDs,
+pubkeys, filters, ciphertext or payloads.
 Physical `QUEUE_CAPACITY_EXCEEDED` behavior remains unchanged.
+
+Native `AbortError` values represent pause/teardown cancellation. The messenger
+reports the first occurrence in each 30-second window as
+`PRIVATE_MESSENGER_CANCELLED`, retaining the native error as `cause`, and adds
+`suppressedCount` when another report is emitted later. Non-cancellation errors
+remain one-for-one callbacks.
 
 External recovery factories are owned by their caller and must be closed after
 the session. Work storage opened by the session is closed by the session.
@@ -282,7 +289,11 @@ Account shutdown fences late admissions and waits for both processors and cleanu
 `onDebug(record)` is disabled by default. Records carry fixed stage names, public
 event/peer identifiers and elapsed milliseconds for admission, local processing,
 channel preparation, publication acceptance and cleanup. Callback failures never
-change delivery. Connect only in development; never log events or crypto buffers.
+change delivery. Connect only under an explicit diagnostic opt-in; consumers
+must sanitize the callback and never log events or crypto buffers.
+Operational diagnostics for subscription interruption/recovery and completed
+recovery ranges contain only relay, code, category, byte, count and elapsed-time
+fields; they never include message filters, payloads or channel identities.
 Custom outbox factories also receive this optional callback for storage timings.
 Recovery archive completion also reports `publicationId`, one aggregate
 `recovery-archive-result` per `putMany`, and sanitized row/unique/existing/
