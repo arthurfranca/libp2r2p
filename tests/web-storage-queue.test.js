@@ -411,6 +411,56 @@ test('queue rejects unknown eviction policies', () => {
   assert.throws(() => createQueue({ prefix: 'test', evictionPolicy: 'random' }), /QUEUE_INVALID_EVICTION_POLICY/)
 })
 
+test('reject policy exposes capacity and never evicts pending items', () => {
+  const queue = createQueue({ prefix: 'test', maxBytes: 220, evictionPolicy: 'reject' })
+  queue.push({ value: 'a'.repeat(120) })
+  const capacity = queue.getCapacity()
+
+  assert.ok(capacity.usedBytes > 0)
+  assert.equal(capacity.maxBytes, 220)
+  assert.throws(() => queue.push({ value: 'b'.repeat(120) }), error => (
+    error.code === 'QUEUE_CAPACITY_EXCEEDED' &&
+    error.usedBytes === capacity.usedBytes &&
+    error.requiredBytes > 0 &&
+    error.maxBytes === 220
+  ))
+  assert.deepEqual(queue.getCapacity(), capacity)
+  assert.deepEqual(queue.shift().value, 'a'.repeat(120))
+})
+
+test('reject policy preserves positional records and smaller-budget reopen state', () => {
+  const queue = createQueue({ prefix: 'test', maxBytes: 600, evictionPolicy: 'reject' })
+  queue.push({ value: 'a'.repeat(120) })
+  queue.push({ value: 'b'.repeat(120) })
+  const before = queue.getCapacity()
+
+  assert.throws(() => queue.setAt(0, { value: 'A'.repeat(500) }), /QUEUE_CAPACITY_EXCEEDED/)
+  assert.throws(() => queue.insertAt(1, { value: 'X'.repeat(500) }), /QUEUE_CAPACITY_EXCEEDED/)
+  assert.deepEqual(queue.getCapacity(), before)
+  assert.deepEqual(queue.shift().value, 'a'.repeat(120))
+  assert.deepEqual(queue.shift().value, 'b'.repeat(120))
+
+  const existing = createQueue({ prefix: 'existing' })
+  existing.push({ value: 'first'.repeat(20) })
+  existing.push({ value: 'second'.repeat(20) })
+  const reusedState = existing.getCapacity()
+  const bounded = createQueue({ prefix: 'existing', maxBytes: 40, evictionPolicy: 'reject' })
+  assert.deepEqual(bounded.getCapacity(), { usedBytes: reusedState.usedBytes, maxBytes: 40 })
+  assert.deepEqual(bounded.shift().value, 'first'.repeat(20))
+  assert.deepEqual(bounded.shift().value, 'second'.repeat(20))
+})
+
+test('reject policy propagates quota errors without trimming existing records', () => {
+  const storageArea = createQuotaStorageArea({ failOnItemWrite: 2 })
+  const queue = createQueue({ prefix: 'test', storageArea, maxBytes: 10_000, evictionPolicy: 'reject' })
+  queue.push({ value: 'kept' })
+  const capacity = queue.getCapacity()
+
+  assert.throws(() => queue.push({ value: 'quota'.repeat(20) }), error => error.name === 'QuotaExceededError')
+  assert.deepEqual(queue.getCapacity(), capacity)
+  assert.deepEqual(queue.shift().value, 'kept')
+})
+
 test('setAt evicts to fit without evicting the item being replaced', () => {
   const queue = createQueue({ prefix: 'test', maxBytes: 400, evictionPolicy: 'fifo' })
   queue.push({ value: 'a'.repeat(120) })

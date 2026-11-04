@@ -53,6 +53,7 @@ export function createQueue ({
 
   function normalizeEvictionPolicy (policy) {
     if (policy === 'opposite-end' || policy === undefined || policy === null) return 'opposite-end'
+    if (policy === 'reject') return 'reject'
     if (policy === 'fifo' || policy === 'head') return 'head'
     if (policy === 'lifo' || policy === 'tail') return 'tail'
     throw new ValidationError('QUEUE_INVALID_EVICTION_POLICY')
@@ -223,6 +224,12 @@ export function createQueue ({
     if (!hasByteLimit()) return state
     const { direction = 'head' } = options
     if (requiredBytes > sessionMaxBytes) throw new Error('QUEUE_ITEM_TOO_LARGE')
+    if (configuredEvictionPolicy === 'reject') {
+      if (state.usedBytes + requiredBytes > sessionMaxBytes) {
+        throw capacityError(requiredBytes, state.usedBytes, sessionMaxBytes)
+      }
+      return state
+    }
     // Make room for the write and retain eviction headroom for the next one.
     const targetBytes = targetBytesAfterWrite(requiredBytes)
     while (state.usedBytes + requiredBytes > targetBytes) {
@@ -236,7 +243,7 @@ export function createQueue ({
   }
 
   function recoverByteLimit (state) {
-    if (!hasByteLimit()) return state
+    if (!hasByteLimit() || configuredEvictionPolicy === 'reject') return state
     return evictToBytes(state, Math.min(sessionMaxBytes, targetBytesAfterWrite(0)), { direction: evictionDirectionFor('recover') })
   }
 
@@ -284,6 +291,7 @@ export function createQueue ({
       storage().setItem(key, raw)
     } catch (err) {
       if (!isQuotaExceeded(err) || !hasByteLimit()) throw err
+      if (configuredEvictionPolicy === 'reject') throw err
       // Actual browser quota can be lower than the configured logical budget.
       lowerSessionMaxBytes(requiredBytes)
       if (options.evict === false) throw err
@@ -643,6 +651,10 @@ export function createQueue ({
   readState()
 
   return {
+    getCapacity: () => {
+      const state = readState()
+      return { usedBytes: state.usedBytes, maxBytes: sessionMaxBytes }
+    },
     enqueue: push,
     push,
     pop,

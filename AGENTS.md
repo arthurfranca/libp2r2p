@@ -159,7 +159,10 @@ suite pass; report independently scoped problems separately.
   coordinates, including an optional outer `created_at`, never ciphertext,
   scopes, payloads, keys or signers.
 
-- `idb-queue.putBy` performs an atomic upsert through a declared unique,
+- `getCapacity()` and `evictionPolicy: 'reject'` belong to both queue
+  implementations. Keep capacity error fields and non-eviction behavior in
+  parity; do not retry a Web Storage quota failure that was configured to reject.
+  `idb-queue.putBy` performs an atomic upsert through a declared unique,
   non-multiEntry index. `existingOnly` checkpoints must never recreate removed
   items. Preserve queue position on replacement, transactional byte accounting,
   capacity policy and reservation-token invalidation. Indexed methods are

@@ -1166,11 +1166,14 @@ the old token: its `ack`, `nack` and `renew` return false. Successful writes wak
 local waiting consumers. Like the other indexed methods, `putBy` is exclusive
 to `idb-queue`; the Web Storage queue's common API is unchanged.
 
-`createQueue({ prefix, evictionPolicy: 'reject', maxBytes })` opts out of
+Both queue implementations support
+`createQueue({ prefix, evictionPolicy: 'reject', maxBytes })` to opt out of
 capacity eviction. Oversized items reject with `QUEUE_ITEM_TOO_LARGE`, full
 queues with `QUEUE_CAPACITY_EXCEEDED`; browser quota errors propagate without
 trimming existing records. Other eviction policies retain their cache behavior.
 Opening a reject-policy queue under a smaller budget preserves existing items.
+Positional replacement and insertion follow the same rule: they reject instead
+of evicting when the resulting queue would exceed the limit.
 
 `queue.reserve({ leaseMs = 30000 })` returns `null` or
 `{ item, ack, nack, renew }`. Reservation token/deadline are internal record
@@ -1180,8 +1183,11 @@ PrivateMessenger supplies both. Do not mix reservations with destructive or
 position-shifting queue operations on the same queue except explicit removal.
 A stale token cannot acknowledge a newly reserved or replaced record.
 
-`queue.getCapacity()` returns `{ usedBytes, maxBytes }`; capacity rejections
-also expose `requiredBytes` and `maxBytes`, without retaining the rejected item.
+`queue.getCapacity()` is part of the common API and returns
+`{ usedBytes, maxBytes }`; capacity rejections also expose `requiredBytes` and
+`maxBytes`, without retaining the rejected item. IDB queues return a Promise,
+while Web Storage queues return the object synchronously according to their
+respective operation conventions; callers can await either form.
 
 
 ### Publication acknowledgement deadlines

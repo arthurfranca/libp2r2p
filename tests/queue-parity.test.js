@@ -5,7 +5,7 @@ import { createQueue as createIdbQueue } from '../idb-queue/index.js'
 import { createQueue as createWebStorageQueue } from '../web-storage-queue/index.js'
 
 const CORE_METHODS = [
-  'enqueue', 'push', 'pop', 'unshift', 'shift', 'items', 'reverseItems',
+  'getCapacity', 'enqueue', 'push', 'pop', 'unshift', 'shift', 'items', 'reverseItems',
   'storedItems', 'reverseStoredItems', 'setAt', 'insertAt', 'insertWhere',
   'removeAt', 'removeWhere', 'some', 'clear'
 ]
@@ -105,20 +105,35 @@ test('both queue types require a prefix and predicate callbacks', async () => {
   }
 })
 
-test('idb reject capacity exposes safe diagnostics', async () => {
-  const queue = await createIdbQueue({
-    prefix: 'idb-capacity',
-    indexedDB: new IDBFactory(),
-    maxBytes: 220,
-    evictionPolicy: 'reject'
-  })
+test('both queues expose capacity and reject without evicting pending items', async () => {
+  const queues = [
+    createWebStorageQueue({
+      prefix: 'web-capacity',
+      storageArea: createStorageArea(),
+      maxBytes: 220,
+      evictionPolicy: 'reject'
+    }),
+    await createIdbQueue({
+      prefix: 'idb-capacity',
+      indexedDB: new IDBFactory(),
+      maxBytes: 220,
+      evictionPolicy: 'reject'
+    })
+  ]
 
-  await call(queue, 'push', { value: 'a'.repeat(120) })
-  await assert.rejects(call(queue, 'push', { value: 'b'.repeat(120) }), error => {
-    assert.equal(error.code, 'QUEUE_CAPACITY_EXCEEDED')
-    assert.ok(error.requiredBytes > 0)
-    assert.ok(error.usedBytes > 0)
-    assert.equal(error.maxBytes, 220)
-    return true
-  })
+  for (const queue of queues) {
+    await call(queue, 'push', { value: 'a'.repeat(120) })
+    const capacity = await call(queue, 'getCapacity')
+    assert.ok(capacity.usedBytes > 0)
+    assert.equal(capacity.maxBytes, 220)
+    await assert.rejects(call(queue, 'push', { value: 'b'.repeat(120) }), error => {
+      assert.equal(error.code, 'QUEUE_CAPACITY_EXCEEDED')
+      assert.equal(error.usedBytes, capacity.usedBytes)
+      assert.ok(error.requiredBytes > 0)
+      assert.equal(error.maxBytes, 220)
+      return true
+    })
+    assert.deepEqual(await call(queue, 'getCapacity'), capacity)
+    assert.equal((await call(queue, 'shift')).value, 'a'.repeat(120))
+  }
 })
