@@ -329,15 +329,169 @@ export class RelayConnection {
     }
   }
 
-  #removeBulkPublish (pending) {
-    const index = this.#bulkQueue.indexOf(pending)
-    if (index >= 0) this.#bulkQueue.splice(index, 1)
-    if (this.#bulkActive === pending) {
-      this.#bulkActive = null
-      pending.onSettled = null
-      this.#bulkNextAt = Math.max(this.#bulkNextAt, Date.now() + BULK_PACING_MS)
+  // A job owns physical transmission and scheduling. Its waiters retain
+  // per-call cancellation, timeout, deadline and retry policy.
+  #mapForType (type) {
+    return type === 'EVENT' ? this.#publishes : this.#authentications
+  }
+
+  #hasJob (job) {
+    return this.#mapForType(job.type).get(job.event.id)?.has(job) === true
+  }
+
+  #findJob (map, id, pacing) {
+    for (const job of map.get(id) ?? []) {
+      if (job.pacing === pacing) return job
     }
-    this.#pumpBulkPublishes()
+    return null
+  }
+
+  #selectJob (map, event, useBulkPacing) {
+    const interactive = this.#findJob(map, event.id, 'interactive')
+    if (!useBulkPacing) {
+      if (interactive) return interactive
+      // Interactive work may benefit from a bulk send already in progress,
+      // but must never wait behind a bulk job that is still queued.
+      const activeBulk = this.#findJob(map, event.id, 'bulk')
+      return activeBulk?.state === 'active' ? activeBulk : null
+    }
+    if (interactive) return interactive
+    return this.#findJob(map, event.id, 'bulk')
+  }
+
+  #addJob (job) {
+    const map = this.#mapForType(job.type)
+    let jobs = map.get(job.event.id)
+    if (!jobs) {
+      jobs = new Set()
+      map.set(job.event.id, jobs)
+    }
+    jobs.add(job)
+  }
+
+  #allJobs (map) {
+    const jobs = []
+    for (const set of map.values()) jobs.push(...set)
+    return jobs
+  }
+
+  #cleanupWaiter (job, waiter) {
+    clearTimeout(waiter.timer)
+    waiter.signal?.removeEventListener('abort', waiter.onAbort)
+    waiter.retrySignal?.removeEventListener('abort', waiter.onRetryAbort)
+    job.waiters.delete(waiter)
+  }
+
+  #detachJob (job) {
+    if (job.detached) return
+    job.detached = true
+    job.awaitingAck = false
+    job.retryScheduled = false
+    const map = this.#mapForType(job.type)
+    const jobs = map.get(job.event.id)
+    if (jobs) {
+      jobs.delete(job)
+      if (!jobs.size) map.delete(job.event.id)
+    }
+    job.cancelSend?.()
+    job.cancelSend = null
+    const index = this.#bulkQueue.indexOf(job)
+    if (index >= 0) this.#bulkQueue.splice(index, 1)
+    const wasActive = this.#bulkActive === job
+    if (wasActive) {
+      this.#bulkActive = null
+      this.#bulkNextAt = Math.max(this.#bulkNextAt, Date.now(), job.startedAt + BULK_PACING_MS)
+    }
+    if (!this.#bulkActive) this.#pumpBulkPublishes()
+  }
+
+  #settleJob (job, reason, value) {
+    if (job.settled) return
+    job.settled = true
+    const waiters = [...job.waiters]
+    for (const waiter of waiters) this.#cleanupWaiter(job, waiter)
+    this.#detachJob(job)
+    for (const waiter of waiters) {
+      if (reason) waiter.reject(errorFrom(reason, 'OPERATION_REJECTED'))
+      else waiter.resolve(value)
+    }
+  }
+
+  #removeWaiter (job, waiter, reason) {
+    if (!job.waiters.has(waiter)) return
+    this.#cleanupWaiter(job, waiter)
+    waiter.reject(errorFrom(reason, 'OPERATION_REJECTED'))
+    if (!job.waiters.size) {
+      job.settled = true
+      this.#detachJob(job)
+    }
+  }
+
+  #canShareScheduledRetry (waiter, retryAt) {
+    return !waiter.retrySignal?.aborted &&
+      (waiter.deadlineAt === null || retryAt < waiter.deadlineAt)
+  }
+
+  #canRetryAfterLimit (waiter, retryAt) {
+    return waiter.observedRateLimitFailures <= waiter.rateLimitRetries &&
+      this.#canShareScheduledRetry(waiter, retryAt)
+  }
+
+  #pruneScheduledRetryWaiters (job) {
+    if (!job.retryScheduled || !job.lastRateLimitError) return
+    for (const waiter of [...job.waiters]) {
+      if (!this.#canShareScheduledRetry(waiter, job.retryAt)) {
+        this.#removeWaiter(job, waiter, job.lastRateLimitError)
+      }
+    }
+  }
+
+  #expireWaiter (job, waiter) {
+    const reason = job.retryScheduled && job.lastRateLimitError
+      ? job.lastRateLimitError
+      : relayTimeoutError(job.timeoutCode, this.#lastTransportError)
+    this.#removeWaiter(job, waiter, reason)
+    this.#pruneScheduledRetryWaiters(job)
+  }
+
+  #abortWaiterRetry (job, waiter) {
+    if (!job.retryScheduled || !job.lastRateLimitError) return
+    this.#removeWaiter(job, waiter, job.lastRateLimitError)
+    this.#pruneScheduledRetryWaiters(job)
+  }
+
+  #addWaiter (job, {
+    signal,
+    retrySignal,
+    deadlineAt,
+    rateLimitRetries
+  }) {
+    const deferred = Promise.withResolvers()
+    const waiter = {
+      ...deferred,
+      signal,
+      retrySignal,
+      deadlineAt,
+      rateLimitRetries,
+      observedRateLimitFailures: 0,
+      timer: null,
+      onAbort: null,
+      onRetryAbort: null
+    }
+    job.waiters.add(waiter)
+    waiter.onAbort = () => this.#removeWaiter(job, waiter, signal.reason)
+    waiter.onRetryAbort = () => this.#abortWaiterRetry(job, waiter)
+    signal?.addEventListener('abort', waiter.onAbort, { once: true })
+    retrySignal?.addEventListener('abort', waiter.onRetryAbort, { once: true })
+    let timeout = this.publishTimeout
+    if (!signal && deadlineAt !== null) timeout = Math.min(timeout, Math.max(0, deadlineAt - Date.now()))
+    waiter.timer = maybeUnref(setTimeout(() => this.#expireWaiter(job, waiter), timeout))
+
+    if (signal?.aborted) this.#removeWaiter(job, waiter, signal.reason)
+    else if (job.retryScheduled && !this.#canShareScheduledRetry(waiter, job.retryAt)) {
+      this.#removeWaiter(job, waiter, job.lastRateLimitError)
+    }
+    return deferred.promise
   }
 
   #clearBulkScheduler () {
@@ -353,8 +507,8 @@ export class RelayConnection {
     clearTimeout(this.#bulkTimer)
     this.#bulkTimer = null
     while (this.#bulkQueue.length) {
-      const pending = this.#bulkQueue[0]
-      if (this.#publishes.get(pending.event.id) === pending && pending.waiters.size > 0) break
+      const job = this.#bulkQueue[0]
+      if (this.#hasJob(job) && job.waiters.size > 0) break
       this.#bulkQueue.shift()
     }
     if (!this.#bulkQueue.length) return
@@ -366,64 +520,67 @@ export class RelayConnection {
       return
     }
 
-    const pending = this.#bulkQueue.shift()
+    const job = this.#bulkQueue.shift()
     const startedAt = now
-    this.#bulkActive = pending
-    pending.onSettled = (success, reason) => {
-      if (this.#bulkActive !== pending) return
-      this.#bulkActive = null
-      pending.onSettled = null
-      const completedAt = Date.now()
-      const hintedRetryAt = retryAtFrom(reason)
-      if (success) {
-        this.#bulkNextAt = Math.max(completedAt, startedAt + BULK_PACING_MS)
-      } else if (hintedRetryAt) {
-        // The relay advice overrides the local backoff for this retry.
-        this.#bulkNextAt = Math.max(completedAt, startedAt + BULK_PACING_MS)
-      } else {
-        this.#bulkNextAt = Math.max(completedAt, startedAt + BULK_PACING_MS)
+    job.state = 'active'
+    job.startedAt = startedAt
+    this.#bulkActive = job
+    this.#dispatchEventAttempt(job)
+  }
+
+  #dispatchEventAttempt (job) {
+    const cancel = this.#dispatchWork(job.type, () => {
+      if (!this.#hasJob(job)) return
+      const retrying = job.retryScheduled
+      for (const waiter of [...job.waiters]) {
+        if (waiter.deadlineAt !== null && Date.now() >= waiter.deadlineAt) {
+          this.#removeWaiter(job, waiter, retrying && job.lastRateLimitError
+            ? job.lastRateLimitError
+            : relayTimeoutError(job.timeoutCode, this.#lastTransportError))
+        }
       }
-      this.#pumpBulkPublishes()
+      if (!job.waiters.size) return
+      job.retryScheduled = false
+      job.awaitingAck = true
+      try {
+        this.send(JSON.stringify([job.type, job.event]))
+      } catch (error) {
+        job.awaitingAck = false
+        throw error
+      }
+    }, error => {
+      job.awaitingAck = false
+      this.#settleJob(job, error)
+    })
+    job.cancelSend = cancel
+    if (!this.#hasJob(job)) cancel()
+  }
+
+  #applyRateLimit (job, reason) {
+    job.awaitingAck = false
+    job.lastRateLimitError = reason
+    const retryAt = Math.max(
+      retryAtFrom(reason),
+      this.#retryAtByType.get(job.type) ?? 0
+    )
+    for (const waiter of [...job.waiters]) {
+      waiter.observedRateLimitFailures++
+      if (!retryAt || !this.#canRetryAfterLimit(waiter, retryAt)) {
+        this.#removeWaiter(job, waiter, reason)
+      }
     }
-    pending.cancelSend = this.#dispatchWork('EVENT', () => {
-      if (pending.deadlineAt !== null && Date.now() >= pending.deadlineAt) {
-        throw pending.retryScheduled ? pending.lastRateLimitError : relayTimeoutError(pending.timeoutCode, this.#lastTransportError)
-      }
-      this.send(JSON.stringify(['EVENT', pending.event]))
-    }, error => this.#settleEvent(this.#publishes, pending.event.id, error), () => {
-      pending.retryScheduled = false
-    })
-  }
-
-  #dispatchEventAttempt (type, event, map, pending) {
-    pending.cancelSend = this.#dispatchWork(type, () => {
-      if (pending.deadlineAt !== null && Date.now() >= pending.deadlineAt) {
-        throw pending.retryScheduled ? pending.lastRateLimitError : relayTimeoutError(pending.timeoutCode, this.#lastTransportError)
-      }
-      this.send(JSON.stringify([type, event]))
-    }, error => this.#settleEvent(map, event.id, error), () => {
-      pending.retryScheduled = false
-    })
-  }
-
-  #retryRateLimitedEvent (map, id, reason) {
-    const pending = map.get(id)
-    if (!pending || !reason?.message?.startsWith('rate-limited:')) return false
-    const retryAt = retryAtFrom(reason)
-    if (!retryAt || pending.rateLimitAttempts >= pending.rateLimitRetries ||
-        pending.retrySignal?.aborted || (pending.deadlineAt !== null && retryAt >= pending.deadlineAt)) return false
-    pending.rateLimitAttempts++
-    pending.lastRateLimitError = reason
-    pending.retryScheduled = true
+    if (!job.waiters.size) return
+    job.retryAt = retryAt
+    job.retryScheduled = true
+    job.retryAttempts++
     debugRateLimitRetry({
       relay: this.url,
-      operation: pending.type,
-      retryAttempt: pending.rateLimitAttempts,
-      maxRetries: pending.rateLimitRetries,
+      operation: job.type,
+      retryAttempt: job.retryAttempts,
+      maxRetries: Math.max(...[...job.waiters].map(waiter => waiter.rateLimitRetries)),
       retryAt
     })
-    this.#dispatchEventAttempt(pending.type, pending.event, map, pending)
-    return true
+    this.#dispatchEventAttempt(job)
   }
 
   #sendEventOperation (type, event, map, timeoutCode, signal, {
@@ -433,70 +590,40 @@ export class RelayConnection {
     deadlineAt = null
   } = {}) {
     if (signal?.aborted) return Promise.reject(signal.reason)
-    let pending = map.get(event.id)
-    const created = !pending
+    let job = this.#selectJob(map, event, useBulkPacing && type === 'EVENT')
+    const created = !job
     if (created) {
-      const timer = maybeUnref(setTimeout(() => this.#settleEvent(map, event.id, relayTimeoutError(timeoutCode, this.#lastTransportError)), this.publishTimeout))
-      pending = {
-        timer,
+      job = {
         waiters: new Set(),
         cancelSend: null,
         event,
         type,
         timeoutCode,
-        useBulkPacing,
-        onSettled: null,
-        rateLimitRetries,
-        rateLimitAttempts: 0,
+        pacing: useBulkPacing && type === 'EVENT' ? 'bulk' : 'interactive',
+        state: useBulkPacing && type === 'EVENT' ? 'queued' : 'active',
+        startedAt: 0,
+        retryAttempts: 0,
         lastRateLimitError: null,
-        retrySignal,
-        deadlineAt,
+        retryAt: 0,
         retryScheduled: false,
-        retryAbort: null
+        awaitingAck: false,
+        detached: false,
+        settled: false
       }
-      map.set(event.id, pending)
+      this.#addJob(job)
     }
-    const deferred = Promise.withResolvers()
-    const onAbort = () => {
-      pending.waiters.delete(waiter)
-      signal.removeEventListener('abort', onAbort)
-      deferred.reject(signal.reason)
-      if (!pending.waiters.size && map.get(event.id) === pending) {
-        map.delete(event.id)
-        pending.cancelSend?.()
-        pending.retrySignal?.removeEventListener('abort', pending.retryAbort)
-        clearTimeout(pending.timer)
-        if (this.#bulkActive === pending) {
-          this.#bulkActive = null
-          pending.onSettled = null
-          this.#bulkNextAt = Math.max(this.#bulkNextAt, Date.now() + BULK_PACING_MS)
-          this.#pumpBulkPublishes()
-        }
-      }
-    }
-    const waiter = { ...deferred, stopAbort: () => signal?.removeEventListener('abort', onAbort) }
-    pending.waiters.add(waiter)
-    signal?.addEventListener('abort', onAbort, { once: true })
-    if (created && useBulkPacing && type === 'EVENT') {
-      pending.cancelSend = () => this.#removeBulkPublish(pending)
-      if (retrySignal) {
-        pending.retryAbort = () => {
-          if (pending.retryScheduled) this.#settleEvent(map, event.id, pending.lastRateLimitError)
-        }
-        retrySignal.addEventListener('abort', pending.retryAbort, { once: true })
-      }
-      this.#bulkQueue.push(pending)
+    const promise = this.#addWaiter(job, {
+      signal,
+      retrySignal,
+      deadlineAt,
+      rateLimitRetries
+    })
+    if (!created || !this.#hasJob(job)) return promise
+    if (job.pacing === 'bulk') {
+      this.#bulkQueue.push(job)
       this.#pumpBulkPublishes()
-    } else if (created) {
-      if (retrySignal) {
-        pending.retryAbort = () => {
-          if (pending.retryScheduled) this.#settleEvent(map, event.id, pending.lastRateLimitError)
-        }
-        retrySignal.addEventListener('abort', pending.retryAbort, { once: true })
-      }
-      this.#dispatchEventAttempt(type, event, map, pending)
-    }
-    return deferred.promise
+    } else this.#dispatchEventAttempt(job)
+    return promise
   }
 
   countWithHll (filters, { signal } = {}) {
@@ -513,20 +640,19 @@ export class RelayConnection {
     return deferred.promise
   }
 
-  #settleEvent (map, id, reason, value) {
-    const pending = map.get(id)
-    if (!pending) return
-    map.delete(id)
-    pending.cancelSend?.()
-    pending.retrySignal?.removeEventListener('abort', pending.retryAbort)
-    clearTimeout(pending.timer)
-    pending.onSettled?.(!reason, reason)
-    for (const waiter of pending.waiters) {
-      waiter.stopAbort()
-      if (reason) waiter.reject(errorFrom(reason, 'OPERATION_REJECTED'))
-      else waiter.resolve(value)
+  #settleJobsSuccess (jobs, value) {
+    for (const job of [...jobs]) this.#settleJob(job, null, value)
+  }
+
+  #handleOkFailure (jobs, type, message, params) {
+    const awaiting = [...jobs].filter(job => job.awaitingAck)
+    if (!awaiting.length) return
+    const reason = this.#rejection(type, message, params, 'EVENT_REJECTED')
+    for (const job of awaiting) {
+      job.awaitingAck = false
+      if (reason.message?.startsWith('rate-limited:')) this.#applyRateLimit(job, reason)
+      else this.#settleJob(job, reason)
     }
-    pending.waiters.clear()
   }
 
   #settleCount (id, payload, reason) {
@@ -577,12 +703,17 @@ export class RelayConnection {
       return
     }
     if (data[0] === 'OK') {
-      for (const [type, pending] of [['EVENT', this.#publishes], ['AUTH', this.#authentications]]) {
-        if (!pending.has(data[1])) continue
-        if (data[2] === true) this.#recordSuccess(type)
-        const reason = data[2] === true ? null : this.#rejection(type, data[3], data[4], 'EVENT_REJECTED')
-        if (reason && this.#retryRateLimitedEvent(pending, data[1], reason)) continue
-        this.#settleEvent(pending, data[1], reason, data[3])
+      for (const [type, map] of [['EVENT', this.#publishes], ['AUTH', this.#authentications]]) {
+        const jobs = map.get(data[1])
+        if (!jobs || ![...jobs].some(job => job.awaitingAck)) continue
+        if (data[2] === true) {
+          this.#recordSuccess(type)
+          // The same relay accepted this exact event. Settle every pacing job
+          // locally, including copies that have not started transmission.
+          this.#settleJobsSuccess(jobs, data[3])
+        } else {
+          this.#handleOkFailure(jobs, type, data[3], data[4])
+        }
       }
       return
     }
@@ -606,10 +737,10 @@ export class RelayConnection {
       subscription.cancelSend?.()
       subscription.handlers.onclose?.(reason)
     }
-    for (const id of [...this.#publishes.keys()]) this.#settleEvent(this.#publishes, id, reason)
-    for (const id of [...this.#authentications.keys()]) this.#settleEvent(this.#authentications, id, reason)
-    for (const id of [...this.#counts.keys()]) this.#settleCount(id, null, reason)
+    const jobs = [...this.#allJobs(this.#publishes), ...this.#allJobs(this.#authentications)]
     this.#clearBulkScheduler()
+    for (const job of jobs) this.#settleJob(job, reason)
+    for (const id of [...this.#counts.keys()]) this.#settleCount(id, null, reason)
     this.onclose?.(reason)
   }
 
@@ -623,10 +754,10 @@ export class RelayConnection {
       subscription.cancelSend?.()
       subscription.handlers.onclose?.()
     }
-    for (const id of [...this.#publishes.keys()]) this.#settleEvent(this.#publishes, id, reason)
-    for (const id of [...this.#authentications.keys()]) this.#settleEvent(this.#authentications, id, reason)
-    for (const id of [...this.#counts.keys()]) this.#settleCount(id, null, reason)
+    const jobs = [...this.#allJobs(this.#publishes), ...this.#allJobs(this.#authentications)]
     this.#clearBulkScheduler()
+    for (const job of jobs) this.#settleJob(job, reason)
+    for (const id of [...this.#counts.keys()]) this.#settleCount(id, null, reason)
     if (socket && socket.readyState < 2) socket.close()
   }
 }

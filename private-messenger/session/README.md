@@ -263,7 +263,10 @@ Rate-limited relay attempts are retried by the pool once by default, within the
 same operation deadline and using the relay's `retryAt` when supplied. A relay
 result reaches the session only after its retry budget is terminal; a first ACK
 from another relay cancels scheduled retries but does not recall work already
-transmitted.
+transmitted. Calls sharing an event and relay keep independent cancellation,
+deadline and retry state even when they reuse the same physical publication.
+Success from that relay is shared locally, but never treated as success on a
+different relay.
 Operations already transmitted cannot be recalled from relays. A messenger pause
 cancels its outstanding publication work and leaves the outbox pending; resume
 creates a fresh publication lifetime, without treating the pause as a user abort.

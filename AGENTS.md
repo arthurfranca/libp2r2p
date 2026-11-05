@@ -380,6 +380,20 @@ NIP-46 against the real pool with controlled transport and injected controls.
   aggregates. Intermediate attempts may use structured debug output containing
   only relay URL, operation, retry attempt/count and numeric deadlines, never
   payloads, filters, event IDs or native reason text.
+- RelayConnection keeps physical publication jobs separate from waiters. Jobs
+  coalesce by event ID and pacing; each waiter retains its own cancellation,
+  timeout, deadline, retry budget and retry signal. Same-pacing calls share one
+  job. Interactive joins an existing interactive job or an active bulk job, but
+  never a queued bulk job. Bulk prefers an interactive job, then an existing bulk
+  job. A success from the same relay settles every sibling job for that event,
+  including an unsent queued copy; in-flight bytes cannot be recalled, so late
+  responses are ignored. A rejection applies only to jobs already awaiting that
+  response. Separate jobs are not correlated by publication call, so cancelling
+  one waiter or exhausting its retry budget must not fail an unrelated waiter.
+  A waiter joining an already scheduled retry may share it with zero remaining
+  retries; only later rate limits consume its observed budget. Never propagate
+  success across relay connections. AUTH keeps separate outer retry loops while
+  sharing an identical physical AUTH send.
 - Reply packers cap UTF-8 JSONL at 128 KiB and 100 records, except one indivisible
   oversized record. They enable `useBulkPacing` by default. Stream outgoing
   fragments from prepared rows without a second Web Storage copy. Cleanup partial

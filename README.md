@@ -1138,6 +1138,23 @@ operation, attempt/count and numeric deadlines. Live and feed recovery keep
 their specialized reconnect behavior; their internal one-shot gap reads disable
 the generic retry budget.
 
+Publication calls for the same event and relay share a physical job only when
+their pacing is compatible. Calls with the same pacing share one send. An
+interactive call joins an existing interactive job or a bulk job already removed
+from the queue and active; it never waits for a queued bulk job and instead may
+race it. A bulk call prefers an existing interactive job, otherwise it joins the
+bulk job. Each waiter keeps its own cancellation, operation deadline, timeout,
+`rateLimitRetries`, retry signal and observed rate-limit count.
+
+A successful ACK on that relay settles every pending job for the event,
+including an unsent bulk sibling. Transmissions already started cannot be
+recalled, and their late responses are ignored. A rejection applies only to
+jobs whose bytes were transmitted and are awaiting that response, so a queued
+job remains pending. Success is never propagated across different relay
+connections. A waiter joining an already scheduled rate-limit retry may share
+that next attempt even with zero remaining retries; only later rate limits count
+against its budget.
+
 Rate limits apply only to the client message type that triggered the refusal:
 `EVENT`, `AUTH`, `REQ` and `COUNT` have independent connection cooldowns. Responses
 are correlated with pending operations; unknown IDs never create cooldowns.
