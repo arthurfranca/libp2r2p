@@ -295,9 +295,60 @@ test('the runtime cap is applied to publication, AUTH and COUNT rejections', asy
   await relay.close()
 })
 
+test('a concurrent success resets local backoff without clearing active relay advice', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  const { relay, socket } = await connected()
+  t.after(() => relay.close())
+  const limitedEvent = signedEvent()
+  const concurrentEvent = signedEvent()
+  const futureEvent = signedEvent()
+  const limited = assert.rejects(relay.publish(limitedEvent), /rate-limited/)
+  const concurrent = relay.publish(concurrentEvent)
+  socket.receive(['OK', limitedEvent.id, false, 'rate-limited: wait', '5000'])
+  await limited
+  socket.receive(['OK', concurrentEvent.id, true, 'saved'])
+  await concurrent
+
+  const future = relay.publish(futureEvent)
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 2)
+  t.mock.timers.tick(4999)
+  await tick()
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 2)
+  t.mock.timers.tick(1)
+  await tick()
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 3)
+  socket.receive(['OK', futureEvent.id, true, 'saved'])
+  await future
+})
+
+test('a shorter concurrent hint does not shorten an existing relay deadline', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  const { relay, socket } = await connected()
+  t.after(() => relay.close())
+  const firstEvent = signedEvent()
+  const secondEvent = signedEvent()
+  const futureEvent = signedEvent()
+  const first = assert.rejects(relay.publish(firstEvent), /rate-limited/)
+  const second = assert.rejects(relay.publish(secondEvent), /rate-limited/)
+  socket.receive(['OK', firstEvent.id, false, 'rate-limited: first', '5000'])
+  await first
+  socket.receive(['OK', secondEvent.id, false, 'rate-limited: second', '1000'])
+  await second
+
+  const future = relay.publish(futureEvent)
+  t.mock.timers.tick(1000)
+  await tick()
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 2)
+  t.mock.timers.tick(4000)
+  await tick()
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 3)
+  socket.receive(['OK', futureEvent.id, true, 'saved'])
+  await future
+})
+
 test('RelayPool options affect existing connections before consumers observe rate limits', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
-  const pool = new RelayPool({ WebSocket: FakeWebSocket, rateLimitCapMs: 5000 })
+  const pool = new RelayPool({ WebSocket: FakeWebSocket, rateLimitCapMs: 5000, rateLimitRetries: 0 })
   t.after(() => pool.disconnectAll())
   const limited = signedEvent()
   const first = pool.sendEvent(limited, ['wss://relay.example'])
@@ -323,16 +374,24 @@ test('RelayPool options affect existing connections before consumers observe rat
   assert.equal((await next).success, true)
 })
 
-test('malformed or unrelated retry metadata cannot stall a connection', async t => {
+test('malformed retry metadata falls back to local backoff without using its value', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
   const { relay, socket } = await connected()
   t.after(() => relay.close())
-  for (const [reason, retry] of [['blocked: no', '60000'], ['rate-limited: busy', '60.5'], ['rate-limited: busy', '-1']]) {
+  for (const [index, [reason, retry]] of [['blocked: no', '60000'], ['rate-limited: busy', '60.5'], ['rate-limited: busy', '-1']].entries()) {
     let rejection
     const sub = relay.subscribe([{}], { onclose: error => { rejection = error } })
     socket.receive(['CLOSED', sub.id, reason, retry])
     await tick()
-    assert.equal(rejection.retryAfterMs, undefined)
+    if (reason.startsWith('rate-limited:')) assert.equal(rejection.retryAfterMs, index === 1 ? 1000 : 2000)
+    else assert.equal(rejection.retryAfterMs, undefined)
     const next = relay.subscribe([{}])
+    if (reason.startsWith('rate-limited:')) {
+      const delay = index === 1 ? 1000 : 2000
+      t.mock.timers.tick(delay - 1)
+      assert.notEqual(socket.sent.at(-1)?.[1], next.id)
+      t.mock.timers.tick(1)
+    }
     assert.equal(socket.sent.at(-1)[1], next.id)
     next.close()
   }
@@ -340,7 +399,7 @@ test('malformed or unrelated retry metadata cannot stall a connection', async t 
 
 test('pool operation timeout cancels a publication waiting for relay cooldown', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
-  const pool = new RelayPool({ WebSocket: FakeWebSocket })
+  const pool = new RelayPool({ WebSocket: FakeWebSocket, rateLimitRetries: 0 })
   t.after(() => pool.disconnectAll())
   const event = signedEvent()
   const first = pool.sendEvent(event, ['wss://relay.example'])
@@ -360,7 +419,7 @@ test('pool operation timeout cancels a publication waiting for relay cooldown', 
   assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 1)
 })
 
-test('relative CLOSED waits from receipt and legacy absolute params are ignored', async t => {
+test('relative CLOSED waits from receipt and legacy absolute params fall back to local backoff', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 14000 })
   const { relay, socket } = await connected()
   t.after(() => relay.close())
@@ -377,7 +436,7 @@ test('relative CLOSED waits from receipt and legacy absolute params are ignored'
   assert.equal(socket.sent.at(-1)[1], next.id)
   t.mock.timers.tick(5000)
   const published = signedEvent()
-  const result = assert.rejects(relay.publish(published), error => error.retryAt === undefined && error.retryAfterMs === undefined)
+  const result = assert.rejects(relay.publish(published), error => error.retryAfterMs === 1000)
   socket.receive(['OK', published.id, false, 'rate-limited: busy', '@20000'])
   await result
   const immediate = relay.subscribe([{}])
@@ -402,7 +461,7 @@ test('cancelling one publication subscriber preserves another subscriber for the
 
 test('a cooled-down relay does not prevent another relay from completing a bulk publication', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
-  const pool = new RelayPool({ WebSocket: FakeWebSocket })
+  const pool = new RelayPool({ WebSocket: FakeWebSocket, rateLimitRetries: 0 })
   t.after(() => pool.disconnectAll())
   const limited = signedEvent()
   const first = pool.sendEvent(limited, ['wss://limited.example'])

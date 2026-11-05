@@ -1115,8 +1115,28 @@ Valid values produce both `retryAfterMs` and `retryAt`, capped by `capMs`.
 Missing or invalid params are ignored and do not instruct clients to retry
 immediately. RelayPool defaults `rateLimitCapMs` to five minutes. Its
 `getOptions()` returns a frozen runtime snapshot and `setOptions(partial)`
-validates and applies allowlisted partial updates. Non-bulk schedulers retain
-their existing max(local backoff deadline, retryAt) behavior.
+validates and applies allowlisted partial updates.
+
+`RelayPool` also exposes `rateLimitRetries`, defaulting to one. The runtime option
+applies to `sendEvent`, `getEvents`, `getEventsGenerator` and `countEvents`, and
+each method accepts a per-call override. The budget is independent for each relay
+and message type; an AUTH retry does not consume the EVENT publication budget.
+`rateLimitRetries: 0` preserves the previous behavior. Relay advice replaces the
+local exponential backoff; without advice, retries use 1, 2, 4... up to 30
+seconds and reset after success. Success resets only the local backoff; an
+unexpired `retryAt` from a concurrent relay response remains authoritative.
+An existing operation deadline is never extended, so a retry whose next deadline
+would expire at or after the operation deadline returns the original bounded
+rate-limit error immediately.
+
+For publication, the first accepted relay aborts retries that are still waiting
+on other relays; attempts already in flight may finish. Bulk retries retain the
+active queue position and do not allow later work to overtake them. Intermediate
+attempts do not reach callbacks, generators or aggregate reports. They may emit
+the sanitized `relay rate-limit retry` debug record with only relay URL,
+operation, attempt/count and numeric deadlines. Live and feed recovery keep
+their specialized reconnect behavior; their internal one-shot gap reads disable
+the generic retry budget.
 
 Rate limits apply only to the client message type that triggered the refusal:
 `EVENT`, `AUTH`, `REQ` and `COUNT` have independent connection cooldowns. Responses
@@ -1297,10 +1317,12 @@ responses are preserved as normalized `retryAt` and `retryAfterMs` on native rel
 errors. Only `rate-limited:`
 responses apply this advice; invalid values are ignored
 and delays are capped by the RelayPool runtime options, defaulting to five
-minutes. New operations of the refused type wait
+minutes. One-shot operations retry the affected relay according to
+`rateLimitRetries`, defaulting to one additional attempt. New operations of the refused type wait
 within their existing deadlines; active subscriptions remain live and `CLOSE`
 never waits. Cancelled or timed-out operations cannot be sent later. A rejection
-is still reported to the caller; this does not silently republish failed events.
+is still reported when retries are exhausted, disabled or cannot finish before
+the operation deadline; intermediate attempts are not reported as final failures.
 
 `createEventReplyPacker` and `createMissingMessageReplyPacker` accept
 `bytesPerChunk` (default 128 KiB of UTF-8 JSONL), in addition to the existing

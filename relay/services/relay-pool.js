@@ -8,6 +8,7 @@ import { maybeUnref } from '../helpers/timer.js'
 import { categorizeRelayError, relayTimeoutError } from '../helpers/error.js'
 import { ReadRetry, isRetryableReadFailure, needsConnectivityCheck, waitUntil } from '../helpers/read-retry.js'
 import { DEFAULT_RATE_LIMIT_CAP_MS } from '../helpers/retry-advice.js'
+import { debugRateLimitRetry } from '../helpers/retry-debug.js'
 import { normalizeRelayUrl } from '../../url/index.js'
 import { isValidEvent } from '../../event/index.js'
 import { RelayConnection } from './relay-connection.js'
@@ -107,6 +108,11 @@ function validateRateLimitCapMs (value) {
   return value
 }
 
+function validateRateLimitRetries (value) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new ValidationError('INVALID_RATE_LIMIT_RETRIES')
+  return value
+}
+
 function assertReadOptions (filter, timeouts) {
   if (!filter || typeof filter !== 'object' || Array.isArray(filter)) throw new ValidationError('INVALID_FILTER')
   for (const value of Object.values(timeouts)) {
@@ -161,8 +167,11 @@ export class RelayPool {
   #readRetry
   #options
 
-  constructor ({ _createRelay, _isOnline, _onOnline, WebSocket: WebSocketImpl, rateLimitCapMs = DEFAULT_RATE_LIMIT_CAP_MS, ...capacity } = {}) {
-    this.#options = { rateLimitCapMs: validateRateLimitCapMs(rateLimitCapMs) }
+  constructor ({ _createRelay, _isOnline, _onOnline, WebSocket: WebSocketImpl, rateLimitCapMs = DEFAULT_RATE_LIMIT_CAP_MS, rateLimitRetries = 1, ...capacity } = {}) {
+    this.#options = {
+      rateLimitCapMs: validateRateLimitCapMs(rateLimitCapMs),
+      rateLimitRetries: validateRateLimitRetries(rateLimitRetries)
+    }
     this.#WebSocket = WebSocketImpl
     this.#createRelay = _createRelay ?? (url => new RelayConnection(url, {
       ...(this.#WebSocket ? { WebSocket: this.#WebSocket } : {}),
@@ -178,13 +187,18 @@ export class RelayPool {
 
   setOptions (partial = {}) {
     if (!partial || typeof partial !== 'object' || Array.isArray(partial)) throw new ValidationError('INVALID_RELAY_POOL_OPTIONS')
-    const unknown = Object.keys(partial).find(key => key !== 'rateLimitCapMs')
+    const unknown = Object.keys(partial).find(key => !['rateLimitCapMs', 'rateLimitRetries'].includes(key))
     if (unknown) throw new ValidationError('UNKNOWN_RELAY_POOL_OPTION')
     const next = { ...this.#options }
     if (Object.hasOwn(partial, 'rateLimitCapMs')) next.rateLimitCapMs = validateRateLimitCapMs(partial.rateLimitCapMs)
+    if (Object.hasOwn(partial, 'rateLimitRetries')) next.rateLimitRetries = validateRateLimitRetries(partial.rateLimitRetries)
     this.#options = next
     for (const relay of this.#relays.values()) relay.setRateLimitCapMs?.(next.rateLimitCapMs)
     return this.getOptions()
+  }
+
+  #retryCount (value) {
+    return validateRateLimitRetries(value === undefined ? this.#options.rateLimitRetries : value)
   }
 
   // Injects the WebSocket implementation used by new pooled connections (e.g.
@@ -276,21 +290,27 @@ export class RelayPool {
 
   // NIP-42 retries happen inside one relay attempt, so sendEvent still reports
   // exactly one terminal outcome for each relay URL.
-  async #publishEvent (relay, event, getAuthEvent, signal, useBulkPacing) {
+  async #publishEvent (relay, event, getAuthEvent, signal, {
+    useBulkPacing,
+    rateLimitRetries,
+    retrySignal,
+    deadlineAt
+  }) {
     try {
-      await relay.publish(event, { signal, useBulkPacing })
+      await relay.publish(event, { signal, useBulkPacing, rateLimitRetries, retrySignal, deadlineAt })
       return 'published'
     } catch (error) {
       const reason = error instanceof Error ? error : new Error(String(error))
       if (!getAuthEvent || !requiresNip42Auth(reason)) throw reason
 
       try {
-        await relay.authenticate(getAuthEvent, { signal })
+        await relay.authenticate(getAuthEvent, { signal, rateLimitRetries, retrySignal, deadlineAt })
       } catch (error) {
         const authReason = error instanceof Error ? error : new Error(String(error))
+        if (retrySignal?.aborted && authReason.message?.startsWith('rate-limited:')) throw authReason
         throw new Nip42AuthenticationError(authReason)
       }
-      await relay.publish(event, { signal, useBulkPacing })
+      await relay.publish(event, { signal, useBulkPacing, rateLimitRetries, retrySignal, deadlineAt })
       return 'published'
     }
   }
@@ -301,12 +321,14 @@ export class RelayPool {
   async countEvents (filter, relays, {
     timeout = COUNT_TIMEOUT_MS,
     timeoutAfterFirstCount = COUNT_TIMEOUT_AFTER_FIRST_COUNT_MS,
-    signal
+    signal,
+    rateLimitRetries
   } = {}) {
     if (!filter || typeof filter !== 'object' || Array.isArray(filter)) {
       throw new ValidationError('COUNT_FILTER_REQUIRED')
     }
     if (signal?.aborted) throw new Error('Aborted')
+    const retries = this.#retryCount(rateLimitRetries)
 
     const urls = normalizedRelayUrls(relays)
     if (!urls.length) {
@@ -314,6 +336,10 @@ export class RelayPool {
     }
 
     const countController = new AbortController()
+    const retryControllers = new Map()
+    const retryCounts = new Map(urls.map(url => [url, 0]))
+    const retryErrors = new Map()
+    const deadline = timeout === null ? null : Date.now() + timeout
     const pending = new Set(urls)
     const errors = []
     let count = null
@@ -327,6 +353,8 @@ export class RelayPool {
       const cleanup = () => {
         clearTimeout(timeoutTimer)
         clearTimeout(graceTimer)
+        for (const controller of retryControllers.values()) controller.abort()
+        retryControllers.clear()
         signal?.removeEventListener('abort', onAbort)
         countController.abort()
       }
@@ -395,13 +423,48 @@ export class RelayPool {
       }
 
       const handleError = (relay, error) => {
-        if (isResolved || !settleRelay(relay)) return
         const reason = error instanceof Error ? error : new Error(String(error))
+        if (isResolved || !pending.has(relay)) return
+        const retryAt = Number.isSafeInteger(reason.retryAt) ? reason.retryAt : 0
+        if (reason.message?.startsWith('rate-limited:') && retryAt &&
+            retryCounts.get(relay) < retries && (deadline === null || retryAt < deadline)) {
+          retryCounts.set(relay, retryCounts.get(relay) + 1)
+          retryErrors.set(relay, reason)
+          debugRateLimitRetry({
+            relay,
+            operation: 'COUNT',
+            retryAttempt: retryCounts.get(relay),
+            maxRetries: retries,
+            retryAt
+          })
+          const controller = new AbortController()
+          const combined = AbortSignal.any([countController.signal, controller.signal])
+          retryControllers.set(relay, controller)
+          waitUntil(retryAt, combined)
+            .then(() => {
+              if (retryControllers.get(relay) === controller) retryControllers.delete(relay)
+              if (isResolved || !pending.has(relay)) return
+              if (deadline !== null && Date.now() >= deadline) {
+                settleRelay(relay)
+                errors.push({ relay, reason: retryErrors.get(relay) ?? countTimeoutError() })
+                finishIfComplete()
+                return
+              }
+              startCount(relay)
+            })
+            .catch(cause => {
+              if (combined.aborted || isResolved || !pending.has(relay)) return
+              if (retryControllers.get(relay) === controller) retryControllers.delete(relay)
+              handleError(relay, asError(cause))
+            })
+          return
+        }
+        settleRelay(relay)
         errors.push({ relay, reason })
         finishIfComplete()
       }
 
-      for (const relay of urls) {
+      const startCount = relay => {
         this.#getRelay(relay)
           .then(async connection => {
             if (isResolved) return null
@@ -412,6 +475,7 @@ export class RelayPool {
             error => handleError(relay, error)
           )
       }
+      for (const relay of urls) startCount(relay)
     })
   }
 
@@ -419,12 +483,31 @@ export class RelayPool {
   // grace window; null disables that window so callers wait for every relay or
   // the operation deadline. Disabling cross-relay deduplication still suppresses
   // repeated ids from the same relay; callbacks remain immediate in both modes.
-  async getEvents (filter, relays, { timeout = 5000, timeoutAfterFirstEose = 500, callback, signal, deduplicateAcrossRelays = true, queueTimeout = 30000, _admissions } = {}) {
+  async getEvents (filter, relays, {
+    timeout = 5000,
+    timeoutAfterFirstEose = 500,
+    callback,
+    signal,
+    deduplicateAcrossRelays = true,
+    queueTimeout = 30000,
+    rateLimitRetries,
+    _admissions
+  } = {}) {
     assertReadOptions(filter, { timeout, timeoutAfterFirstEose, queueTimeout })
     if (typeof deduplicateAcrossRelays !== 'boolean') throw new ValidationError('INVALID_DEDUPLICATE_ACROSS_RELAYS')
     if (signal?.aborted) throw new Error('Aborted')
+    const retries = this.#retryCount(rateLimitRetries)
     const urls = normalizedRelayUrls(relays)
     const subscriptions = new Map()
+    const retryControllers = new Map()
+    const retryCounts = new Map(urls.map(url => [url, 0]))
+    const deadlines = new Map()
+    const remainingTimeout = url => {
+      if (timeout === null) return null
+      if (!deadlines.has(url)) deadlines.set(url, Date.now() + timeout)
+      return Math.max(0, deadlines.get(url) - Date.now())
+    }
+    const seenIdsByRelay = new Map()
     const outcomes = new Map()
     const errors = []
     const events = []
@@ -440,6 +523,8 @@ export class RelayPool {
       const cleanup = () => {
         admissionAbort.abort()
         for (const timer of timers.values()) clearTimeout(timer)
+        for (const controller of retryControllers.values()) controller.abort()
+        retryControllers.clear()
         clearTimeout(eoseTimer)
         signal?.removeEventListener('abort', onAbort)
         for (const sub of subscriptions.values()) sub.close()
@@ -492,18 +577,58 @@ export class RelayPool {
       signal?.addEventListener('abort', onAbort, { once: true })
       if (!urls.length) { finish(); return }
 
-      for (const url of urls) {
-        const seenIds = eventIds ?? new Set()
-        const reservation = _admissions?.get(url) ?? this.#admission.acquire(normalizeRelayUrl(url), { history: true, signal: admissionSignal, queueTimeout })
+      const scheduleRetry = (url, error) => {
+        if (isResolved || outcomes.has(url) || retryControllers.has(url) ||
+            retryCounts.get(url) >= retries || !error?.message?.startsWith('rate-limited:')) return false
+        const retryAt = Number.isSafeInteger(error.retryAt) ? error.retryAt : 0
+        if (!retryAt || (deadlines.has(url) && retryAt >= deadlines.get(url))) return false
+        retryCounts.set(url, retryCounts.get(url) + 1)
+        debugRateLimitRetry({
+          relay: url,
+          operation: 'REQ',
+          retryAttempt: retryCounts.get(url),
+          maxRetries: retries,
+          retryAt
+        })
+        const controller = new AbortController()
+        const combined = AbortSignal.any([admissionSignal, controller.signal])
+        retryControllers.set(url, controller)
+        waitUntil(retryAt, combined)
+          .then(() => {
+            if (retryControllers.get(url) === controller) retryControllers.delete(url)
+            if (isResolved || outcomes.has(url)) return
+            if (deadlines.has(url) && Date.now() >= deadlines.get(url)) {
+              settleRelay(url, 'error', error)
+              finishIfComplete()
+              return
+            }
+            startRelay(url)
+          })
+          .catch(reason => {
+            if (combined.aborted) return
+            if (retryControllers.get(url) === controller) retryControllers.delete(url)
+            settleRelay(url, 'error', asError(reason))
+            finishIfComplete()
+          })
+        return true
+      }
+      const startRelay = url => {
+        const seenIds = eventIds ?? seenIdsByRelay.get(url) ?? new Set()
+        if (!eventIds) seenIdsByRelay.set(url, seenIds)
+        const existingLease = leases.get(url)
+        const reservation = existingLease
+          ? Promise.resolve({ history: existingLease })
+          : _admissions?.get(url) ?? this.#admission.acquire(normalizeRelayUrl(url), { history: true, signal: admissionSignal, queueTimeout })
         reservation.then(async slots => {
           const lease = slots.history
           if (isResolved || outcomes.has(url)) { lease.release(); return }
           leases.set(url, lease)
-          if (timeout !== null) {
+          const relayTimeout = remainingTimeout(url)
+          if (relayTimeout !== null) {
             timers.set(url, maybeUnref(setTimeout(() => {
               settleRelay(url, 'timeout', getEventsTimeoutError())
               finishIfComplete()
-            }, timeout)))
+            }, relayTimeout)))
           }
           const relay = await this.#getRelay(url)
           if (isResolved || outcomes.has(url)) return
@@ -539,6 +664,12 @@ export class RelayPool {
             onclose: error => {
               if (isResolved || outcomes.has(url)) return
               const reason = error === undefined ? undefined : asError(error)
+              if (reason && scheduleRetry(url, reason)) {
+                clearTimeout(timers.get(url))
+                timers.delete(url)
+                subscriptions.delete(url)
+                return
+              }
               settleRelay(url, reason ? 'error' : 'closed', reason)
               subscriptions.delete(url)
               finishIfComplete()
@@ -552,6 +683,7 @@ export class RelayPool {
           finishIfComplete()
         })
       }
+      for (const url of urls) startRelay(url)
     })
   }
 
@@ -886,6 +1018,7 @@ export class RelayPool {
         queueTimeout,
         timeout: timeoutForReconnectGap,
         timeoutAfterFirstEose: timeoutAfterFirstReconnectGapEose,
+        rateLimitRetries: 0,
         signal,
         _stopSignal: AbortSignal.any([gapAc.signal, attempt.stop.signal])
       })
@@ -1109,7 +1242,10 @@ export class RelayPool {
     const options = { timeout, timeoutAfterFirstEose, queueTimeout, signal, _stopSignal }
     if (!live) {
       const bounds = { since: filter.since ?? 0, until: Math.min(filter.until ?? Infinity, Math.floor(Date.now() / 1000)) }
-      for await (const item of _eventsGenerator(snapshot ? { ...filter, ...bounds } : filter, relays, options)) {
+      for await (const item of _eventsGenerator(snapshot ? { ...filter, ...bounds } : filter, relays, {
+        ...options,
+        rateLimitRetries: 0
+      })) {
         if (signal.aborted) return
         yield snapshot && item.type === 'eose' ? { ...item, snapshot: bounds } : item
       }
@@ -1140,7 +1276,14 @@ export class RelayPool {
       reservation.catch(() => {})
       reservations.set(url, reservation)
     }
-    const readOptions = { ...options, signal: inputSignal, _admissions: reservations, maxBufferedLiveEvents, maxBufferedLiveBytes }
+    const readOptions = {
+      ...options,
+      signal: inputSignal,
+      _admissions: reservations,
+      maxBufferedLiveEvents,
+      maxBufferedLiveBytes,
+      rateLimitRetries: 0
+    }
     const liveFilter = { ...filter }
     if (snapshot) delete liveFilter.until
     const liveGen = _liveGenerator(liveFilter, urls, readOptions)
@@ -1248,11 +1391,13 @@ export class RelayPool {
     getRetryEvent,
     onRelayResult,
     signal,
-    useBulkPacing = false
+    useBulkPacing = false,
+    rateLimitRetries
   } = {}) {
     if (signal != null && (typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) throw new ValidationError('INVALID_RELAY_SIGNAL')
     if (getRetryEvent != null && typeof getRetryEvent !== 'function') throw new ValidationError('INVALID_RETRY_EVENT_CALLBACK')
     if (typeof useBulkPacing !== 'boolean') throw new ValidationError('INVALID_USE_BULK_PACING')
+    const retries = this.#retryCount(rateLimitRetries)
     const urls = normalizedRelayUrls(relays)
     if (!urls.length) {
       const promise = Promise.resolve(publishSummary([], urls, {
@@ -1268,6 +1413,7 @@ export class RelayPool {
       const eventForAttempt = eventToSend.meta ? { ...eventToSend } : eventToSend
       if (eventForAttempt.meta) delete eventForAttempt.meta
       const sendControllers = urls.map(() => new AbortController())
+      const retryControllers = urls.map(() => new AbortController())
       const sendDeferreds = urls.map(() => Promise.withResolvers())
       const sendPromises = sendDeferreds.map(({ promise }) => promise)
       const bufferedResults = []
@@ -1307,7 +1453,12 @@ export class RelayPool {
             if (operationSignal.aborted) throw operationSignal.reason
             const relay = await this.#getRelay(url)
             if (operationSignal.aborted) throw operationSignal.reason
-            return await this.#publishEvent(relay, eventForAttempt, getAuthEvent, operationSignal, useBulkPacing)
+            return await this.#publishEvent(relay, eventForAttempt, getAuthEvent, operationSignal, {
+              useBulkPacing,
+              rateLimitRetries: retries,
+              retrySignal: retryControllers[index].signal,
+              deadlineAt: deadline
+            })
           } catch (err) {
             const reason = err instanceof Error ? err : new Error(String(err))
             if (reason instanceof Nip42AuthenticationError) throw reason
@@ -1327,6 +1478,7 @@ export class RelayPool {
       const success = await firstFulfillment(sendPromises, earlyTimeout, {
         fallback: promise.then(report => report.success)
       })
+      if (success) for (const controller of retryControllers) controller.abort()
       if (!success) settlement.timeout()
 
       const result = {

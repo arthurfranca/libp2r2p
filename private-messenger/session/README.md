@@ -259,6 +259,11 @@ It returns the existing result/report envelopes with the original abort reason
 for unfinished relays, preserving partial acceptance and avoiding synthetic
 timeouts. Cancellation releases publication waiters and deferred sends without
 closing shared sockets or cancelling another subscriber for the same event ID.
+Rate-limited relay attempts are retried by the pool once by default, within the
+same operation deadline and using the relay's `retryAt` when supplied. A relay
+result reaches the session only after its retry budget is terminal; a first ACK
+from another relay cancels scheduled retries but does not recall work already
+transmitted.
 Operations already transmitted cannot be recalled from relays. A messenger pause
 cancels its outstanding publication work and leaves the outbox pending; resume
 creates a fresh publication lifetime, without treating the pause as a user abort.

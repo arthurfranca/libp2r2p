@@ -208,20 +208,23 @@ function hll (entries = {}) {
 
 test('relay exports one shared RelayPool singleton', () => {
   assert.ok(relayPool instanceof RelayPool)
-  assert.deepEqual(relayPool.getOptions(), { rateLimitCapMs: 300000 })
+  assert.deepEqual(relayPool.getOptions(), { rateLimitCapMs: 300000, rateLimitRetries: 1 })
 })
 
 test('RelayPool exposes atomic runtime options with a frozen snapshot', () => {
-  const pool = new RelayPool({ _createRelay: url => new FakeRelay(url), rateLimitCapMs: 1000 })
+  const pool = new RelayPool({ _createRelay: url => new FakeRelay(url), rateLimitCapMs: 1000, rateLimitRetries: 2 })
   const initial = pool.getOptions()
-  assert.deepEqual(initial, { rateLimitCapMs: 1000 })
+  assert.deepEqual(initial, { rateLimitCapMs: 1000, rateLimitRetries: 2 })
   assert.equal(Object.isFrozen(initial), true)
   assert.throws(() => { initial.rateLimitCapMs = 1 }, TypeError)
-  assert.deepEqual(pool.setOptions({}), { rateLimitCapMs: 1000 })
-  assert.deepEqual(pool.setOptions({ rateLimitCapMs: 2000 }), { rateLimitCapMs: 2000 })
+  assert.deepEqual(pool.setOptions({}), { rateLimitCapMs: 1000, rateLimitRetries: 2 })
+  assert.deepEqual(pool.setOptions({ rateLimitCapMs: 2000 }), { rateLimitCapMs: 2000, rateLimitRetries: 2 })
+  assert.deepEqual(pool.setOptions({ rateLimitRetries: 0 }), { rateLimitCapMs: 2000, rateLimitRetries: 0 })
   assert.throws(() => pool.setOptions({ unknown: true }), { code: 'UNKNOWN_RELAY_POOL_OPTION' })
   assert.throws(() => pool.setOptions({ rateLimitCapMs: 0 }), { code: 'INVALID_RATE_LIMIT_CAP_MS' })
-  assert.deepEqual(pool.getOptions(), { rateLimitCapMs: 2000 })
+  assert.throws(() => pool.setOptions({ rateLimitCapMs: 3000, rateLimitRetries: -1 }), { code: 'INVALID_RATE_LIMIT_RETRIES' })
+  assert.throws(() => pool.setOptions({ rateLimitRetries: -1 }), { code: 'INVALID_RATE_LIMIT_RETRIES' })
+  assert.deepEqual(pool.getOptions(), { rateLimitCapMs: 2000, rateLimitRetries: 0 })
 })
 
 test('RelayPool rejects a non-boolean bulk pacing option', async () => {
@@ -1008,6 +1011,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       await tick()
       assert.equal(capturedOpts.timeout, 3000)
       assert.equal(capturedOpts.timeoutAfterFirstEose, 200)
+      assert.equal(capturedOpts.rateLimitRetries, 0)
       ac.abort()
     })
   })
@@ -1033,6 +1037,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       await promise
       assert.equal(capturedArgs.o.timeout, 3000)
       assert.equal(capturedArgs.o.timeoutAfterFirstEose, 200)
+      assert.equal(capturedArgs.o.rateLimitRetries, 0)
       assert.equal(capturedArgs.o.signal.aborted, false)
       ac.abort()
       assert.equal(capturedArgs.o.signal.aborted, true)
@@ -1073,6 +1078,7 @@ describe('RelayPool.getEventsFeedGenerator', () => {
       await promise
       assert.equal(capturedArgs.o.timeout, 4000)
       assert.equal(capturedArgs.o.timeoutAfterFirstEose, null)
+      assert.equal(capturedArgs.o.rateLimitRetries, 0)
       assert.equal(capturedArgs.o.signal.aborted, false)
       ac.abort()
       assert.equal(capturedArgs.o.signal.aborted, true)
@@ -2451,6 +2457,25 @@ describe('RelayPool read admission and snapshots', () => {
     assert.equal((await first).value.relays[0].status, 'eose')
     await stream.return()
     assert.equal(active(relay).length, 0)
+  })
+
+  it('starts a one-shot relay network deadline only after history admission', async () => {
+    const pool = configuredPool({ maxConcurrentHistoryPerRelay: 1 })
+    const hold = pool.getEvents({}, ['wss://r1'], { timeout: null })
+    await tick()
+    const relay = relayRegistry.get('wss://r1')
+    const pending = pool.getEvents({ kinds: [1] }, ['wss://r1'], { timeout: 10, queueTimeout: 1000 })
+    await new Promise(resolve => setTimeout(resolve, 25))
+    assert.equal(relay.subscriptions.length, 1)
+
+    relay.subscriptions[0].handlers.oneose()
+    await hold
+    await tick()
+    const queued = relay.subscriptions.find(sub => !sub.isClosed)
+    assert.ok(queued)
+    queued.handlers.oneose()
+    const report = await pending
+    assert.equal(report.relays[0].status, 'eose')
   })
 
   it('return cancels queued one-shot and feed reads immediately without later REQs', async () => {

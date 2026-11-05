@@ -136,6 +136,25 @@ test('rate limits use max(backoff, retryAt), avoid probes and retain their absol
   assert.equal(f.state.checks, 0)
 })
 
+test('reconnect gap reads disable the generic one-shot retry budget', async t => {
+  const f = fixture(t)
+  let gapOptions
+  f.read([A], {
+    _gapEventsGenerator: (_filter, _relays, options) => {
+      gapOptions = options
+      return (async function * () {
+        await new Promise(() => {})
+      })()
+    }
+  })
+  await flush()
+  f.live().handlers.oneose()
+  f.live().close(disconnected())
+  await f.advance(1000)
+  assert.ok(gapOptions)
+  assert.equal(gapOptions.rateLimitRetries, 0)
+})
+
 test('online failure backoff doubles and resets only after live and gap recovery succeed', async t => {
   const f = fixture(t)
   f.read()

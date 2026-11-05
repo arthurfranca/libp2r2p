@@ -2,12 +2,14 @@ import { isValidEvent } from '../../event/index.js'
 import { ValidationError } from '../../error/index.js'
 import { maybeUnref } from '../helpers/timer.js'
 import { categorizeRelayError, relayCloseError, relayTimeoutError, relayRejectionError } from '../helpers/error.js'
+import { debugRateLimitRetry } from '../helpers/retry-debug.js'
 import { DEFAULT_RATE_LIMIT_CAP_MS } from '../helpers/retry-advice.js'
 
 const DEFAULT_CONNECT_TIMEOUT = 3000
 const DEFAULT_OPERATION_TIMEOUT = 30000
 const BULK_PACING_MS = 1000
-const BULK_BACKOFF_MAX_MS = 30000
+const RATE_LIMIT_BACKOFF_MAX_MS = 30000
+const OPERATION_TYPES = ['EVENT', 'AUTH', 'REQ', 'COUNT']
 
 function errorFrom (reason, fallback) {
   return reason instanceof Error ? reason : new Error(String(reason || fallback))
@@ -28,6 +30,23 @@ function retryAtFrom (value) {
     }
   }
   return retryAt
+}
+
+function waitForRetry (deadline, signal, retrySignal) {
+  const combined = AbortSignal.any([signal, retrySignal].filter(Boolean))
+  if (combined.aborted) return Promise.reject(combined.reason)
+  return new Promise((resolve, reject) => {
+    const timer = maybeUnref(setTimeout(() => {
+      combined.removeEventListener('abort', onAbort)
+      resolve()
+    }, Math.max(0, deadline - Date.now())))
+    const onAbort = () => {
+      clearTimeout(timer)
+      combined.removeEventListener('abort', onAbort)
+      reject(combined.reason)
+    }
+    combined.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 function hasMatchingPrefix (values, candidate) {
@@ -75,8 +94,8 @@ export class RelayConnection {
   #bulkQueue = []
   #bulkActive = null
   #bulkTimer = null
-  #bulkBackoffMs = BULK_PACING_MS
   #bulkNextAt = 0
+  #rateLimitBackoffMs = new Map(OPERATION_TYPES.map(type => [type, BULK_PACING_MS]))
   #getRateLimitCapMs
 
   constructor (url, {
@@ -173,7 +192,7 @@ export class RelayConnection {
 
   // New work respects relay cooldowns; cleanup uses send() directly. These
   // waits stay within the caller's existing deadline and are cancellable.
-  #dispatchWork (type, send, fail) {
+  #dispatchWork (type, send, fail, onDispatch) {
     let timer = null
     let cancelled = false
     const wake = () => {
@@ -189,6 +208,7 @@ export class RelayConnection {
         return
       }
       this.#cooldownWaiters.delete(wake)
+      onDispatch?.()
       try { send() } catch (error) { fail(error) }
     }
     const dispatch = () => {
@@ -205,8 +225,23 @@ export class RelayConnection {
 
   #rejection (type, reason, params, fallback) {
     const error = relayRejectionError(reason, params, fallback, { rateLimitCapMs: this.#getRateLimitCapMs() })
-    if (error.retryAt !== undefined) this.#retryAtByType.set(type, Math.max(this.#retryAtByType.get(type) ?? 0, error.retryAt))
+    if (error.message?.startsWith('rate-limited:')) {
+      const now = Date.now()
+      const hasAdvice = Number.isSafeInteger(error.retryAt)
+      if (!hasAdvice) {
+        const delay = this.#rateLimitBackoffMs.get(type) ?? BULK_PACING_MS
+        error.retryAt = now + delay
+        error.retryAfterMs = delay
+      }
+      const delay = this.#rateLimitBackoffMs.get(type) ?? BULK_PACING_MS
+      this.#rateLimitBackoffMs.set(type, Math.min(RATE_LIMIT_BACKOFF_MAX_MS, delay * 2))
+      this.#retryAtByType.set(type, Math.max(this.#retryAtByType.get(type) ?? 0, error.retryAt))
+    }
     return error
+  }
+
+  #recordSuccess (type) {
+    this.#rateLimitBackoffMs.set(type, BULK_PACING_MS)
   }
 
   subscribe (filters, handlers = {}) {
@@ -236,17 +271,62 @@ export class RelayConnection {
     return { id, close }
   }
 
-  publish (event, { signal, useBulkPacing = false } = {}) {
+  publish (event, {
+    signal,
+    useBulkPacing = false,
+    rateLimitRetries = 0,
+    retrySignal,
+    deadlineAt = null
+  } = {}) {
     if (!isValidEvent(event)) return Promise.reject(new Error('INVALID_EVENT'))
     if (typeof useBulkPacing !== 'boolean') return Promise.reject(new ValidationError('INVALID_USE_BULK_PACING'))
-    return this.#sendEventOperation('EVENT', event, this.#publishes, 'PUBLISH_TIMEOUT', signal, { useBulkPacing })
+    if (!Number.isSafeInteger(rateLimitRetries) || rateLimitRetries < 0) return Promise.reject(new ValidationError('INVALID_RATE_LIMIT_RETRIES'))
+    return this.#sendEventOperation('EVENT', event, this.#publishes, 'PUBLISH_TIMEOUT', signal, {
+      useBulkPacing,
+      rateLimitRetries,
+      retrySignal,
+      deadlineAt
+    })
   }
 
-  async authenticate (getAuthEvent, { signal } = {}) {
+  async authenticate (getAuthEvent, {
+    signal,
+    rateLimitRetries = 0,
+    deadlineAt = null,
+    retrySignal
+  } = {}) {
     if (!this.#challenge) throw new Error('AUTH_CHALLENGE_MISSING')
-    const event = await getAuthEvent({ relay: this.url, challenge: this.#challenge })
-    if (!isValidEvent(event)) throw new ValidationError('INVALID_AUTH_EVENT')
-    return await this.#sendEventOperation('AUTH', event, this.#authentications, 'AUTH_TIMEOUT', signal)
+    if (!Number.isSafeInteger(rateLimitRetries) || rateLimitRetries < 0) throw new ValidationError('INVALID_RATE_LIMIT_RETRIES')
+    let lastRateLimitError = null
+    for (let attempt = 0; ; attempt++) {
+      if (signal?.aborted) throw signal.reason
+      if (deadlineAt !== null && Date.now() >= deadlineAt) {
+        throw lastRateLimitError ?? relayTimeoutError('AUTH_TIMEOUT', this.#lastTransportError)
+      }
+      const event = await getAuthEvent({ relay: this.url, challenge: this.#challenge })
+      if (!isValidEvent(event)) throw new ValidationError('INVALID_AUTH_EVENT')
+      try {
+        return await this.#sendEventOperation('AUTH', event, this.#authentications, 'AUTH_TIMEOUT', signal, { deadlineAt })
+      } catch (error) {
+        if (!error?.message?.startsWith('rate-limited:') || attempt >= rateLimitRetries) throw error
+        const retryAt = retryAtFrom(error)
+        if (!retryAt || (deadlineAt !== null && retryAt >= deadlineAt)) throw error
+        debugRateLimitRetry({
+          relay: this.url,
+          operation: 'AUTH',
+          retryAttempt: attempt + 1,
+          maxRetries: rateLimitRetries,
+          retryAt
+        })
+        lastRateLimitError = error
+        try {
+          await waitForRetry(retryAt, signal, retrySignal)
+        } catch (cause) {
+          if (retrySignal?.aborted) throw error
+          throw cause
+        }
+      }
+    }
   }
 
   #removeBulkPublish (pending) {
@@ -266,7 +346,6 @@ export class RelayConnection {
     this.#bulkQueue.length = 0
     this.#bulkActive = null
     this.#bulkNextAt = 0
-    this.#bulkBackoffMs = BULK_PACING_MS
   }
 
   #pumpBulkPublishes () {
@@ -297,30 +376,84 @@ export class RelayConnection {
       const completedAt = Date.now()
       const hintedRetryAt = retryAtFrom(reason)
       if (success) {
-        this.#bulkBackoffMs = BULK_PACING_MS
         this.#bulkNextAt = Math.max(completedAt, startedAt + BULK_PACING_MS)
       } else if (hintedRetryAt) {
         // The relay advice overrides the local backoff for this retry.
         this.#bulkNextAt = Math.max(completedAt, startedAt + BULK_PACING_MS)
-        this.#bulkBackoffMs = Math.min(BULK_BACKOFF_MAX_MS, this.#bulkBackoffMs * 2)
       } else {
-        this.#bulkNextAt = Math.max(completedAt + this.#bulkBackoffMs, startedAt + BULK_PACING_MS)
-        this.#bulkBackoffMs = Math.min(BULK_BACKOFF_MAX_MS, this.#bulkBackoffMs * 2)
+        this.#bulkNextAt = Math.max(completedAt, startedAt + BULK_PACING_MS)
       }
       this.#pumpBulkPublishes()
     }
     pending.cancelSend = this.#dispatchWork('EVENT', () => {
+      if (pending.deadlineAt !== null && Date.now() >= pending.deadlineAt) {
+        throw pending.retryScheduled ? pending.lastRateLimitError : relayTimeoutError(pending.timeoutCode, this.#lastTransportError)
+      }
       this.send(JSON.stringify(['EVENT', pending.event]))
-    }, error => this.#settleEvent(this.#publishes, pending.event.id, error))
+    }, error => this.#settleEvent(this.#publishes, pending.event.id, error), () => {
+      pending.retryScheduled = false
+    })
   }
 
-  #sendEventOperation (type, event, map, timeoutCode, signal, { useBulkPacing = false } = {}) {
+  #dispatchEventAttempt (type, event, map, pending) {
+    pending.cancelSend = this.#dispatchWork(type, () => {
+      if (pending.deadlineAt !== null && Date.now() >= pending.deadlineAt) {
+        throw pending.retryScheduled ? pending.lastRateLimitError : relayTimeoutError(pending.timeoutCode, this.#lastTransportError)
+      }
+      this.send(JSON.stringify([type, event]))
+    }, error => this.#settleEvent(map, event.id, error), () => {
+      pending.retryScheduled = false
+    })
+  }
+
+  #retryRateLimitedEvent (map, id, reason) {
+    const pending = map.get(id)
+    if (!pending || !reason?.message?.startsWith('rate-limited:')) return false
+    const retryAt = retryAtFrom(reason)
+    if (!retryAt || pending.rateLimitAttempts >= pending.rateLimitRetries ||
+        pending.retrySignal?.aborted || (pending.deadlineAt !== null && retryAt >= pending.deadlineAt)) return false
+    pending.rateLimitAttempts++
+    pending.lastRateLimitError = reason
+    pending.retryScheduled = true
+    debugRateLimitRetry({
+      relay: this.url,
+      operation: pending.type,
+      retryAttempt: pending.rateLimitAttempts,
+      maxRetries: pending.rateLimitRetries,
+      retryAt
+    })
+    this.#dispatchEventAttempt(pending.type, pending.event, map, pending)
+    return true
+  }
+
+  #sendEventOperation (type, event, map, timeoutCode, signal, {
+    useBulkPacing = false,
+    rateLimitRetries = 0,
+    retrySignal,
+    deadlineAt = null
+  } = {}) {
     if (signal?.aborted) return Promise.reject(signal.reason)
     let pending = map.get(event.id)
     const created = !pending
     if (created) {
       const timer = maybeUnref(setTimeout(() => this.#settleEvent(map, event.id, relayTimeoutError(timeoutCode, this.#lastTransportError)), this.publishTimeout))
-      pending = { timer, waiters: new Set(), cancelSend: null, event, type, timeoutCode, useBulkPacing, onSettled: null }
+      pending = {
+        timer,
+        waiters: new Set(),
+        cancelSend: null,
+        event,
+        type,
+        timeoutCode,
+        useBulkPacing,
+        onSettled: null,
+        rateLimitRetries,
+        rateLimitAttempts: 0,
+        lastRateLimitError: null,
+        retrySignal,
+        deadlineAt,
+        retryScheduled: false,
+        retryAbort: null
+      }
       map.set(event.id, pending)
     }
     const deferred = Promise.withResolvers()
@@ -331,6 +464,7 @@ export class RelayConnection {
       if (!pending.waiters.size && map.get(event.id) === pending) {
         map.delete(event.id)
         pending.cancelSend?.()
+        pending.retrySignal?.removeEventListener('abort', pending.retryAbort)
         clearTimeout(pending.timer)
         if (this.#bulkActive === pending) {
           this.#bulkActive = null
@@ -345,12 +479,22 @@ export class RelayConnection {
     signal?.addEventListener('abort', onAbort, { once: true })
     if (created && useBulkPacing && type === 'EVENT') {
       pending.cancelSend = () => this.#removeBulkPublish(pending)
+      if (retrySignal) {
+        pending.retryAbort = () => {
+          if (pending.retryScheduled) this.#settleEvent(map, event.id, pending.lastRateLimitError)
+        }
+        retrySignal.addEventListener('abort', pending.retryAbort, { once: true })
+      }
       this.#bulkQueue.push(pending)
       this.#pumpBulkPublishes()
     } else if (created) {
-      pending.cancelSend = this.#dispatchWork(type, () => {
-        this.send(JSON.stringify([type, event]))
-      }, error => this.#settleEvent(map, event.id, error))
+      if (retrySignal) {
+        pending.retryAbort = () => {
+          if (pending.retryScheduled) this.#settleEvent(map, event.id, pending.lastRateLimitError)
+        }
+        retrySignal.addEventListener('abort', pending.retryAbort, { once: true })
+      }
+      this.#dispatchEventAttempt(type, event, map, pending)
     }
     return deferred.promise
   }
@@ -374,6 +518,7 @@ export class RelayConnection {
     if (!pending) return
     map.delete(id)
     pending.cancelSend?.()
+    pending.retrySignal?.removeEventListener('abort', pending.retryAbort)
     clearTimeout(pending.timer)
     pending.onSettled?.(!reason, reason)
     for (const waiter of pending.waiters) {
@@ -388,6 +533,7 @@ export class RelayConnection {
     const pending = this.#counts.get(id)
     if (!pending) return
     this.#counts.delete(id)
+    if (!reason) this.#recordSuccess('COUNT')
     pending.cancelSend?.()
     pending.signal?.removeEventListener('abort', pending.onAbort)
     if (reason) pending.reject(errorFrom(reason, 'COUNT_REJECTED'))
@@ -411,7 +557,11 @@ export class RelayConnection {
       return
     }
     if (data[0] === 'EOSE') {
-      this.#subscriptions.get(data[1])?.handlers.oneose?.()
+      const subscription = this.#subscriptions.get(data[1])
+      if (subscription) {
+        this.#recordSuccess('REQ')
+        subscription.handlers.oneose?.()
+      }
       return
     }
     if (data[0] === 'CLOSED') {
@@ -429,7 +579,9 @@ export class RelayConnection {
     if (data[0] === 'OK') {
       for (const [type, pending] of [['EVENT', this.#publishes], ['AUTH', this.#authentications]]) {
         if (!pending.has(data[1])) continue
+        if (data[2] === true) this.#recordSuccess(type)
         const reason = data[2] === true ? null : this.#rejection(type, data[3], data[4], 'EVENT_REJECTED')
+        if (reason && this.#retryRateLimitedEvent(pending, data[1], reason)) continue
         this.#settleEvent(pending, data[1], reason, data[3])
       }
       return

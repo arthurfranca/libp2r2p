@@ -365,8 +365,21 @@ NIP-46 against the real pool with controlled transport and injected controls.
   snapshot and `setOptions(partial)` performs validated, allowlisted partial
   updates. Lowering the cap clamps existing rate-limit deadlines; increasing it
   affects future responses. Preserve bounded retryAfterMs/retryAt through
-  subscription diagnostics. Existing operation deadlines remain authoritative;
-  do not silently republish failures.
+  subscription diagnostics. One-shot `sendEvent`, `getEvents`,
+  `getEventsGenerator` and `countEvents` automatically retry correlated
+  rate-limited relay attempts. `rateLimitRetries` defaults to one and may be
+  overridden per call; zero preserves the pre-retry behavior. Count the budget
+  per relay and message type, with AUTH independent from the EVENT that requested
+  it. Relay advice replaces local exponential backoff; without advice, retries
+  back off from 1 to 30 seconds and reset after same-type success. A success
+  resets only the local backoff; never clear an unexpired relay retryAt supplied
+  by a concurrent response. Never extend the operation deadline. A first
+  publication ACK aborts only scheduled retries;
+  an in-flight attempt may finish. Bulk retries retain the active queue position.
+  Expose only one terminal result per relay to callbacks, generators and
+  aggregates. Intermediate attempts may use structured debug output containing
+  only relay URL, operation, retry attempt/count and numeric deadlines, never
+  payloads, filters, event IDs or native reason text.
 - Reply packers cap UTF-8 JSONL at 128 KiB and 100 records, except one indivisible
   oversized record. They enable `useBulkPacing` by default. Stream outgoing
   fragments from prepared rows without a second Web Storage copy. Cleanup partial
@@ -377,6 +390,10 @@ NIP-46 against the real pool with controlled transport and injected controls.
   relay-provided retryAt overrides that local backoff. Interactive publications
   bypass the bulk queue but still respect retryAt. Never place the flag on the
   event or persistence format.
+- Live/feed generators retain their specialized reconnect and gap-recovery
+  loops. Internal one-shot readers spawned by feed and reconnect recovery pass
+  `rateLimitRetries: 0`; do not layer the generic retry budget onto live
+  recovery or subscription overflow handling.
 
 - Private-channel subscriptions expose a non-rejecting `done` result; private-message
   retires only the matching generation. Overflow retries await every affected
