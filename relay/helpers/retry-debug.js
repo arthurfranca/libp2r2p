@@ -5,7 +5,9 @@ export function debugRateLimitRetry ({
   operation,
   retryAttempt,
   maxRetries,
-  retryAt
+  retryAt,
+  effectiveWaitMs,
+  maxWaitMs
 }) {
   try {
     console.debug('relay rate-limit retry', {
@@ -14,7 +16,9 @@ export function debugRateLimitRetry ({
       retryAttempt,
       maxRetries,
       retryAt,
-      delayMs: Math.max(0, retryAt - Date.now())
+      delayMs: Math.max(0, retryAt - Date.now()),
+      effectiveWaitMs,
+      maxWaitMs
     })
   } catch {}
 }

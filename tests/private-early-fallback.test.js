@@ -33,9 +33,10 @@ function clock () {
 function fixture ({ attemptStartedAt, delay = 3000, read = primaries, fallbacks = [fallback], outcomes = {}, online = true, primaryRelays, primaryRelayToReceivers, peers = [peer], relaysByPubkey } = {}) {
   const time = clock(); const calls = []; const exclusions = new Map(); const controller = new AbortController(); const pause = new AbortController()
   const state = { online, current: true, probes: 0 }
-  const sendEvent = async (value, relays, { signal } = {}) => {
+  const sendEvent = async (value, relays, options = {}) => {
+    const { signal } = options
     assert.equal(value, event)
-    calls.push({ at: time.now(), relays: [...relays], event: value })
+    calls.push({ at: time.now(), relays: [...relays], event: value, rateLimitRetries: options.rateLimitRetries })
     const early = Promise.withResolvers(); const full = Promise.withResolvers(); const results = new Map(); const tasks = []
     const finish = () => {
       if (results.size !== relays.length) return
@@ -83,6 +84,7 @@ test('ten silent primaries yield to fallback at three seconds, keeping deadlines
   assert.deepEqual(f.calls.map(call => call.at), [0, 3000])
   assert.deepEqual(f.calls[1].relays, [fallback])
   assert.ok(f.calls.every(call => JSON.stringify(call.event) === JSON.stringify(event)))
+  assert.ok(f.calls.every(call => call.rateLimitRetries === 0))
   assert.equal(f.exclusions.size, 0, 'waiting three seconds is not a failure')
   await f.time.advance(26999)
   assert.equal((await result.promise).errors.length, 2)
@@ -186,6 +188,7 @@ test('explicit routes and default null retain sequential primary exhaustion', as
     assert.equal(f.calls[1].at, 30000)
     await f.time.advance(1)
     assert.equal((await work).success, true)
+    assert.ok(f.calls.every(call => call.rateLimitRetries === 0))
   }
 })
 

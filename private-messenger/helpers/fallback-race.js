@@ -66,7 +66,13 @@ export function publishWithEarlyFallback ({ event, receivers, first, mirrors, tr
     const slot = Promise.withResolvers()
     summaries.push(slot.promise)
     let result
-    try { result = await sendEvent(event, relays, { signal: transportSignal, getRetryEvent }) } catch (reason) {
+    try {
+      result = await sendEvent(event, relays, {
+        signal: transportSignal,
+        getRetryEvent,
+        rateLimitRetries: 0
+      })
+    } catch (reason) {
       if (reason?.code === 'RETRY_EVENT_PREPARATION_FAILED') {
         fail(reason)
         return

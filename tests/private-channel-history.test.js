@@ -18,6 +18,17 @@ const reader = (events, requests = []) => async (filter, relays, options) => {
 const run = options => readHistory({ filter: { kinds: [3560], since: 0, until: 100 }, relays: [relay], processEvent: async () => {}, ...options })
 const tick = () => new Promise(resolve => setImmediate(resolve))
 
+test('history delegates rate-limit retries to its bounded recovery loop', async () => {
+  let options
+  await run({
+    getEvents: async (_filter, [url], next) => {
+      options = next
+      return { result: [], errors: [], relays: [{ relay: url, status: 'eose' }] }
+    }
+  })
+  assert.equal(options.rateLimitRetries, 0)
+})
+
 test('bounded history subdivides saturated intervals and processes each leaf before reading again', async () => {
   const events = Array.from({ length: 65 }, (_, index) => event(index))
   const processed = []

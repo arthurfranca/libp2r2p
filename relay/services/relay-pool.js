@@ -19,6 +19,7 @@ const COUNT_TIMEOUT_AFTER_FIRST_COUNT_MS = 500
 const SEND_TIMEOUT_MS = 30000
 const LIVE_OVERLAP_SECONDS = 600
 const LIVE_PROGRESS_INTERVAL_MS = 60000
+const DEFAULT_MAX_RATE_LIMIT_RETRY_WAIT_MS = 1500
 
 // Returns a function that should be called for each received event (valid or invalid).
 // Calls onSatisfied() and stops counting once the filter is fully satisfied per relay:
@@ -113,6 +114,36 @@ function validateRateLimitRetries (value) {
   return value
 }
 
+function validateMaxRateLimitRetryWaitMs (value) {
+  if (value !== null && (!Number.isSafeInteger(value) || value < 0)) {
+    throw new ValidationError('INVALID_MAX_RATE_LIMIT_RETRY_WAIT_MS')
+  }
+  return value
+}
+
+function effectiveRetryAt (value) {
+  const pending = [value]
+  const seen = new Set()
+  let retryAt = 0
+  while (pending.length) {
+    const current = pending.pop()
+    if (!current || typeof current !== 'object' || seen.has(current)) continue
+    seen.add(current)
+    for (const key of ['retryAt', 'effectiveRetryAt']) {
+      if (Number.isSafeInteger(current[key])) retryAt = Math.max(retryAt, current[key])
+    }
+    for (const key of ['cause', 'reason', 'error']) pending.push(current[key])
+    for (const key of ['errors', 'reports', 'relays']) {
+      if (Array.isArray(current[key])) pending.push(...current[key])
+    }
+  }
+  return retryAt
+}
+
+function retryWaitAllowed (retryAt, maxWaitMs, now = Date.now()) {
+  return maxWaitMs === null || Math.max(0, retryAt - now) <= maxWaitMs
+}
+
 function assertReadOptions (filter, timeouts) {
   if (!filter || typeof filter !== 'object' || Array.isArray(filter)) throw new ValidationError('INVALID_FILTER')
   for (const value of Object.values(timeouts)) {
@@ -167,10 +198,20 @@ export class RelayPool {
   #readRetry
   #options
 
-  constructor ({ _createRelay, _isOnline, _onOnline, WebSocket: WebSocketImpl, rateLimitCapMs = DEFAULT_RATE_LIMIT_CAP_MS, rateLimitRetries = 1, ...capacity } = {}) {
+  constructor ({
+    _createRelay,
+    _isOnline,
+    _onOnline,
+    WebSocket: WebSocketImpl,
+    rateLimitCapMs = DEFAULT_RATE_LIMIT_CAP_MS,
+    rateLimitRetries = 1,
+    maxRateLimitRetryWaitMs = DEFAULT_MAX_RATE_LIMIT_RETRY_WAIT_MS,
+    ...capacity
+  } = {}) {
     this.#options = {
       rateLimitCapMs: validateRateLimitCapMs(rateLimitCapMs),
-      rateLimitRetries: validateRateLimitRetries(rateLimitRetries)
+      rateLimitRetries: validateRateLimitRetries(rateLimitRetries),
+      maxRateLimitRetryWaitMs: validateMaxRateLimitRetryWaitMs(maxRateLimitRetryWaitMs)
     }
     this.#WebSocket = WebSocketImpl
     this.#createRelay = _createRelay ?? (url => new RelayConnection(url, {
@@ -187,11 +228,14 @@ export class RelayPool {
 
   setOptions (partial = {}) {
     if (!partial || typeof partial !== 'object' || Array.isArray(partial)) throw new ValidationError('INVALID_RELAY_POOL_OPTIONS')
-    const unknown = Object.keys(partial).find(key => !['rateLimitCapMs', 'rateLimitRetries'].includes(key))
+    const unknown = Object.keys(partial).find(key => !['rateLimitCapMs', 'rateLimitRetries', 'maxRateLimitRetryWaitMs'].includes(key))
     if (unknown) throw new ValidationError('UNKNOWN_RELAY_POOL_OPTION')
     const next = { ...this.#options }
     if (Object.hasOwn(partial, 'rateLimitCapMs')) next.rateLimitCapMs = validateRateLimitCapMs(partial.rateLimitCapMs)
     if (Object.hasOwn(partial, 'rateLimitRetries')) next.rateLimitRetries = validateRateLimitRetries(partial.rateLimitRetries)
+    if (Object.hasOwn(partial, 'maxRateLimitRetryWaitMs')) {
+      next.maxRateLimitRetryWaitMs = validateMaxRateLimitRetryWaitMs(partial.maxRateLimitRetryWaitMs)
+    }
     this.#options = next
     for (const relay of this.#relays.values()) relay.setRateLimitCapMs?.(next.rateLimitCapMs)
     return this.getOptions()
@@ -199,6 +243,12 @@ export class RelayPool {
 
   #retryCount (value) {
     return validateRateLimitRetries(value === undefined ? this.#options.rateLimitRetries : value)
+  }
+
+  #maxRetryWait (value) {
+    return validateMaxRateLimitRetryWaitMs(
+      value === undefined ? this.#options.maxRateLimitRetryWaitMs : value
+    )
   }
 
   // Injects the WebSocket implementation used by new pooled connections (e.g.
@@ -293,24 +343,45 @@ export class RelayPool {
   async #publishEvent (relay, event, getAuthEvent, signal, {
     useBulkPacing,
     rateLimitRetries,
+    maxRateLimitRetryWaitMs,
     retrySignal,
     deadlineAt
   }) {
     try {
-      await relay.publish(event, { signal, useBulkPacing, rateLimitRetries, retrySignal, deadlineAt })
+      await relay.publish(event, {
+        signal,
+        useBulkPacing,
+        rateLimitRetries,
+        maxRateLimitRetryWaitMs,
+        retrySignal,
+        deadlineAt
+      })
       return 'published'
     } catch (error) {
       const reason = error instanceof Error ? error : new Error(String(error))
       if (!getAuthEvent || !requiresNip42Auth(reason)) throw reason
 
       try {
-        await relay.authenticate(getAuthEvent, { signal, rateLimitRetries, retrySignal, deadlineAt })
+        await relay.authenticate(getAuthEvent, {
+          signal,
+          rateLimitRetries,
+          maxRateLimitRetryWaitMs,
+          retrySignal,
+          deadlineAt
+        })
       } catch (error) {
         const authReason = error instanceof Error ? error : new Error(String(error))
         if (retrySignal?.aborted && authReason.message?.startsWith('rate-limited:')) throw authReason
         throw new Nip42AuthenticationError(authReason)
       }
-      await relay.publish(event, { signal, useBulkPacing, rateLimitRetries, retrySignal, deadlineAt })
+      await relay.publish(event, {
+        signal,
+        useBulkPacing,
+        rateLimitRetries,
+        maxRateLimitRetryWaitMs,
+        retrySignal,
+        deadlineAt
+      })
       return 'published'
     }
   }
@@ -322,13 +393,15 @@ export class RelayPool {
     timeout = COUNT_TIMEOUT_MS,
     timeoutAfterFirstCount = COUNT_TIMEOUT_AFTER_FIRST_COUNT_MS,
     signal,
-    rateLimitRetries
+    rateLimitRetries,
+    maxRateLimitRetryWaitMs
   } = {}) {
     if (!filter || typeof filter !== 'object' || Array.isArray(filter)) {
       throw new ValidationError('COUNT_FILTER_REQUIRED')
     }
     if (signal?.aborted) throw new Error('Aborted')
     const retries = this.#retryCount(rateLimitRetries)
+    const maxRetryWait = this.#maxRetryWait(maxRateLimitRetryWaitMs)
 
     const urls = normalizedRelayUrls(relays)
     if (!urls.length) {
@@ -425,9 +498,10 @@ export class RelayPool {
       const handleError = (relay, error) => {
         const reason = error instanceof Error ? error : new Error(String(error))
         if (isResolved || !pending.has(relay)) return
-        const retryAt = Number.isSafeInteger(reason.retryAt) ? reason.retryAt : 0
+        const retryAt = effectiveRetryAt(reason)
         if (reason.message?.startsWith('rate-limited:') && retryAt &&
-            retryCounts.get(relay) < retries && (deadline === null || retryAt < deadline)) {
+            retryCounts.get(relay) < retries && (deadline === null || retryAt < deadline) &&
+            retryWaitAllowed(retryAt, maxRetryWait)) {
           retryCounts.set(relay, retryCounts.get(relay) + 1)
           retryErrors.set(relay, reason)
           debugRateLimitRetry({
@@ -435,7 +509,9 @@ export class RelayPool {
             operation: 'COUNT',
             retryAttempt: retryCounts.get(relay),
             maxRetries: retries,
-            retryAt
+            retryAt,
+            effectiveWaitMs: Math.max(0, retryAt - Date.now()),
+            maxWaitMs: maxRetryWait
           })
           const controller = new AbortController()
           const combined = AbortSignal.any([countController.signal, controller.signal])
@@ -491,12 +567,14 @@ export class RelayPool {
     deduplicateAcrossRelays = true,
     queueTimeout = 30000,
     rateLimitRetries,
+    maxRateLimitRetryWaitMs,
     _admissions
   } = {}) {
     assertReadOptions(filter, { timeout, timeoutAfterFirstEose, queueTimeout })
     if (typeof deduplicateAcrossRelays !== 'boolean') throw new ValidationError('INVALID_DEDUPLICATE_ACROSS_RELAYS')
     if (signal?.aborted) throw new Error('Aborted')
     const retries = this.#retryCount(rateLimitRetries)
+    const maxRetryWait = this.#maxRetryWait(maxRateLimitRetryWaitMs)
     const urls = normalizedRelayUrls(relays)
     const subscriptions = new Map()
     const retryControllers = new Map()
@@ -580,15 +658,18 @@ export class RelayPool {
       const scheduleRetry = (url, error) => {
         if (isResolved || outcomes.has(url) || retryControllers.has(url) ||
             retryCounts.get(url) >= retries || !error?.message?.startsWith('rate-limited:')) return false
-        const retryAt = Number.isSafeInteger(error.retryAt) ? error.retryAt : 0
-        if (!retryAt || (deadlines.has(url) && retryAt >= deadlines.get(url))) return false
+        const retryAt = effectiveRetryAt(error)
+        if (!retryAt || (deadlines.has(url) && retryAt >= deadlines.get(url)) ||
+            !retryWaitAllowed(retryAt, maxRetryWait)) return false
         retryCounts.set(url, retryCounts.get(url) + 1)
         debugRateLimitRetry({
           relay: url,
           operation: 'REQ',
           retryAttempt: retryCounts.get(url),
           maxRetries: retries,
-          retryAt
+          retryAt,
+          effectiveWaitMs: Math.max(0, retryAt - Date.now()),
+          maxWaitMs: maxRetryWait
         })
         const controller = new AbortController()
         const combined = AbortSignal.any([admissionSignal, controller.signal])
@@ -1392,12 +1473,14 @@ export class RelayPool {
     onRelayResult,
     signal,
     useBulkPacing = false,
-    rateLimitRetries
+    rateLimitRetries,
+    maxRateLimitRetryWaitMs
   } = {}) {
     if (signal != null && (typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) throw new ValidationError('INVALID_RELAY_SIGNAL')
     if (getRetryEvent != null && typeof getRetryEvent !== 'function') throw new ValidationError('INVALID_RETRY_EVENT_CALLBACK')
     if (typeof useBulkPacing !== 'boolean') throw new ValidationError('INVALID_USE_BULK_PACING')
     const retries = this.#retryCount(rateLimitRetries)
+    const maxRetryWait = this.#maxRetryWait(maxRateLimitRetryWaitMs)
     const urls = normalizedRelayUrls(relays)
     if (!urls.length) {
       const promise = Promise.resolve(publishSummary([], urls, {
@@ -1456,6 +1539,7 @@ export class RelayPool {
             return await this.#publishEvent(relay, eventForAttempt, getAuthEvent, operationSignal, {
               useBulkPacing,
               rateLimitRetries: retries,
+              maxRateLimitRetryWaitMs: maxRetryWait,
               retrySignal: retryControllers[index].signal,
               deadlineAt: deadline
             })

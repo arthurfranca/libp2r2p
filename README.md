@@ -1122,8 +1122,14 @@ applies to `sendEvent`, `getEvents`, `getEventsGenerator` and `countEvents`, and
 each method accepts a per-call override. The budget is independent for each relay
 and message type; an AUTH retry does not consume the EVENT publication budget.
 `rateLimitRetries: 0` preserves the previous behavior. Relay advice replaces the
-local exponential backoff; without advice, retries use 1, 2, 4... up to 30
-seconds and reset after success. Success resets only the local backoff; an
+local exponential backoff; without advice, retries use 1, 1.5, 2, 4, 8, 16 and
+30 seconds and reset after success.
+
+`maxRateLimitRetryWaitMs` defaults to 1500 and may be overridden per call or set
+to `null`. Before an automatic retry, the pool computes the effective remaining
+wait from relay advice and any active cooldown for the same relay/message type.
+Waits above the gate return the original bounded rate-limit error immediately.
+Success resets only the local backoff; an
 unexpired `retryAt` from a concurrent relay response remains authoritative.
 An existing operation deadline is never extended, so a retry whose next deadline
 would expire at or after the operation deadline returns the original bounded
@@ -1134,9 +1140,14 @@ on other relays; attempts already in flight may finish. Bulk retries retain the
 active queue position and do not allow later work to overtake them. Intermediate
 attempts do not reach callbacks, generators or aggregate reports. They may emit
 the sanitized `relay rate-limit retry` debug record with only relay URL,
-operation, attempt/count and numeric deadlines. Live and feed recovery keep
+operation, attempt/count, numeric deadlines and the wait gate. Live and feed recovery keep
 their specialized reconnect behavior; their internal one-shot gap reads disable
 the generic retry budget.
+
+Paged private-channel history and private-message fallback pass
+`rateLimitRetries: 0`; their range recovery and routing layers own rate-limit
+retry and fallback timing. Ephemeral one-shots without such recovery retain the
+guarded default.
 
 Publication calls for the same event and relay share a physical job only when
 their pacing is compatible. Calls with the same pacing share one send. An

@@ -9,6 +9,7 @@ const DEFAULT_CONNECT_TIMEOUT = 3000
 const DEFAULT_OPERATION_TIMEOUT = 30000
 const BULK_PACING_MS = 1000
 const RATE_LIMIT_BACKOFF_MAX_MS = 30000
+const DEFAULT_MAX_RATE_LIMIT_RETRY_WAIT_MS = 1500
 const OPERATION_TYPES = ['EVENT', 'AUTH', 'REQ', 'COUNT']
 
 function errorFrom (reason, fallback) {
@@ -30,6 +31,16 @@ function retryAtFrom (value) {
     }
   }
   return retryAt
+}
+
+function nextRateLimitBackoff (delay) {
+  if (delay === BULK_PACING_MS) return 1500
+  if (delay === 1500) return 2000
+  return Math.min(RATE_LIMIT_BACKOFF_MAX_MS, delay * 2)
+}
+
+function retryWaitAllowed (retryAt, maxWaitMs, now = Date.now()) {
+  return maxWaitMs === null || Math.max(0, retryAt - now) <= maxWaitMs
 }
 
 function waitForRetry (deadline, signal, retrySignal) {
@@ -97,10 +108,12 @@ export class RelayConnection {
   #bulkNextAt = 0
   #rateLimitBackoffMs = new Map(OPERATION_TYPES.map(type => [type, BULK_PACING_MS]))
   #getRateLimitCapMs
+  #defaultMaxRateLimitRetryWaitMs
 
   constructor (url, {
     WebSocket: WebSocketImpl = globalThis.WebSocket,
-    rateLimitCapMs = () => DEFAULT_RATE_LIMIT_CAP_MS
+    rateLimitCapMs = () => DEFAULT_RATE_LIMIT_CAP_MS,
+    maxRateLimitRetryWaitMs = DEFAULT_MAX_RATE_LIMIT_RETRY_WAIT_MS
   } = {}) {
     this.url = url
     this.#WebSocket = WebSocketImpl
@@ -110,6 +123,11 @@ export class RelayConnection {
     this.#getRateLimitCapMs = typeof rateLimitCapMs === 'function'
       ? rateLimitCapMs
       : () => rateLimitCapMs
+    if (maxRateLimitRetryWaitMs !== null &&
+        (!Number.isSafeInteger(maxRateLimitRetryWaitMs) || maxRateLimitRetryWaitMs < 0)) {
+      throw new ValidationError('INVALID_MAX_RATE_LIMIT_RETRY_WAIT_MS')
+    }
+    this.#defaultMaxRateLimitRetryWaitMs = maxRateLimitRetryWaitMs
     this.ws = null
     this.publishTimeout = DEFAULT_OPERATION_TIMEOUT
     this.onnotice = null
@@ -234,8 +252,13 @@ export class RelayConnection {
         error.retryAfterMs = delay
       }
       const delay = this.#rateLimitBackoffMs.get(type) ?? BULK_PACING_MS
-      this.#rateLimitBackoffMs.set(type, Math.min(RATE_LIMIT_BACKOFF_MAX_MS, delay * 2))
+      this.#rateLimitBackoffMs.set(type, nextRateLimitBackoff(delay))
       this.#retryAtByType.set(type, Math.max(this.#retryAtByType.get(type) ?? 0, error.retryAt))
+      Object.defineProperty(error, 'effectiveRetryAt', {
+        value: Math.max(error.retryAt, this.#retryAtByType.get(type) ?? 0),
+        enumerable: false,
+        configurable: true
+      })
     }
     return error
   }
@@ -275,15 +298,21 @@ export class RelayConnection {
     signal,
     useBulkPacing = false,
     rateLimitRetries = 0,
+    maxRateLimitRetryWaitMs = this.#defaultMaxRateLimitRetryWaitMs,
     retrySignal,
     deadlineAt = null
   } = {}) {
     if (!isValidEvent(event)) return Promise.reject(new Error('INVALID_EVENT'))
     if (typeof useBulkPacing !== 'boolean') return Promise.reject(new ValidationError('INVALID_USE_BULK_PACING'))
     if (!Number.isSafeInteger(rateLimitRetries) || rateLimitRetries < 0) return Promise.reject(new ValidationError('INVALID_RATE_LIMIT_RETRIES'))
+    if (maxRateLimitRetryWaitMs !== null &&
+        (!Number.isSafeInteger(maxRateLimitRetryWaitMs) || maxRateLimitRetryWaitMs < 0)) {
+      return Promise.reject(new ValidationError('INVALID_MAX_RATE_LIMIT_RETRY_WAIT_MS'))
+    }
     return this.#sendEventOperation('EVENT', event, this.#publishes, 'PUBLISH_TIMEOUT', signal, {
       useBulkPacing,
       rateLimitRetries,
+      maxRateLimitRetryWaitMs,
       retrySignal,
       deadlineAt
     })
@@ -292,11 +321,16 @@ export class RelayConnection {
   async authenticate (getAuthEvent, {
     signal,
     rateLimitRetries = 0,
+    maxRateLimitRetryWaitMs = this.#defaultMaxRateLimitRetryWaitMs,
     deadlineAt = null,
     retrySignal
   } = {}) {
     if (!this.#challenge) throw new Error('AUTH_CHALLENGE_MISSING')
     if (!Number.isSafeInteger(rateLimitRetries) || rateLimitRetries < 0) throw new ValidationError('INVALID_RATE_LIMIT_RETRIES')
+    if (maxRateLimitRetryWaitMs !== null &&
+        (!Number.isSafeInteger(maxRateLimitRetryWaitMs) || maxRateLimitRetryWaitMs < 0)) {
+      throw new ValidationError('INVALID_MAX_RATE_LIMIT_RETRY_WAIT_MS')
+    }
     let lastRateLimitError = null
     for (let attempt = 0; ; attempt++) {
       if (signal?.aborted) throw signal.reason
@@ -309,14 +343,20 @@ export class RelayConnection {
         return await this.#sendEventOperation('AUTH', event, this.#authentications, 'AUTH_TIMEOUT', signal, { deadlineAt })
       } catch (error) {
         if (!error?.message?.startsWith('rate-limited:') || attempt >= rateLimitRetries) throw error
-        const retryAt = retryAtFrom(error)
+        const retryAt = Math.max(
+          retryAtFrom(error),
+          this.#retryAtByType.get('AUTH') ?? 0
+        )
         if (!retryAt || (deadlineAt !== null && retryAt >= deadlineAt)) throw error
+        if (!retryWaitAllowed(retryAt, maxRateLimitRetryWaitMs)) throw error
         debugRateLimitRetry({
           relay: this.url,
           operation: 'AUTH',
           retryAttempt: attempt + 1,
           maxRetries: rateLimitRetries,
-          retryAt
+          retryAt,
+          effectiveWaitMs: Math.max(0, retryAt - Date.now()),
+          maxWaitMs: maxRateLimitRetryWaitMs
         })
         lastRateLimitError = error
         try {
@@ -434,6 +474,7 @@ export class RelayConnection {
 
   #canRetryAfterLimit (waiter, retryAt) {
     return waiter.observedRateLimitFailures <= waiter.rateLimitRetries &&
+      retryWaitAllowed(retryAt, waiter.maxRateLimitRetryWaitMs) &&
       this.#canShareScheduledRetry(waiter, retryAt)
   }
 
@@ -464,7 +505,8 @@ export class RelayConnection {
     signal,
     retrySignal,
     deadlineAt,
-    rateLimitRetries
+    rateLimitRetries,
+    maxRateLimitRetryWaitMs
   }) {
     const deferred = Promise.withResolvers()
     const waiter = {
@@ -473,6 +515,7 @@ export class RelayConnection {
       retrySignal,
       deadlineAt,
       rateLimitRetries,
+      maxRateLimitRetryWaitMs,
       observedRateLimitFailures: 0,
       timer: null,
       onAbort: null,
@@ -573,12 +616,15 @@ export class RelayConnection {
     job.retryAt = retryAt
     job.retryScheduled = true
     job.retryAttempts++
+    const waitLimits = [...job.waiters].map(waiter => waiter.maxRateLimitRetryWaitMs)
     debugRateLimitRetry({
       relay: this.url,
       operation: job.type,
       retryAttempt: job.retryAttempts,
       maxRetries: Math.max(...[...job.waiters].map(waiter => waiter.rateLimitRetries)),
-      retryAt
+      retryAt,
+      effectiveWaitMs: Math.max(0, retryAt - Date.now()),
+      maxWaitMs: waitLimits.includes(null) ? null : Math.max(...waitLimits)
     })
     this.#dispatchEventAttempt(job)
   }
@@ -586,6 +632,7 @@ export class RelayConnection {
   #sendEventOperation (type, event, map, timeoutCode, signal, {
     useBulkPacing = false,
     rateLimitRetries = 0,
+    maxRateLimitRetryWaitMs = this.#defaultMaxRateLimitRetryWaitMs,
     retrySignal,
     deadlineAt = null
   } = {}) {
@@ -616,7 +663,8 @@ export class RelayConnection {
       signal,
       retrySignal,
       deadlineAt,
-      rateLimitRetries
+      rateLimitRetries,
+      maxRateLimitRetryWaitMs
     })
     if (!created || !this.#hasJob(job)) return promise
     if (job.pacing === 'bulk') {

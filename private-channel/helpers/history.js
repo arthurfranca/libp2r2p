@@ -65,7 +65,10 @@ export async function readHistory ({ filter, relays, receiverPubkey, signal, get
           releasePage = await acquirePage?.(signal)
           signal?.throwIfAborted()
           page = await getEvents({ ...filter, ...interval }, [relay], {
-            signal, timeout: TIMEOUT_MS, timeoutAfterFirstEose: null,
+            signal,
+            timeout: TIMEOUT_MS,
+            timeoutAfterFirstEose: null,
+            rateLimitRetries: 0,
             callback: item => {
               if (item.type !== 'event') return
               bytes += encoder.encode(JSON.stringify(item.event)).byteLength

@@ -371,15 +371,18 @@ NIP-46 against the real pool with controlled transport and injected controls.
   overridden per call; zero preserves the pre-retry behavior. Count the budget
   per relay and message type, with AUTH independent from the EVENT that requested
   it. Relay advice replaces local exponential backoff; without advice, retries
-  back off from 1 to 30 seconds and reset after same-type success. A success
+  back off through 1, 1.5, 2, 4, 8, 16 and 30 seconds and reset after same-type
+  success. `maxRateLimitRetryWaitMs` defaults to 1500 and gates all automatic
+  retries using the effective remaining wait, including concurrent per-type
+  relay cooldowns; `null` disables that gate. A success
   resets only the local backoff; never clear an unexpired relay retryAt supplied
   by a concurrent response. Never extend the operation deadline. A first
   publication ACK aborts only scheduled retries;
   an in-flight attempt may finish. Bulk retries retain the active queue position.
   Expose only one terminal result per relay to callbacks, generators and
   aggregates. Intermediate attempts may use structured debug output containing
-  only relay URL, operation, retry attempt/count and numeric deadlines, never
-  payloads, filters, event IDs or native reason text.
+  only relay URL, operation, retry attempt/count, numeric deadlines and wait-gate
+  values, never payloads, filters, event IDs or native reason text.
 - RelayConnection keeps physical publication jobs separate from waiters. Jobs
   coalesce by event ID and pacing; each waiter retains its own cancellation,
   timeout, deadline, retry budget and retry signal. Same-pacing calls share one
@@ -408,6 +411,9 @@ NIP-46 against the real pool with controlled transport and injected controls.
   loops. Internal one-shot readers spawned by feed and reconnect recovery pass
   `rateLimitRetries: 0`; do not layer the generic retry budget onto live
   recovery or subscription overflow handling.
+- Private-channel paged history and private-message fallback ownership pass
+  `rateLimitRetries: 0`: their range recovery and relay routing own the
+  rate-limit decision. Ephemeral one-shots retain the guarded default.
 
 - Private-channel subscriptions expose a non-rejecting `done` result; private-message
   retires only the matching generation. Overflow retries await every affected

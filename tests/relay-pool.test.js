@@ -208,23 +208,34 @@ function hll (entries = {}) {
 
 test('relay exports one shared RelayPool singleton', () => {
   assert.ok(relayPool instanceof RelayPool)
-  assert.deepEqual(relayPool.getOptions(), { rateLimitCapMs: 300000, rateLimitRetries: 1 })
+  assert.deepEqual(relayPool.getOptions(), {
+    rateLimitCapMs: 300000,
+    rateLimitRetries: 1,
+    maxRateLimitRetryWaitMs: 1500
+  })
 })
 
 test('RelayPool exposes atomic runtime options with a frozen snapshot', () => {
-  const pool = new RelayPool({ _createRelay: url => new FakeRelay(url), rateLimitCapMs: 1000, rateLimitRetries: 2 })
+  const pool = new RelayPool({
+    _createRelay: url => new FakeRelay(url),
+    rateLimitCapMs: 1000,
+    rateLimitRetries: 2,
+    maxRateLimitRetryWaitMs: 2500
+  })
   const initial = pool.getOptions()
-  assert.deepEqual(initial, { rateLimitCapMs: 1000, rateLimitRetries: 2 })
+  assert.deepEqual(initial, { rateLimitCapMs: 1000, rateLimitRetries: 2, maxRateLimitRetryWaitMs: 2500 })
   assert.equal(Object.isFrozen(initial), true)
   assert.throws(() => { initial.rateLimitCapMs = 1 }, TypeError)
-  assert.deepEqual(pool.setOptions({}), { rateLimitCapMs: 1000, rateLimitRetries: 2 })
-  assert.deepEqual(pool.setOptions({ rateLimitCapMs: 2000 }), { rateLimitCapMs: 2000, rateLimitRetries: 2 })
-  assert.deepEqual(pool.setOptions({ rateLimitRetries: 0 }), { rateLimitCapMs: 2000, rateLimitRetries: 0 })
+  assert.deepEqual(pool.setOptions({}), { rateLimitCapMs: 1000, rateLimitRetries: 2, maxRateLimitRetryWaitMs: 2500 })
+  assert.deepEqual(pool.setOptions({ rateLimitCapMs: 2000 }), { rateLimitCapMs: 2000, rateLimitRetries: 2, maxRateLimitRetryWaitMs: 2500 })
+  assert.deepEqual(pool.setOptions({ rateLimitRetries: 0 }), { rateLimitCapMs: 2000, rateLimitRetries: 0, maxRateLimitRetryWaitMs: 2500 })
+  assert.deepEqual(pool.setOptions({ maxRateLimitRetryWaitMs: null }), { rateLimitCapMs: 2000, rateLimitRetries: 0, maxRateLimitRetryWaitMs: null })
   assert.throws(() => pool.setOptions({ unknown: true }), { code: 'UNKNOWN_RELAY_POOL_OPTION' })
   assert.throws(() => pool.setOptions({ rateLimitCapMs: 0 }), { code: 'INVALID_RATE_LIMIT_CAP_MS' })
   assert.throws(() => pool.setOptions({ rateLimitCapMs: 3000, rateLimitRetries: -1 }), { code: 'INVALID_RATE_LIMIT_RETRIES' })
+  assert.throws(() => pool.setOptions({ rateLimitCapMs: 3000, maxRateLimitRetryWaitMs: -1 }), { code: 'INVALID_MAX_RATE_LIMIT_RETRY_WAIT_MS' })
   assert.throws(() => pool.setOptions({ rateLimitRetries: -1 }), { code: 'INVALID_RATE_LIMIT_RETRIES' })
-  assert.deepEqual(pool.getOptions(), { rateLimitCapMs: 2000, rateLimitRetries: 0 })
+  assert.deepEqual(pool.getOptions(), { rateLimitCapMs: 2000, rateLimitRetries: 0, maxRateLimitRetryWaitMs: null })
 })
 
 test('RelayPool rejects a non-boolean bulk pacing option', async () => {

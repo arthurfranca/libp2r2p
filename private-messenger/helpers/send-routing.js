@@ -159,7 +159,11 @@ export function createSendRelayRouting ({ peer, peers = [peer], relaysByPubkey, 
       for (const relay of relays) tried.add(normalized(relay))
       // Every relay in this batch serves the same pending recipient subset.
       // One ACK covers that subset, never unrelated members of the ciphertext.
-      result = await sendEvent(event, relays, { signal: transportSignal, getRetryEvent: context.getRetryEvent })
+      result = await sendEvent(event, relays, {
+        signal: transportSignal,
+        getRetryEvent: context.getRetryEvent,
+        rateLimitRetries: 0
+      })
       const settled = Promise.resolve(result.promise)
       summaries.push(settled)
       settled.then(report => rememberSuccess(report?.succeededRelays || [])).catch(() => {})

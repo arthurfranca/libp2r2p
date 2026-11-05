@@ -383,11 +383,11 @@ test('malformed retry metadata falls back to local backoff without using its val
     const sub = relay.subscribe([{}], { onclose: error => { rejection = error } })
     socket.receive(['CLOSED', sub.id, reason, retry])
     await tick()
-    if (reason.startsWith('rate-limited:')) assert.equal(rejection.retryAfterMs, index === 1 ? 1000 : 2000)
+    if (reason.startsWith('rate-limited:')) assert.equal(rejection.retryAfterMs, index === 1 ? 1000 : 1500)
     else assert.equal(rejection.retryAfterMs, undefined)
     const next = relay.subscribe([{}])
     if (reason.startsWith('rate-limited:')) {
-      const delay = index === 1 ? 1000 : 2000
+      const delay = index === 1 ? 1000 : 1500
       t.mock.timers.tick(delay - 1)
       assert.notEqual(socket.sent.at(-1)?.[1], next.id)
       t.mock.timers.tick(1)

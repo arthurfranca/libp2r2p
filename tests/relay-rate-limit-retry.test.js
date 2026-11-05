@@ -71,7 +71,9 @@ test('sendEvent retries one rate limit by default without exposing the intermedi
       retryAttempt: 1,
       maxRetries: 1,
       retryAt: 10200,
-      delayMs: 200
+      delayMs: 200,
+      effectiveWaitMs: 200,
+      maxWaitMs: 1500
     }
   ])
 })
@@ -129,6 +131,96 @@ test('per-call retry zero and a deadline before retryAt disable automatic retry'
   t.mock.timers.tick(200)
   await tick()
   assert.equal(tooLateSocket.sent.filter(frame => frame[0] === 'EVENT').length, 1)
+})
+
+test('retry wait gates produce an immediate final failure by default', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  FakeWebSocket.instances.length = 0
+  const pool = new RelayPool({ WebSocket: FakeWebSocket })
+  t.after(() => pool.disconnectAll())
+  const published = event()
+  const work = pool.sendEvent(published, ['wss://relay.example'], {
+    timeout: 5000,
+    onRelayResult: () => {}
+  })
+  const socket = FakeWebSocket.instances.at(-1)
+  socket.open()
+  await tick()
+  socket.receive(['OK', published.id, false, 'rate-limited: wait', '2000'])
+  const result = await work
+  const report = await result.promise
+  assert.equal(result.success, false)
+  assert.equal(report.errors[0].reason.retryAfterMs, 2000)
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 1)
+})
+
+test('per-call max wait and null can override the default gate', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  FakeWebSocket.instances.length = 0
+  const pool = new RelayPool({ WebSocket: FakeWebSocket })
+  t.after(() => pool.disconnectAll())
+
+  const raised = event()
+  const first = pool.sendEvent(raised, ['wss://raised.example'], {
+    maxRateLimitRetryWaitMs: 2500,
+    timeout: 5000
+  })
+  const firstSocket = FakeWebSocket.instances.at(-1)
+  firstSocket.open()
+  await tick()
+  firstSocket.receive(['OK', raised.id, false, 'rate-limited: wait', '2000'])
+  await tick()
+  t.mock.timers.tick(1999)
+  await tick()
+  assert.equal(firstSocket.sent.filter(frame => frame[0] === 'EVENT').length, 1)
+  t.mock.timers.tick(1)
+  await tick()
+  assert.equal(firstSocket.sent.filter(frame => frame[0] === 'EVENT').length, 2)
+  firstSocket.receive(['OK', raised.id, true, 'saved'])
+  assert.equal((await first).success, true)
+
+  const unlimited = event()
+  const second = pool.sendEvent(unlimited, ['wss://unlimited.example'], {
+    maxRateLimitRetryWaitMs: null,
+    timeout: 5000
+  })
+  const secondSocket = FakeWebSocket.instances.at(-1)
+  secondSocket.open()
+  await tick()
+  secondSocket.receive(['OK', unlimited.id, false, 'rate-limited: wait', '4000'])
+  await tick()
+  t.mock.timers.tick(4000)
+  await tick()
+  assert.equal(secondSocket.sent.filter(frame => frame[0] === 'EVENT').length, 2)
+  secondSocket.receive(['OK', unlimited.id, true, 'saved'])
+  assert.equal((await second).success, true)
+})
+
+test('the retry gate uses the maximum active cooldown, not only the latest hint', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  FakeWebSocket.instances.length = 0
+  const relay = new RelayConnection('wss://relay.example/', { WebSocket: FakeWebSocket })
+  const connecting = relay.connect()
+  const socket = FakeWebSocket.instances.at(-1)
+  socket.open()
+  await connecting
+  t.after(() => relay.close())
+
+  const firstEvent = event()
+  const secondEvent = event()
+  const first = assert.rejects(relay.publish(firstEvent), /rate-limited/)
+  const second = assert.rejects(
+    relay.publish(secondEvent, { rateLimitRetries: 1 }),
+    error => error.retryAt === 10100 && error.effectiveRetryAt === 15000
+  )
+  socket.receive(['OK', firstEvent.id, false, 'rate-limited: long', '5000'])
+  await first
+
+  const startedAt = Date.now()
+  socket.receive(['OK', secondEvent.id, false, 'rate-limited: short', '100'])
+  await second
+  assert.equal(Date.now() - startedAt, 0)
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 2)
 })
 
 test('a first ACK aborts only scheduled retries from other relays', async t => {
@@ -239,6 +331,35 @@ test('rate-limited AUTH has an independent retry and renews its signed event', a
   assert.equal(authCalls, 2)
 })
 
+test('AUTH retry wait gate fails without signing another event', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  FakeWebSocket.instances.length = 0
+  const pool = new RelayPool({ WebSocket: FakeWebSocket })
+  t.after(() => pool.disconnectAll())
+  const published = event()
+  let authCalls = 0
+  const work = pool.sendEvent(published, ['wss://relay.example'], {
+    maxRateLimitRetryWaitMs: 100,
+    timeout: 1000,
+    getAuthEvent: async () => {
+      authCalls++
+      return event(22242)
+    }
+  })
+  const socket = FakeWebSocket.instances.at(-1)
+  socket.open()
+  socket.receive(['AUTH', 'challenge'])
+  await tick()
+  socket.receive(['OK', published.id, false, 'auth-required: authenticate'])
+  await tick()
+  const firstAuth = socket.sent.find(frame => frame[0] === 'AUTH')
+  socket.receive(['OK', firstAuth[1].id, false, 'rate-limited: auth', '200'])
+  const result = await work
+  assert.equal(result.success, false)
+  assert.equal(authCalls, 1)
+  assert.equal(socket.sent.filter(frame => frame[0] === 'AUTH').length, 1)
+})
+
 test('first ACK cancels a waiting AUTH retry with its original rate-limit error', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
   FakeWebSocket.instances.length = 0
@@ -298,6 +419,41 @@ test('getEvents retries a rate-limited relay without exposing the intermediate e
   assert.equal(result.success, true)
   assert.deepEqual(result.errors, [])
   assert.equal(callbacks.some(item => item.type === 'error'), false)
+})
+
+test('getEvents and countEvents honor the per-call retry wait gate', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  FakeWebSocket.instances.length = 0
+  const pool = new RelayPool({ WebSocket: FakeWebSocket })
+  t.after(() => pool.disconnectAll())
+
+  const read = pool.getEvents({ kinds: [1] }, ['wss://read.example'], {
+    maxRateLimitRetryWaitMs: 50,
+    timeout: 1000
+  })
+  await tick()
+  const readSocket = FakeWebSocket.instances.at(-1)
+  readSocket.open()
+  await tick()
+  const readId = readSocket.sent.find(frame => frame[0] === 'REQ')[1]
+  readSocket.receive(['CLOSED', readId, 'rate-limited: slow', '100'])
+  const readResult = await read
+  assert.equal(readResult.errors[0].reason.retryAfterMs, 100)
+  assert.equal(readSocket.sent.filter(frame => frame[0] === 'REQ').length, 1)
+
+  const count = pool.countEvents({ kinds: [1] }, ['wss://count.example'], {
+    maxRateLimitRetryWaitMs: 50,
+    timeout: 1000
+  })
+  await tick()
+  const countSocket = FakeWebSocket.instances.at(-1)
+  countSocket.open()
+  await tick()
+  const countId = countSocket.sent.find(frame => frame[0] === 'COUNT')[1]
+  countSocket.receive(['CLOSED', countId, 'rate-limited: slow', '100'])
+  const countResult = await count
+  assert.equal(countResult.errors[0].reason.retryAfterMs, 100)
+  assert.equal(countSocket.sent.filter(frame => frame[0] === 'COUNT').length, 1)
 })
 
 test('getEventsGenerator suppresses an intermediate retry error and returns the successful report', async t => {
@@ -412,7 +568,7 @@ test('countEvents merges HLL and exact counts after an individual relay retry', 
   assert.deepEqual(result.errors, [])
 })
 
-test('connection-local retry advice grows from 1s to 2s and resets after success', async t => {
+test('connection-local retry advice grows from 1s to 1.5s then 2s and resets after success', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
   FakeWebSocket.instances.length = 0
   const relay = new RelayConnection('wss://relay.example/', { WebSocket: FakeWebSocket })
@@ -435,7 +591,7 @@ test('connection-local retry advice grows from 1s to 2s and resets after success
 
   socket.receive(['OK', firstEvent.id, false, 'rate-limited: no advice'])
   await tick()
-  t.mock.timers.tick(1999)
+  t.mock.timers.tick(1499)
   await tick()
   assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 2)
   t.mock.timers.tick(1)
