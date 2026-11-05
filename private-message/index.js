@@ -678,10 +678,11 @@ async function sendPrivateMessage ({
   fileChunkIndex,
   onPreparedSeed,
   preparedPublications,
+  useBulkPacing = false,
   _publish = privateChannel.publish
 }) {
   if (!privateChannelSigner?.getPublicKey) throw new ValidationError('PRIVATE_CHANNEL_WRITER_REQUIRED')
-  return _publish({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed, preparedPublications: preparedPublications?.length ? preparedPublications : undefined, _getIykcProofs })
+  return _publish({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed, preparedPublications: preparedPublications?.length ? preparedPublications : undefined, useBulkPacing, _getIykcProofs })
 }
 
 async function sendNymMessage ({
@@ -693,12 +694,13 @@ async function sendNymMessage ({
   relayToReceivers,
   recoveryRelays,
   expirationSeconds,
+  useBulkPacing = false,
   deletionPubkey,
   _publish = privateChannel.publishNymEvent
 }) {
   if (!nymSigner?.getPublicKey) throw new ValidationError('NYM_SIGNER_REQUIRED')
   if (!privateChannelSigner?.getPublicKey) throw new ValidationError('PRIVATE_CHANNEL_WRITER_REQUIRED')
-  return _publish({ nymSigner, privateChannelSigner, privateChannelReaderPubkey, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds })
+  return _publish({ nymSigner, privateChannelSigner, privateChannelReaderPubkey, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, useBulkPacing })
 }
 
 export async function ask ({
@@ -716,6 +718,7 @@ export async function ask ({
   error,
   content,
   expirationSeconds,
+  useBulkPacing = false,
   temporaryStorageArea,
   _getIykcProofs,
   deletionPubkey,
@@ -734,7 +737,7 @@ export async function ask ({
     const identity = await senderSigner?.getPublicKey?.()
     const session = defaultSessions.get(identity)
     if (!session) throw new Error('PRIVATE_MESSAGE_NOT_WATCHING')
-    return session.ask({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receiverPubkey, relays, relayToReceivers, recoveryRelays, message, code, payload, error, content, expirationSeconds, temporaryStorageArea, _getIykcProofs, deletionPubkey, deletionSeckey, autoDeletionCapability, _publish })
+    return session.ask({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receiverPubkey, relays, relayToReceivers, recoveryRelays, message, code, payload, error, content, expirationSeconds, useBulkPacing, temporaryStorageArea, _getIykcProofs, deletionPubkey, deletionSeckey, autoDeletionCapability, _publish })
   }
 
   const { event: question, wireEvent } = await makeOutgoingRumor({
@@ -746,7 +749,7 @@ export async function ask ({
     })
   })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
-  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers: [receiverPubkey], receiverTag: receiverPubkey, deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed, _getIykcProofs, _publish })
+  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers: [receiverPubkey], receiverTag: receiverPubkey, deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, useBulkPacing, temporaryStorageArea, fileChunkIndex, onPreparedSeed, _getIykcProofs, _publish })
 
   return withDelivery({ question }, reports, deletion.deletionSeckey)
 }
@@ -767,6 +770,7 @@ export async function reply ({
   error,
   content,
   expirationSeconds,
+  useBulkPacing = false,
   temporaryStorageArea,
   _getIykcProofs,
   deletionPubkey,
@@ -787,7 +791,7 @@ export async function reply ({
     })
   })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
-  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers: [receiverPubkey], receiverTag: receiverPubkey, deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed, _getIykcProofs, _publish })
+  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers: [receiverPubkey], receiverTag: receiverPubkey, deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, useBulkPacing, temporaryStorageArea, fileChunkIndex, onPreparedSeed, _getIykcProofs, _publish })
   return withDelivery({ reply: event }, reports, deletion.deletionSeckey)
 }
 
@@ -806,6 +810,7 @@ export async function tell ({
   error,
   content,
   expirationSeconds,
+  useBulkPacing = false,
   temporaryStorageArea,
   _getIykcProofs,
   deletionPubkey,
@@ -825,7 +830,7 @@ export async function tell ({
     })
   })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
-  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers: [receiverPubkey], receiverTag: receiverPubkey, deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed, _getIykcProofs, _publish })
+  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers: [receiverPubkey], receiverTag: receiverPubkey, deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, useBulkPacing, temporaryStorageArea, fileChunkIndex, onPreparedSeed, _getIykcProofs, _publish })
   return withDelivery({ tell: event }, reports, deletion.deletionSeckey)
 }
 
@@ -844,6 +849,7 @@ export async function yell ({
   error,
   content,
   expirationSeconds,
+  useBulkPacing = false,
   temporaryStorageArea,
   _getIykcProofs,
   deletionPubkey,
@@ -872,7 +878,7 @@ export async function yell ({
     rumor
   })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability, preparedPublications: prepared })
-  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublications: prepared, _getIykcProofs, _publish })
+  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, useBulkPacing, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublications: prepared, _getIykcProofs, _publish })
   return withDelivery({ yell: event }, reports, deletion.deletionSeckey)
 }
 
@@ -887,6 +893,7 @@ export async function broadcastRumor ({
   recoveryRelays,
   rumor,
   expirationSeconds,
+  useBulkPacing = false,
   temporaryStorageArea,
   _getIykcProofs,
   deletionPubkey,
@@ -903,7 +910,7 @@ export async function broadcastRumor ({
   const prepared = normalizePreparedPublications({ preparedPublication, preparedPublications })
   const { event, wireEvent } = await makeOutgoingRumor({ senderSigner, rumor })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability, preparedPublications: prepared })
-  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublications: prepared, _getIykcProofs, _publish })
+  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, useBulkPacing, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublications: prepared, _getIykcProofs, _publish })
   return withDelivery({ rumor: event }, reports, deletion.deletionSeckey)
 }
 
@@ -918,6 +925,7 @@ export async function broadcastEvent ({
   recoveryRelays,
   event,
   expirationSeconds,
+  useBulkPacing = false,
   temporaryStorageArea,
   _getIykcProofs,
   deletionPubkey,
@@ -934,7 +942,7 @@ export async function broadcastEvent ({
   const prepared = normalizePreparedPublications({ preparedPublication, preparedPublications })
   const wireEvent = assertValidSignedEvent({ ...event, tags: cloneTags(event?.tags) })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability, preparedPublications: prepared })
-  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublications: prepared, _getIykcProofs, _publish })
+  const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, useBulkPacing, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublications: prepared, _getIykcProofs, _publish })
   return withDelivery({ event: wireEvent }, reports, deletion.deletionSeckey)
 }
 
@@ -947,6 +955,7 @@ export async function broadcastNymRumor ({
   recoveryRelays,
   rumor,
   expirationSeconds,
+  useBulkPacing = false,
   deletionPubkey,
   deletionSeckey,
   autoDeletionCapability = true,
@@ -957,7 +966,7 @@ export async function broadcastNymRumor ({
   if (rumor.pubkey !== undefined && rumor.pubkey !== await nymSigner.getPublicKey()) throw new ValidationError('NYM_RUMOR_AUTHOR_MISMATCH')
   const { event, wireEvent } = await makeOutgoingRumor({ senderSigner: nymSigner, rumor })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
-  const reports = await sendNymMessage({ nymSigner, privateChannelSigner, privateChannelReaderPubkey, deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, _publish })
+  const reports = await sendNymMessage({ nymSigner, privateChannelSigner, privateChannelReaderPubkey, deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, useBulkPacing, _publish })
   return withDelivery({ rumor: event }, reports, deletion.deletionSeckey)
 }
 
@@ -970,6 +979,7 @@ export async function broadcastNymEvent ({
   recoveryRelays,
   event,
   expirationSeconds,
+  useBulkPacing = false,
   deletionPubkey,
   deletionSeckey,
   autoDeletionCapability = true,
@@ -978,6 +988,6 @@ export async function broadcastNymEvent ({
   if (!nymSigner?.getPublicKey) throw new ValidationError('NYM_SIGNER_REQUIRED')
   const wireEvent = assertValidSignedEvent({ ...event, tags: cloneTags(event?.tags) })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
-  const reports = await sendNymMessage({ nymSigner, privateChannelSigner, privateChannelReaderPubkey, deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, _publish })
+  const reports = await sendNymMessage({ nymSigner, privateChannelSigner, privateChannelReaderPubkey, deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, useBulkPacing, _publish })
   return withDelivery({ event: wireEvent }, reports, deletion.deletionSeckey)
 }

@@ -277,6 +277,7 @@ test('ask publishes an ask rumor and watch dispatches the reply with its questio
     relays: ['wss://relay.example'],
     temporaryStorageArea: globalThis.localStorage,
     message: { code: 'PING', payload: { ok: true } },
+    useBulkPacing: true,
     _publish: async options => {
       published = options
       return [{ success: true }]
@@ -287,9 +288,11 @@ test('ask publishes an ask rumor and watch dispatches the reply with its questio
   assert.equal(published.event.sig, undefined)
   assert.equal(published.event.id, undefined)
   assert.equal(published.event.pubkey, undefined)
+  assert.equal(Object.hasOwn(published.event, 'useBulkPacing'), false)
   assert.equal(published.receiverTag, 'receiver')
   assert.deepEqual(published.receivers, ['receiver'])
   assert.equal(published.privateChannelReaderPubkey, 'reader-channel')
+  assert.equal(published.useBulkPacing, true)
   assert.equal(published.temporaryStorageArea, globalThis.localStorage)
   assert.deepEqual(JSON.parse(published.event.content), { ok: true })
   assert.deepEqual(published.event.tags, [['r', 'receiver'], ['h', 'PING']])

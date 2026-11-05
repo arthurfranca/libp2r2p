@@ -1106,16 +1106,17 @@ also admits relay policy refusals (`blocked:`, `restricted:`, `auth-required:`,
 Local authentication denials, invalid events and unknown errors qualify for
 neither policy. Predicates classify individual native errors; callers decide
 how to handle mixed per-relay outcomes and application-specific aggregates.
-`parseRelayRetryAdvice(reason, params, { now = Date.now() })`, exported by
+`parseRelayRetryAdvice(reason, params, { now = Date.now(), capMs = 300000 })`, exported by
 `libp2r2p/relay`, returns `{ retryAt, retryAfterMs }` or `null`. It only interprets
 leading `rate-limited:` refusals. The optional string `params` is relative
 milliseconds (e.g. "2500"). Values must be positive safe integers in canonical
 decimal form, without signs, whitespace, fractions, leading zeros or prefixes.
-Valid values produce both `retryAfterMs` and `retryAt`. Future waits are capped
-at five minutes. Missing or invalid params are ignored and do not instruct
-clients to retry immediately. Schedulers wait until
-max(local backoff deadline, retryAt), never sum the two or renew the deadline on
-online notifications.
+Valid values produce both `retryAfterMs` and `retryAt`, capped by `capMs`.
+Missing or invalid params are ignored and do not instruct clients to retry
+immediately. RelayPool defaults `rateLimitCapMs` to five minutes. Its
+`getOptions()` returns a frozen runtime snapshot and `setOptions(partial)`
+validates and applies allowlisted partial updates. Non-bulk schedulers retain
+their existing max(local backoff deadline, retryAt) behavior.
 
 Rate limits apply only to the client message type that triggered the refusal:
 `EVENT`, `AUTH`, `REQ` and `COUNT` have independent connection cooldowns. Responses
@@ -1295,7 +1296,8 @@ Optional decimal `params` milliseconds on relay `CLOSED` and rejected `OK`
 responses are preserved as normalized `retryAt` and `retryAfterMs` on native relay
 errors. Only `rate-limited:`
 responses apply this advice; invalid values are ignored
-and delays are capped at five minutes. New operations of the refused type wait
+and delays are capped by the RelayPool runtime options, defaulting to five
+minutes. New operations of the refused type wait
 within their existing deadlines; active subscriptions remain live and `CLOSE`
 never waits. Cancelled or timed-out operations cannot be sent later. A rejection
 is still reported to the caller; this does not silently republish failed events.
@@ -1308,6 +1310,10 @@ publication failures retain the payload/index for retry. Outbound channel
 fragmentation streams from prepared encrypted rows, cleans partial writes and
 removes failed new keys from the temporary-storage registry. It does not raise
 the browser's Web Storage quota or delete unrelated application data.
+Both packers use `useBulkPacing: true` by default. Bulk EVENT publications are
+serialized per relay, start at least one second apart, and use a relay-local
+1..30 second exponential backoff when no retryAt is supplied. Relay advice
+overrides the local backoff and relays remain independent.
 
 
 ### Private subscription recovery (0.11.8)

@@ -1754,7 +1754,8 @@ test('private messenger debug reports send and enqueue events without payload se
   await messenger.yell({
     receiverPubkeys: ['alice', 'bob'],
     code: 'contentKeys_reply_v1',
-    payload: { keys: [{ pubkey: 'pubkey', seckey: 'sent-secret' }] }
+    payload: { keys: [{ pubkey: 'pubkey', seckey: 'sent-secret' }] },
+    useBulkPacing: true
   })
   await pm.watchCalls[0].onReply({
     event: { id: 'reply-id', kind: REPLY_KIND, pubkey: 'alice', created_at: 12, tags: [['q', 'question-id']], content: 'pong' },
@@ -1771,6 +1772,7 @@ test('private messenger debug reports send and enqueue events without payload se
   assert.equal(send.code, 'contentKeys_reply_v1')
   assert.deepEqual(send.receiverPubkeys, ['alice', 'bob'])
   assert.equal(send.receiverCount, 2)
+  assert.equal(pm.sent[0].options.useBulkPacing, true)
   assert.equal(enqueue.code, 'contentKeys_reply_v1')
   assert.equal(enqueue.channelPubkey, 'channel')
   assert.equal(enqueue.senderPubkey, 'alice')
@@ -2883,6 +2885,7 @@ test('missing-message reply packer streams compact seed routers only', async () 
 
   assert.equal(replies.length, 1)
   assert.equal(replies[0].code, MISSING_MESSAGES_REPLY_CODE)
+  assert.equal(replies[0].useBulkPacing, true)
   assert.equal(replies[0].receiverPubkey, 'user')
   assert.equal(replies[0].payload.since, 5)
   assert.equal(replies[0].payload.until, 20)
@@ -2933,6 +2936,7 @@ test('event reply packer streams regular event lists', async () => {
 
   assert.equal(replies.length, 2)
   assert.equal(replies[0].code, 'eventSync_test')
+  assert.equal(replies[0].useBulkPacing, true)
   assert.equal(replies[0].receiverPubkey, 'peer')
   assert.deepEqual(replies[0].payload.collection, 'local-db')
   assert.equal(replies[0].payload.index, 0)

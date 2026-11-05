@@ -520,15 +520,17 @@ test('publish splits relay-targeted routers by receiver subset with separate rou
     recoveryRelays: ['wss://seed.example', 'wss://one.example'],
     deletionPubkey: 'd'.repeat(64),
     event,
+    useBulkPacing: true,
     temporaryStorageArea,
     _getIykcProofs: noContentKeys,
-    _publish: async (outer, relays) => {
-      published.push({ outer, relays })
+    _publish: async (outer, relays, options) => {
+      published.push({ outer, relays, options })
       return { success: true }
     }
   })
 
   assert.equal(published.length, 2)
+  assert.ok(published.every(({ options }) => options.useBulkPacing === true))
   assert.deepEqual(published.map(({ outer }) => outer.tags.find(tag => tag[0] === 's')), [
     ['s', 'd'.repeat(64)],
     ['s', 'd'.repeat(64)]

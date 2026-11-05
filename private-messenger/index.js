@@ -2534,7 +2534,7 @@ export class PrivateMessenger {
     return delivery
   }
 
-  async ask ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey }) {
+  async ask ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey, useBulkPacing = false }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
@@ -2556,13 +2556,14 @@ export class PrivateMessenger {
         payload,
         error,
         content,
+        useBulkPacing,
         onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
         _getIykcProofs: this.contentKeyLookup()
       })
     } finally { releaseActivity() }
   }
 
-  async reply ({ channelPubkey = this.defaultChannelPubkey(), question, receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey }) {
+  async reply ({ channelPubkey = this.defaultChannelPubkey(), question, receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey, useBulkPacing = false }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
@@ -2586,13 +2587,14 @@ export class PrivateMessenger {
         payload,
         error,
         content,
+        useBulkPacing,
         onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
         _getIykcProofs: this.contentKeyLookup()
       })
     } finally { releaseActivity() }
   }
 
-  async tell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey }) {
+  async tell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey, useBulkPacing = false }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
@@ -2614,13 +2616,14 @@ export class PrivateMessenger {
         payload,
         error,
         content,
+        useBulkPacing,
         onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
         _getIykcProofs: this.contentKeyLookup()
       })
     } finally { releaseActivity() }
   }
 
-  async yell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey, createdAt, onPreparedSeed, preparedPublication, preparedPublications }) {
+  async yell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey, createdAt, onPreparedSeed, preparedPublication, preparedPublications, useBulkPacing = false }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
@@ -2647,6 +2650,7 @@ export class PrivateMessenger {
         error,
         content,
         createdAt,
+        useBulkPacing,
         onPreparedSeed: onPreparedSeed || this.outgoingSeedHandler(channelPubkey),
         preparedPublications: prepared.length ? prepared : undefined,
         _getIykcProofs: this.contentKeyLookup()
@@ -2654,7 +2658,7 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async broadcastRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug }) {
+  async broadcastRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug, useBulkPacing = false }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
@@ -2676,6 +2680,7 @@ export class PrivateMessenger {
         deletionPubkey,
         autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
         rumor,
+        useBulkPacing,
         onPreparedSeed: onPreparedSeed || this.outgoingSeedHandler(channelPubkey),
         preparedPublications: prepared.length ? prepared : undefined,
         _getIykcProofs: this.contentKeyLookup()
@@ -2683,7 +2688,7 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async broadcastEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug }) {
+  async broadcastEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug, useBulkPacing = false }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
@@ -2705,6 +2710,7 @@ export class PrivateMessenger {
         deletionPubkey,
         autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
         event,
+        useBulkPacing,
         onPreparedSeed: onPreparedSeed || this.outgoingSeedHandler(channelPubkey),
         preparedPublications: prepared.length ? prepared : undefined,
         _getIykcProofs: this.contentKeyLookup()
@@ -2712,7 +2718,7 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async broadcastNymRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, nymSigner, deletionPubkey }) {
+  async broadcastNymRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, nymSigner, deletionPubkey, useBulkPacing = false }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
@@ -2727,12 +2733,13 @@ export class PrivateMessenger {
         expirationSeconds: this.eventExpirationSecondsFor(channel),
         deletionPubkey,
         autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
-        rumor
+        rumor,
+        useBulkPacing
       })
     } finally { releaseActivity() }
   }
 
-  async broadcastNymEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, nymSigner, deletionPubkey }) {
+  async broadcastNymEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, nymSigner, deletionPubkey, useBulkPacing = false }) {
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
@@ -2747,7 +2754,8 @@ export class PrivateMessenger {
         expirationSeconds: this.eventExpirationSecondsFor(channel),
         deletionPubkey,
         autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
-        event
+        event,
+        useBulkPacing
       })
     } finally { releaseActivity() }
   }
@@ -2770,6 +2778,7 @@ export class PrivateMessenger {
       autoDeletionCapability: this.autoDeletionCapabilityFor(channel),
       code: SEEDER_PRESENCE_CODE,
       payload: {},
+      useBulkPacing: true,
       onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
       _getIykcProofs: this.contentKeyLookup()
     })
@@ -3009,7 +3018,8 @@ export class PrivateMessenger {
           channelPubkey,
           receiverPubkey: seeder,
           code: MISSING_MESSAGES_ASK_CODE,
-          payload: { since, until }
+          payload: { since, until },
+          useBulkPacing: true
         })
         asks.push(ask)
         await assertMessagePublished(ask, ask.question)

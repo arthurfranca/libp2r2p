@@ -2,12 +2,32 @@ import { isValidEvent } from '../../event/index.js'
 import { ValidationError } from '../../error/index.js'
 import { maybeUnref } from '../helpers/timer.js'
 import { categorizeRelayError, relayCloseError, relayTimeoutError, relayRejectionError } from '../helpers/error.js'
+import { DEFAULT_RATE_LIMIT_CAP_MS } from '../helpers/retry-advice.js'
 
 const DEFAULT_CONNECT_TIMEOUT = 3000
 const DEFAULT_OPERATION_TIMEOUT = 30000
+const BULK_PACING_MS = 1000
+const BULK_BACKOFF_MAX_MS = 30000
 
 function errorFrom (reason, fallback) {
   return reason instanceof Error ? reason : new Error(String(reason || fallback))
+}
+
+function retryAtFrom (value) {
+  const pending = [value]
+  const seen = new Set()
+  let retryAt = 0
+  while (pending.length) {
+    const current = pending.pop()
+    if (!current || typeof current !== 'object' || seen.has(current)) continue
+    seen.add(current)
+    if (Number.isSafeInteger(current.retryAt)) retryAt = Math.max(retryAt, current.retryAt)
+    for (const key of ['cause', 'reason', 'error']) pending.push(current[key])
+    for (const key of ['errors', 'reports', 'relays']) {
+      if (Array.isArray(current[key])) pending.push(...current[key])
+    }
+  }
+  return retryAt
 }
 
 function hasMatchingPrefix (values, candidate) {
@@ -51,10 +71,26 @@ export class RelayConnection {
   #authentications = new Map()
   #counts = new Map()
   #retryAtByType = new Map()
+  #cooldownWaiters = new Set()
+  #bulkQueue = []
+  #bulkActive = null
+  #bulkTimer = null
+  #bulkBackoffMs = BULK_PACING_MS
+  #bulkNextAt = 0
+  #getRateLimitCapMs
 
-  constructor (url, { WebSocket: WebSocketImpl = globalThis.WebSocket } = {}) {
+  constructor (url, {
+    WebSocket: WebSocketImpl = globalThis.WebSocket,
+    rateLimitCapMs = () => DEFAULT_RATE_LIMIT_CAP_MS
+  } = {}) {
     this.url = url
     this.#WebSocket = WebSocketImpl
+    if (typeof rateLimitCapMs !== 'function' && (!Number.isSafeInteger(rateLimitCapMs) || rateLimitCapMs < 1)) {
+      throw new ValidationError('INVALID_RATE_LIMIT_CAP_MS')
+    }
+    this.#getRateLimitCapMs = typeof rateLimitCapMs === 'function'
+      ? rateLimitCapMs
+      : () => rateLimitCapMs
     this.ws = null
     this.publishTimeout = DEFAULT_OPERATION_TIMEOUT
     this.onnotice = null
@@ -65,6 +101,19 @@ export class RelayConnection {
 
   // Exposes socket context to the pool's operation-wide publication deadline.
   get lastTransportError () { return this.#lastTransportError }
+
+  setRateLimitCapMs (capMs, now = Date.now()) {
+    if (!Number.isSafeInteger(capMs) || capMs < 1) throw new ValidationError('INVALID_RATE_LIMIT_CAP_MS')
+    const limit = now + Math.min(capMs, Number.MAX_SAFE_INTEGER - now)
+    let changed = false
+    for (const [type, retryAt] of this.#retryAtByType) {
+      if (retryAt <= limit) continue
+      this.#retryAtByType.set(type, limit)
+      changed = true
+    }
+    if (changed) for (const wake of [...this.#cooldownWaiters]) wake()
+    this.#pumpBulkPublishes()
+  }
 
   async connect ({ timeout = DEFAULT_CONNECT_TIMEOUT, signal } = {}) {
     if (this.ws?.readyState === 1) return
@@ -127,21 +176,35 @@ export class RelayConnection {
   #dispatchWork (type, send, fail) {
     let timer = null
     let cancelled = false
-    const dispatch = () => {
+    const wake = () => {
+      clearTimeout(timer)
+      timer = null
+      schedule()
+    }
+    const schedule = () => {
       if (cancelled) return
       const remaining = (this.#retryAtByType.get(type) ?? 0) - Date.now()
       if (remaining > 0) {
-        timer = maybeUnref(setTimeout(dispatch, remaining))
+        timer = maybeUnref(setTimeout(wake, remaining))
         return
       }
+      this.#cooldownWaiters.delete(wake)
       try { send() } catch (error) { fail(error) }
     }
+    const dispatch = () => {
+      this.#cooldownWaiters.add(wake)
+      schedule()
+    }
     dispatch()
-    return () => { cancelled = true; clearTimeout(timer) }
+    return () => {
+      cancelled = true
+      this.#cooldownWaiters.delete(wake)
+      clearTimeout(timer)
+    }
   }
 
   #rejection (type, reason, params, fallback) {
-    const error = relayRejectionError(reason, params, fallback)
+    const error = relayRejectionError(reason, params, fallback, { rateLimitCapMs: this.#getRateLimitCapMs() })
     if (error.retryAt !== undefined) this.#retryAtByType.set(type, Math.max(this.#retryAtByType.get(type) ?? 0, error.retryAt))
     return error
   }
@@ -173,9 +236,10 @@ export class RelayConnection {
     return { id, close }
   }
 
-  publish (event, { signal } = {}) {
+  publish (event, { signal, useBulkPacing = false } = {}) {
     if (!isValidEvent(event)) return Promise.reject(new Error('INVALID_EVENT'))
-    return this.#sendEventOperation('EVENT', event, this.#publishes, 'PUBLISH_TIMEOUT', signal)
+    if (typeof useBulkPacing !== 'boolean') return Promise.reject(new ValidationError('INVALID_USE_BULK_PACING'))
+    return this.#sendEventOperation('EVENT', event, this.#publishes, 'PUBLISH_TIMEOUT', signal, { useBulkPacing })
   }
 
   async authenticate (getAuthEvent, { signal } = {}) {
@@ -185,13 +249,78 @@ export class RelayConnection {
     return await this.#sendEventOperation('AUTH', event, this.#authentications, 'AUTH_TIMEOUT', signal)
   }
 
-  #sendEventOperation (type, event, map, timeoutCode, signal) {
+  #removeBulkPublish (pending) {
+    const index = this.#bulkQueue.indexOf(pending)
+    if (index >= 0) this.#bulkQueue.splice(index, 1)
+    if (this.#bulkActive === pending) {
+      this.#bulkActive = null
+      pending.onSettled = null
+      this.#bulkNextAt = Math.max(this.#bulkNextAt, Date.now() + BULK_PACING_MS)
+    }
+    this.#pumpBulkPublishes()
+  }
+
+  #clearBulkScheduler () {
+    clearTimeout(this.#bulkTimer)
+    this.#bulkTimer = null
+    this.#bulkQueue.length = 0
+    this.#bulkActive = null
+    this.#bulkNextAt = 0
+    this.#bulkBackoffMs = BULK_PACING_MS
+  }
+
+  #pumpBulkPublishes () {
+    if (this.#bulkActive || this.#bulkQueue.length === 0) return
+    clearTimeout(this.#bulkTimer)
+    this.#bulkTimer = null
+    while (this.#bulkQueue.length) {
+      const pending = this.#bulkQueue[0]
+      if (this.#publishes.get(pending.event.id) === pending && pending.waiters.size > 0) break
+      this.#bulkQueue.shift()
+    }
+    if (!this.#bulkQueue.length) return
+
+    const now = Date.now()
+    const eligibleAt = Math.max(this.#bulkNextAt, this.#retryAtByType.get('EVENT') ?? 0)
+    if (eligibleAt > now) {
+      this.#bulkTimer = maybeUnref(setTimeout(() => this.#pumpBulkPublishes(), eligibleAt - now))
+      return
+    }
+
+    const pending = this.#bulkQueue.shift()
+    const startedAt = now
+    this.#bulkActive = pending
+    pending.onSettled = (success, reason) => {
+      if (this.#bulkActive !== pending) return
+      this.#bulkActive = null
+      pending.onSettled = null
+      const completedAt = Date.now()
+      const hintedRetryAt = retryAtFrom(reason)
+      if (success) {
+        this.#bulkBackoffMs = BULK_PACING_MS
+        this.#bulkNextAt = Math.max(completedAt, startedAt + BULK_PACING_MS)
+      } else if (hintedRetryAt) {
+        // The relay advice overrides the local backoff for this retry.
+        this.#bulkNextAt = Math.max(completedAt, startedAt + BULK_PACING_MS)
+        this.#bulkBackoffMs = Math.min(BULK_BACKOFF_MAX_MS, this.#bulkBackoffMs * 2)
+      } else {
+        this.#bulkNextAt = Math.max(completedAt + this.#bulkBackoffMs, startedAt + BULK_PACING_MS)
+        this.#bulkBackoffMs = Math.min(BULK_BACKOFF_MAX_MS, this.#bulkBackoffMs * 2)
+      }
+      this.#pumpBulkPublishes()
+    }
+    pending.cancelSend = this.#dispatchWork('EVENT', () => {
+      this.send(JSON.stringify(['EVENT', pending.event]))
+    }, error => this.#settleEvent(this.#publishes, pending.event.id, error))
+  }
+
+  #sendEventOperation (type, event, map, timeoutCode, signal, { useBulkPacing = false } = {}) {
     if (signal?.aborted) return Promise.reject(signal.reason)
     let pending = map.get(event.id)
     const created = !pending
     if (created) {
       const timer = maybeUnref(setTimeout(() => this.#settleEvent(map, event.id, relayTimeoutError(timeoutCode, this.#lastTransportError)), this.publishTimeout))
-      pending = { timer, waiters: new Set(), cancelSend: null }
+      pending = { timer, waiters: new Set(), cancelSend: null, event, type, timeoutCode, useBulkPacing, onSettled: null }
       map.set(event.id, pending)
     }
     const deferred = Promise.withResolvers()
@@ -203,12 +332,22 @@ export class RelayConnection {
         map.delete(event.id)
         pending.cancelSend?.()
         clearTimeout(pending.timer)
+        if (this.#bulkActive === pending) {
+          this.#bulkActive = null
+          pending.onSettled = null
+          this.#bulkNextAt = Math.max(this.#bulkNextAt, Date.now() + BULK_PACING_MS)
+          this.#pumpBulkPublishes()
+        }
       }
     }
     const waiter = { ...deferred, stopAbort: () => signal?.removeEventListener('abort', onAbort) }
     pending.waiters.add(waiter)
     signal?.addEventListener('abort', onAbort, { once: true })
-    if (created) {
+    if (created && useBulkPacing && type === 'EVENT') {
+      pending.cancelSend = () => this.#removeBulkPublish(pending)
+      this.#bulkQueue.push(pending)
+      this.#pumpBulkPublishes()
+    } else if (created) {
       pending.cancelSend = this.#dispatchWork(type, () => {
         this.send(JSON.stringify([type, event]))
       }, error => this.#settleEvent(map, event.id, error))
@@ -236,6 +375,7 @@ export class RelayConnection {
     map.delete(id)
     pending.cancelSend?.()
     clearTimeout(pending.timer)
+    pending.onSettled?.(!reason, reason)
     for (const waiter of pending.waiters) {
       waiter.stopAbort()
       if (reason) waiter.reject(errorFrom(reason, 'OPERATION_REJECTED'))
@@ -317,6 +457,7 @@ export class RelayConnection {
     for (const id of [...this.#publishes.keys()]) this.#settleEvent(this.#publishes, id, reason)
     for (const id of [...this.#authentications.keys()]) this.#settleEvent(this.#authentications, id, reason)
     for (const id of [...this.#counts.keys()]) this.#settleCount(id, null, reason)
+    this.#clearBulkScheduler()
     this.onclose?.(reason)
   }
 
@@ -333,6 +474,7 @@ export class RelayConnection {
     for (const id of [...this.#publishes.keys()]) this.#settleEvent(this.#publishes, id, reason)
     for (const id of [...this.#authentications.keys()]) this.#settleEvent(this.#authentications, id, reason)
     for (const id of [...this.#counts.keys()]) this.#settleCount(id, null, reason)
+    this.#clearBulkScheduler()
     if (socket && socket.readyState < 2) socket.close()
   }
 }

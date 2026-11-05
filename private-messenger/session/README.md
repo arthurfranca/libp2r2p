@@ -295,6 +295,11 @@ Operational diagnostics for subscription interruption/recovery and completed
 recovery ranges contain only relay, code, category, byte, count and elapsed-time
 fields; they never include message filters, payloads or channel identities.
 Custom outbox factories also receive this optional callback for storage timings.
+Private-message methods accept runtime-only `useBulkPacing`. Recovery packers,
+seeder asks, presence and file chunks enable it by default; interactive chat
+omits it. The relay pool serializes bulk event sends per relay, spaces starts by
+at least one second, resets backoff after success and lets relay retryAt override
+the local exponential deadline.
 Recovery archive completion also reports `publicationId`, one aggregate
 `recovery-archive-result` per `putMany`, and sanitized row/unique/existing/
 inserted/blocked/expired/stored/skipped counts. A single-row batch may include

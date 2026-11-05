@@ -1,4 +1,4 @@
-import { parseRelayRetryAdvice } from './retry-advice.js'
+import { DEFAULT_RATE_LIMIT_CAP_MS, parseRelayRetryAdvice } from './retry-advice.js'
 
 // Adds transport context without replacing native messages, codes or causes.
 export function categorizeRelayError (reason, category, fallback = 'RELAY_OPERATION_FAILED') {
@@ -33,8 +33,8 @@ export function relayCloseError (event, category, cause) {
 
 // Keep native diagnostics and attach only bounded timing advice. The launcher
 // bridge refreshes the standard relative value immediately before delivery.
-export function relayRejectionError (reason, params, fallback) {
+export function relayRejectionError (reason, params, fallback, { rateLimitCapMs = DEFAULT_RATE_LIMIT_CAP_MS } = {}) {
   const error = categorizeRelayError(reason, 'relay', fallback)
-  Object.assign(error, parseRelayRetryAdvice(error.message, params))
+  Object.assign(error, parseRelayRetryAdvice(error.message, params, { capMs: rateLimitCapMs }))
   return error
 }

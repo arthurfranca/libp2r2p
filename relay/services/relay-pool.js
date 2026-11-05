@@ -7,6 +7,7 @@ import { drainableStream } from '../helpers/drainable-stream.js'
 import { maybeUnref } from '../helpers/timer.js'
 import { categorizeRelayError, relayTimeoutError } from '../helpers/error.js'
 import { ReadRetry, isRetryableReadFailure, needsConnectivityCheck, waitUntil } from '../helpers/read-retry.js'
+import { DEFAULT_RATE_LIMIT_CAP_MS } from '../helpers/retry-advice.js'
 import { normalizeRelayUrl } from '../../url/index.js'
 import { isValidEvent } from '../../event/index.js'
 import { RelayConnection } from './relay-connection.js'
@@ -101,6 +102,11 @@ function asError (error) {
   return error instanceof Error ? error : new Error(String(error))
 }
 
+function validateRateLimitCapMs (value) {
+  if (!Number.isSafeInteger(value) || value < 1) throw new ValidationError('INVALID_RATE_LIMIT_CAP_MS')
+  return value
+}
+
 function assertReadOptions (filter, timeouts) {
   if (!filter || typeof filter !== 'object' || Array.isArray(filter)) throw new ValidationError('INVALID_FILTER')
   for (const value of Object.values(timeouts)) {
@@ -153,12 +159,32 @@ export class RelayPool {
   #WebSocket
   #admission
   #readRetry
+  #options
 
-  constructor ({ _createRelay, _isOnline, _onOnline, WebSocket: WebSocketImpl, ...capacity } = {}) {
+  constructor ({ _createRelay, _isOnline, _onOnline, WebSocket: WebSocketImpl, rateLimitCapMs = DEFAULT_RATE_LIMIT_CAP_MS, ...capacity } = {}) {
+    this.#options = { rateLimitCapMs: validateRateLimitCapMs(rateLimitCapMs) }
     this.#WebSocket = WebSocketImpl
-    this.#createRelay = _createRelay ?? (url => new RelayConnection(url, this.#WebSocket ? { WebSocket: this.#WebSocket } : undefined))
+    this.#createRelay = _createRelay ?? (url => new RelayConnection(url, {
+      ...(this.#WebSocket ? { WebSocket: this.#WebSocket } : {}),
+      rateLimitCapMs: () => this.#options.rateLimitCapMs
+    }))
     this.#admission = new ReadAdmission(capacity)
     this.#readRetry = new ReadRetry({ checkOnline: _isOnline, watchOnline: _onOnline })
+  }
+
+  getOptions () {
+    return Object.freeze({ ...this.#options })
+  }
+
+  setOptions (partial = {}) {
+    if (!partial || typeof partial !== 'object' || Array.isArray(partial)) throw new ValidationError('INVALID_RELAY_POOL_OPTIONS')
+    const unknown = Object.keys(partial).find(key => key !== 'rateLimitCapMs')
+    if (unknown) throw new ValidationError('UNKNOWN_RELAY_POOL_OPTION')
+    const next = { ...this.#options }
+    if (Object.hasOwn(partial, 'rateLimitCapMs')) next.rateLimitCapMs = validateRateLimitCapMs(partial.rateLimitCapMs)
+    this.#options = next
+    for (const relay of this.#relays.values()) relay.setRateLimitCapMs?.(next.rateLimitCapMs)
+    return this.getOptions()
   }
 
   // Injects the WebSocket implementation used by new pooled connections (e.g.
@@ -250,9 +276,9 @@ export class RelayPool {
 
   // NIP-42 retries happen inside one relay attempt, so sendEvent still reports
   // exactly one terminal outcome for each relay URL.
-  async #publishEvent (relay, event, getAuthEvent, signal) {
+  async #publishEvent (relay, event, getAuthEvent, signal, useBulkPacing) {
     try {
-      await relay.publish(event, { signal })
+      await relay.publish(event, { signal, useBulkPacing })
       return 'published'
     } catch (error) {
       const reason = error instanceof Error ? error : new Error(String(error))
@@ -264,7 +290,7 @@ export class RelayPool {
         const authReason = error instanceof Error ? error : new Error(String(error))
         throw new Nip42AuthenticationError(authReason)
       }
-      await relay.publish(event, { signal })
+      await relay.publish(event, { signal, useBulkPacing })
       return 'published'
     }
   }
@@ -1221,10 +1247,12 @@ export class RelayPool {
     getAuthEvent,
     getRetryEvent,
     onRelayResult,
-    signal
+    signal,
+    useBulkPacing = false
   } = {}) {
     if (signal != null && (typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) throw new ValidationError('INVALID_RELAY_SIGNAL')
     if (getRetryEvent != null && typeof getRetryEvent !== 'function') throw new ValidationError('INVALID_RETRY_EVENT_CALLBACK')
+    if (typeof useBulkPacing !== 'boolean') throw new ValidationError('INVALID_USE_BULK_PACING')
     const urls = normalizedRelayUrls(relays)
     if (!urls.length) {
       const promise = Promise.resolve(publishSummary([], urls, {
@@ -1279,7 +1307,7 @@ export class RelayPool {
             if (operationSignal.aborted) throw operationSignal.reason
             const relay = await this.#getRelay(url)
             if (operationSignal.aborted) throw operationSignal.reason
-            return await this.#publishEvent(relay, eventForAttempt, getAuthEvent, operationSignal)
+            return await this.#publishEvent(relay, eventForAttempt, getAuthEvent, operationSignal, useBulkPacing)
           } catch (err) {
             const reason = err instanceof Error ? err : new Error(String(err))
             if (reason instanceof Nip42AuthenticationError) throw reason

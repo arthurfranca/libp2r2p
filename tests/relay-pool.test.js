@@ -208,6 +208,27 @@ function hll (entries = {}) {
 
 test('relay exports one shared RelayPool singleton', () => {
   assert.ok(relayPool instanceof RelayPool)
+  assert.deepEqual(relayPool.getOptions(), { rateLimitCapMs: 300000 })
+})
+
+test('RelayPool exposes atomic runtime options with a frozen snapshot', () => {
+  const pool = new RelayPool({ _createRelay: url => new FakeRelay(url), rateLimitCapMs: 1000 })
+  const initial = pool.getOptions()
+  assert.deepEqual(initial, { rateLimitCapMs: 1000 })
+  assert.equal(Object.isFrozen(initial), true)
+  assert.throws(() => { initial.rateLimitCapMs = 1 }, TypeError)
+  assert.deepEqual(pool.setOptions({}), { rateLimitCapMs: 1000 })
+  assert.deepEqual(pool.setOptions({ rateLimitCapMs: 2000 }), { rateLimitCapMs: 2000 })
+  assert.throws(() => pool.setOptions({ unknown: true }), { code: 'UNKNOWN_RELAY_POOL_OPTION' })
+  assert.throws(() => pool.setOptions({ rateLimitCapMs: 0 }), { code: 'INVALID_RATE_LIMIT_CAP_MS' })
+  assert.deepEqual(pool.getOptions(), { rateLimitCapMs: 2000 })
+})
+
+test('RelayPool rejects a non-boolean bulk pacing option', async () => {
+  const pool = createRelayPool()
+  await assert.rejects(pool.sendEvent(makeEvent(), ['wss://r1'], { useBulkPacing: 'yes' }), {
+    code: 'INVALID_USE_BULK_PACING'
+  })
 })
 
 describe('RelayPool.getLiveEventsGenerator', () => {

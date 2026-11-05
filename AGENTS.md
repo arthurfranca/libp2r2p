@@ -360,12 +360,23 @@ NIP-46 against the real pool with controlled transport and injected controls.
   routing from params; do not interpret legacy timing objects. Scope connection
   cooldowns by EVENT/AUTH/REQ/COUNT after correlating pending operations.
 - Honor optional absolute/relative relay timing on rate-limited CLOSED/OK, bounded
-  to five minutes, without blocking CLOSE or sending cancelled work later.
-  Preserve retryAfterMs/retryAt through subscription diagnostics. Existing
-  operation deadlines remain authoritative; do not silently republish failures.
+  by a RelayPool-level `rateLimitCapMs` default of five minutes, without blocking
+  CLOSE or sending cancelled work later. `getOptions()` returns a frozen runtime
+  snapshot and `setOptions(partial)` performs validated, allowlisted partial
+  updates. Lowering the cap clamps existing rate-limit deadlines; increasing it
+  affects future responses. Preserve bounded retryAfterMs/retryAt through
+  subscription diagnostics. Existing operation deadlines remain authoritative;
+  do not silently republish failures.
 - Reply packers cap UTF-8 JSONL at 128 KiB and 100 records, except one indivisible
-  oversized record. Stream outgoing fragments from prepared rows without a
-  second Web Storage copy. Cleanup partial writes and failed tracking entries.
+  oversized record. They enable `useBulkPacing` by default. Stream outgoing
+  fragments from prepared rows without a second Web Storage copy. Cleanup partial
+  writes and failed tracking entries.
+- `useBulkPacing` is runtime-only. Each RelayConnection serializes bulk EVENT
+  publications per relay, starts them at least one second apart, and applies
+  exponential backoff from 1 to 30 seconds when no relay deadline exists. A
+  relay-provided retryAt overrides that local backoff. Interactive publications
+  bypass the bulk queue but still respect retryAt. Never place the flag on the
+  event or persistence format.
 
 - Private-channel subscriptions expose a non-rejecting `done` result; private-message
   retires only the matching generation. Overflow retries await every affected

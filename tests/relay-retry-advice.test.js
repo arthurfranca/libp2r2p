@@ -9,6 +9,8 @@ test('params use integer milliseconds, including one millisecond, and bound futu
   assert.deepEqual(parseRelayRetryAdvice(message, '1', { now: 10000 }), { retryAfterMs: 1, retryAt: 10001 })
   assert.deepEqual(parseRelayRetryAdvice(message, '2500', { now: 10000 }), { retryAfterMs: 2500, retryAt: 12500 })
   assert.deepEqual(parseRelayRetryAdvice(message, '999999', { now: 10000 }), { retryAfterMs: 300000, retryAt: 310000 })
+  assert.deepEqual(parseRelayRetryAdvice(message, '999999', { now: 10000, capMs: 10000 }), { retryAfterMs: 10000, retryAt: 20000 })
+  assert.deepEqual(parseRelayRetryAdvice(message, '999999', { now: 10000, capMs: 999999 }), { retryAfterMs: 999999, retryAt: 1009999 })
 })
 
 test('malformed, unsafe and legacy params are ignored', () => {
@@ -18,6 +20,7 @@ test('malformed, unsafe and legacy params are ignored', () => {
     assert.equal(parseRelayRetryAdvice(message, params, { now: 10000 }), null)
   }
   for (const now of [NaN, Infinity, -Infinity]) assert.equal(parseRelayRetryAdvice(message, '1', { now }), null)
+  for (const capMs of [0, -1, 1.5, NaN, Infinity, '1000']) assert.equal(parseRelayRetryAdvice(message, '1', { now: 10000, capMs }), null)
 })
 
 test('only rate-limited refusals supply timing, without changing failure policy', () => {

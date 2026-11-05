@@ -637,6 +637,7 @@ async function publishOuterEvents ({
   privateChannelSigner,
   expirationSeconds,
   onPreparedSeed,
+  useBulkPacing = false,
   _publish,
   includeCoverage = true,
   includeRoutingContext = true
@@ -664,9 +665,10 @@ async function publishOuterEvents ({
       ? {
           receiverPubkeys: receiverPubkeys(receivers),
           primaryRelays,
+          useBulkPacing,
           getRetryEvent
         }
-      : { getRetryEvent })
+      : { useBulkPacing, getRetryEvent })
     results.push(includeCoverage ? withPublicationCoverage(report, current.events[index], receivers) : report)
   }
   return { publication: current, results }
@@ -685,7 +687,7 @@ function relayMapForReceivers (relayToReceivers, receivers) {
   return relays
 }
 
-export async function publish ({ senderSigner, imkcSigner, privateChannelSigner = senderSigner, privateChannelReaderPubkey, receivers, receiverTag, fileChunkIndex, onPreparedSeed, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, _getIykcProofs = getIykcProofs, _publish = sendToRelays, preparedPublication, preparedPublications }) {
+export async function publish ({ senderSigner, imkcSigner, privateChannelSigner = senderSigner, privateChannelReaderPubkey, receivers, receiverTag, fileChunkIndex, onPreparedSeed, useBulkPacing = false, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, temporaryStorageArea, _getIykcProofs = getIykcProofs, _publish = sendToRelays, preparedPublication, preparedPublications }) {
   const normalizedDeletionPubkey = normalizeDeletionPubkey(deletionPubkey)
   const results = []
   const requestedReceivers = receiverPubkeys(receivers)
@@ -722,6 +724,7 @@ export async function publish ({ senderSigner, imkcSigner, privateChannelSigner 
         privateChannelSigner,
         expirationSeconds,
         onPreparedSeed,
+        useBulkPacing,
         _publish
       })
       prepared[publicationIndex] = outcome.publication
@@ -773,6 +776,7 @@ export async function publish ({ senderSigner, imkcSigner, privateChannelSigner 
           privateChannelSigner,
           expirationSeconds,
           onPreparedSeed,
+          useBulkPacing,
           _publish
         })
         results.push(...outcome.results)
@@ -811,13 +815,14 @@ export async function publish ({ senderSigner, imkcSigner, privateChannelSigner 
     privateChannelSigner,
     expirationSeconds,
     onPreparedSeed,
+    useBulkPacing,
     _publish
   })
   results.push(...outcome.results)
   return results
 }
 
-export async function publishNymEvent ({ nymSigner, privateChannelSigner, privateChannelReaderPubkey, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, _publish = sendToRelays }) {
+export async function publishNymEvent ({ nymSigner, privateChannelSigner, privateChannelReaderPubkey, deletionPubkey, event, relays, relayToReceivers, recoveryRelays, expirationSeconds, useBulkPacing = false, _publish = sendToRelays }) {
   const normalizedDeletionPubkey = normalizeDeletionPubkey(deletionPubkey)
   const results = []
   const publishRelays = withRecoveryRelays(relayToReceivers ? relaysFromRelayReceivers(relayToReceivers) : relays, recoveryRelays)
@@ -834,6 +839,7 @@ export async function publishNymEvent ({ nymSigner, privateChannelSigner, privat
       receivers: [],
       privateChannelSigner,
       expirationSeconds,
+      useBulkPacing,
       includeCoverage: false,
       includeRoutingContext: false,
       _publish

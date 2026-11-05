@@ -227,7 +227,8 @@ export function createEventReplyPacker ({
   eventsPerChunk = DEFAULT_EVENTS_PER_CHUNK,
   bytesPerChunk = DEFAULT_REPLY_BYTES_PER_CHUNK,
   recordsFromInput = eventRecordFromInput,
-  sendEmptyReply = false
+  sendEmptyReply = false,
+  useBulkPacing = true
 }) {
   if (!messenger?.reply) throw new ValidationError('MESSENGER_REQUIRED')
   if (!question?.id) throw new ValidationError('QUESTION_REQUIRED')
@@ -249,6 +250,7 @@ export function createEventReplyPacker ({
       question,
       receiverPubkey,
       code,
+      useBulkPacing,
       payload: {
         ...payload,
         index,
@@ -308,7 +310,8 @@ export function createMissingMessageReplyPacker ({
   until,
   eventsPerChunk = DEFAULT_EVENTS_PER_CHUNK,
   bytesPerChunk = DEFAULT_REPLY_BYTES_PER_CHUNK,
-  sendEmptyReply = false
+  sendEmptyReply = false,
+  useBulkPacing = true
 }) {
   if (!messenger?.reply) throw new ValidationError('MESSENGER_REQUIRED')
   if (!question?.id) throw new ValidationError('QUESTION_REQUIRED')
@@ -327,6 +330,7 @@ export function createMissingMessageReplyPacker ({
     eventsPerChunk,
     bytesPerChunk,
     sendEmptyReply,
+    useBulkPacing,
     recordsFromInput: seed => compactRecordsFromSeed(seed, { receiverPubkey, since: range.since, until: range.until })
   })
 }

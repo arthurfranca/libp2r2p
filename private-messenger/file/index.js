@@ -150,7 +150,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     return messenger.resolveSendRouting({ channel: parent, receiverPubkeys: [receiverPubkey], signal, attemptStartedAt, onDebug })
   }
   function sendOptions (file, routes) {
-    return { senderSigner: messenger.userSigner, imkcSigner: messenger.contentKeySigner, privateChannelSigner: file.signer, ...routes, temporaryStorageArea: messenger.temporaryStorageArea, expirationSeconds: messenger.eventExpirationSecondsFor(file.controlChannelPubkey), _getIykcProofs: messenger.contentKeyLookup() }
+    return { senderSigner: messenger.userSigner, imkcSigner: messenger.contentKeySigner, privateChannelSigner: file.signer, ...routes, temporaryStorageArea: messenger.temporaryStorageArea, expirationSeconds: messenger.eventExpirationSecondsFor(file.controlChannelPubkey), useBulkPacing: true, _getIykcProofs: messenger.contentKeyLookup() }
   }
   async function publishChunk (descriptor, event, { signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug } = {}) {
     const file = await register(descriptor)

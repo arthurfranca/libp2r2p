@@ -133,6 +133,196 @@ test('publication relative params is preserved and delaying work is bounded by i
   assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 1)
 })
 
+test('bulk publications are serial and paced per relay', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  const { relay, socket } = await connected()
+  t.after(() => relay.close())
+  const firstEvent = signedEvent()
+  const secondEvent = signedEvent()
+  await assert.rejects(relay.publish(signedEvent(), { useBulkPacing: 'yes' }), { code: 'INVALID_USE_BULK_PACING' })
+
+  const first = relay.publish(firstEvent, { useBulkPacing: true })
+  const second = relay.publish(secondEvent, { useBulkPacing: true })
+  await tick()
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 1)
+
+  socket.receive(['OK', firstEvent.id, true, 'saved'])
+  assert.equal(await first, 'saved')
+  t.mock.timers.tick(999)
+  await tick()
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 1)
+  t.mock.timers.tick(1)
+  await tick()
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, 2)
+  socket.receive(['OK', secondEvent.id, true, 'saved'])
+  assert.equal(await second, 'saved')
+})
+
+test('cancelling a queued bulk publication releases its queue position', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  const { relay, socket } = await connected()
+  t.after(() => relay.close())
+  const firstEvent = signedEvent()
+  const cancelledEvent = signedEvent()
+  const lastEvent = signedEvent()
+  const cancelled = new AbortController()
+  const reason = new DOMException('cancelled', 'AbortError')
+
+  const first = relay.publish(firstEvent, { useBulkPacing: true })
+  const rejected = assert.rejects(relay.publish(cancelledEvent, { useBulkPacing: true, signal: cancelled.signal }), error => error === reason)
+  const last = relay.publish(lastEvent, { useBulkPacing: true })
+  cancelled.abort(reason)
+  await rejected
+  socket.receive(['OK', firstEvent.id, true, 'saved'])
+  await first
+  t.mock.timers.tick(1000)
+  await tick()
+  const publishedIds = socket.sent.filter(frame => frame[0] === 'EVENT').map(frame => frame[1].id)
+  assert.deepEqual(publishedIds, [firstEvent.id, lastEvent.id])
+  socket.receive(['OK', lastEvent.id, true, 'saved'])
+  assert.equal(await last, 'saved')
+})
+
+test('bulk backoff grows, yields to earlier relay advice and resets after success', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  const { relay, socket } = await connected()
+  t.after(() => relay.close())
+  const events = Array.from({ length: 6 }, () => signedEvent())
+
+  const first = assert.rejects(relay.publish(events[0], { useBulkPacing: true }), /rate-limited/)
+  const second = assert.rejects(relay.publish(events[1], { useBulkPacing: true }), /rate-limited/)
+  const third = assert.rejects(relay.publish(events[2], { useBulkPacing: true }), /rate-limited/)
+  const fourth = relay.publish(events[3], { useBulkPacing: true })
+  const fifth = assert.rejects(relay.publish(events[4], { useBulkPacing: true }), /rate-limited/)
+  const sixth = relay.publish(events[5], { useBulkPacing: true })
+  await tick()
+  socket.receive(['OK', events[0].id, false, 'rate-limited: busy'])
+  await first
+
+  t.mock.timers.tick(1000)
+  await tick()
+  socket.receive(['OK', events[1].id, false, 'rate-limited: busy'])
+  await second
+
+  t.mock.timers.tick(2000)
+  await tick()
+  socket.receive(['OK', events[2].id, false, 'rate-limited: busy', '100'])
+  await third
+
+  const sentBefore = socket.sent.filter(frame => frame[0] === 'EVENT').length
+  t.mock.timers.tick(999)
+  await tick()
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, sentBefore)
+  t.mock.timers.tick(1)
+  await tick()
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, sentBefore + 1)
+  socket.receive(['OK', events[3].id, true, 'saved'])
+  assert.equal(await fourth, 'saved')
+  t.mock.timers.tick(1000)
+  await tick()
+  socket.receive(['OK', events[4].id, false, 'rate-limited: busy'])
+  await fifth
+  t.mock.timers.tick(999)
+  await tick()
+  const afterFailure = socket.sent.filter(frame => frame[0] === 'EVENT').length
+  t.mock.timers.tick(1)
+  await tick()
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, afterFailure + 1)
+  socket.receive(['OK', events[5].id, true, 'saved'])
+  assert.equal(await sixth, 'saved')
+})
+
+test('runtime rate-limit cap updates future errors and clamps existing cooldowns', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  let capMs = 5000
+  const relay = new RelayConnection('wss://relay.example/', {
+    WebSocket: FakeWebSocket,
+    rateLimitCapMs: () => capMs
+  })
+  const connection = relay.connect()
+  const socket = FakeWebSocket.instances.at(-1)
+  socket.open()
+  await connection
+  t.after(() => relay.close())
+
+  let rejection
+  const first = relay.subscribe([{}], { onclose: error => { rejection = error } })
+  socket.receive(['CLOSED', first.id, 'rate-limited: busy', '10000'])
+  await tick()
+  assert.equal(rejection.retryAfterMs, 5000)
+
+  const queued = relay.subscribe([{}])
+  relay.setRateLimitCapMs(500)
+  t.mock.timers.tick(499)
+  assert.ok(!socket.sent.some(frame => frame[1] === queued.id))
+  t.mock.timers.tick(1)
+  assert.ok(socket.sent.some(frame => frame[1] === queued.id))
+
+  capMs = 2000
+  let nextRejection
+  const second = relay.subscribe([{}], { onclose: error => { nextRejection = error } })
+  socket.receive(['CLOSED', second.id, 'rate-limited: busy', '10000'])
+  await tick()
+  assert.equal(nextRejection.retryAfterMs, 2000)
+})
+
+test('the runtime cap is applied to publication, AUTH and COUNT rejections', async () => {
+  const relay = new RelayConnection('wss://relay.example/', {
+    WebSocket: FakeWebSocket,
+    rateLimitCapMs: () => 1500
+  })
+  const connection = relay.connect()
+  const socket = FakeWebSocket.instances.at(-1)
+  socket.open()
+  await connection
+
+  const event = signedEvent()
+  const published = assert.rejects(relay.publish(event), error => error.retryAfterMs === 1500)
+  socket.receive(['OK', event.id, false, 'rate-limited: busy', '5000'])
+  await published
+
+  socket.receive(['AUTH', 'challenge'])
+  await tick()
+  const authEvent = signedEvent({ kind: 22242 })
+  const authenticated = assert.rejects(relay.authenticate(async () => authEvent), error => error.retryAfterMs === 1500)
+  socket.receive(['OK', authEvent.id, false, 'rate-limited: busy', '5000'])
+  await authenticated
+
+  const counted = assert.rejects(relay.countWithHll([{ kinds: [1] }]), error => error.retryAfterMs === 1500)
+  const id = socket.sent.find(message => message[0] === 'COUNT')[1]
+  socket.receive(['CLOSED', id, 'rate-limited: busy', '5000'])
+  await counted
+  await relay.close()
+})
+
+test('RelayPool options affect existing connections before consumers observe rate limits', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  const pool = new RelayPool({ WebSocket: FakeWebSocket, rateLimitCapMs: 5000 })
+  t.after(() => pool.disconnectAll())
+  const limited = signedEvent()
+  const first = pool.sendEvent(limited, ['wss://relay.example'])
+  const socket = FakeWebSocket.instances.at(-1)
+  socket.open()
+  await tick()
+  socket.receive(['OK', limited.id, false, 'rate-limited: busy', '10000'])
+  const rejected = await first
+  const report = await rejected.promise
+  assert.equal(report.errors[0].reason.retryAfterMs, 5000)
+
+  pool.setOptions({ rateLimitCapMs: 500 })
+  const queued = signedEvent()
+  const next = pool.sendEvent(queued, ['wss://relay.example'], { timeout: 2000 })
+  const before = socket.sent.filter(frame => frame[0] === 'EVENT').length
+  t.mock.timers.tick(499)
+  await tick()
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, before)
+  t.mock.timers.tick(1)
+  await tick()
+  assert.equal(socket.sent.filter(frame => frame[0] === 'EVENT').length, before + 1)
+  socket.receive(['OK', queued.id, true, 'saved'])
+  assert.equal((await next).success, true)
+})
+
 test('malformed or unrelated retry metadata cannot stall a connection', async t => {
   const { relay, socket } = await connected()
   t.after(() => relay.close())
@@ -208,6 +398,30 @@ test('cancelling one publication subscriber preserves another subscriber for the
   socket.receive(['OK', event.id, true, 'saved'])
   assert.equal(await second, 'saved')
   await relay.close()
+})
+
+test('a cooled-down relay does not prevent another relay from completing a bulk publication', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  const pool = new RelayPool({ WebSocket: FakeWebSocket })
+  t.after(() => pool.disconnectAll())
+  const limited = signedEvent()
+  const first = pool.sendEvent(limited, ['wss://limited.example'])
+  const limitedSocket = FakeWebSocket.instances.at(-1)
+  limitedSocket.open()
+  await tick()
+  limitedSocket.receive(['OK', limited.id, false, 'rate-limited: busy', '2000'])
+  assert.equal((await first).success, false)
+
+  const accepted = signedEvent()
+  const second = pool.sendEvent(accepted, ['wss://limited.example', 'wss://healthy.example'], {
+    useBulkPacing: true,
+    timeout: 100
+  })
+  const healthySocket = FakeWebSocket.instances.at(-1)
+  healthySocket.open()
+  await tick()
+  healthySocket.receive(['OK', accepted.id, true, 'saved'])
+  assert.equal((await second).success, true)
 })
 
 test('pool abort settles reports with the original cancellation without closing a shared socket', async t => {
