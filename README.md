@@ -364,14 +364,19 @@ await messenger.tell({
 `PrivateMessenger` accepts an optional synchronous
 `resolveInboundCoalescing(message, { idempotencyKey })` constructor callback.
 The enriched `message` includes `type` and `channelPubkey`. The callback returns
-`null` or `{ key, keep? }`, where `key` is a lowercase 64-character SHA-256
-digest and `keep` is `latest` (default) or `oldest`.
+`null` or `{ key, keep?, sequence? }`, where `key` is a lowercase 64-character
+SHA-256 digest, `keep` is `latest` (default) or `oldest`, and `sequence` is an
+optional non-negative safe integer. Sequence units are resolver-owned and are
+compared only within records sharing the final scoped coalescing key.
 
 The resolver runs for ask, reply, tell, yell, message and nym deliveries after
 exact event-ID deduplication. The final coalescing key is scoped by channel,
 sender, type, message code and provenance. `latest` replaces the pending item in
-place; `oldest` preserves it. While an item is reserved, both policies allow at
-most one successor. Older recovered events do not replace newer requests.
+place; when both records carry a sequence, `latest` compares it before envelope
+`created_at`, then falls back to outer/inner timestamps and event ID. `oldest`
+preserves the pending item. While an item is reserved, both policies allow at
+most one successor. Sequences persist in the internal queue metadata and are
+not delivered to the app. Older recovered events do not replace newer requests.
 
 For ask, reply, tell and yell, exactly one `["D", key]` tag may serve as an
 automatic fallback when the resolver returns `null`. Its key is non-empty and

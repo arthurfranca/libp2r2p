@@ -2237,12 +2237,16 @@ export class PrivateMessenger {
 
     let digest = null
     let keep = 'latest'
+    let sequence = null
     if (resolved != null) {
       if (isPlainObject(resolved) && typeof resolved.key === 'string' &&
           COALESCING_DIGEST.test(resolved.key) &&
-          (resolved.keep == null || COALESCING_KEEP.has(resolved.keep))) {
+          (resolved.keep == null || COALESCING_KEEP.has(resolved.keep)) &&
+          (resolved.sequence == null ||
+            (Number.isSafeInteger(resolved.sequence) && resolved.sequence >= 0))) {
         digest = resolved.key
         keep = resolved.keep || 'latest'
+        sequence = resolved.sequence ?? null
       } else {
         this.onError?.(coalescingError(new ValidationError('INVALID_INBOUND_COALESCING_RESULT')))
       }
@@ -2266,7 +2270,7 @@ export class PrivateMessenger {
         digest
       ]),
       coalescingKeep: keep,
-      coalescingOrder: coalescingOrder(message)
+      coalescingOrder: coalescingOrder(message, sequence)
     }
   }
 
@@ -3937,15 +3941,21 @@ function messageCode (message) {
     : null
 }
 
-function coalescingOrder (message) {
-  return {
+function coalescingOrder (message, sequence = null) {
+  const order = {
     outer: Number.isSafeInteger(message?.outer?.created_at) ? message.outer.created_at : 0,
     inner: Number.isSafeInteger(message?.event?.created_at) ? message.event.created_at : 0,
     eventId: message?.event?.id || ''
   }
+  if (sequence != null) order.sequence = sequence
+  return order
 }
 
 function compareCoalescingOrder (left, right) {
+  if (Number.isSafeInteger(left?.sequence) && Number.isSafeInteger(right?.sequence) &&
+      left.sequence !== right.sequence) {
+    return left.sequence < right.sequence ? -1 : 1
+  }
   if ((left?.outer || 0) !== (right?.outer || 0)) return (left?.outer || 0) - (right?.outer || 0)
   if ((left?.inner || 0) !== (right?.inner || 0)) return (left?.inner || 0) - (right?.inner || 0)
   const leftId = left?.eventId || ''

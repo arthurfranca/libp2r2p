@@ -130,11 +130,15 @@ suite pass; report independently scoped problems separately.
   Keep unknown/storage/permission errors operational, with unchanged ACK/NACK.
 - `PrivateMessenger` accepts optional synchronous `resolveInboundCoalescing`.
   It receives the decrypted message enriched with `type`/`channelPubkey` plus
-  `{ idempotencyKey }`, and returns null or `{ key, keep? }`. Keys are lowercase
-  SHA-256 digests; keep defaults to `latest` and may be `oldest`. Run it for all
-  inbox types after exact event-ID dedupe and scope the final key by channel,
-  sender, type, code and provenance. It never replaces trust checks,
-  pause/capacity gates or ACK/NACK ownership.
+  `{ idempotencyKey }`, and returns null or `{ key, keep?, sequence? }`. Keys are
+  lowercase SHA-256 digests; keep defaults to `latest` and may be `oldest`.
+  Sequence is an optional non-negative safe integer owned by the resolver and
+  compared only within one final scoped key. `latest` compares it before
+  envelope timestamps when both rows have one, then falls back to the existing
+  outer/inner/event-ID order. Persist the sequence only in internal coalescing
+  metadata. Run the resolver for all inbox types after exact event-ID dedupe and
+  scope the final key by channel, sender, type, code and provenance. It never
+  replaces trust checks, pause/capacity gates or ACK/NACK ownership.
 - Only ask, reply, tell and yell interpret exactly one `["D", key]` automatically.
   Keys are non-empty UTF-8 strings up to 256 bytes and fall back to latest-wins.
   Message/nym always pass `idempotencyKey: null` and retain arbitrary-kind tag

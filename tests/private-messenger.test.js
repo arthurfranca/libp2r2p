@@ -1339,6 +1339,78 @@ test('coalesced asks remain latest and durable across messenger instances', asyn
   assert.equal(restored.payload.payload.requestId, 'new')
 })
 
+test('coalescing sequence orders latest before envelope timestamps', async () => {
+  const pm = fakePrivateMessage()
+  const key = '8'.repeat(64)
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    resolveInboundCoalescing: message => ({
+      key,
+      keep: 'latest',
+      sequence: message.payload.payload.sequence
+    })
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const message = (id, createdAt, sequence) => {
+    const value = inboxRumor('tell', id, createdAt, { code: 'ordered-state' })
+    value.payload.payload.sequence = sequence
+    return value
+  }
+
+  await deliverInboxRumor(pm, 'tell', message('sequence-newer', 10, 100))
+  await deliverInboxRumor(pm, 'tell', message('created-at-newer', 20, 50))
+  await deliverInboxRumor(pm, 'tell', message('sequence-middle', 30, 75))
+
+  const stored = await Array.fromAsync(messenger.queue.storedItems())
+  assert.equal(stored.length, 1)
+  assert.equal(stored[0].event.id, 'sequence-newer')
+  assert.equal(stored[0].coalescingOrder.sequence, 100)
+  assert.equal((await takeMessage(messenger)).event.id, 'sequence-newer')
+  assert.equal(await takeMessage(messenger), null)
+})
+
+test('coalescing sequence survives reload and invalid values preserve admission', async () => {
+  const indexedDB = new IDBFactory()
+  const key = '9'.repeat(64)
+  const init = {
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  }
+  const resolve = message => ({
+    key,
+    keep: 'latest',
+    sequence: message.payload.payload.sequence
+  })
+  const first = await new PrivateMessenger({
+    _indexedDB: indexedDB,
+    _privateMessage: fakePrivateMessage(),
+    resolveInboundCoalescing: resolve
+  }).init(init)
+  const message = (id, createdAt, sequence) => {
+    const value = inboxRumor('tell', id, createdAt, { code: 'ordered-state' })
+    value.payload.payload.sequence = sequence
+    return value
+  }
+  await deliverInboxRumor(first._privateMessage, 'tell', message('older-sequence', 20, 10))
+  await deliverInboxRumor(first._privateMessage, 'tell', message('newer-sequence', 10, 20))
+  await first.close()
+
+  const second = await new PrivateMessenger({
+    _indexedDB: indexedDB,
+    _privateMessage: fakePrivateMessage(),
+    resolveInboundCoalescing: resolve
+  }).init(init)
+  assert.equal((await takeMessage(second)).event.id, 'newer-sequence')
+
+  const errors = []
+  second.onError = error => errors.push(error)
+  await deliverInboxRumor(second._privateMessage, 'tell', message('invalid-sequence', 30, -1))
+  assert.equal(errors.some(error => error.code === 'INVALID_INBOUND_COALESCING_KEY'), true)
+  assert.equal((await takeMessage(second)).event.id, 'invalid-sequence')
+})
+
 test('private messenger scopes ask coalescing by channel sender and code', async () => {
   const pm = fakePrivateMessage()
   const messenger = await new PrivateMessenger({
