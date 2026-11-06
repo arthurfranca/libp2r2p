@@ -782,6 +782,7 @@ export async function createQueue ({
 
   async function coalesceBy (indexName, item, {
     compare,
+    keep = 'latest',
     now = Date.now()
   } = {}) {
     const definition = indexDefinition(indexName)
@@ -790,6 +791,9 @@ export async function createQueue ({
     }
     if (compare != null && typeof compare !== 'function') {
       throw new ValidationError('QUEUE_COALESCE_COMPARE_INVALID')
+    }
+    if (keep !== 'oldest' && keep !== 'latest') {
+      throw new ValidationError('QUEUE_COALESCE_KEEP_INVALID')
     }
     if (!Number.isSafeInteger(now) || now < 0) throw new ValidationError('QUEUE_COALESCE_NOW_INVALID')
     const value = structuredClone(item)
@@ -812,6 +816,10 @@ export async function createQueue ({
         if (compare(value, latest.item) <= 0) {
           return { status: 'ignored', removed: 0, position: null }
         }
+      }
+
+      if (keep === 'oldest' && pending.length) {
+        return { status: 'ignored', removed: 0, position: null }
       }
 
       if (!pending.length) {
@@ -878,11 +886,11 @@ export async function createQueue ({
   async function reserve ({
     leaseMs = 30000,
     now = Date.now(),
-    nackCoalesceIndex
+    nackCoalescingIndex
   } = {}) {
     if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0 || !Number.isSafeInteger(now) || now < 0) throw new ValidationError('QUEUE_INVALID_LEASE')
-    const nackDefinition = nackCoalesceIndex == null ? null : indexDefinition(nackCoalesceIndex)
-    if (nackCoalesceIndex != null &&
+    const nackDefinition = nackCoalescingIndex == null ? null : indexDefinition(nackCoalescingIndex)
+    if (nackCoalescingIndex != null &&
         (!nackDefinition || nackDefinition.unique || nackDefinition.multiEntry)) {
       throw new ValidationError('QUEUE_NACK_COALESCE_INDEX_INVALID')
     }
@@ -928,7 +936,7 @@ export async function createQueue ({
                     'getAll',
                     [key],
                     ITEMS_STORE,
-                    nackCoalesceIndex,
+                    nackCoalescingIndex,
                     { tx }
                   )
                   superseded = matches.some(match => match.position > record.position)

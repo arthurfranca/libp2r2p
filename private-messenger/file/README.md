@@ -75,6 +75,8 @@ the existing compact-record JSONL packer's `index`, `isLast`, and `jsonl` fields
 The inner reply's `q` references the request event. No new terminal availability
 message is required and `isLast` never establishes file completeness. Late
 responses from authorized seeders remain useful during an active download.
+Each reply carries D as `<code>:<question-id>:<root>:<index>`; retries of one
+chunk therefore share an identity without collapsing other chunks.
 Seed replies run outside the DM dispatcher, with at most two reply workers and
 sixteen queued requests; workers yield between records so control traffic can
 continue. Requests discarded at the queue bound can be retried.

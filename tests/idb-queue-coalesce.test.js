@@ -61,6 +61,32 @@ test('coalesceBy ignores stale items when a comparator is provided', async t => 
   assert.deepEqual(await stored(queue), [{ coalescingKey: 'ask', version: 2 }])
 })
 
+test('coalesceBy supports explicit keep-oldest with active successor safety', async t => {
+  const queue = await open(t)
+  await queue.push({ coalescingKey: 'state', version: 1 })
+  assert.deepEqual(
+    await queue.coalesceBy('byCoalescingKey', { coalescingKey: 'state', version: 2 }, {
+      compare: byVersion,
+      keep: 'oldest'
+    }),
+    { status: 'ignored', removed: 0, position: null }
+  )
+  assert.deepEqual(await stored(queue), [{ coalescingKey: 'state', version: 1 }])
+
+  const active = await queue.reserve()
+  assert.equal(
+    (await queue.coalesceBy('byCoalescingKey', { coalescingKey: 'state', version: 2 }, {
+      compare: byVersion,
+      keep: 'oldest'
+    })).status,
+    'successor'
+  )
+  assert.equal(await active.ack(), true)
+  const successor = await queue.reserve()
+  assert.equal(successor.item.version, 2)
+  assert.equal(await successor.ack(), true)
+})
+
 test('coalesceBy keeps an active item and maintains one pending successor', async t => {
   const queue = await open(t)
   await queue.push({ coalescingKey: 'ask', version: 1 })
@@ -88,7 +114,7 @@ test('coalesceBy keeps an active item and maintains one pending successor', asyn
 test('nack removes an active item superseded by a pending successor', async t => {
   const queue = await open(t)
   await queue.push({ coalescingKey: 'ask', version: 1 })
-  const active = await queue.reserve({ nackCoalesceIndex: 'byCoalescingKey' })
+  const active = await queue.reserve({ nackCoalescingIndex: 'byCoalescingKey' })
   await queue.coalesceBy('byCoalescingKey', { coalescingKey: 'ask', version: 2 }, { compare: byVersion })
 
   assert.equal(await active.nack(), true)
@@ -138,7 +164,11 @@ test('coalesceBy serializes competing instances and validates its index', async 
     error => error instanceof ValidationError && error.code === 'QUEUE_COALESCE_KEY_INVALID'
   )
   await assert.rejects(
-    first.reserve({ nackCoalesceIndex: 'missing' }),
+    first.coalesceBy('byCoalescingKey', { coalescingKey: 'ask' }, { keep: 'middle' }),
+    error => error instanceof ValidationError && error.code === 'QUEUE_COALESCE_KEEP_INVALID'
+  )
+  await assert.rejects(
+    first.reserve({ nackCoalescingIndex: 'missing' }),
     error => error instanceof ValidationError && error.code === 'QUEUE_NACK_COALESCE_INDEX_INVALID'
   )
 })

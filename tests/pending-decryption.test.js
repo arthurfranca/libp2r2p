@@ -18,7 +18,7 @@ afterEach(() => Signer.releaseAll())
 const signer = () => Signer.getOrCreate(bytesToHex(generateSecretKey()))
 const currentIndexes = {
   byChannel: 'channelPubkey',
-  byAskCoalescingKey: 'askCoalescingKey',
+  byCoalescingKey: 'coalescingKey',
   byChannelTypeEventId: { keyPath: ['channelPubkey', 'type', 'event.id', 'provenance'], unique: true }
 }
 globalThis.IDBKeyRange = IDBKeyRange

@@ -19,10 +19,10 @@
 //   await persistPrivateMessage(message)
 //   await ack()
 // }
-// await messenger.ask({ receiverPubkey, payload: { ping: true } })
-// await messenger.reply({ question: msg.question, payload: { ok: true } })
-// await messenger.tell({ receiverPubkey, payload: { note: 'hello' } })
-// await messenger.yell({ receiverPubkeys, payload: { notice: 'hello all' } })
+// const { question } = await messenger.ask({ receiverPubkey, payload: { ping: true }, idempotencyKey: 'request:42' })
+// await messenger.reply({ question, payload: { ok: true }, idempotencyKey: 'reply:42' })
+// await messenger.tell({ receiverPubkey, payload: { note: 'hello' }, idempotencyKey: 'notification:42' })
+// await messenger.yell({ receiverPubkeys, payload: { notice: 'hello all' }, idempotencyKey: 'notice:42' })
 // await messenger.broadcastRumor({ receiverPubkeys, rumor: { kind, tags: [], content } })
 // await messenger.broadcastEvent({ receiverPubkeys, event: signedNostrEvent })
 // await messenger.broadcastNymRumor({ rumor: { kind, tags: [], content } })
@@ -62,13 +62,16 @@ import { migrateMessageQueue } from './services/migrate-message-queue.js'
 import { createPendingDecryption, pendingContentKeyGroup, pendingMissingContentKeyGroup } from './services/pending-decryption.js'
 import { createDecryptionScheduler } from './services/decryption-scheduler.js'
 import { decryptionError, isDeferredDecryptionError } from '../private-channel/helpers/decryption-error.js'
+import { bytesToHex } from '../base16/index.js'
 import { bytesToBase64 } from '../base64/index.js'
+import { sha256 } from '@noble/hashes/sha2.js'
 import { ValidationError } from '../error/index.js'
 import { getRelaysByPubkey, pickRelaysForPubkeys, subscribeRelayListUpdates, relayPool } from '../relay/index.js'
 import * as privateChannel from '../private-channel/index.js'
 import { DEFAULT_RECEIVED_CHUNK_TTL_MS } from '../private-channel/services/received-chunks.js'
 import { createQueue } from '../idb-queue/index.js'
 import { createChannelStateStore } from './services/channel-state.js'
+import { normalizeIdempotencyKey, readIdempotencyKey } from '../private-message/helpers/idempotency.js'
 import { DEFAULT_STALE_CHANNEL_SECONDS } from './constants/index.js'
 import {
   activatePrivateMessengerStorage,
@@ -123,11 +126,13 @@ const MESSAGE_QUEUE_HIGH_WATER_RATIO = 0.7
 const MESSAGE_QUEUE_LOW_WATER_RATIO = 0.5
 const SEED_KEY = '__p2r2pSeedKey'
 const SEED_TIME = '__p2r2pSeedTime'
-const ASK_COALESCING_INDEX = 'byAskCoalescingKey'
-const ASK_COALESCING_DIGEST = /^[0-9a-f]{64}$/
+const COALESCING_INDEX = 'byCoalescingKey'
+const COALESCING_DIGEST = /^[0-9a-f]{64}$/
+const COALESCING_KEEP = new Set(['oldest', 'latest'])
+const DEDUPE_TYPES = new Set(['ask', 'reply', 'tell', 'yell'])
 const MESSAGE_QUEUE_INDEXES = {
   byChannel: 'channelPubkey',
-  [ASK_COALESCING_INDEX]: 'askCoalescingKey',
+  [COALESCING_INDEX]: 'coalescingKey',
   byChannelTypeEventId: {
     keyPath: ['channelPubkey', 'type', 'event.id', 'provenance'],
     unique: true
@@ -306,7 +311,7 @@ export class PrivateMessenger {
     onStateChanged,
     onDebug,
     onError = defaultOnError,
-    resolveAskCoalescingKey,
+    resolveInboundCoalescing,
     _privateMessage = privateMessage,
     _privateChannel = privateChannel,
     _getRelaysByPubkey = getRelaysByPubkey,
@@ -328,8 +333,8 @@ export class PrivateMessenger {
   } = {}) {
     if (onStateChanged != null && typeof onStateChanged !== 'function') throw new ValidationError('INVALID_ON_STATE_CHANGED')
     if (typeof pendingDecryptionReady !== 'boolean') throw new ValidationError('INVALID_PENDING_DECRYPTION_READY')
-    if (resolveAskCoalescingKey != null && typeof resolveAskCoalescingKey !== 'function') {
-      throw new ValidationError('INVALID_RESOLVE_ASK_COALESCING_KEY')
+    if (resolveInboundCoalescing != null && typeof resolveInboundCoalescing !== 'function') {
+      throw new ValidationError('INVALID_RESOLVE_INBOUND_COALESCING')
     }
     this.fallbackRelays = normalizeFallbackRelays(fallbackRelays)
     this.fallbackDelayMs = normalizeFallbackDelay(fallbackDelayMs)
@@ -375,7 +380,7 @@ export class PrivateMessenger {
     this._random = _random
     this.onMessageQueued = onMessageQueued
     this.onDebug = onDebug
-    this.resolveAskCoalescingKey = resolveAskCoalescingKey
+    this.resolveInboundCoalescing = resolveInboundCoalescing
     this._privateMessage = _privateMessage.createPrivateMessageSession?.() ?? _privateMessage
     this._privateChannel = _privateChannel
     this._getRelaysByPubkey = _getRelaysByPubkey
@@ -1954,9 +1959,10 @@ export class PrivateMessenger {
       const pubkey = pending.record.channelPubkey
       if (!this.channels.has(pubkey) || !this.desiredChannels.has(pubkey)) { this.pendingStorageWrites.delete(key); continue }
       try {
-        if (pending.record.askCoalescingKey) {
-          await this.queue.coalesceBy(ASK_COALESCING_INDEX, pending.record, {
-            compare: compareAskCoalescingItems
+        if (pending.record.coalescingKey) {
+          await this.queue.coalesceBy(COALESCING_INDEX, pending.record, {
+            compare: compareCoalescingItems,
+            keep: pending.record.coalescingKeep
           })
         } else if (!pending.dedupeKey || !await this.queue.someBy('byChannelTypeEventId', pending.dedupeKey)) {
           await this.queue.enqueue(pending.record)
@@ -2200,29 +2206,67 @@ export class PrivateMessenger {
     await this.enqueueRumor('message', channelPubkey, message)
   }
 
-  #askCoalescingMetadata (type, channelPubkey, message, info) {
-    if (type !== 'ask' || info.provenance === 'hearsay' || !this.resolveAskCoalescingKey) return null
-    let digest
-    try {
-      digest = this.resolveAskCoalescingKey(message)
-      if (digest != null && typeof digest?.then === 'function') {
-        throw new Error('ASK_COALESCING_RESOLVER_MUST_BE_SYNCHRONOUS')
-      }
-    } catch (cause) {
-      this.onError?.(askCoalescingError(cause))
-      return null
+  #coalescingMetadata (type, channelPubkey, message, info) {
+    const supportsIdempotencyTag = DEDUPE_TYPES.has(type)
+    const tagged = supportsIdempotencyTag
+      ? readIdempotencyKey(message.event)
+      : { key: null, reason: '' }
+    if (tagged.reason && tagged.reason !== 'missing') {
+      this.debug('idempotency-tag-ignored', {
+        type,
+        code: messageCode(message) || '',
+        reason: tagged.reason
+      })
     }
-    if (digest == null) return null
+
+    let resolved = null
+    if (this.resolveInboundCoalescing) {
+      try {
+        resolved = this.resolveInboundCoalescing(
+          { ...message, type, channelPubkey },
+          { idempotencyKey: tagged.key }
+        )
+        if (resolved != null && typeof resolved?.then === 'function') {
+          throw new Error('COALESCING_RESOLVER_MUST_BE_SYNCHRONOUS')
+        }
+      } catch (cause) {
+        this.onError?.(coalescingError(cause))
+        resolved = null
+      }
+    }
+
+    let digest = null
+    let keep = 'latest'
+    if (resolved != null) {
+      if (isPlainObject(resolved) && typeof resolved.key === 'string' &&
+          COALESCING_DIGEST.test(resolved.key) &&
+          (resolved.keep == null || COALESCING_KEEP.has(resolved.keep))) {
+        digest = resolved.key
+        keep = resolved.keep || 'latest'
+      } else {
+        this.onError?.(coalescingError(new ValidationError('INVALID_INBOUND_COALESCING_RESULT')))
+      }
+    }
+    if (!digest && tagged.key) digest = idempotencyDigest(tagged.key)
+    if (!digest) return null
+
     const senderPubkey = info.senderPubkey || message.event?.pubkey || ''
     const code = messageCode(message)
-    if (typeof digest !== 'string' || !ASK_COALESCING_DIGEST.test(digest) ||
-        !channelPubkey || !senderPubkey || typeof code !== 'string' || !code) {
-      this.onError?.(askCoalescingError(new ValidationError('INVALID_ASK_COALESCING_KEY')))
+    if (!channelPubkey || !senderPubkey || typeof code !== 'string' || !info.provenance) {
+      this.onError?.(coalescingError(new ValidationError('INVALID_INBOUND_COALESCING_SCOPE')))
       return null
     }
     return {
-      askCoalescingKey: JSON.stringify([channelPubkey, senderPubkey, code, digest]),
-      askCoalescingOrder: askCoalescingOrder(message)
+      coalescingKey: JSON.stringify([
+        channelPubkey,
+        senderPubkey,
+        type,
+        code,
+        info.provenance,
+        digest
+      ]),
+      coalescingKeep: keep,
+      coalescingOrder: coalescingOrder(message)
     }
   }
 
@@ -2255,25 +2299,28 @@ export class PrivateMessenger {
       outer: message.outer || null,
       meta: message.meta || null
     }
-    Object.assign(record, this.#askCoalescingMetadata(type, channelPubkey, message, info) || {})
+    Object.assign(record, this.#coalescingMetadata(type, channelPubkey, message, info) || {})
     try {
-      const coalesced = record.askCoalescingKey
-        ? await this.queue.coalesceBy(ASK_COALESCING_INDEX, record, {
-          compare: compareAskCoalescingItems
+      const coalesced = record.coalescingKey
+        ? await this.queue.coalesceBy(COALESCING_INDEX, record, {
+          compare: compareCoalescingItems,
+          keep: record.coalescingKeep
         })
         : null
       if (!coalesced) await this.queue.enqueue(record)
       if (coalesced?.status === 'ignored') {
         this.markSeen(channelPubkey, message.outer?.created_at || message.event?.created_at || nowSeconds())
-        this.debug('ask-coalescing-ignored', {
+        this.debug('message-coalescing-ignored', {
           code: messageCode(message) || '',
+          keep: record.coalescingKeep,
           payloadBytes: encoder.encode(JSON.stringify(record)).byteLength
         })
         return
       }
       if (coalesced) {
-        this.debug('ask-coalesced', {
+        this.debug('message-coalesced', {
           code: messageCode(message) || '',
+          keep: record.coalescingKeep,
           status: coalesced.status,
           removedUnreserved: coalesced.removed,
           payloadBytes: encoder.encode(JSON.stringify(record)).byteLength
@@ -2290,7 +2337,7 @@ export class PrivateMessenger {
       // Do not await stop from inside its own transport callback.
       const atCapacity = isQueueCapacityError(err)
       if (!atCapacity && isRecoverableStorageFailure(err)) {
-        const storageKey = record.askCoalescingKey || JSON.stringify(dedupeKey || [channelPubkey, type])
+        const storageKey = record.coalescingKey || JSON.stringify(dedupeKey || [channelPubkey, type])
         this.pendingStorageWrites.set(storageKey, {
           record,
           dedupeKey,
@@ -2312,7 +2359,7 @@ export class PrivateMessenger {
     }
     this.markSeen(channelPubkey, message.outer?.created_at || message.event?.created_at || nowSeconds())
     this.wakeDeliveries()
-    if (!record.askCoalescingKey) this.debug('enqueue', debugMessageInfo(type, channelPubkey, message))
+    if (!record.coalescingKey) this.debug('enqueue', debugMessageInfo(type, channelPubkey, message))
     this.onMessageQueued?.()
   }
 
@@ -2570,7 +2617,7 @@ export class PrivateMessenger {
     this.assertOpen()
     this.touchStorageActivity().catch(err => this.onError?.(err))
     await this.queueOperationTail
-    const reservation = await this.queue.reserve({ nackCoalesceIndex: ASK_COALESCING_INDEX })
+    const reservation = await this.queue.reserve({ nackCoalescingIndex: COALESCING_INDEX })
     if (!reservation) return null
     if (this.closePromise) { await reservation.nack(); return null }
     let finish
@@ -2603,7 +2650,8 @@ export class PrivateMessenger {
     return delivery
   }
 
-  async ask ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey, useBulkPacing = false }) {
+  async ask ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, idempotencyKey, deletionPubkey, useBulkPacing = false }) {
+    idempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
@@ -2625,6 +2673,7 @@ export class PrivateMessenger {
         payload,
         error,
         content,
+        idempotencyKey,
         useBulkPacing,
         onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
         _getIykcProofs: this.contentKeyLookup()
@@ -2632,7 +2681,8 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async reply ({ channelPubkey = this.defaultChannelPubkey(), question, receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey, useBulkPacing = false }) {
+  async reply ({ channelPubkey = this.defaultChannelPubkey(), question, receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, idempotencyKey, deletionPubkey, useBulkPacing = false }) {
+    idempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
@@ -2656,6 +2706,7 @@ export class PrivateMessenger {
         payload,
         error,
         content,
+        idempotencyKey,
         useBulkPacing,
         onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
         _getIykcProofs: this.contentKeyLookup()
@@ -2663,7 +2714,8 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async tell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey, useBulkPacing = false }) {
+  async tell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, idempotencyKey, deletionPubkey, useBulkPacing = false }) {
+    idempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
@@ -2685,6 +2737,7 @@ export class PrivateMessenger {
         payload,
         error,
         content,
+        idempotencyKey,
         useBulkPacing,
         onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
         _getIykcProofs: this.contentKeyLookup()
@@ -2692,7 +2745,8 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async yell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, message, code, payload, error, content, deletionPubkey, createdAt, onPreparedSeed, preparedPublication, preparedPublications, useBulkPacing = false }) {
+  async yell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, message, code, payload, error, content, idempotencyKey, deletionPubkey, createdAt, onPreparedSeed, preparedPublication, preparedPublications, useBulkPacing = false }) {
+    idempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
@@ -2718,6 +2772,7 @@ export class PrivateMessenger {
         payload,
         error,
         content,
+        idempotencyKey,
         createdAt,
         useBulkPacing,
         onPreparedSeed: onPreparedSeed || this.outgoingSeedHandler(channelPubkey),
@@ -3882,7 +3937,7 @@ function messageCode (message) {
     : null
 }
 
-function askCoalescingOrder (message) {
+function coalescingOrder (message) {
   return {
     outer: Number.isSafeInteger(message?.outer?.created_at) ? message.outer.created_at : 0,
     inner: Number.isSafeInteger(message?.event?.created_at) ? message.event.created_at : 0,
@@ -3890,7 +3945,7 @@ function askCoalescingOrder (message) {
   }
 }
 
-function compareAskCoalescingOrder (left, right) {
+function compareCoalescingOrder (left, right) {
   if ((left?.outer || 0) !== (right?.outer || 0)) return (left?.outer || 0) - (right?.outer || 0)
   if ((left?.inner || 0) !== (right?.inner || 0)) return (left?.inner || 0) - (right?.inner || 0)
   const leftId = left?.eventId || ''
@@ -3899,13 +3954,17 @@ function compareAskCoalescingOrder (left, right) {
   return leftId < rightId ? -1 : 1
 }
 
-function compareAskCoalescingItems (left, right) {
-  return compareAskCoalescingOrder(left?.askCoalescingOrder, right?.askCoalescingOrder)
+function compareCoalescingItems (left, right) {
+  return compareCoalescingOrder(left?.coalescingOrder, right?.coalescingOrder)
 }
 
-function askCoalescingError (cause) {
-  return Object.assign(new Error('INVALID_ASK_COALESCING_KEY'), {
-    code: 'INVALID_ASK_COALESCING_KEY',
+function idempotencyDigest (idempotencyKey) {
+  return bytesToHex(sha256(encoder.encode(JSON.stringify(['idempotency', idempotencyKey]))))
+}
+
+function coalescingError (cause) {
+  return Object.assign(new Error('INVALID_INBOUND_COALESCING_KEY'), {
+    code: 'INVALID_INBOUND_COALESCING_KEY',
     cause
   })
 }
@@ -3999,8 +4058,9 @@ function nymCarrierSeedKey (record) {
 function withoutQueueMetadata (item) {
   if (!item) return null
   const value = { ...item }
-  delete value.askCoalescingKey
-  delete value.askCoalescingOrder
+  delete value.coalescingKey
+  delete value.coalescingKeep
+  delete value.coalescingOrder
   delete value[SEED_KEY]
   delete value[SEED_TIME]
   return value

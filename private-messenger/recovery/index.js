@@ -2,6 +2,7 @@ import { getEventHash } from '../../event/index.js'
 import { bytesToBase64, base64ToBytes } from '../../base64/index.js'
 import { ValidationError } from '../../error/index.js'
 import { ASK_KIND, parseRumorContent } from '../../private-message/index.js'
+import { chunkIdempotencyKey, normalizeIdempotencyKeyBase } from '../../private-message/helpers/idempotency.js'
 
 export const SEEDER_PRESENCE_CODE = 'seederPresence_8mj8'
 export const MISSING_MESSAGES_ASK_CODE = 'missingMessages_ask_8mj8'
@@ -228,13 +229,15 @@ export function createEventReplyPacker ({
   bytesPerChunk = DEFAULT_REPLY_BYTES_PER_CHUNK,
   recordsFromInput = eventRecordFromInput,
   sendEmptyReply = false,
-  useBulkPacing = true
+  useBulkPacing = true,
+  idempotencyKey
 }) {
   if (!messenger?.reply) throw new ValidationError('MESSENGER_REQUIRED')
   if (!question?.id) throw new ValidationError('QUESTION_REQUIRED')
   if (!receiverPubkey) throw new ValidationError('RECEIVER_PUBKEY_REQUIRED')
   if (!Number.isSafeInteger(eventsPerChunk) || eventsPerChunk < 1) throw new ValidationError('INVALID_EVENTS_PER_CHUNK')
   if (!Number.isSafeInteger(bytesPerChunk) || bytesPerChunk < 1) throw new ValidationError('INVALID_BYTES_PER_CHUNK')
+  const idempotencyKeyBase = normalizeIdempotencyKeyBase(idempotencyKey)
 
   let chunk = ''
   let chunkEvents = 0
@@ -250,6 +253,9 @@ export function createEventReplyPacker ({
       question,
       receiverPubkey,
       code,
+      ...(idempotencyKeyBase
+        ? { idempotencyKey: chunkIdempotencyKey(idempotencyKeyBase, index) }
+        : {}),
       useBulkPacing,
       payload: {
         ...payload,
@@ -311,13 +317,15 @@ export function createMissingMessageReplyPacker ({
   eventsPerChunk = DEFAULT_EVENTS_PER_CHUNK,
   bytesPerChunk = DEFAULT_REPLY_BYTES_PER_CHUNK,
   sendEmptyReply = false,
-  useBulkPacing = true
+  useBulkPacing = true,
+  idempotencyKey
 }) {
   if (!messenger?.reply) throw new ValidationError('MESSENGER_REQUIRED')
   if (!question?.id) throw new ValidationError('QUESTION_REQUIRED')
   if (!receiverPubkey) throw new ValidationError('RECEIVER_PUBKEY_REQUIRED')
   if (!Number.isSafeInteger(eventsPerChunk) || eventsPerChunk < 1) throw new ValidationError('INVALID_EVENTS_PER_CHUNK')
   if (!Number.isSafeInteger(bytesPerChunk) || bytesPerChunk < 1) throw new ValidationError('INVALID_BYTES_PER_CHUNK')
+  idempotencyKey ||= `${MISSING_MESSAGES_REPLY_CODE}:${question.id}`
 
   const range = backfillRequestRange(question, since, until)
   return createEventReplyPacker({
@@ -331,6 +339,7 @@ export function createMissingMessageReplyPacker ({
     bytesPerChunk,
     sendEmptyReply,
     useBulkPacing,
+    idempotencyKey,
     recordsFromInput: seed => compactRecordsFromSeed(seed, { receiverPubkey, since: range.since, until: range.until })
   })
 }

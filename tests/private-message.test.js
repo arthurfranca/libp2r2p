@@ -385,6 +385,88 @@ test('reply tell and yell publish recognizable private message rumors', async ()
   assert.deepEqual(signedResult.event, signedEvent)
 })
 
+test('basic private messages add D before h and validate idempotency keys', async () => {
+  const published = []
+  const _publish = async options => {
+    published.push(options)
+    return []
+  }
+  const sender = signer(pubkeyFixture(4))
+  const question = {
+    id: 'question-id',
+    pubkey: 'alice',
+    kind: ASK_KIND,
+    created_at: 1,
+    tags: [['r', 'bob']],
+    content: '{}'
+  }
+
+  await ask({
+    senderSigner: sender,
+    receiverPubkey: 'alice',
+    code: 'ask-code',
+    payload: {},
+    idempotencyKey: 'ask-operation',
+    _assertWatching: () => {},
+    _publish
+  })
+  await reply({
+    senderSigner: sender,
+    question,
+    code: 'reply-code',
+    payload: {},
+    idempotencyKey: 'reply-chunk:0',
+    _publish
+  })
+  await tell({
+    senderSigner: sender,
+    receiverPubkey: 'alice',
+    code: 'tell-code',
+    payload: {},
+    idempotencyKey: 'tell-operation',
+    _publish
+  })
+  await yell({
+    senderSigner: sender,
+    receiverPubkeys: ['alice', 'bob'],
+    code: 'yell-code',
+    payload: {},
+    idempotencyKey: 'yell-operation',
+    _publish
+  })
+
+  assert.deepEqual(published[0].event.tags, [
+    ['D', 'ask-operation'],
+    ['r', 'alice'],
+    ['h', 'ask-code']
+  ])
+  assert.deepEqual(published[1].event.tags, [
+    ['D', 'reply-chunk:0'],
+    ['q', 'question-id'],
+    ['r', 'alice'],
+    ['h', 'reply-code']
+  ])
+  assert.deepEqual(published[2].event.tags, [
+    ['D', 'tell-operation'],
+    ['r', 'alice'],
+    ['h', 'tell-code']
+  ])
+  assert.deepEqual(published[3].event.tags, [
+    ['D', 'yell-operation'],
+    ['h', 'yell-code']
+  ])
+
+  for (const idempotencyKey of ['', null, 1, 'x'.repeat(257)]) {
+    await assert.rejects(tell({
+      senderSigner: sender,
+      receiverPubkey: 'alice',
+      payload: {},
+      idempotencyKey,
+      _publish
+    }), { code: 'INVALID_IDEMPOTENCY_KEY' })
+  }
+})
+
 test('private message sends share one deletion capability and return delivery reports', async () => {
   const published = []
   const reports = [{ success: true, total: 1 }, { success: false, total: 1 }]

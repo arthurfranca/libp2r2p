@@ -100,6 +100,51 @@ async function takeMessage (messenger) {
   return delivery.message
 }
 
+function inboxRumor (type, id, createdAt, {
+  code = `${type}-code`,
+  tags = []
+} = {}) {
+  const kind = type === 'ask'
+    ? ASK_KIND
+    : type === 'reply'
+      ? REPLY_KIND
+      : type === 'tell' || type === 'yell'
+        ? TELL_KIND
+        : type === 'message'
+          ? 9
+          : 1
+  const event = {
+    id,
+    kind,
+    pubkey: 'alice',
+    created_at: createdAt,
+    tags,
+    content: '{}'
+  }
+  return {
+    event,
+    outer: { id: `outer-${id}`, created_at: createdAt },
+    meta: { channelPubkey: 'channel' },
+    senderPubkey: 'alice',
+    payload: { code, payload: { id } },
+    ...(type === 'ask' ? { question: event } : {}),
+    ...(type === 'reply' ? { questionId: tags.find(tag => tag[0] === 'q')?.[1] || '' } : {}),
+    ...(type === 'tell' ? { tell: event } : {}),
+    ...(type === 'yell' ? { yell: event } : {}),
+    ...(type === 'nym' ? { nym: event } : {})
+  }
+}
+
+async function deliverInboxRumor (privateMessage, type, message) {
+  const callbacks = privateMessage.watchCalls[0]
+  if (type === 'ask') return callbacks.onAsk(message)
+  if (type === 'reply') return callbacks.onReply(message)
+  if (type === 'tell') return callbacks.onTell(message)
+  if (type === 'yell') return callbacks.onYell(message)
+  if (type === 'nym') return callbacks.onNym(message)
+  return callbacks.onMessage(message)
+}
+
 function signer (pubkey) {
   return {
     getPublicKey: () => pubkey,
@@ -1174,9 +1219,9 @@ test('private messenger coalesces equivalent asks with the latest request', asyn
   const digest = 'a'.repeat(64)
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
-    resolveAskCoalescingKey: message => {
+    resolveInboundCoalescing: message => {
       resolved.push(message.event.id)
-      return message.payload.code === 'sync-ask' ? digest : null
+      return message.payload.code === 'sync-ask' ? { key: digest, keep: 'latest' } : null
     }
   }).init({
     userSigner: signer('user'),
@@ -1213,8 +1258,9 @@ test('private messenger coalesces equivalent asks with the latest request', asyn
   assert.equal(queued.event.id, 'ask-2')
   assert.equal(queued.question.id, 'ask-2')
   assert.equal(queued.payload.payload.requestId, 'request-2')
-  assert.equal(Object.hasOwn(queued, 'askCoalescingKey'), false)
-  assert.equal(Object.hasOwn(queued, 'askCoalescingOrder'), false)
+  assert.equal(Object.hasOwn(queued, 'coalescingKey'), false)
+  assert.equal(Object.hasOwn(queued, 'coalescingKeep'), false)
+  assert.equal(Object.hasOwn(queued, 'coalescingOrder'), false)
   assert.equal(await takeMessage(messenger), null)
   assert.deepEqual(resolved, ['ask-1', 'ask-2', 'ask-older'])
 })
@@ -1223,7 +1269,7 @@ test('private messenger keeps one latest successor while an ask is active', asyn
   const pm = fakePrivateMessage()
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
-    resolveAskCoalescingKey: () => 'b'.repeat(64)
+    resolveInboundCoalescing: () => ({ key: 'b'.repeat(64), keep: 'latest' })
   }).init({
     userSigner: signer('user'),
     channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
@@ -1268,7 +1314,7 @@ test('coalesced asks remain latest and durable across messenger instances', asyn
   const first = await new PrivateMessenger({
     _indexedDB: indexedDB,
     _privateMessage: fakePrivateMessage(),
-    resolveAskCoalescingKey: resolver
+    resolveInboundCoalescing: () => ({ key: resolver(), keep: 'latest' })
   }).init(init)
   const ask = (id, outerAt) => ({
     event: { id, kind: ASK_KIND, pubkey: 'alice', created_at: outerAt, tags: [['r', 'user']], content: '' },
@@ -1285,7 +1331,7 @@ test('coalesced asks remain latest and durable across messenger instances', asyn
   const second = await new PrivateMessenger({
     _indexedDB: indexedDB,
     _privateMessage: fakePrivateMessage(),
-    resolveAskCoalescingKey: resolver
+    resolveInboundCoalescing: () => ({ key: resolver(), keep: 'latest' })
   }).init(init)
   const restored = await takeMessage(second)
   assert.equal(restored.event.id, 'new')
@@ -1297,7 +1343,7 @@ test('private messenger scopes ask coalescing by channel sender and code', async
   const pm = fakePrivateMessage()
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
-    resolveAskCoalescingKey: () => 'c'.repeat(64)
+    resolveInboundCoalescing: () => ({ key: 'c'.repeat(64), keep: 'latest' })
   }).init({
     userSigner: signer('user'),
     channels: [
@@ -1328,8 +1374,8 @@ test('private messenger scopes ask coalescing by channel sender and code', async
 
 test('private messenger reports invalid ask coalescing resolvers and preserves admission', async () => {
   assert.throws(
-    () => new PrivateMessenger({ _privateMessage: fakePrivateMessage(), resolveAskCoalescingKey: true }),
-    { code: 'INVALID_RESOLVE_ASK_COALESCING_KEY' }
+    () => new PrivateMessenger({ _privateMessage: fakePrivateMessage(), resolveInboundCoalescing: true }),
+    { code: 'INVALID_RESOLVE_INBOUND_COALESCING' }
   )
   const pm = fakePrivateMessage()
   const errors = []
@@ -1337,10 +1383,10 @@ test('private messenger reports invalid ask coalescing resolvers and preserves a
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
     onError: error => errors.push(error),
-    resolveAskCoalescingKey: message => {
+    resolveInboundCoalescing: message => {
       calls++
       if (message.payload.code === 'throw-ask') throw new Error('resolver failed')
-      return 'not-a-digest'
+      return { key: 'not-a-digest' }
     }
   }).init({
     userSigner: signer('user'),
@@ -1366,11 +1412,138 @@ test('private messenger reports invalid ask coalescing resolvers and preserves a
     reply: { id: 'reply' }
   })
 
-  assert.equal(calls, 2)
-  assert.equal(errors.filter(error => error.code === 'INVALID_ASK_COALESCING_KEY').length, 2)
+  assert.equal(calls, 3)
+  assert.equal(errors.filter(error => error.code === 'INVALID_INBOUND_COALESCING_KEY').length, 3)
   assert.equal((await takeMessage(messenger)).event.id, 'throw')
   assert.equal((await takeMessage(messenger)).event.id, 'invalid')
   assert.equal((await takeMessage(messenger)).event.id, 'reply')
+})
+
+test('generic receive coalescing applies D only to stable control types', async () => {
+  const pm = fakePrivateMessage()
+  const observed = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    resolveInboundCoalescing: (message, { idempotencyKey }) => {
+      observed.push({ type: message.type, eventId: message.event.id, idempotencyKey })
+      return null
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const generic = (type, id, createdAt) => inboxRumor(type, id, createdAt, {
+    tags: [['D', 'shared-operation']]
+  })
+
+  for (const type of ['ask', 'reply', 'tell', 'yell', 'message', 'nym']) {
+    await deliverInboxRumor(pm, type, generic(type, `${type}-1`, 10))
+  }
+  await deliverInboxRumor(pm, 'ask', generic('ask', 'ask-2', 20))
+  await deliverInboxRumor(pm, 'reply', generic('reply', 'reply-2', 20))
+  await deliverInboxRumor(pm, 'tell', generic('tell', 'tell-2', 20))
+  await deliverInboxRumor(pm, 'yell', generic('yell', 'yell-2', 20))
+  await deliverInboxRumor(pm, 'message', generic('message', 'message-2', 20))
+  await deliverInboxRumor(pm, 'nym', generic('nym', 'nym-2', 20))
+
+  assert.deepEqual(
+    observed.slice(0, 6).map(entry => [entry.type, entry.idempotencyKey]),
+    [
+      ['ask', 'shared-operation'],
+      ['reply', 'shared-operation'],
+      ['tell', 'shared-operation'],
+      ['yell', 'shared-operation'],
+      ['message', null],
+      ['nym', null]
+    ]
+  )
+  assert.deepEqual(observed.slice(-6).map(entry => entry.idempotencyKey), [
+    'shared-operation',
+    'shared-operation',
+    'shared-operation',
+    'shared-operation',
+    null,
+    null
+  ])
+  const stored = await Array.fromAsync(messenger.queue.storedItems())
+  assert.deepEqual(
+    stored.map(item => item.event.id),
+    ['ask-2', 'reply-2', 'tell-2', 'yell-2', 'message-1', 'nym-1', 'message-2', 'nym-2']
+  )
+  for (const item of stored) {
+    assert.equal(String(item.coalescingKey || '').includes('shared-operation'), false)
+  }
+})
+
+test('generic resolver key overrides D and supports keep-oldest', async () => {
+  const pm = fakePrivateMessage()
+  const keys = {
+    latest: 'e'.repeat(64),
+    oldest: 'f'.repeat(64),
+    message: '1'.repeat(64),
+    nym: '2'.repeat(64)
+  }
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    resolveInboundCoalescing: message => ({
+      key: keys[message.payload.code],
+      keep: message.payload.code === 'oldest' ? 'oldest' : 'latest'
+    })
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const latest = inboxRumor('tell', 'latest-1', 10, {
+    code: 'latest',
+    tags: [['D', 'first-d']]
+  })
+  const latestNext = inboxRumor('tell', 'latest-2', 20, {
+    code: 'latest',
+    tags: [['D', 'different-d']]
+  })
+  latestNext.tell = latestNext.event
+  await deliverInboxRumor(pm, 'tell', latest)
+  await deliverInboxRumor(pm, 'tell', latestNext)
+
+  const oldest = inboxRumor('yell', 'oldest-1', 10, { code: 'oldest' })
+  const oldestNext = inboxRumor('yell', 'oldest-2', 20, { code: 'oldest' })
+  await deliverInboxRumor(pm, 'yell', oldest)
+  await deliverInboxRumor(pm, 'yell', oldestNext)
+
+  for (const type of ['message', 'nym']) {
+    await deliverInboxRumor(pm, type, inboxRumor(type, `${type}-1`, 10, { code: type, tags: [['D', 'ignored-d']] }))
+    await deliverInboxRumor(pm, type, inboxRumor(type, `${type}-2`, 20, { code: type, tags: [['D', 'different-ignored-d']] }))
+  }
+
+  assert.deepEqual(
+    (await Array.fromAsync(messenger.queue.storedItems())).map(item => item.event.id),
+    ['latest-2', 'oldest-1', 'message-2', 'nym-2']
+  )
+})
+
+test('invalid D tags are ignored without blocking message admission', async () => {
+  const pm = fakePrivateMessage()
+  const debug = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    onDebug: event => debug.push(event)
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const messages = [
+    inboxRumor('tell', 'empty', 10, { tags: [['D', '']] }),
+    inboxRumor('tell', 'duplicate', 20, { tags: [['D', 'one'], ['D', 'two']] }),
+    inboxRumor('tell', 'extra', 30, { tags: [['D', 'one', 'extra']] }),
+    inboxRumor('tell', 'oversized', 40, { tags: [['D', 'x'.repeat(257)]] })
+  ]
+  for (const message of messages) await deliverInboxRumor(pm, 'tell', message)
+
+  assert.deepEqual(
+    (await Array.fromAsync(messenger.queue.storedItems())).map(item => item.event.id),
+    ['empty', 'duplicate', 'extra', 'oversized']
+  )
+  assert.equal(debug.filter(event => event.action === 'idempotency-tag-ignored').length, 4)
 })
 
 test('private messenger reports content key usage changes for sent and received messages', async () => {
@@ -1452,16 +1625,22 @@ test('private messenger delegates send helpers with scoped signers and relays', 
     channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'] }]
   })
 
-  await messenger.ask({ receiverPubkey: 'alice', payload: 'ping' })
-  await messenger.reply({ question: { id: 'q', pubkey: 'alice' }, payload: 'pong' })
-  await messenger.tell({ receiverPubkey: 'alice', payload: 'note' })
-  await messenger.yell({ receiverPubkeys: ['alice', 'bob'], payload: 'news' })
+  await messenger.ask({ receiverPubkey: 'alice', payload: 'ping', idempotencyKey: 'ask-op' })
+  await messenger.reply({ question: { id: 'q', pubkey: 'alice' }, payload: 'pong', idempotencyKey: 'reply-op:0' })
+  await messenger.tell({ receiverPubkey: 'alice', payload: 'note', idempotencyKey: 'tell-op' })
+  await messenger.yell({ receiverPubkeys: ['alice', 'bob'], payload: 'news', idempotencyKey: 'yell-op' })
   await messenger.broadcastRumor({ receiverPubkeys: ['alice', 'bob'], rumor: { kind: 9001, created_at: 1, tags: [], content: 'raw' } })
   await messenger.broadcastEvent({ receiverPubkeys: ['alice', 'bob'], event: { id: 'signed-id', kind: 9002, pubkey: 'author', created_at: 2, tags: [], content: 'signed', sig: 'sig' } })
   await messenger.broadcastNymRumor({ rumor: { kind: 9003, created_at: 3, tags: [], content: 'nym raw' } })
   await messenger.broadcastNymEvent({ event: { id: 'nym-signed-id', kind: 9004, pubkey: 'author', created_at: 4, tags: [], content: 'nym signed', sig: 'sig' } })
 
   assert.deepEqual(pm.sent.map(s => s.method), ['ask', 'reply', 'tell', 'yell', 'broadcastRumor', 'broadcastEvent', 'broadcastNymRumor', 'broadcastNymEvent'])
+  assert.deepEqual(pm.sent.slice(0, 4).map(sent => sent.options.idempotencyKey), [
+    'ask-op',
+    'reply-op:0',
+    'tell-op',
+    'yell-op'
+  ])
   for (const sent of pm.sent.slice(0, 6)) {
     assert.equal(sent.options.senderSigner.getPublicKey(), 'user')
     assert.equal(sent.options.imkcSigner.getPublicKey(), 'content')
@@ -1480,6 +1659,10 @@ test('private messenger delegates send helpers with scoped signers and relays', 
   assert.equal(pm.sent[7].options.nymSigner.getPublicKey(), 'global-nym')
   assert.equal(pm.sent[7].options.event.pubkey, 'author')
   assert.equal(pm.sent[7].options.autoDeletionCapability, true)
+  await assert.rejects(
+    messenger.tell({ receiverPubkey: 'alice', payload: 'invalid', idempotencyKey: '' }),
+    { code: 'INVALID_IDEMPOTENCY_KEY' }
+  )
 })
 
 test('private messenger configures automatic deletion capabilities and forwards caller pubkeys', async () => {
@@ -3095,6 +3278,7 @@ test('missing-message reply packer streams compact seed routers only', async () 
   assert.equal(replies[0].payload.since, 5)
   assert.equal(replies[0].payload.until, 20)
   assert.equal(replies[0].payload.isLast, true)
+  assert.equal(replies[0].idempotencyKey, `${MISSING_MESSAGES_REPLY_CODE}:question-id:0`)
   const lines = replies[0].payload.jsonl.trim().split('\n')
   assert.equal(lines.length, 1)
   const record = JSON.parse(lines[0])
@@ -3151,6 +3335,36 @@ test('event reply packer streams regular event lists', async () => {
   assert.equal(replies[1].payload.index, 1)
   assert.equal(replies[1].payload.isLast, true)
   assert.deepEqual(replies[1].payload.jsonl.trim().split('\n').map(line => JSON.parse(line).id), ['event-3'])
+})
+
+test('event reply packers derive one idempotency key per chunk', async () => {
+  const replies = []
+  assert.throws(() => createEventReplyPacker({
+    messenger: { reply: async () => {} },
+    channelPubkey: 'channel',
+    question: { id: 'question', pubkey: 'peer' },
+    code: 'eventSync_test',
+    idempotencyKey: 'x'.repeat(240)
+  }), { code: 'INVALID_IDEMPOTENCY_KEY' })
+  const packer = createEventReplyPacker({
+    messenger: { reply: async options => replies.push(options) },
+    channelPubkey: 'channel',
+    question: { id: 'question', pubkey: 'peer' },
+    code: 'eventSync_test',
+    eventsPerChunk: 1,
+    idempotencyKey: 'event-reply'
+  })
+
+  await packer.update({ id: 'one', kind: 1, pubkey: 'peer', created_at: 1, tags: [], content: '' })
+  await packer.update({ id: 'two', kind: 1, pubkey: 'peer', created_at: 2, tags: [], content: '' })
+  await packer.finalize()
+
+  assert.deepEqual(replies.map(reply => reply.idempotencyKey), [
+    'event-reply:0',
+    'event-reply:1',
+    'event-reply:2'
+  ])
+  assert.deepEqual(replies.map(reply => reply.payload.isLast), [false, false, true])
 })
 
 test('event reply packer can send configured empty replies', async () => {
@@ -4228,14 +4442,19 @@ test('reply packer keeps failed final payload and index for retry', async () => 
   let failing = true
   const replies = []
   const packer = createEventReplyPacker({
-    messenger: { reply: async ({ payload }) => { replies.push(payload); if (failing) throw failure } },
-    question: { id: 'question', pubkey: 'peer' }, code: 'test', recordsFromInput: event => [event]
+    messenger: { reply: async options => { replies.push(options); if (failing) throw failure } },
+    question: { id: 'question', pubkey: 'peer' },
+    code: 'test',
+    idempotencyKey: 'retry-reply',
+    recordsFromInput: event => [event]
   })
   await packer.update({ id: 'one' })
   await assert.rejects(packer.finalize(), error => error === failure)
   failing = false
   await packer.finalize()
-  assert.deepEqual(replies[1], replies[0])
+  assert.deepEqual(replies[1].payload, replies[0].payload)
+  assert.equal(replies[1].idempotencyKey, replies[0].idempotencyKey)
+  assert.equal(replies[1].idempotencyKey, 'retry-reply:0')
   await packer.finalize()
   assert.equal(replies.length, 2)
 })

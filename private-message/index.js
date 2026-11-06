@@ -5,6 +5,7 @@ import { generateKeypair, keypairFromSeckey } from '../key/index.js'
 import * as privateChannel from '../private-channel/index.js'
 import { normalizeRumor, deliveryInfo } from '../private-channel/helpers/rumor.js'
 import { normalizePreparedPublications } from '../private-channel/helpers/prepared.js'
+import { appendIdempotencyTag } from './helpers/idempotency.js'
 
 export const ASK_KIND = 7329
 export const REPLY_KIND = 7330
@@ -118,11 +119,11 @@ function addHeaderTag (tags, { code, error }) {
   return out.concat([header])
 }
 
-function makeMessageRumor ({ kind, tags, message }) {
+function makeMessageRumor ({ kind, tags, message, idempotencyKey }) {
   const normalized = normalizeMessage(message)
   return {
     kind,
-    tags: addHeaderTag(tags, normalized),
+    tags: addHeaderTag(appendIdempotencyTag(tags, idempotencyKey), normalized),
     content: normalized.content
   }
 }
@@ -717,6 +718,7 @@ export async function ask ({
   payload,
   error,
   content,
+  idempotencyKey,
   expirationSeconds,
   useBulkPacing = false,
   temporaryStorageArea,
@@ -737,7 +739,7 @@ export async function ask ({
     const identity = await senderSigner?.getPublicKey?.()
     const session = defaultSessions.get(identity)
     if (!session) throw new Error('PRIVATE_MESSAGE_NOT_WATCHING')
-    return session.ask({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receiverPubkey, relays, relayToReceivers, recoveryRelays, message, code, payload, error, content, expirationSeconds, useBulkPacing, temporaryStorageArea, _getIykcProofs, deletionPubkey, deletionSeckey, autoDeletionCapability, _publish })
+    return session.ask({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receiverPubkey, relays, relayToReceivers, recoveryRelays, message, code, payload, error, content, idempotencyKey, expirationSeconds, useBulkPacing, temporaryStorageArea, _getIykcProofs, deletionPubkey, deletionSeckey, autoDeletionCapability, _publish })
   }
 
   const { event: question, wireEvent } = await makeOutgoingRumor({
@@ -745,7 +747,8 @@ export async function ask ({
     rumor: makeMessageRumor({
       kind: ASK_KIND,
       tags: [['r', receiverPubkey]],
-      message: message || { code, payload, error, content }
+      message: message || { code, payload, error, content },
+      idempotencyKey
     })
   })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
@@ -769,6 +772,7 @@ export async function reply ({
   payload,
   error,
   content,
+  idempotencyKey,
   expirationSeconds,
   useBulkPacing = false,
   temporaryStorageArea,
@@ -787,7 +791,8 @@ export async function reply ({
     rumor: makeMessageRumor({
       kind: REPLY_KIND,
       tags: [['q', question.id], ['r', receiverPubkey]],
-      message: message || { code, payload, error, content }
+      message: message || { code, payload, error, content },
+      idempotencyKey
     })
   })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
@@ -809,6 +814,7 @@ export async function tell ({
   payload,
   error,
   content,
+  idempotencyKey,
   expirationSeconds,
   useBulkPacing = false,
   temporaryStorageArea,
@@ -826,7 +832,8 @@ export async function tell ({
     rumor: makeMessageRumor({
       kind: TELL_KIND,
       tags: [['r', receiverPubkey]],
-      message: message || { code, payload, error, content }
+      message: message || { code, payload, error, content },
+      idempotencyKey
     })
   })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability })
@@ -848,6 +855,7 @@ export async function yell ({
   payload,
   error,
   content,
+  idempotencyKey,
   expirationSeconds,
   useBulkPacing = false,
   temporaryStorageArea,
@@ -870,7 +878,8 @@ export async function yell ({
   const rumor = makeMessageRumor({
     kind: TELL_KIND,
     tags: [],
-    message: message || { code, payload, error, content }
+    message: message || { code, payload, error, content },
+    idempotencyKey
   })
   if (createdAt !== undefined) rumor.created_at = createdAt
   const { event, wireEvent } = await makeOutgoingRumor({

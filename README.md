@@ -359,21 +359,33 @@ await messenger.tell({
 })
 ```
 
-### Inbound ask coalescing
+### Inbound message coalescing
 
 `PrivateMessenger` accepts an optional synchronous
-`resolveAskCoalescingKey(message)` constructor callback. It must return `null`
-or one lowercase 64-character SHA-256 digest and must not perform I/O. The
-messenger scopes the digest by channel, sender and message code, then keeps at
-most one pending ask per semantic key. A newer equivalent ask replaces the
-pending item in place; while the current item is reserved, at most one latest
-successor is retained. Older recovered asks do not replace newer requests.
+`resolveInboundCoalescing(message, { idempotencyKey })` constructor callback.
+The enriched `message` includes `type` and `channelPubkey`. The callback returns
+`null` or `{ key, keep? }`, where `key` is a lowercase 64-character SHA-256
+digest and `keep` is `latest` (default) or `oldest`.
 
-The callback applies only to direct asks. It does not replace exact event-ID
-deduplication, authorization, quarantine, pause/capacity handling or ACK/NACK
-ownership. An invalid result or callback exception is reported through
-`onError`; the ask still follows normal admission. Coalescing metadata is
-removed before the app receives the message.
+The resolver runs for ask, reply, tell, yell, message and nym deliveries after
+exact event-ID deduplication. The final coalescing key is scoped by channel,
+sender, type, message code and provenance. `latest` replaces the pending item in
+place; `oldest` preserves it. While an item is reserved, both policies allow at
+most one successor. Older recovered events do not replace newer requests.
+
+For ask, reply, tell and yell, exactly one `["D", key]` tag may serve as an
+automatic fallback when the resolver returns `null`. Its key is non-empty and
+limited to 256 UTF-8 bytes. Message and nym always expose
+`idempotencyKey: null` to the resolver and do not interpret D automatically, so
+arbitrary Nostr kinds retain their own tag semantics.
+
+`ask`, `reply`, `tell` and `yell` accept `idempotencyKey` and place D before the
+`h` tag. Invalid keys throw `INVALID_IDEMPOTENCY_KEY`. Broadcast/signed-event
+APIs require the app to put D into the event before hashing/signing.
+
+Coalescing does not provide an ingress rate limit or per-peer quota. Exact
+event deduplication, authorization, quarantine, global inbox capacity,
+pause/ACK/NACK ownership and existing storage policy remain independent.
 
 ### Deleting Private Broadcasts
 
@@ -1235,14 +1247,15 @@ the old token: its `ack`, `nack` and `renew` return false. Successful writes wak
 local waiting consumers. Like the other indexed methods, `putBy` is exclusive
 to `idb-queue`; the Web Storage queue's common API is unchanged.
 
-`queue.coalesceBy(indexName, item, { compare, now })` is the non-unique-indexed
-latest-wins variant. It replaces the oldest unreserved match in place, removes
-other unreserved matches atomically and appends one successor only when every
-match is currently reserved. The optional comparator keeps an older item from
-replacing a newer one and returns `{ status: 'ignored', removed: 0, position:
-null }`. Successful results use `inserted`, `replaced` or `successor`, with the
-number of extra pending rows removed and the retained/appended position.
-Capacity and byte accounting follow the same `reject` rules as `putBy`.
+`queue.coalesceBy(indexName, item, { keep = 'latest', compare, now })` is the
+non-unique-indexed coalescing variant. `latest` replaces the oldest unreserved
+match in place and removes other unreserved matches atomically. `oldest` keeps
+the existing pending match and reports it as ignored. Both policies append one
+successor when every match is currently reserved. The optional comparator keeps
+an older item from replacing a newer one. Results use `inserted`, `replaced`,
+`successor` or `ignored`, with the number of extra pending rows removed and the
+retained/appended position. Capacity and byte accounting follow the same
+`reject` rules as `putBy`.
 
 Both queue implementations support
 `createQueue({ prefix, evictionPolicy: 'reject', maxBytes })` to opt out of
@@ -1253,14 +1266,14 @@ Opening a reject-policy queue under a smaller budget preserves existing items.
 Positional replacement and insertion follow the same rule: they reject instead
 of evicting when the resulting queue would exceed the limit.
 
-`queue.reserve({ leaseMs = 30000, nackCoalesceIndex })` returns `null` or
+`queue.reserve({ leaseMs = 30000, nackCoalescingIndex })` returns `null` or
 `{ item, ack, nack, renew }`. Reservation token/deadline are internal record
 metadata, persisted atomically in the same IndexedDB transaction as selection.
 `renew()` extends a still-valid lease. Low-level callers own renewal and release;
 PrivateMessenger supplies both. Do not mix reservations with destructive or
 position-shifting queue operations on the same queue except explicit removal.
 A stale token cannot acknowledge a newly reserved or replaced record.
-`nackCoalesceIndex` names a non-unique index: when another matching item is
+`nackCoalescingIndex` names a non-unique index: when another matching item is
 pending, NACK deletes the superseded active item instead of requeueing it.
 
 `queue.getCapacity()` is part of the common API and returns
@@ -1391,6 +1404,8 @@ Both packers use `useBulkPacing: true` by default. Bulk EVENT publications are
 serialized per relay, start at least one second apart, and use a relay-local
 1..30 second exponential backoff when no retryAt is supplied. Relay advice
 overrides the local backoff and relays remain independent.
+Packers may receive a shared `idempotencyKey` base and append `:<index>` to each
+reply. Missing-message recovery supplies a question-scoped base by default.
 
 
 ### Private subscription recovery (0.11.8)

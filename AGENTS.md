@@ -128,12 +128,19 @@ suite pass; report independently scoped problems separately.
   attempts persist across visits; force is explicit. A successful retry admits
   the normal inbox before deleting ciphertext. Pause/close fence late results.
   Keep unknown/storage/permission errors operational, with unchanged ACK/NACK.
-- `PrivateMessenger` accepts optional synchronous `resolveAskCoalescingKey`.
-  It returns null or a lowercase SHA-256 digest; the messenger scopes it by
-  channel, sender and message code. Coalescing applies only to direct asks and
-  never replaces the exact event-ID dedupe, trust checks, pause/capacity gates or
-  ACK/NACK ownership. Keep the callback protocol-agnostic and free of I/O.
-  Invalid callback output is reported but must not drop the message.
+- `PrivateMessenger` accepts optional synchronous `resolveInboundCoalescing`.
+  It receives the decrypted message enriched with `type`/`channelPubkey` plus
+  `{ idempotencyKey }`, and returns null or `{ key, keep? }`. Keys are lowercase
+  SHA-256 digests; keep defaults to `latest` and may be `oldest`. Run it for all
+  inbox types after exact event-ID dedupe and scope the final key by channel,
+  sender, type, code and provenance. It never replaces trust checks,
+  pause/capacity gates or ACK/NACK ownership.
+- Only ask, reply, tell and yell interpret exactly one `["D", key]` automatically.
+  Keys are non-empty UTF-8 strings up to 256 bytes and fall back to latest-wins.
+  Message/nym always pass `idempotencyKey: null` and retain arbitrary-kind tag
+  semantics. Basic send methods accept `idempotencyKey`; broadcast/signed-event
+  methods require the app to add D before hashing/signing. Coalescing is not an
+  ingress rate limit or per-peer quota.
 - `PRIVATE_MESSENGER_PAUSED` carries its stable code and a copied pauseReasons
   array. `QUEUE_CAPACITY_EXCEEDED` carries the queue kind (`inbox` or `seeds`)
   plus requiredBytes, usedBytes and maxBytes. Keep these additive diagnostics
@@ -179,12 +186,12 @@ suite pass; report independently scoped problems separately.
   capacity policy and reservation-token invalidation. Indexed methods are
   extensions beyond the common Web Storage queue API; keep parity tests scoped
   to that common API.
-- `idb-queue.coalesceBy` is a latest-wins indexed extension. It preserves the
-  oldest unreserved position, removes extra unreserved matches in the same
-  transaction and appends only one successor when every match is reserved.
-  Stale items never replace newer ones. A reservation created with
-  `nackCoalesceIndex` is deleted rather than requeued when a pending successor
-  exists. Never modify or remove a valid reserved row while coalescing.
+- `idb-queue.coalesceBy` has `keep: 'latest' | 'oldest'` with latest as default.
+  Latest replaces an unreserved position and removes extra matches; oldest keeps
+  the pending match and reports ignored. Both append only one successor when all
+  matches are reserved. Stale items never replace newer ones. A reservation
+  created with `nackCoalescingIndex` is deleted rather than requeued when a
+  pending successor exists. Never modify or remove a valid reserved row.
 - The default local recovery-seed queue serializes incoming and outgoing
   `enqueueSeed()` operations per PrivateMessenger. Treat a bounded
   `ConstraintError` as an idempotent duplicate: NYM rows remain first-write-wins,
@@ -412,7 +419,9 @@ NIP-46 against the real pool with controlled transport and injected controls.
 - Reply packers cap UTF-8 JSONL at 128 KiB and 100 records, except one indivisible
   oversized record. They enable `useBulkPacing` by default. Stream outgoing
   fragments from prepared rows without a second Web Storage copy. Cleanup partial
-  writes and failed tracking entries.
+  writes and failed tracking entries. An optional idempotency-key base derives a
+  distinct `<base>:<index>` for every physical reply; never reuse one key across
+  chunks.
 - `useBulkPacing` is runtime-only. Each RelayConnection serializes bulk EVENT
   publications per relay, starts them at least one second apart, and applies
   exponential backoff from 1 to 30 seconds when no relay deadline exists. A

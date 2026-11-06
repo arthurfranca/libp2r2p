@@ -196,7 +196,10 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
           }
         },
         channelPubkey: file.fileChannelPubkey, question, receiverPubkey: question.pubkey,
-        code: FILE_CHUNKS_REPLY_CODE, eventsPerChunk: 1, recordsFromInput: record => [record]
+        code: FILE_CHUNKS_REPLY_CODE,
+        idempotencyKey: `${FILE_CHUNKS_REPLY_CODE}:${question.id}:${file.root}`,
+        eventsPerChunk: 1,
+        recordsFromInput: record => [record]
       })
       for (const index of indices) {
         usable(file)
@@ -224,7 +227,21 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
       if (file.fileChannelPubkey !== payload.fileChannelPubkey) throw new ValidationError('FILE_CHANNEL_MISMATCH')
       if (!packer) {
         const routes = await routing(file, question.pubkey)
-        packer = createEventReplyPacker({ messenger: { reply: async options => { usable(file); return _messages.reply({ ...sendOptions(file, routes), ...options }) } }, channelPubkey: file.fileChannelPubkey, question, receiverPubkey: question.pubkey, code: FILE_CHUNKS_REPLY_CODE, eventsPerChunk: 1, recordsFromInput: row => compactRecordsFromSeed(row, { receiverPubkey: question.pubkey }) })
+        packer = createEventReplyPacker({
+          messenger: {
+            reply: async options => {
+              usable(file)
+              return _messages.reply({ ...sendOptions(file, routes), ...options })
+            }
+          },
+          channelPubkey: file.fileChannelPubkey,
+          question,
+          receiverPubkey: question.pubkey,
+          code: FILE_CHUNKS_REPLY_CODE,
+          idempotencyKey: `${FILE_CHUNKS_REPLY_CODE}:${question.id}:${file.root}`,
+          eventsPerChunk: 1,
+          recordsFromInput: row => compactRecordsFromSeed(row, { receiverPubkey: question.pubkey })
+        })
       }
       await packer.update(seed)
       await new Promise(resolve => setTimeout(resolve, 0))

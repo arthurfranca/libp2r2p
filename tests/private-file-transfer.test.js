@@ -191,6 +191,7 @@ test('watchtower keeps durable recipient seeds and replies on data, never on dm'
     assert.equal(await replies[0].privateChannelSigner.getPublicKey(), data)
     assert.equal(replies[0].code, 'fileChunksReply_p5cc')
     assert.equal(replies[0].question.id, question.id)
+    assert.equal(replies[0].idempotencyKey, `fileChunksReply_p5cc:${question.id}:${f.descriptor.root}:0`)
     assert.equal(JSON.parse(replies[0].payload.jsonl.trim()).router.tags.find(tag => tag[0] === 'i')[1], '0')
     f.messenger.offlineRecoverySecondsFor = () => 0
     replies.length = 0
