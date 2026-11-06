@@ -123,8 +123,11 @@ const MESSAGE_QUEUE_HIGH_WATER_RATIO = 0.7
 const MESSAGE_QUEUE_LOW_WATER_RATIO = 0.5
 const SEED_KEY = '__p2r2pSeedKey'
 const SEED_TIME = '__p2r2pSeedTime'
+const ASK_COALESCING_INDEX = 'byAskCoalescingKey'
+const ASK_COALESCING_DIGEST = /^[0-9a-f]{64}$/
 const MESSAGE_QUEUE_INDEXES = {
   byChannel: 'channelPubkey',
+  [ASK_COALESCING_INDEX]: 'askCoalescingKey',
   byChannelTypeEventId: {
     keyPath: ['channelPubkey', 'type', 'event.id', 'provenance'],
     unique: true
@@ -303,6 +306,7 @@ export class PrivateMessenger {
     onStateChanged,
     onDebug,
     onError = defaultOnError,
+    resolveAskCoalescingKey,
     _privateMessage = privateMessage,
     _privateChannel = privateChannel,
     _getRelaysByPubkey = getRelaysByPubkey,
@@ -324,6 +328,9 @@ export class PrivateMessenger {
   } = {}) {
     if (onStateChanged != null && typeof onStateChanged !== 'function') throw new ValidationError('INVALID_ON_STATE_CHANGED')
     if (typeof pendingDecryptionReady !== 'boolean') throw new ValidationError('INVALID_PENDING_DECRYPTION_READY')
+    if (resolveAskCoalescingKey != null && typeof resolveAskCoalescingKey !== 'function') {
+      throw new ValidationError('INVALID_RESOLVE_ASK_COALESCING_KEY')
+    }
     this.fallbackRelays = normalizeFallbackRelays(fallbackRelays)
     this.fallbackDelayMs = normalizeFallbackDelay(fallbackDelayMs)
     this.offlineRecoverySeconds = normalizeOfflineRecoverySeconds(offlineRecoverySeconds)
@@ -368,6 +375,7 @@ export class PrivateMessenger {
     this._random = _random
     this.onMessageQueued = onMessageQueued
     this.onDebug = onDebug
+    this.resolveAskCoalescingKey = resolveAskCoalescingKey
     this._privateMessage = _privateMessage.createPrivateMessageSession?.() ?? _privateMessage
     this._privateChannel = _privateChannel
     this._getRelaysByPubkey = _getRelaysByPubkey
@@ -1946,7 +1954,13 @@ export class PrivateMessenger {
       const pubkey = pending.record.channelPubkey
       if (!this.channels.has(pubkey) || !this.desiredChannels.has(pubkey)) { this.pendingStorageWrites.delete(key); continue }
       try {
-        if (!pending.dedupeKey || !await this.queue.someBy('byChannelTypeEventId', pending.dedupeKey)) await this.queue.enqueue(pending.record)
+        if (pending.record.askCoalescingKey) {
+          await this.queue.coalesceBy(ASK_COALESCING_INDEX, pending.record, {
+            compare: compareAskCoalescingItems
+          })
+        } else if (!pending.dedupeKey || !await this.queue.someBy('byChannelTypeEventId', pending.dedupeKey)) {
+          await this.queue.enqueue(pending.record)
+        }
       } catch (error) { if (error?.name !== 'ConstraintError') throw error }
       signal.throwIfAborted()
       this.pendingStorageWrites.delete(key)
@@ -2186,6 +2200,32 @@ export class PrivateMessenger {
     await this.enqueueRumor('message', channelPubkey, message)
   }
 
+  #askCoalescingMetadata (type, channelPubkey, message, info) {
+    if (type !== 'ask' || info.provenance === 'hearsay' || !this.resolveAskCoalescingKey) return null
+    let digest
+    try {
+      digest = this.resolveAskCoalescingKey(message)
+      if (digest != null && typeof digest?.then === 'function') {
+        throw new Error('ASK_COALESCING_RESOLVER_MUST_BE_SYNCHRONOUS')
+      }
+    } catch (cause) {
+      this.onError?.(askCoalescingError(cause))
+      return null
+    }
+    if (digest == null) return null
+    const senderPubkey = info.senderPubkey || message.event?.pubkey || ''
+    const code = messageCode(message)
+    if (typeof digest !== 'string' || !ASK_COALESCING_DIGEST.test(digest) ||
+        !channelPubkey || !senderPubkey || typeof code !== 'string' || !code) {
+      this.onError?.(askCoalescingError(new ValidationError('INVALID_ASK_COALESCING_KEY')))
+      return null
+    }
+    return {
+      askCoalescingKey: JSON.stringify([channelPubkey, senderPubkey, code, digest]),
+      askCoalescingOrder: askCoalescingOrder(message)
+    }
+  }
+
   async enqueueRumor (type, channelPubkey, message) {
     const channel = this.channels.get(channelPubkey)
     if (channel?.mode === 'watchtower' && type !== 'ask') return
@@ -2215,8 +2255,30 @@ export class PrivateMessenger {
       outer: message.outer || null,
       meta: message.meta || null
     }
+    Object.assign(record, this.#askCoalescingMetadata(type, channelPubkey, message, info) || {})
     try {
-      await this.queue.enqueue(record)
+      const coalesced = record.askCoalescingKey
+        ? await this.queue.coalesceBy(ASK_COALESCING_INDEX, record, {
+          compare: compareAskCoalescingItems
+        })
+        : null
+      if (!coalesced) await this.queue.enqueue(record)
+      if (coalesced?.status === 'ignored') {
+        this.markSeen(channelPubkey, message.outer?.created_at || message.event?.created_at || nowSeconds())
+        this.debug('ask-coalescing-ignored', {
+          code: messageCode(message) || '',
+          payloadBytes: encoder.encode(JSON.stringify(record)).byteLength
+        })
+        return
+      }
+      if (coalesced) {
+        this.debug('ask-coalesced', {
+          code: messageCode(message) || '',
+          status: coalesced.status,
+          removedUnreserved: coalesced.removed,
+          payloadBytes: encoder.encode(JSON.stringify(record)).byteLength
+        })
+      }
     } catch (err) {
       // The unique index closes the small cross-instance race after `someBy`.
       if (dedupeKey && err?.name === 'ConstraintError') {
@@ -2227,7 +2289,14 @@ export class PrivateMessenger {
       this.recordInterruption([channelPubkey], message.outer?.created_at || message.event?.created_at || nowSeconds())
       // Do not await stop from inside its own transport callback.
       const atCapacity = isQueueCapacityError(err)
-      if (!atCapacity && isRecoverableStorageFailure(err)) this.pendingStorageWrites.set(JSON.stringify(dedupeKey || [channelPubkey, type]), { record, dedupeKey, at: message.outer?.created_at || message.event?.created_at })
+      if (!atCapacity && isRecoverableStorageFailure(err)) {
+        const storageKey = record.askCoalescingKey || JSON.stringify(dedupeKey || [channelPubkey, type])
+        this.pendingStorageWrites.set(storageKey, {
+          record,
+          dedupeKey,
+          at: message.outer?.created_at || message.event?.created_at
+        })
+      }
       if (atCapacity) {
         await annotateQueueCapacityError(err, 'inbox', () => this.queue.getCapacity())
         this.applyCapacityRecoveryTarget(err)
@@ -2243,7 +2312,7 @@ export class PrivateMessenger {
     }
     this.markSeen(channelPubkey, message.outer?.created_at || message.event?.created_at || nowSeconds())
     this.wakeDeliveries()
-    this.debug('enqueue', debugMessageInfo(type, channelPubkey, message))
+    if (!record.askCoalescingKey) this.debug('enqueue', debugMessageInfo(type, channelPubkey, message))
     this.onMessageQueued?.()
   }
 
@@ -2501,7 +2570,7 @@ export class PrivateMessenger {
     this.assertOpen()
     this.touchStorageActivity().catch(err => this.onError?.(err))
     await this.queueOperationTail
-    const reservation = await this.queue.reserve()
+    const reservation = await this.queue.reserve({ nackCoalesceIndex: ASK_COALESCING_INDEX })
     if (!reservation) return null
     if (this.closePromise) { await reservation.nack(); return null }
     let finish
@@ -3813,6 +3882,34 @@ function messageCode (message) {
     : null
 }
 
+function askCoalescingOrder (message) {
+  return {
+    outer: Number.isSafeInteger(message?.outer?.created_at) ? message.outer.created_at : 0,
+    inner: Number.isSafeInteger(message?.event?.created_at) ? message.event.created_at : 0,
+    eventId: message?.event?.id || ''
+  }
+}
+
+function compareAskCoalescingOrder (left, right) {
+  if ((left?.outer || 0) !== (right?.outer || 0)) return (left?.outer || 0) - (right?.outer || 0)
+  if ((left?.inner || 0) !== (right?.inner || 0)) return (left?.inner || 0) - (right?.inner || 0)
+  const leftId = left?.eventId || ''
+  const rightId = right?.eventId || ''
+  if (leftId === rightId) return 0
+  return leftId < rightId ? -1 : 1
+}
+
+function compareAskCoalescingItems (left, right) {
+  return compareAskCoalescingOrder(left?.askCoalescingOrder, right?.askCoalescingOrder)
+}
+
+function askCoalescingError (cause) {
+  return Object.assign(new Error('INVALID_ASK_COALESCING_KEY'), {
+    code: 'INVALID_ASK_COALESCING_KEY',
+    cause
+  })
+}
+
 function safeDiagnosticToken (value) {
   return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9:._-]{0,159}$/.test(value)
     ? value
@@ -3902,6 +3999,8 @@ function nymCarrierSeedKey (record) {
 function withoutQueueMetadata (item) {
   if (!item) return null
   const value = { ...item }
+  delete value.askCoalescingKey
+  delete value.askCoalescingOrder
   delete value[SEED_KEY]
   delete value[SEED_TIME]
   return value

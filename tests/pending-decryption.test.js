@@ -16,7 +16,11 @@ import { ValidationError } from '../error/index.js'
 
 afterEach(() => Signer.releaseAll())
 const signer = () => Signer.getOrCreate(bytesToHex(generateSecretKey()))
-const currentIndexes = { byChannel: 'channelPubkey', byChannelTypeEventId: { keyPath: ['channelPubkey', 'type', 'event.id', 'provenance'], unique: true } }
+const currentIndexes = {
+  byChannel: 'channelPubkey',
+  byAskCoalescingKey: 'askCoalescingKey',
+  byChannelTypeEventId: { keyPath: ['channelPubkey', 'type', 'event.id', 'provenance'], unique: true }
+}
 globalThis.IDBKeyRange = IDBKeyRange
 const temporary = new Map()
 globalThis.sessionStorage = {

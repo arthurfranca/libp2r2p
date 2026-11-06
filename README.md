@@ -359,6 +359,22 @@ await messenger.tell({
 })
 ```
 
+### Inbound ask coalescing
+
+`PrivateMessenger` accepts an optional synchronous
+`resolveAskCoalescingKey(message)` constructor callback. It must return `null`
+or one lowercase 64-character SHA-256 digest and must not perform I/O. The
+messenger scopes the digest by channel, sender and message code, then keeps at
+most one pending ask per semantic key. A newer equivalent ask replaces the
+pending item in place; while the current item is reserved, at most one latest
+successor is retained. Older recovered asks do not replace newer requests.
+
+The callback applies only to direct asks. It does not replace exact event-ID
+deduplication, authorization, quarantine, pause/capacity handling or ACK/NACK
+ownership. An invalid result or callback exception is reported through
+`onError`; the ask still follows normal admission. Coalescing metadata is
+removed before the app receives the message.
+
 ### Deleting Private Broadcasts
 
 By default, each high-level private-message send creates one fresh deletion
@@ -1219,6 +1235,15 @@ the old token: its `ack`, `nack` and `renew` return false. Successful writes wak
 local waiting consumers. Like the other indexed methods, `putBy` is exclusive
 to `idb-queue`; the Web Storage queue's common API is unchanged.
 
+`queue.coalesceBy(indexName, item, { compare, now })` is the non-unique-indexed
+latest-wins variant. It replaces the oldest unreserved match in place, removes
+other unreserved matches atomically and appends one successor only when every
+match is currently reserved. The optional comparator keeps an older item from
+replacing a newer one and returns `{ status: 'ignored', removed: 0, position:
+null }`. Successful results use `inserted`, `replaced` or `successor`, with the
+number of extra pending rows removed and the retained/appended position.
+Capacity and byte accounting follow the same `reject` rules as `putBy`.
+
 Both queue implementations support
 `createQueue({ prefix, evictionPolicy: 'reject', maxBytes })` to opt out of
 capacity eviction. Oversized items reject with `QUEUE_ITEM_TOO_LARGE`, full
@@ -1228,13 +1253,15 @@ Opening a reject-policy queue under a smaller budget preserves existing items.
 Positional replacement and insertion follow the same rule: they reject instead
 of evicting when the resulting queue would exceed the limit.
 
-`queue.reserve({ leaseMs = 30000 })` returns `null` or
+`queue.reserve({ leaseMs = 30000, nackCoalesceIndex })` returns `null` or
 `{ item, ack, nack, renew }`. Reservation token/deadline are internal record
 metadata, persisted atomically in the same IndexedDB transaction as selection.
 `renew()` extends a still-valid lease. Low-level callers own renewal and release;
 PrivateMessenger supplies both. Do not mix reservations with destructive or
 position-shifting queue operations on the same queue except explicit removal.
 A stale token cannot acknowledge a newly reserved or replaced record.
+`nackCoalesceIndex` names a non-unique index: when another matching item is
+pending, NACK deletes the superseded active item instead of requeueing it.
 
 `queue.getCapacity()` is part of the common API and returns
 `{ usedBytes, maxBytes }`; capacity rejections also expose `requiredBytes` and

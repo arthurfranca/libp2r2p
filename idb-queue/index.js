@@ -295,6 +295,25 @@ export async function createQueue ({
     return Number.isFinite(sessionMaxBytes)
   }
 
+  function indexDefinition (indexName) {
+    return indexDefinitions.find(index => index.name === indexName) || null
+  }
+
+  function itemIndexKey (definition, item) {
+    const readKey = path => path.split('.').reduce((part, key) => part?.[key], item)
+    return Array.isArray(definition.keyPath)
+      ? definition.keyPath.map(readKey)
+      : readKey(definition.keyPath)
+  }
+
+  function assertValidIndexKey (key, code = 'QUEUE_PUT_KEY_INVALID') {
+    try {
+      indexedDB.cmp(key, key)
+    } catch {
+      throw new ValidationError(code)
+    }
+  }
+
   function evictionDirectionFor (operation, { index = 0, length = 0 } = {}) {
     if (configuredEvictionPolicy === 'head') return 'head'
     if (configuredEvictionPolicy === 'tail') return 'tail'
@@ -735,14 +754,13 @@ export async function createQueue ({
   }
 
   async function putBy (indexName, item, { existingOnly = false } = {}) {
-    const definition = indexDefinitions.find(index => index.name === indexName)
+    const definition = indexDefinition(indexName)
     if (!definition?.unique || definition.multiEntry) throw new ValidationError('QUEUE_PUT_INDEX_INVALID')
     // Snapshot before awaiting IndexedDB so the lookup key and stored value
     // cannot diverge if the caller changes its object during the transaction.
     const value = structuredClone(item)
-    const readKey = path => path.split('.').reduce((part, key) => part?.[key], value)
-    const key = Array.isArray(definition.keyPath) ? definition.keyPath.map(readKey) : readKey(definition.keyPath)
-    try { indexedDB.cmp(key, key) } catch { throw new ValidationError('QUEUE_PUT_KEY_INVALID') }
+    const key = itemIndexKey(definition, value)
+    assertValidIndexKey(key)
     const requiredBytes = itemForStorage(0, value).byteSize
     const written = await mutate(async (tx, state) => {
       const { result: previous } = await run('get', [key], ITEMS_STORE, indexName, { tx })
@@ -760,6 +778,68 @@ export async function createQueue ({
     }, { requiredBytes })
     if (written) wake()
     return written
+  }
+
+  async function coalesceBy (indexName, item, {
+    compare,
+    now = Date.now()
+  } = {}) {
+    const definition = indexDefinition(indexName)
+    if (!definition || definition.unique || definition.multiEntry) {
+      throw new ValidationError('QUEUE_COALESCE_INDEX_INVALID')
+    }
+    if (compare != null && typeof compare !== 'function') {
+      throw new ValidationError('QUEUE_COALESCE_COMPARE_INVALID')
+    }
+    if (!Number.isSafeInteger(now) || now < 0) throw new ValidationError('QUEUE_COALESCE_NOW_INVALID')
+    const value = structuredClone(item)
+    const key = itemIndexKey(definition, value)
+    assertValidIndexKey(key, 'QUEUE_COALESCE_KEY_INVALID')
+    const requiredBytes = itemForStorage(0, value).byteSize
+    return mutate(async (tx, state) => {
+      const { result: records } = await run('getAll', [key], ITEMS_STORE, indexName, { tx })
+      const active = []
+      const pending = []
+      for (const record of records) {
+        if (record.reservation?.until > now) active.push(record)
+        else pending.push(record)
+      }
+      pending.sort((left, right) => left.position - right.position)
+      if (compare && records.length) {
+        const latest = records.reduce((current, candidate) => (
+          compare(candidate.item, current.item) > 0 ? candidate : current
+        ))
+        if (compare(value, latest.item) <= 0) {
+          return { status: 'ignored', removed: 0, position: null }
+        }
+      }
+
+      if (!pending.length) {
+        await pushInTransaction(tx, state, value)
+        return {
+          status: active.length ? 'successor' : 'inserted',
+          removed: 0,
+          position: state.tail - 1
+        }
+      }
+
+      const target = pending[0]
+      let removed = 0
+      for (const record of pending.slice(1)) {
+        await deleteRecord(tx, record.position)
+        state.usedBytes = Math.max(0, state.usedBytes - (record.byteSize || 0))
+        removed++
+      }
+      await putItem(tx, state, target.position, value, {
+        direction: evictionDirectionFor('setAt', {
+          index: target.position - state.head,
+          length: state.tail - state.head
+        }),
+        protectedPositions: new Set([target.position])
+      })
+      await trimBounds(tx, state)
+      return { status: 'replaced', removed, position: target.position }
+    }, { requiredBytes, wakeWaiters: true })
   }
 
   async function getBy (indexName, query) {
@@ -795,8 +875,17 @@ export async function createQueue ({
   // Reservations are stored atomically with the item; another tab/process can
   // reclaim an expired lease after a crash. Destructive/positional queue APIs
   // must not be mixed with reservations on the same queue.
-  async function reserve ({ leaseMs = 30000, now = Date.now() } = {}) {
+  async function reserve ({
+    leaseMs = 30000,
+    now = Date.now(),
+    nackCoalesceIndex
+  } = {}) {
     if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0 || !Number.isSafeInteger(now) || now < 0) throw new ValidationError('QUEUE_INVALID_LEASE')
+    const nackDefinition = nackCoalesceIndex == null ? null : indexDefinition(nackCoalesceIndex)
+    if (nackCoalesceIndex != null &&
+        (!nackDefinition || nackDefinition.unique || nackDefinition.multiEntry)) {
+      throw new ValidationError('QUEUE_NACK_COALESCE_INDEX_INVALID')
+    }
     const token = globalThis.crypto.randomUUID()
     const reserved = await mutate(async tx => {
       const p = deferred()
@@ -829,8 +918,31 @@ export async function createQueue ({
             await trimBounds(tx, state)
           } else {
             if (action === 'renew') record.reservation.until = at + leaseMs
-            else delete record.reservation
-            await putRecord(tx, record)
+            else {
+              let superseded = false
+              if (nackDefinition) {
+                try {
+                  const key = itemIndexKey(nackDefinition, record.item)
+                  indexedDB.cmp(key, key)
+                  const { result: matches } = await run(
+                    'getAll',
+                    [key],
+                    ITEMS_STORE,
+                    nackCoalesceIndex,
+                    { tx }
+                  )
+                  superseded = matches.some(match => match.position > record.position)
+                } catch {}
+              }
+              if (superseded) {
+                await deleteRecord(tx, record.position)
+                state.usedBytes = Math.max(0, state.usedBytes - record.byteSize)
+                await trimBounds(tx, state)
+              } else {
+                delete record.reservation
+                await putRecord(tx, record)
+              }
+            }
           }
           return true
         }, { wakeWaiters: action !== 'renew' })
@@ -937,6 +1049,7 @@ export async function createQueue ({
     some,
     clear,
     putBy,
+    coalesceBy,
     getBy,
     someBy,
     removeBy,

@@ -128,6 +128,12 @@ suite pass; report independently scoped problems separately.
   attempts persist across visits; force is explicit. A successful retry admits
   the normal inbox before deleting ciphertext. Pause/close fence late results.
   Keep unknown/storage/permission errors operational, with unchanged ACK/NACK.
+- `PrivateMessenger` accepts optional synchronous `resolveAskCoalescingKey`.
+  It returns null or a lowercase SHA-256 digest; the messenger scopes it by
+  channel, sender and message code. Coalescing applies only to direct asks and
+  never replaces the exact event-ID dedupe, trust checks, pause/capacity gates or
+  ACK/NACK ownership. Keep the callback protocol-agnostic and free of I/O.
+  Invalid callback output is reported but must not drop the message.
 - `PRIVATE_MESSENGER_PAUSED` carries its stable code and a copied pauseReasons
   array. `QUEUE_CAPACITY_EXCEEDED` carries the queue kind (`inbox` or `seeds`)
   plus requiredBytes, usedBytes and maxBytes. Keep these additive diagnostics
@@ -173,6 +179,12 @@ suite pass; report independently scoped problems separately.
   capacity policy and reservation-token invalidation. Indexed methods are
   extensions beyond the common Web Storage queue API; keep parity tests scoped
   to that common API.
+- `idb-queue.coalesceBy` is a latest-wins indexed extension. It preserves the
+  oldest unreserved position, removes extra unreserved matches in the same
+  transaction and appends only one successor when every match is reserved.
+  Stale items never replace newer ones. A reservation created with
+  `nackCoalesceIndex` is deleted rather than requeued when a pending successor
+  exists. Never modify or remove a valid reserved row while coalescing.
 - The default local recovery-seed queue serializes incoming and outgoing
   `enqueueSeed()` operations per PrivateMessenger. Treat a bounded
   `ConstraintError` as an idempotent duplicate: NYM rows remain first-write-wins,

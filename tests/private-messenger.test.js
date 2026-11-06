@@ -1168,6 +1168,211 @@ test('private messenger skips duplicate pending app messages by channel type and
   assert.equal(messenger.readState().channels.channel.lastSeenAt, 12)
 })
 
+test('private messenger coalesces equivalent asks with the latest request', async () => {
+  const pm = fakePrivateMessage()
+  const resolved = []
+  const digest = 'a'.repeat(64)
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    resolveAskCoalescingKey: message => {
+      resolved.push(message.event.id)
+      return message.payload.code === 'sync-ask' ? digest : null
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const ask = (id, outerAt, requestId) => ({
+    event: {
+      id,
+      kind: ASK_KIND,
+      pubkey: 'alice',
+      created_at: outerAt,
+      tags: [['r', 'user']],
+      content: requestId
+    },
+    outer: { id: `outer-${id}`, created_at: outerAt },
+    meta: { channelPubkey: 'channel' },
+    senderPubkey: 'alice',
+    payload: { code: 'sync-ask', payload: { requestId } },
+    question: {
+      id,
+      kind: ASK_KIND,
+      pubkey: 'alice',
+      created_at: outerAt,
+      tags: [['r', 'user']],
+      content: requestId
+    }
+  })
+
+  await pm.watchCalls[0].onAsk(ask('ask-1', 10, 'request-1'))
+  await pm.watchCalls[0].onAsk(ask('ask-2', 20, 'request-2'))
+  await pm.watchCalls[0].onAsk(ask('ask-older', 15, 'request-old'))
+
+  const queued = await takeMessage(messenger)
+  assert.equal(queued.event.id, 'ask-2')
+  assert.equal(queued.question.id, 'ask-2')
+  assert.equal(queued.payload.payload.requestId, 'request-2')
+  assert.equal(Object.hasOwn(queued, 'askCoalescingKey'), false)
+  assert.equal(Object.hasOwn(queued, 'askCoalescingOrder'), false)
+  assert.equal(await takeMessage(messenger), null)
+  assert.deepEqual(resolved, ['ask-1', 'ask-2', 'ask-older'])
+})
+
+test('private messenger keeps one latest successor while an ask is active', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    resolveAskCoalescingKey: () => 'b'.repeat(64)
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const ask = (id, outerAt) => ({
+    event: {
+      id,
+      kind: ASK_KIND,
+      pubkey: 'alice',
+      created_at: outerAt,
+      tags: [['r', 'user'], ['q', id]],
+      content: id
+    },
+    outer: { id: `outer-${id}`, created_at: outerAt },
+    meta: { channelPubkey: 'channel' },
+    senderPubkey: 'alice',
+    payload: { code: 'sync-ask', payload: { requestId: id } },
+    question: { id, kind: ASK_KIND, pubkey: 'alice', created_at: outerAt, tags: [] }
+  })
+
+  await pm.watchCalls[0].onAsk(ask('ask-1', 10))
+  const active = await messenger.nextMessage()
+  assert.equal(active.message.event.id, 'ask-1')
+  await pm.watchCalls[0].onAsk(ask('ask-2', 20))
+  await pm.watchCalls[0].onAsk(ask('ask-3', 30))
+
+  assert.equal(await active.nack(), true)
+  const successor = await takeMessage(messenger)
+  assert.equal(successor.event.id, 'ask-3')
+  assert.equal(successor.question.id, 'ask-3')
+  assert.equal(successor.payload.payload.requestId, 'ask-3')
+  assert.equal(await takeMessage(messenger), null)
+})
+
+test('coalesced asks remain latest and durable across messenger instances', async () => {
+  const indexedDB = new IDBFactory()
+  const resolver = () => 'd'.repeat(64)
+  const init = {
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  }
+  const first = await new PrivateMessenger({
+    _indexedDB: indexedDB,
+    _privateMessage: fakePrivateMessage(),
+    resolveAskCoalescingKey: resolver
+  }).init(init)
+  const ask = (id, outerAt) => ({
+    event: { id, kind: ASK_KIND, pubkey: 'alice', created_at: outerAt, tags: [['r', 'user']], content: '' },
+    outer: { id: `outer-${id}`, created_at: outerAt },
+    meta: { channelPubkey: 'channel' },
+    senderPubkey: 'alice',
+    payload: { code: 'sync-ask', payload: { requestId: id } },
+    question: { id, kind: ASK_KIND, pubkey: 'alice', created_at: outerAt, tags: [] }
+  })
+  await first._privateMessage.watchCalls[0].onAsk(ask('old', 10))
+  await first._privateMessage.watchCalls[0].onAsk(ask('new', 20))
+  await first.close()
+
+  const second = await new PrivateMessenger({
+    _indexedDB: indexedDB,
+    _privateMessage: fakePrivateMessage(),
+    resolveAskCoalescingKey: resolver
+  }).init(init)
+  const restored = await takeMessage(second)
+  assert.equal(restored.event.id, 'new')
+  assert.equal(restored.question.id, 'new')
+  assert.equal(restored.payload.payload.requestId, 'new')
+})
+
+test('private messenger scopes ask coalescing by channel sender and code', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    resolveAskCoalescingKey: () => 'c'.repeat(64)
+  }).init({
+    userSigner: signer('user'),
+    channels: [
+      { signer: signer('channel-one'), relays: ['wss://relay.example'] },
+      { signer: signer('channel-two'), relays: ['wss://relay.example'] }
+    ]
+  })
+  const ask = (channelPubkey, id, pubkey, code, outerAt) => ({
+    event: { id, kind: ASK_KIND, pubkey, created_at: outerAt, tags: [['r', 'user']], content: '' },
+    outer: { id: `outer-${id}`, created_at: outerAt },
+    meta: { channelPubkey },
+    senderPubkey: pubkey,
+    payload: { code, payload: { requestId: id } },
+    question: { id, kind: ASK_KIND, pubkey, created_at: outerAt, tags: [] }
+  })
+
+  await pm.watchCalls[0].onAsk(ask('channel-one', 'one', 'alice', 'sync-ask', 10))
+  await pm.watchCalls[0].onAsk(ask('channel-one', 'latest', 'alice', 'sync-ask', 15))
+  await pm.watchCalls[0].onAsk(ask('channel-one', 'code', 'alice', 'other-ask', 20))
+  await pm.watchCalls[0].onAsk(ask('channel-one', 'sender', 'bob', 'sync-ask', 30))
+  await pm.watchCalls[1].onAsk(ask('channel-two', 'channel', 'alice', 'sync-ask', 40))
+
+  assert.deepEqual(
+    [...new Set((await Array.fromAsync(messenger.queue.storedItems())).map(item => item.event.id))].sort(),
+    ['channel', 'code', 'latest', 'sender']
+  )
+})
+
+test('private messenger reports invalid ask coalescing resolvers and preserves admission', async () => {
+  assert.throws(
+    () => new PrivateMessenger({ _privateMessage: fakePrivateMessage(), resolveAskCoalescingKey: true }),
+    { code: 'INVALID_RESOLVE_ASK_COALESCING_KEY' }
+  )
+  const pm = fakePrivateMessage()
+  const errors = []
+  let calls = 0
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    onError: error => errors.push(error),
+    resolveAskCoalescingKey: message => {
+      calls++
+      if (message.payload.code === 'throw-ask') throw new Error('resolver failed')
+      return 'not-a-digest'
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const ask = (id, code, createdAt) => ({
+    event: { id, kind: ASK_KIND, pubkey: 'alice', created_at: createdAt, tags: [['r', 'user']], content: '' },
+    outer: { id: `outer-${id}`, created_at: createdAt },
+    meta: { channelPubkey: 'channel' },
+    senderPubkey: 'alice',
+    payload: { code, payload: {} },
+    question: { id, kind: ASK_KIND, pubkey: 'alice', created_at: createdAt, tags: [] }
+  })
+
+  await pm.watchCalls[0].onAsk(ask('throw', 'throw-ask', 10))
+  await pm.watchCalls[0].onAsk(ask('invalid', 'invalid-ask', 20))
+  await pm.watchCalls[0].onReply({
+    event: { id: 'reply', kind: REPLY_KIND, pubkey: 'alice', created_at: 30, tags: [['q', 'question']], content: '' },
+    outer: { id: 'outer-reply', created_at: 31 },
+    meta: { channelPubkey: 'channel' },
+    payload: { code: 'sync-ask', payload: {} },
+    questionId: 'question',
+    reply: { id: 'reply' }
+  })
+
+  assert.equal(calls, 2)
+  assert.equal(errors.filter(error => error.code === 'INVALID_ASK_COALESCING_KEY').length, 2)
+  assert.equal((await takeMessage(messenger)).event.id, 'throw')
+  assert.equal((await takeMessage(messenger)).event.id, 'invalid')
+  assert.equal((await takeMessage(messenger)).event.id, 'reply')
+})
+
 test('private messenger reports content key usage changes for sent and received messages', async () => {
   const pm = fakePrivateMessage()
   const changes = []

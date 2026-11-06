@@ -71,6 +71,7 @@ test('idb queue preserves the web-storage queue core API and semantics', async (
   )
   assert.equal(typeof idbQueue.getBy, 'function')
   assert.equal(typeof idbQueue.putBy, 'function')
+  assert.equal(typeof idbQueue.coalesceBy, 'function')
   assert.equal(typeof idbQueue.someBy, 'function')
   assert.equal(typeof idbQueue.removeBy, 'function')
   assert.equal(typeof idbQueue.storedItemsBy, 'function')
