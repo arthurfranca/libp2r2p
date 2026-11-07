@@ -130,15 +130,26 @@ suite pass; report independently scoped problems separately.
   Keep unknown/storage/permission errors operational, with unchanged ACK/NACK.
 - `PrivateMessenger` accepts optional synchronous `resolveInboundCoalescing`.
   It receives the decrypted message enriched with `type`/`channelPubkey` plus
-  `{ idempotencyKey }`, and returns null or `{ key, keep?, sequence? }`. Keys are
-  lowercase SHA-256 digests; keep defaults to `latest` and may be `oldest`.
-  Sequence is an optional non-negative safe integer owned by the resolver and
-  compared only within one final scoped key. `latest` compares it before
-  envelope timestamps when both rows have one, then falls back to the existing
-  outer/inner/event-ID order. Persist the sequence only in internal coalescing
-  metadata. Run the resolver for all inbox types after exact event-ID dedupe and
-  scope the final key by channel, sender, type, code and provenance. It never
-  replaces trust checks, pause/capacity gates or ACK/NACK ownership.
+  `{ idempotencyKey, eventCreatedAtMs }`, and returns null or
+  `{ key, keep?, sequence? }`. Keys are lowercase SHA-256 digests; keep defaults
+  to `latest` and may be `oldest`. Sequence is an optional non-negative safe
+  integer owned by the resolver. `latest` orders by explicit sequence, then the
+  inner timestamp plus `ms`, then outer `created_at`, then event ID. Persist
+  ordering only in internal coalescing metadata. Run the resolver for all inbox
+  types after exact event-ID dedupe and scope the final key by channel, sender,
+  type, code and provenance. It never replaces trust checks, pause/capacity
+  gates or ACK/NACK ownership.
+- New ask, reply, tell and yell rumors carry exactly one canonical
+  `["ms", "0".."999"]` tag derived from the same instant as inner `created_at`.
+  Missing tags mean zero for legacy events. Invalid or duplicate tags also mean
+  zero with sanitized debug only. Do not interpret `ms` for message, nym,
+  broadcast or caller-signed APIs. Prefer inner event time over outer transport
+  time for logical ordering.
+- `yell` accepts additive `createdAtMs`; legacy `createdAt` maps to milliseconds
+  zero. Prepared replays reuse the original milliseconds. A legacy prepared
+  inner without `ms` must remain replayable; when a timestamped prepared inner
+  cannot be reconstructed without `createdAtMs`, fail with
+  `CREATED_AT_MS_REQUIRED` rather than changing its ID.
 - Only ask, reply, tell and yell interpret exactly one `["D", key]` automatically.
   Keys are non-empty UTF-8 strings up to 256 bytes and fall back to latest-wins.
   Message/nym always pass `idempotencyKey: null` and retain arbitrary-kind tag

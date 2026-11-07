@@ -6,6 +6,7 @@ import * as privateChannel from '../private-channel/index.js'
 import { normalizeRumor, deliveryInfo } from '../private-channel/helpers/rumor.js'
 import { normalizePreparedPublications } from '../private-channel/helpers/prepared.js'
 import { appendIdempotencyTag } from './helpers/idempotency.js'
+import { messageTimestamp, setMillisecondsTag } from './helpers/timestamp.js'
 
 export const ASK_KIND = 7329
 export const REPLY_KIND = 7330
@@ -153,16 +154,36 @@ function cloneTags (tags) {
   return tags.map(tag => Array.isArray(tag) ? [...tag] : tag)
 }
 
-async function makeOutgoingRumor ({ senderSigner, rumor }) {
+async function makeOutgoingRumor ({ senderSigner, rumor, timestamped = false, createdAtMs }) {
   if (!senderSigner?.getPublicKey) throw new ValidationError('SENDER_SIGNER_REQUIRED')
   const senderPubkey = await senderSigner.getPublicKey()
   if (rumor.pubkey !== undefined && rumor.pubkey !== senderPubkey && rumor.created_at === undefined) {
     throw new ValidationError('FORWARDED_RUMOR_TIMESTAMP_REQUIRED')
   }
-  const event = normalizeRumor({ ...rumor, tags: cloneTags(rumor.tags), created_at: rumor.created_at === undefined ? nowSeconds() : rumor.created_at }, senderPubkey)
+  const timestamp = messageTimestamp({ createdAt: rumor.created_at, createdAtMs })
+  const tags = timestamped
+    ? setMillisecondsTag(rumor.tags, timestamp.milliseconds)
+    : cloneTags(rumor.tags)
+  const event = normalizeRumor({ ...rumor, tags, created_at: timestamp.createdAt }, senderPubkey)
   const { id: _, pubkey, ...template } = event
   const wireEvent = pubkey === senderPubkey ? template : { ...template, pubkey }
   return { event, wireEvent }
+}
+
+function preparedInnerEventsMatch (publications, event) {
+  return publications.length > 0 && publications.every(publication => (
+    publication?.innerEventId && publication.innerEventId === event?.id
+  ))
+}
+
+async function makeYellRumor ({ senderSigner, rumor, createdAtMs, prepared }) {
+  const timestamped = await makeOutgoingRumor({ senderSigner, rumor, timestamped: true, createdAtMs })
+  if (!prepared.length || preparedInnerEventsMatch(prepared, timestamped.event)) return timestamped
+
+  const legacy = await makeOutgoingRumor({ senderSigner, rumor })
+  if (preparedInnerEventsMatch(prepared, legacy.event)) return legacy
+  if (createdAtMs == null) throw new ValidationError('CREATED_AT_MS_REQUIRED')
+  throw new ValidationError('INVALID_PREPARED_PUBLICATION')
 }
 
 function assertValidSignedEvent (event) {
@@ -744,6 +765,7 @@ export async function ask ({
 
   const { event: question, wireEvent } = await makeOutgoingRumor({
     senderSigner,
+    timestamped: true,
     rumor: makeMessageRumor({
       kind: ASK_KIND,
       tags: [['r', receiverPubkey]],
@@ -788,6 +810,7 @@ export async function reply ({
   if (!receiverPubkey) throw new ValidationError('RECEIVER_PUBKEY_REQUIRED')
   const { event, wireEvent } = await makeOutgoingRumor({
     senderSigner,
+    timestamped: true,
     rumor: makeMessageRumor({
       kind: REPLY_KIND,
       tags: [['q', question.id], ['r', receiverPubkey]],
@@ -829,6 +852,7 @@ export async function tell ({
   if (!receiverPubkey) throw new ValidationError('RECEIVER_PUBKEY_REQUIRED')
   const { event, wireEvent } = await makeOutgoingRumor({
     senderSigner,
+    timestamped: true,
     rumor: makeMessageRumor({
       kind: TELL_KIND,
       tags: [['r', receiverPubkey]],
@@ -865,6 +889,7 @@ export async function yell ({
   autoDeletionCapability = true,
   fileChunkIndex,
   createdAt,
+  createdAtMs,
   onPreparedSeed,
   preparedPublication,
   preparedPublications,
@@ -882,9 +907,11 @@ export async function yell ({
     idempotencyKey
   })
   if (createdAt !== undefined) rumor.created_at = createdAt
-  const { event, wireEvent } = await makeOutgoingRumor({
+  const { event, wireEvent } = await makeYellRumor({
     senderSigner,
-    rumor
+    rumor,
+    createdAtMs,
+    prepared
   })
   const deletion = resolveDeletionCapability({ deletionPubkey, deletionSeckey, autoDeletionCapability, preparedPublications: prepared })
   const reports = await sendPrivateMessage({ senderSigner, imkcSigner, privateChannelSigner, privateChannelReaderPubkey, receivers, receiverTag: '', deletionPubkey: deletion.deletionPubkey, event: wireEvent, relays, relayToReceivers, recoveryRelays, expirationSeconds, useBulkPacing, temporaryStorageArea, fileChunkIndex, onPreparedSeed: preparedSeedHandler(onPreparedSeed, deletion), preparedPublications: prepared, _getIykcProofs, _publish })

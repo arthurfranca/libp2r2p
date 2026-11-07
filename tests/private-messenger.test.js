@@ -1411,6 +1411,74 @@ test('coalescing sequence survives reload and invalid values preserve admission'
   assert.equal((await takeMessage(second)).event.id, 'invalid-sequence')
 })
 
+test('coalescing order prioritizes inner milliseconds, then outer time', async () => {
+  const pm = fakePrivateMessage()
+  const key = 'a'.repeat(64)
+  const observed = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    resolveInboundCoalescing: (message, context) => {
+      observed.push(context.eventCreatedAtMs)
+      return { key, keep: 'latest' }
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const message = (id, inner, outer, milliseconds) => {
+    const value = inboxRumor('tell', id, inner, {
+      code: 'ordered-state',
+      tags: [['ms', String(milliseconds)]]
+    })
+    value.outer.created_at = outer
+    return value
+  }
+
+  await deliverInboxRumor(pm, 'tell', message('inner-newer', 20, 10, 900))
+  await deliverInboxRumor(pm, 'tell', message('outer-newer', 20, 30, 900))
+  await deliverInboxRumor(pm, 'tell', message('inner-older', 20, 40, 100))
+
+  assert.deepEqual(observed, [20900, 20900, 20100])
+  assert.equal((await takeMessage(messenger)).event.id, 'outer-newer')
+  assert.equal(await takeMessage(messenger), null)
+  const dropped = message('inner-priority', 30, 5, 0)
+  await deliverInboxRumor(pm, 'tell', message('outer-priority', 20, 50, 999))
+  await deliverInboxRumor(pm, 'tell', dropped)
+  assert.equal((await takeMessage(messenger)).event.id, 'inner-priority')
+})
+
+test('missing and malformed milliseconds use zero without blocking admission', async () => {
+  const pm = fakePrivateMessage()
+  const debug = []
+  const observed = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    onDebug: event => debug.push(event),
+    resolveInboundCoalescing: (_message, context) => {
+      observed.push(context.eventCreatedAtMs)
+      return null
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  await deliverInboxRumor(pm, 'tell', inboxRumor('tell', 'missing', 10))
+  await deliverInboxRumor(pm, 'tell', inboxRumor('tell', 'invalid', 20, {
+    tags: [['ms', '001']]
+  }))
+  await deliverInboxRumor(pm, 'tell', inboxRumor('tell', 'duplicate', 30, {
+    tags: [['ms', '1'], ['ms', '2']]
+  }))
+
+  assert.deepEqual(observed, [10000, 20000, 30000])
+  assert.equal(debug.filter(event => event.action === 'milliseconds-tag-ignored').length, 2)
+  assert.deepEqual(
+    (await Array.fromAsync(messenger.queue.storedItems())).map(item => item.event.id),
+    ['missing', 'invalid', 'duplicate']
+  )
+})
+
 test('private messenger scopes ask coalescing by channel sender and code', async () => {
   const pm = fakePrivateMessage()
   const messenger = await new PrivateMessenger({
@@ -2006,7 +2074,7 @@ test('private messenger forwards canonical prepared publications and derives pen
 
   await messenger.yell({
     payload: 'retry',
-    createdAt: 1700000000,
+    createdAtMs: 1700000000300,
     preparedPublications: prepared
   })
   await messenger.broadcastRumor({
@@ -2015,7 +2083,7 @@ test('private messenger forwards canonical prepared publications and derives pen
   })
 
   assert.deepEqual(pm.sent[0].options.receiverPubkeys, ['alice'])
-  assert.equal(pm.sent[0].options.createdAt, 1700000000)
+  assert.equal(pm.sent[0].options.createdAtMs, 1700000000300)
   assert.equal(pm.sent[0].options.preparedPublications, prepared)
   assert.deepEqual(pm.sent[1].options.receiverPubkeys, ['alice'])
   assert.equal(pm.sent[1].options.preparedPublications, prepared)

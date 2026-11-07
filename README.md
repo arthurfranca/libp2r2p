@@ -362,21 +362,29 @@ await messenger.tell({
 ### Inbound message coalescing
 
 `PrivateMessenger` accepts an optional synchronous
-`resolveInboundCoalescing(message, { idempotencyKey })` constructor callback.
-The enriched `message` includes `type` and `channelPubkey`. The callback returns
-`null` or `{ key, keep?, sequence? }`, where `key` is a lowercase 64-character
-SHA-256 digest, `keep` is `latest` (default) or `oldest`, and `sequence` is an
-optional non-negative safe integer. Sequence units are resolver-owned and are
-compared only within records sharing the final scoped coalescing key.
+`resolveInboundCoalescing(message, { idempotencyKey, eventCreatedAtMs })`
+constructor callback. The enriched `message` includes `type` and
+`channelPubkey`. The callback returns `null` or `{ key, keep?, sequence? }`,
+where `key` is a lowercase 64-character SHA-256 digest, `keep` is `latest`
+(default) or `oldest`, and `sequence` is an optional non-negative safe integer.
+Sequence units are resolver-owned and are compared only within records sharing
+the final scoped coalescing key.
 
 The resolver runs for ask, reply, tell, yell, message and nym deliveries after
 exact event-ID deduplication. The final coalescing key is scoped by channel,
 sender, type, message code and provenance. `latest` replaces the pending item in
-place; when both records carry a sequence, `latest` compares it before envelope
-`created_at`, then falls back to outer/inner timestamps and event ID. `oldest`
-preserves the pending item. While an item is reserved, both policies allow at
-most one successor. Sequences persist in the internal queue metadata and are
-not delivered to the app. Older recovered events do not replace newer requests.
+place. Its order is: explicit sequence; `eventCreatedAtMs`, read from the inner
+`created_at` plus the `ms` tag; outer `created_at`; event ID. `oldest` preserves
+the pending item. While an item is reserved, both policies allow at most one
+successor. Timestamp and sequence ordering persist in internal queue metadata.
+Older recovered events do not replace newer requests.
+
+New high-level ask, reply, tell and yell rumors include exactly one
+`["ms", "0".."999"]` tag and use the same instant to derive inner `created_at`.
+Missing `ms` means zero for legacy messages; malformed or duplicate tags also
+order as zero and are reported only through sanitized debug diagnostics.
+`message`, `nym`, broadcast rumors and signed-event APIs do not interpret `ms`
+automatically.
 
 For ask, reply, tell and yell, exactly one `["D", key]` tag may serve as an
 automatic fallback when the resolver returns `null`. Its key is non-empty and
@@ -1377,8 +1385,10 @@ signatures, and routed only for the pending peers. The legacy
 `preparedPublication` public argument is rejected with
 `LEGACY_PREPARED_PUBLICATION`; existing encrypted outbox snapshots containing
 `prepared.publication` are migrated internally to
-`prepared.publications` before processing. `yell` callers must reuse the
-original `createdAt` when replaying so the inner rumor identity matches;
+`prepared.publications` before processing. New `yell` replays pass the original
+`createdAtMs` so the inner rumor identity matches. Legacy prepared inners
+without `ms` are detected and replayed without adding the tag; a prepared inner
+that requires an unavailable `createdAtMs` fails with `CREATED_AT_MS_REQUIRED`.
 `broadcastRumor` and `broadcastEvent` already carry their original inner event.
 Nym broadcasts intentionally remain a single carrier union.
 

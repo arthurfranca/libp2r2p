@@ -44,6 +44,14 @@ function pubkeyFixture (index) {
   return index.toString(16).padStart(64, '0')
 }
 
+function millisecondsTag (tags) {
+  const matches = tags.filter(tag => tag[0] === 'ms')
+  assert.equal(matches.length, 1)
+  assert.match(matches[0][1], /^(0|[1-9][0-9]{0,2})$/)
+  assert.ok(Number(matches[0][1]) <= 999)
+  return matches[0]
+}
+
 function fakeSubscribeFactory () {
   const calls = []
   const closed = []
@@ -295,7 +303,8 @@ test('ask publishes an ask rumor and watch dispatches the reply with its questio
   assert.equal(published.useBulkPacing, true)
   assert.equal(published.temporaryStorageArea, globalThis.localStorage)
   assert.deepEqual(JSON.parse(published.event.content), { ok: true })
-  assert.deepEqual(published.event.tags, [['r', 'receiver'], ['h', 'PING']])
+  assert.deepEqual(published.event.tags.slice(0, -1), [['r', 'receiver'], ['h', 'PING']])
+  millisecondsTag(published.event.tags)
   assert.equal(result.question.pubkey, senderPubkey)
   assert.equal(result.question.id, getEventHash({ ...published.event, pubkey: senderPubkey }))
   assert.deepEqual(result.delivery.reports, [{ success: true }])
@@ -358,15 +367,18 @@ test('reply tell and yell publish recognizable private message rumors', async ()
   assert.equal(published[0].event.pubkey, undefined)
   assert.equal(replyResult.reply.pubkey, bobPubkey)
   assert.equal(replyResult.reply.id, getEventHash({ ...published[0].event, pubkey: bobPubkey }))
-  assert.deepEqual(published[0].event.tags, [['q', 'question-id'], ['r', 'alice']])
+  assert.deepEqual(published[0].event.tags.slice(0, -1), [['q', 'question-id'], ['r', 'alice']])
+  millisecondsTag(published[0].event.tags)
   assert.equal(published[0].receiverTag, 'alice')
   assert.equal(published[1].event.kind, TELL_KIND)
   assert.equal(tellResult.tell.id, getEventHash({ ...published[1].event, pubkey: bobPubkey }))
-  assert.deepEqual(published[1].event.tags, [['r', 'alice']])
+  assert.deepEqual(published[1].event.tags.slice(0, -1), [['r', 'alice']])
+  millisecondsTag(published[1].event.tags)
   assert.equal(published[1].receiverTag, 'alice')
   assert.equal(published[2].event.kind, TELL_KIND)
   assert.equal(yellResult.yell.id, getEventHash({ ...published[2].event, pubkey: bobPubkey }))
-  assert.deepEqual(published[2].event.tags, [])
+  assert.deepEqual(published[2].event.tags.slice(0, -1), [])
+  millisecondsTag(published[2].event.tags)
   assert.equal(published[2].receiverTag, '')
   assert.deepEqual(published[2].receivers, ['alice', 'carol'])
   assert.equal(published[3].event.kind, 9001)
@@ -435,26 +447,27 @@ test('basic private messages add D before h and validate idempotency keys', asyn
     _publish
   })
 
-  assert.deepEqual(published[0].event.tags, [
+  assert.deepEqual(published[0].event.tags.slice(0, -1), [
     ['D', 'ask-operation'],
     ['r', 'alice'],
     ['h', 'ask-code']
   ])
-  assert.deepEqual(published[1].event.tags, [
+  assert.deepEqual(published[1].event.tags.slice(0, -1), [
     ['D', 'reply-chunk:0'],
     ['q', 'question-id'],
     ['r', 'alice'],
     ['h', 'reply-code']
   ])
-  assert.deepEqual(published[2].event.tags, [
+  assert.deepEqual(published[2].event.tags.slice(0, -1), [
     ['D', 'tell-operation'],
     ['r', 'alice'],
     ['h', 'tell-code']
   ])
-  assert.deepEqual(published[3].event.tags, [
+  assert.deepEqual(published[3].event.tags.slice(0, -1), [
     ['D', 'yell-operation'],
     ['h', 'yell-code']
   ])
+  for (const entry of published.slice(0, 4)) millisecondsTag(entry.event.tags)
 
   for (const idempotencyKey of ['', null, 1, 'x'.repeat(257)]) {
     await assert.rejects(tell({
@@ -759,12 +772,13 @@ test('yell replays prepared publications with the original inner timestamp', asy
     senderSigner: sender,
     receiverPubkeys: [receiver],
     payload: 'same yell',
-    createdAt: 1700000000,
+    createdAtMs: 1700000000300,
     onPreparedSeed: seed => { prepared = structuredClone(seed.publication) },
     _publish: async request => {
       published.push(request)
       await request.onPreparedSeed?.({
         publication: request.preparedPublications?.[0] || {
+          innerEventId: getEventHash({ ...request.event, pubkey: sender.getPublicKey() }),
           events: [{ tags: [['s', request.deletionPubkey]] }],
           receiverPubkeys: [receiver]
         }
@@ -780,5 +794,105 @@ test('yell replays prepared publications with the original inner timestamp', asy
   })
 
   assert.equal(replay.yell.id, original.yell.id)
+  assert.deepEqual(millisecondsTag(original.yell.tags), ['ms', '300'])
+  assert.deepEqual(millisecondsTag(replay.yell.tags), ['ms', '300'])
   assert.deepEqual(published[1].preparedPublications, [prepared])
+})
+
+test('millisecond timestamps preserve explicit seconds and prepared legacy inners', async () => {
+  const senderPubkey = pubkeyFixture(3)
+  const sender = signer(senderPubkey)
+  const receiverPubkeys = [pubkeyFixture(4)]
+  const published = []
+  const _publish = async options => {
+    published.push(options)
+    return [{ success: true }]
+  }
+
+  const precise = await yell({
+    senderSigner: sender,
+    receiverPubkeys,
+    payload: 'precise',
+    createdAt: 1700000000,
+    createdAtMs: 1700000000300,
+    _publish
+  })
+  assert.equal(precise.yell.created_at, 1700000000)
+  assert.deepEqual(millisecondsTag(precise.yell.tags), ['ms', '300'])
+
+  const secondsOnly = await yell({
+    senderSigner: sender,
+    receiverPubkeys,
+    payload: 'seconds',
+    createdAt: 1700000001,
+    _publish
+  })
+  assert.equal(secondsOnly.yell.created_at, 1700000001)
+  assert.deepEqual(millisecondsTag(secondsOnly.yell.tags), ['ms', '0'])
+
+  await assert.rejects(yell({
+    senderSigner: sender,
+    receiverPubkeys,
+    payload: 'invalid',
+    createdAt: 1700000002,
+    createdAtMs: 1700000003000,
+    _publish
+  }), { code: 'INVALID_CREATED_AT_MS' })
+
+  const legacyInner = {
+    kind: TELL_KIND,
+    pubkey: senderPubkey,
+    created_at: 1700000004,
+    tags: [],
+    content: 'legacy'
+  }
+  const legacyPrepared = [{
+    innerEventId: getEventHash(legacyInner),
+    deletionCapability: { deletionPubkey: 'e'.repeat(64) },
+    receiverPubkeys,
+    events: [],
+    seeds: []
+  }]
+  const legacyReplay = await yell({
+    senderSigner: sender,
+    receiverPubkeys,
+    payload: 'legacy',
+    createdAt: 1700000004,
+    preparedPublications: legacyPrepared,
+    _publish
+  })
+  assert.equal(legacyReplay.yell.id, getEventHash(legacyInner))
+  assert.equal(legacyReplay.yell.tags.some(tag => tag[0] === 'ms'), false)
+})
+
+test('new prepared yells require createdAtMs when milliseconds cannot be reconstructed', async () => {
+  const sender = signer(pubkeyFixture(3))
+  const receiverPubkeys = [pubkeyFixture(4)]
+  let prepared
+  const options = {
+    senderSigner: sender,
+    receiverPubkeys,
+    payload: 'prepared',
+    createdAtMs: 1700000000300,
+    onPreparedSeed: seed => { prepared = structuredClone(seed.publication) },
+    _publish: async request => {
+      await request.onPreparedSeed?.({
+        publication: request.preparedPublications?.[0] || {
+          innerEventId: getEventHash({ ...request.event, pubkey: sender.getPublicKey() }),
+          events: [{ tags: [['s', request.deletionPubkey]] }],
+          receiverPubkeys
+        }
+      })
+      return [{ success: true }]
+    }
+  }
+  await yell(options)
+
+  await assert.rejects(yell({
+    ...options,
+    createdAt: 1700000000,
+    createdAtMs: undefined,
+    onPreparedSeed: undefined,
+    preparedPublications: [prepared]
+  }), { code: 'CREATED_AT_MS_REQUIRED' })
 })

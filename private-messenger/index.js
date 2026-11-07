@@ -72,6 +72,7 @@ import { DEFAULT_RECEIVED_CHUNK_TTL_MS } from '../private-channel/services/recei
 import { createQueue } from '../idb-queue/index.js'
 import { createChannelStateStore } from './services/channel-state.js'
 import { normalizeIdempotencyKey, readIdempotencyKey } from '../private-message/helpers/idempotency.js'
+import { eventCreatedAtMs, readMilliseconds } from '../private-message/helpers/timestamp.js'
 import { DEFAULT_STALE_CHANNEL_SECONDS } from './constants/index.js'
 import {
   activatePrivateMessengerStorage,
@@ -130,6 +131,11 @@ const COALESCING_INDEX = 'byCoalescingKey'
 const COALESCING_DIGEST = /^[0-9a-f]{64}$/
 const COALESCING_KEEP = new Set(['oldest', 'latest'])
 const DEDUPE_TYPES = new Set(['ask', 'reply', 'tell', 'yell'])
+const TIMESTAMPED_PRIVATE_MESSAGE_KINDS = new Set([
+  privateMessage.ASK_KIND,
+  privateMessage.REPLY_KIND,
+  privateMessage.TELL_KIND
+])
 const MESSAGE_QUEUE_INDEXES = {
   byChannel: 'channelPubkey',
   [COALESCING_INDEX]: 'coalescingKey',
@@ -2218,13 +2224,30 @@ export class PrivateMessenger {
         reason: tagged.reason
       })
     }
+    const timestamped = TIMESTAMPED_PRIVATE_MESSAGE_KINDS.has(message.event?.kind)
+    const milliseconds = timestamped
+      ? readMilliseconds(message.event)
+      : { milliseconds: 0, reason: '' }
+    if (milliseconds.reason && milliseconds.reason !== 'missing') {
+      this.debug('milliseconds-tag-ignored', {
+        type,
+        code: messageCode(message) || '',
+        reason: milliseconds.reason
+      })
+    }
+    const messageCreatedAtMs = eventCreatedAtMs(message.event, {
+      readMillisecondsTag: timestamped
+    })
 
     let resolved = null
     if (this.resolveInboundCoalescing) {
       try {
         resolved = this.resolveInboundCoalescing(
           { ...message, type, channelPubkey },
-          { idempotencyKey: tagged.key }
+          {
+            idempotencyKey: tagged.key,
+            eventCreatedAtMs: messageCreatedAtMs
+          }
         )
         if (resolved != null && typeof resolved?.then === 'function') {
           throw new Error('COALESCING_RESOLVER_MUST_BE_SYNCHRONOUS')
@@ -2270,7 +2293,7 @@ export class PrivateMessenger {
         digest
       ]),
       coalescingKeep: keep,
-      coalescingOrder: coalescingOrder(message, sequence)
+      coalescingOrder: coalescingOrder(message, sequence, messageCreatedAtMs)
     }
   }
 
@@ -2749,7 +2772,7 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async yell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, message, code, payload, error, content, idempotencyKey, deletionPubkey, createdAt, onPreparedSeed, preparedPublication, preparedPublications, useBulkPacing = false }) {
+  async yell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, message, code, payload, error, content, idempotencyKey, deletionPubkey, createdAt, createdAtMs, onPreparedSeed, preparedPublication, preparedPublications, useBulkPacing = false }) {
     idempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
@@ -2778,6 +2801,7 @@ export class PrivateMessenger {
         content,
         idempotencyKey,
         createdAt,
+        createdAtMs,
         useBulkPacing,
         onPreparedSeed: onPreparedSeed || this.outgoingSeedHandler(channelPubkey),
         preparedPublications: prepared.length ? prepared : undefined,
@@ -3941,8 +3965,9 @@ function messageCode (message) {
     : null
 }
 
-function coalescingOrder (message, sequence = null) {
+function coalescingOrder (message, sequence = null, messageCreatedAtMs = 0) {
   const order = {
+    eventTimeMs: messageCreatedAtMs,
     outer: Number.isSafeInteger(message?.outer?.created_at) ? message.outer.created_at : 0,
     inner: Number.isSafeInteger(message?.event?.created_at) ? message.event.created_at : 0,
     eventId: message?.event?.id || ''
@@ -3956,8 +3981,14 @@ function compareCoalescingOrder (left, right) {
       left.sequence !== right.sequence) {
     return left.sequence < right.sequence ? -1 : 1
   }
+  const leftTime = Number.isSafeInteger(left?.eventTimeMs)
+    ? left.eventTimeMs
+    : (Number.isSafeInteger(left?.inner) ? left.inner * 1000 : 0)
+  const rightTime = Number.isSafeInteger(right?.eventTimeMs)
+    ? right.eventTimeMs
+    : (Number.isSafeInteger(right?.inner) ? right.inner * 1000 : 0)
+  if (leftTime !== rightTime) return leftTime < rightTime ? -1 : 1
   if ((left?.outer || 0) !== (right?.outer || 0)) return (left?.outer || 0) - (right?.outer || 0)
-  if ((left?.inner || 0) !== (right?.inner || 0)) return (left?.inner || 0) - (right?.inner || 0)
   const leftId = left?.eventId || ''
   const rightId = right?.eventId || ''
   if (leftId === rightId) return 0
