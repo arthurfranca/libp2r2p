@@ -136,9 +136,17 @@ suite pass; report independently scoped problems separately.
   integer owned by the resolver. `latest` orders by explicit sequence, then the
   inner timestamp plus `ms`, then outer `created_at`, then event ID. Persist
   ordering only in internal coalescing metadata. Run the resolver for all inbox
-  types after exact event-ID dedupe and scope the final key by channel, sender,
-  type, code and provenance. It never replaces trust checks, pause/capacity
-  gates or ACK/NACK ownership.
+  types after exact event-ID dedupe and scope its key by channel, sender, type,
+  code and provenance. A valid resolver or `D` key precedes the automatic
+  Nostr-identity fallback. It never replaces trust checks, pause/capacity gates
+  or ACK/NACK ownership.
+- Automatic inbox identity applies to ask, reply, tell, yell, message and nym
+  after resolver and `D` fallbacks. Keep channel and type in scope. Use the first
+  string `d` tag as address; replaceable/addressable events without one use
+  `""`; regular and ephemeral events use `event.id`; ephemeral events never use
+  an address. Same-ID copies order `signed > direct > hearsay`. Address versions
+  order by inner `created_at`, then lower event ID, with hearsay below
+  direct/signed and without outer/`ms` input. Do not backfill legacy rows.
 - New ask, reply, tell and yell rumors carry exactly one canonical
   `["ms", "0".."999"]` tag derived from the same instant as inner `created_at`.
   Missing tags mean zero for legacy events. Invalid or duplicate tags also mean

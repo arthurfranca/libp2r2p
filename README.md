@@ -370,14 +370,29 @@ where `key` is a lowercase 64-character SHA-256 digest, `keep` is `latest`
 Sequence units are resolver-owned and are compared only within records sharing
 the final scoped coalescing key.
 
-The resolver runs for ask, reply, tell, yell, message and nym deliveries after
-exact event-ID deduplication. The final coalescing key is scoped by channel,
-sender, type, message code and provenance. `latest` replaces the pending item in
-place. Its order is: explicit sequence; `eventCreatedAtMs`, read from the inner
-`created_at` plus the `ms` tag; outer `created_at`; event ID. `oldest` preserves
-the pending item. While an item is reserved, both policies allow at most one
-successor. Timestamp and sequence ordering persist in internal queue metadata.
-Older recovered events do not replace newer requests.
+Every inbox type first attempts exact deduplication by channel, type, event ID
+and provenance, then a valid resolver key, then the automatic `D` fallback for
+ask/reply/tell/yell. When none supplies an identity, ask, reply, tell, yell,
+message and nym fall back to Nostr identity within the same channel and type:
+the first usable `d` tag selects an address, replaceable/addressable events
+without a usable `d` use `""`, and regular or ephemeral events use `event.id`.
+Ephemeral events never use an address. An explicit `d` is not merged with a
+regular event that has no address.
+
+Resolver and `D` keys retain channel, sender, type, code and provenance scope.
+Automatic keys omit sender, provenance and code. For copies with the same event
+ID, provenance orders `signed > direct > hearsay`. Different versions of an
+address follow NIP-01: higher inner `created_at`, then lower event ID on a tie;
+`signed` and `direct` compare as legitimate versions, while hearsay never
+displaces either. Address ordering ignores outer time and the `ms` tag.
+
+Resolver/idempotency `latest` replaces the pending item in place. Its order is:
+explicit sequence; `eventCreatedAtMs`, read from the inner `created_at` plus the
+`ms` tag; outer `created_at`; event ID. `oldest` preserves the pending item.
+While an item is reserved, all policies allow at most one successor. Ordering
+metadata persists internally, is removed before app delivery, and older pending
+records remain valid until drained. Older recovered events do not replace newer
+requests.
 
 New high-level ask, reply, tell and yell rumors include exactly one
 `["ms", "0".."999"]` tag and use the same instant to derive inner `created_at`.

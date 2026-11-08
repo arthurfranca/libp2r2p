@@ -1766,6 +1766,176 @@ test('invalid D tags are ignored without blocking message admission', async () =
   assert.equal(debug.filter(event => event.action === 'idempotency-tag-ignored').length, 4)
 })
 
+test('automatic Nostr event identity coalesces every inbox type by strongest provenance', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  for (const type of ['ask', 'reply', 'tell', 'yell', 'message', 'nym']) {
+    const direct = inboxRumor(type, `${type}-same-event`, 10)
+    const signed = inboxRumor(type, `${type}-same-event`, 10)
+    signed.event.sig = 'signed'
+    await deliverInboxRumor(pm, type, direct)
+    await deliverInboxRumor(pm, type, signed)
+    const message = await takeMessage(messenger)
+    assert.equal(message.event.id, `${type}-same-event`)
+    assert.equal(message.provenance, 'signed')
+    assert.equal(Object.hasOwn(message, 'coalescingKey'), false)
+    assert.equal(Object.hasOwn(message, 'coalescingOrder'), false)
+  }
+  assert.equal(await takeMessage(messenger), null)
+})
+
+test('automatic Nostr event identity keeps type and channel in scope', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
+    userSigner: signer('user'),
+    channels: [
+      { signer: signer('channel-one'), relays: ['wss://relay.example'] },
+      { signer: signer('channel-two'), relays: ['wss://relay.example'] }
+    ]
+  })
+  const event = inboxRumor('message', 'shared-event', 10)
+  await deliverInboxRumor(pm, 'tell', event)
+  await deliverInboxRumor(pm, 'yell', event)
+  await pm.watchCalls[1].onMessage(event)
+
+  assert.deepEqual(
+    (await Array.fromAsync(messenger.queue.storedItems())).map(item => [item.channelPubkey, item.type]),
+    [['channel-one', 'tell'], ['channel-one', 'yell'], ['channel-two', 'message']]
+  )
+})
+
+test('automatic address coalescing follows NIP-01 replacement order', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const version = (id, createdAt, {
+    d = 'state',
+    outer = createdAt,
+    milliseconds = 0,
+    senderPubkey = 'alice',
+    signed = false
+  } = {}) => {
+    const message = inboxRumor('message', id, createdAt, {
+      tags: [['d', d], ...(milliseconds == null ? [] : [['ms', String(milliseconds)]])]
+    })
+    message.outer.created_at = outer
+    message.senderPubkey = senderPubkey
+    if (signed) message.event.sig = 'signed'
+    return message
+  }
+
+  await deliverInboxRumor(pm, 'message', version('z', 20, { outer: 1000, milliseconds: 999 }))
+  await deliverInboxRumor(pm, 'message', version('a', 20, { outer: 1, milliseconds: 0 }))
+  assert.equal((await takeMessage(messenger)).event.id, 'a')
+
+  await deliverInboxRumor(pm, 'message', version('b', 30, { outer: 1 }))
+  await deliverInboxRumor(pm, 'message', version('0', 40, { senderPubkey: 'forwarder' }))
+  assert.equal((await takeMessage(messenger)).event.id, 'b')
+  assert.equal(await takeMessage(messenger), null)
+
+  await deliverInboxRumor(pm, 'message', version('d', 50))
+  await deliverInboxRumor(pm, 'message', version('s', 40, { signed: true }))
+  assert.equal((await takeMessage(messenger)).event.id, 'd')
+
+  await deliverInboxRumor(pm, 'message', version('same', 60))
+  await deliverInboxRumor(pm, 'message', version('same', 60, { signed: true }))
+  assert.equal((await takeMessage(messenger)).provenance, 'signed')
+})
+
+test('automatic address coalescing normalizes replaceable and addressable d tags', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const deliver = async (id, kind, tags, createdAt = 10) => {
+    const message = inboxRumor('message', id, createdAt, { tags })
+    message.event.kind = kind
+    await deliverInboxRumor(pm, 'message', message)
+  }
+
+  await deliver('replaceable-missing', 10000, [])
+  await deliver('replaceable-empty', 10000, [['d', '']], 20)
+  assert.equal((await takeMessage(messenger)).event.id, 'replaceable-empty')
+
+  await deliver('addressable-missing', 30000, [], 10)
+  await deliver('addressable-empty', 30000, [['d', '']], 20)
+  assert.equal((await takeMessage(messenger)).event.id, 'addressable-empty')
+
+  await deliver('regular-no-d', 9, [])
+  await deliver('regular-with-d', 9, [['d', 'x']], 20)
+  assert.deepEqual(
+    [await takeMessage(messenger), await takeMessage(messenger)].map(message => message.event.id),
+    ['regular-no-d', 'regular-with-d']
+  )
+
+  await deliver('malformed-first', 9, [['d'], ['d', 'state']])
+  await deliver('valid-first', 9, [['d', 'state']], 20)
+  assert.deepEqual(
+    [await takeMessage(messenger), await takeMessage(messenger)].map(message => message.event.id),
+    ['malformed-first', 'valid-first']
+  )
+
+  await deliver('ephemeral-one', 21000, [['d', 'state']])
+  await deliver('ephemeral-two', 21000, [['d', 'state']], 20)
+  assert.deepEqual(
+    [await takeMessage(messenger), await takeMessage(messenger)].map(message => message.event.id),
+    ['ephemeral-one', 'ephemeral-two']
+  )
+})
+
+test('automatic identity is durable and preserves one active successor', async () => {
+  const indexedDB = new IDBFactory()
+  const init = {
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  }
+  const first = await new PrivateMessenger({ _indexedDB: indexedDB, _privateMessage: fakePrivateMessage() }).init(init)
+  const direct = inboxRumor('message', 'same-event', 10, { tags: [['d', 'state']] })
+  const signed = inboxRumor('message', 'same-event', 10, { tags: [['d', 'state']] })
+  signed.event.sig = 'signed'
+  await deliverInboxRumor(first._privateMessage, 'message', direct)
+  const active = await first.nextMessage()
+  assert.equal(active.message.provenance, 'direct')
+  await deliverInboxRumor(first._privateMessage, 'message', signed)
+  await first.close()
+
+  const second = await new PrivateMessenger({ _indexedDB: indexedDB, _privateMessage: fakePrivateMessage() }).init(init)
+  const successor = await takeMessage(second)
+  assert.equal(successor.event.id, 'same-event')
+  assert.equal(successor.provenance, 'signed')
+  assert.equal(Object.hasOwn(successor, 'coalescingOrder'), false)
+  assert.equal(await takeMessage(second), null)
+})
+
+test('invalid semantic resolvers fall back to automatic Nostr identity', async () => {
+  const pm = fakePrivateMessage()
+  const errors = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    onError: error => errors.push(error),
+    resolveInboundCoalescing: () => {
+      throw new Error('resolver failed')
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const direct = inboxRumor('message', 'fallback-event', 10)
+  const signed = inboxRumor('message', 'fallback-event', 10)
+  signed.event.sig = 'signed'
+  await deliverInboxRumor(pm, 'message', direct)
+  await deliverInboxRumor(pm, 'message', signed)
+  assert.equal(errors.filter(error => error.code === 'INVALID_INBOUND_COALESCING_KEY').length, 2)
+  assert.equal((await takeMessage(messenger)).provenance, 'signed')
+})
+
 test('private messenger reports content key usage changes for sent and received messages', async () => {
   const pm = fakePrivateMessage()
   const changes = []
@@ -3683,7 +3853,7 @@ test('capacity pauses ingestion without eviction and ack resumes durable recover
   let recovered = 0
   const errors = []
   const messenger = await new PrivateMessenger({
-    _privateMessage: pm, messageQueueMaxBytes: 850, onError: err => errors.push(err),
+    _privateMessage: pm, messageQueueMaxBytes: 1200, onError: err => errors.push(err),
     _privateChannel: { fetchHistory: async () => { recovered++; return [] } }
   }).init({
     userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
@@ -3695,7 +3865,7 @@ test('capacity pauses ingestion without eviction and ack resumes durable recover
     await assert.rejects(pm.watchCalls[0].onMessage(message('two')), error => {
       assert.equal(error.code, 'QUEUE_CAPACITY_EXCEEDED')
       assert.equal(error.queue, 'inbox')
-      assert.equal(error.maxBytes, 850)
+      assert.equal(error.maxBytes, 1200)
       assert.ok(error.requiredBytes > 0)
       assert.ok(error.usedBytes > 0)
       assert.deepEqual(error.pauseReasons, ['capacity'])
@@ -3876,8 +4046,8 @@ test('capacity monitor resumes after another instance acknowledges a delivery', 
   const watch = pm.watch
   pm.watch = async options => { const stop = await watch(options); if (pm.watchCalls.length > 1) resumed.resolve(); return stop }
   const init = { userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }] }
-  const first = await new PrivateMessenger({ _privateMessage: pm, messageQueueMaxBytes: 850, onError: () => {} }).init(init)
-  const second = await new PrivateMessenger({ _privateMessage: fakePrivateMessage(), messageQueueMaxBytes: 850 }).init(init)
+  const first = await new PrivateMessenger({ _privateMessage: pm, messageQueueMaxBytes: 1200, onError: () => {} }).init(init)
+  const second = await new PrivateMessenger({ _privateMessage: fakePrivateMessage(), messageQueueMaxBytes: 1200 }).init(init)
   try {
     const now = Math.floor(Date.now() / 1000)
     const message = id => ({ event: { kind: 9, id, pubkey: 'peer', tags: [], created_at: now, content: 'a'.repeat(250) }, outer: { created_at: now }, senderPubkey: 'peer' })
@@ -3914,7 +4084,6 @@ test('a pending hearsay does not suppress a direct original of the same event', 
     await pm.watchCalls[0].onMessage({ event, senderPubkey: 'forwarder' })
     await pm.watchCalls[0].onMessage({ event, senderPubkey: 'author' })
     await pm.watchCalls[0].onMessage({ event, senderPubkey: 'author' })
-    assert.equal((await takeMessage(messenger)).provenance, 'hearsay')
     assert.equal((await takeMessage(messenger)).provenance, 'direct')
     assert.equal(await messenger.nextMessage(), null)
   } finally { await messenger.close() }

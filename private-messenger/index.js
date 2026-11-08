@@ -70,6 +70,7 @@ import { getRelaysByPubkey, pickRelaysForPubkeys, subscribeRelayListUpdates, rel
 import * as privateChannel from '../private-channel/index.js'
 import { DEFAULT_RECEIVED_CHUNK_TTL_MS } from '../private-channel/services/received-chunks.js'
 import { createQueue } from '../idb-queue/index.js'
+import { classifyEvent, isEphemeralEvent } from '../event/index.js'
 import { createChannelStateStore } from './services/channel-state.js'
 import { normalizeIdempotencyKey, readIdempotencyKey } from '../private-message/helpers/idempotency.js'
 import { eventCreatedAtMs, readMilliseconds } from '../private-message/helpers/timestamp.js'
@@ -131,6 +132,11 @@ const COALESCING_INDEX = 'byCoalescingKey'
 const COALESCING_DIGEST = /^[0-9a-f]{64}$/
 const COALESCING_KEEP = new Set(['oldest', 'latest'])
 const DEDUPE_TYPES = new Set(['ask', 'reply', 'tell', 'yell'])
+const PROVENANCE_PRIORITY = {
+  signed: 2,
+  direct: 1,
+  hearsay: 0
+}
 const TIMESTAMPED_PRIVATE_MESSAGE_KINDS = new Set([
   privateMessage.ASK_KIND,
   privateMessage.REPLY_KIND,
@@ -2309,6 +2315,7 @@ export class PrivateMessenger {
     let digest = null
     let keep = 'latest'
     let sequence = null
+    let policy = 'semantic'
     if (resolved != null) {
       if (isPlainObject(resolved) && typeof resolved.key === 'string' &&
           COALESCING_DIGEST.test(resolved.key) &&
@@ -2322,27 +2329,37 @@ export class PrivateMessenger {
         this.onError?.(coalescingError(new ValidationError('INVALID_INBOUND_COALESCING_RESULT')))
       }
     }
-    if (!digest && tagged.key) digest = idempotencyDigest(tagged.key)
-    if (!digest) return null
+    if (!digest && tagged.key) {
+      digest = idempotencyDigest(tagged.key)
+      policy = 'idempotency'
+    }
 
     const senderPubkey = info.senderPubkey || message.event?.pubkey || ''
     const code = messageCode(message)
-    if (!channelPubkey || !senderPubkey || typeof code !== 'string' || !info.provenance) {
+    if (digest && (!channelPubkey || !senderPubkey || typeof code !== 'string' || !info.provenance)) {
       this.onError?.(coalescingError(new ValidationError('INVALID_INBOUND_COALESCING_SCOPE')))
-      return null
+      digest = null
     }
-    return {
-      coalescingKey: JSON.stringify([
-        channelPubkey,
-        senderPubkey,
-        type,
-        code,
-        info.provenance,
-        digest
-      ]),
-      coalescingKeep: keep,
-      coalescingOrder: coalescingOrder(message, sequence, messageCreatedAtMs)
+    if (digest) {
+      return {
+        coalescingKey: JSON.stringify([
+          channelPubkey,
+          senderPubkey,
+          type,
+          code,
+          info.provenance,
+          digest
+        ]),
+        coalescingKeep: keep,
+        coalescingOrder: coalescingOrder(message, {
+          policy,
+          sequence,
+          eventCreatedAtMs: messageCreatedAtMs
+        })
+      }
     }
+
+    return automaticCoalescingMetadata(type, channelPubkey, message, info)
   }
 
   async enqueueRumor (type, channelPubkey, message) {
@@ -2350,7 +2367,7 @@ export class PrivateMessenger {
     if (channel?.mode === 'watchtower' && type !== 'ask') return
     const info = deliveryInfo(message.event, message.senderPubkey ?? message.meta?.senderPubkey ?? message.meta?.router?.tags?.find(tag => tag[0] === 'f')?.[1])
     const eventId = message.event?.id || ''
-    // Stronger provenance must reach the app even while hearsay is pending.
+    // Exact copies are dropped; stronger provenance participates in coalescing below.
     const dedupeKey = eventId ? [channelPubkey, type, eventId, info.provenance] : null
     if (dedupeKey && await this.queue.someBy('byChannelTypeEventId', dedupeKey)) {
       this.markSeen(channelPubkey, message.outer?.created_at || message.event?.created_at || nowSeconds())
@@ -2375,8 +2392,9 @@ export class PrivateMessenger {
       meta: message.meta || null
     }
     Object.assign(record, this.#coalescingMetadata(type, channelPubkey, message, info) || {})
+    let coalesced = null
     try {
-      const coalesced = record.coalescingKey
+      coalesced = record.coalescingKey
         ? await this.queue.coalesceBy(COALESCING_INDEX, record, {
           compare: compareCoalescingItems,
           keep: record.coalescingKeep
@@ -2387,6 +2405,7 @@ export class PrivateMessenger {
         this.markSeen(channelPubkey, message.outer?.created_at || message.event?.created_at || nowSeconds())
         this.debug('message-coalescing-ignored', {
           code: messageCode(message) || '',
+          policy: record.coalescingOrder?.policy || 'legacy',
           keep: record.coalescingKeep,
           payloadBytes: encoder.encode(JSON.stringify(record)).byteLength
         })
@@ -2395,6 +2414,7 @@ export class PrivateMessenger {
       if (coalesced) {
         this.debug('message-coalesced', {
           code: messageCode(message) || '',
+          policy: record.coalescingOrder?.policy || 'legacy',
           keep: record.coalescingKeep,
           status: coalesced.status,
           removedUnreserved: coalesced.removed,
@@ -2434,7 +2454,9 @@ export class PrivateMessenger {
     }
     this.markSeen(channelPubkey, message.outer?.created_at || message.event?.created_at || nowSeconds())
     this.wakeDeliveries()
-    if (!record.coalescingKey) this.debug('enqueue', debugMessageInfo(type, channelPubkey, message))
+    if (!record.coalescingKey || coalesced?.status === 'inserted') {
+      this.debug('enqueue', debugMessageInfo(type, channelPubkey, message))
+    }
     this.onMessageQueued?.()
   }
 
@@ -4013,9 +4035,65 @@ function messageCode (message) {
     : null
 }
 
-function coalescingOrder (message, sequence = null, messageCreatedAtMs = 0) {
+function automaticCoalescingMetadata (type, channelPubkey, message, info) {
+  const identity = automaticEventIdentity(message.event)
+  if (!identity || !channelPubkey || !type || !info.provenance) return null
+  const eventIdPriority = PROVENANCE_PRIORITY[info.provenance] ?? 0
+  return {
+    coalescingKey: JSON.stringify([
+      channelPubkey,
+      type,
+      'nostr-identity',
+      identity.kind,
+      identity.digest
+    ]),
+    coalescingKeep: 'latest',
+    coalescingOrder: identity.kind === 'address'
+      ? {
+          policy: 'event-address',
+          eventIdPriority,
+          inner: Number.isSafeInteger(message.event?.created_at) ? message.event.created_at : 0,
+          eventId: message.event.id
+        }
+      : {
+          policy: 'event-id',
+          eventIdPriority
+        }
+  }
+}
+
+function automaticEventIdentity (event) {
+  if (!event || typeof event.id !== 'string' || !event.id) return null
+  if (!isEphemeralEvent(event)) {
+    const firstD = event.tags?.find(tag => Array.isArray(tag) && tag[0] === 'd')
+    let coordinate = null
+    if (typeof firstD?.[1] === 'string') {
+      coordinate = firstD[1]
+    } else {
+      const classes = classifyEvent(event)
+      if (classes.includes('replaceable') || classes.includes('addressable')) coordinate = ''
+    }
+    if (coordinate !== null && Number.isSafeInteger(event.kind) && event.kind >= 0 && typeof event.pubkey === 'string') {
+      return {
+        kind: 'address',
+        digest: coalescingDigest(['nostr-address:v1', event.kind, event.pubkey, coordinate])
+      }
+    }
+  }
+  return {
+    kind: 'event-id',
+    digest: coalescingDigest(['nostr-event-id:v1', event.id])
+  }
+}
+
+function coalescingOrder (message, {
+  policy = 'semantic',
+  sequence = null,
+  eventCreatedAtMs = 0
+} = {}) {
   const order = {
-    eventTimeMs: messageCreatedAtMs,
+    policy,
+    eventTimeMs: eventCreatedAtMs,
     outer: Number.isSafeInteger(message?.outer?.created_at) ? message.outer.created_at : 0,
     inner: Number.isSafeInteger(message?.event?.created_at) ? message.event.created_at : 0,
     eventId: message?.event?.id || ''
@@ -4025,6 +4103,34 @@ function coalescingOrder (message, sequence = null, messageCreatedAtMs = 0) {
 }
 
 function compareCoalescingOrder (left, right) {
+  if (left?.policy === 'event-id' || right?.policy === 'event-id') {
+    return compareEventIdCoalescingOrder(left, right)
+  }
+  if (left?.policy === 'event-address' || right?.policy === 'event-address') {
+    return compareAddressCoalescingOrder(left, right)
+  }
+  return compareLegacyCoalescingOrder(left, right)
+}
+
+function compareEventIdCoalescingOrder (left, right) {
+  return (left?.eventIdPriority || 0) - (right?.eventIdPriority || 0)
+}
+
+function compareAddressCoalescingOrder (left, right) {
+  const leftId = left?.eventId || ''
+  const rightId = right?.eventId || ''
+  if (leftId === rightId) {
+    return (left?.eventIdPriority || 0) - (right?.eventIdPriority || 0)
+  }
+  const trust = ((left?.eventIdPriority || 0) > 0 ? 1 : 0) - ((right?.eventIdPriority || 0) > 0 ? 1 : 0)
+  if (trust) return trust
+  const leftTime = Number.isSafeInteger(left?.inner) ? left.inner : 0
+  const rightTime = Number.isSafeInteger(right?.inner) ? right.inner : 0
+  if (leftTime !== rightTime) return leftTime < rightTime ? -1 : 1
+  return leftId < rightId ? 1 : -1
+}
+
+function compareLegacyCoalescingOrder (left, right) {
   if (Number.isSafeInteger(left?.sequence) && Number.isSafeInteger(right?.sequence) &&
       left.sequence !== right.sequence) {
     return left.sequence < right.sequence ? -1 : 1
@@ -4048,7 +4154,11 @@ function compareCoalescingItems (left, right) {
 }
 
 function idempotencyDigest (idempotencyKey) {
-  return bytesToHex(sha256(encoder.encode(JSON.stringify(['idempotency', idempotencyKey]))))
+  return coalescingDigest(['idempotency', idempotencyKey])
+}
+
+function coalescingDigest (value) {
+  return bytesToHex(sha256(encoder.encode(JSON.stringify(value))))
 }
 
 function coalescingError (cause) {

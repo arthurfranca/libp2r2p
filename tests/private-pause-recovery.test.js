@@ -199,9 +199,12 @@ test('local recovery backoff caps at thirty seconds and ignores stale work after
 
 test('internal queue recovery retries the refused record before releasing storage and marking it seen', async t => {
   const f = await fixture(t)
-  const enqueue = f.messenger.queue.enqueue.bind(f.messenger.queue)
+  const coalesce = f.messenger.queue.coalesceBy.bind(f.messenger.queue)
   let failing = true
-  f.messenger.queue.enqueue = async record => { if (failing) throw new Error('IDB_TEMPORARY_WRITE_FAILURE'); return enqueue(record) }
+  f.messenger.queue.coalesceBy = async (...args) => {
+    if (failing) throw new Error('IDB_TEMPORARY_WRITE_FAILURE')
+    return coalesce(...args)
+  }
   await assert.rejects(f.receive(), /IDB_TEMPORARY_WRITE_FAILURE/)
   assert.equal(f.messenger.readStatus().pauseReasons[0], 'storage')
   assert.equal(f.messenger.readState().channels[channel].lastSeenAt, undefined)
@@ -237,7 +240,7 @@ test('absolute retry advice survives connectivity wakeups and is not added to th
 
 test('a local permission failure does not acquire automatic storage recovery', async t => {
   const f = await fixture(t)
-  f.messenger.queue.enqueue = async () => { throw new DOMException('Account permission denied', 'NotAllowedError') }
+  f.messenger.queue.coalesceBy = async () => { throw new DOMException('Account permission denied', 'NotAllowedError') }
   await assert.rejects(f.receive(), { name: 'NotAllowedError' })
   assert.deepEqual(f.messenger.readStatus().pauseReasons, ['storage'])
   assert.equal(f.time.timers.size, 0)
