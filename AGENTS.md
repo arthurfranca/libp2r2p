@@ -150,6 +150,13 @@ suite pass; report independently scoped problems separately.
   inner without `ms` must remain replayable; when a timestamped prepared inner
   cannot be reconstructed without `createdAtMs`, fail with
   `CREATED_AT_MS_REQUIRED` rather than changing its ID.
+- `PrivateMessenger` accepts optional synchronous `admitInboundPeer(message,
+  context)`. It runs after decryption and lifecycle gates but before handlers,
+  automatic replies, seed ingestion and inbox admission. Context contains type,
+  channel, sender, code, bytes and now. `false` drops locally without NACK;
+  errors, Promise or invalid results fail open and report while preserving
+  delivery. Disabled by default. Direct typed events must invoke admission only
+  once, not again through `onMessage`.
 - Only ask, reply, tell and yell interpret exactly one `["D", key]` automatically.
   Keys are non-empty UTF-8 strings up to 256 bytes and fall back to latest-wins.
   Message/nym always pass `idempotencyKey: null` and retain arbitrary-kind tag

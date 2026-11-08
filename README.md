@@ -400,6 +400,22 @@ Coalescing does not provide an ingress rate limit or per-peer quota. Exact
 event deduplication, authorization, quarantine, global inbox capacity,
 pause/ACK/NACK ownership and existing storage policy remain independent.
 
+### Inbound peer admission
+
+`PrivateMessenger` accepts an optional synchronous
+`admitInboundPeer(message, context)` callback. It runs after decryption and
+lifecycle gates, but before typed handlers, automatic replies, seed ingestion
+and inbox admission. The context contains `type`, `channelPubkey`,
+`senderPubkey`, `code`, `bytes` and `now`.
+
+Returning `false` drops that delivery locally without an operational error or
+NACK. A thrown error, Promise or non-boolean result fails open: the message is
+admitted and the error is reported. The hook is disabled by default and does
+not coalesce, authorize or persist limits itself.
+
+Direct ask/reply/tell/yell events invoke their typed callback once and do not
+invoke `onMessage` again for admission purposes.
+
 ### Deleting Private Broadcasts
 
 By default, each high-level private-message send creates one fresh deletion

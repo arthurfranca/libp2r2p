@@ -318,6 +318,7 @@ export class PrivateMessenger {
     onDebug,
     onError = defaultOnError,
     resolveInboundCoalescing,
+    admitInboundPeer,
     _privateMessage = privateMessage,
     _privateChannel = privateChannel,
     _getRelaysByPubkey = getRelaysByPubkey,
@@ -341,6 +342,9 @@ export class PrivateMessenger {
     if (typeof pendingDecryptionReady !== 'boolean') throw new ValidationError('INVALID_PENDING_DECRYPTION_READY')
     if (resolveInboundCoalescing != null && typeof resolveInboundCoalescing !== 'function') {
       throw new ValidationError('INVALID_RESOLVE_INBOUND_COALESCING')
+    }
+    if (admitInboundPeer != null && typeof admitInboundPeer !== 'function') {
+      throw new ValidationError('INVALID_ADMIT_INBOUND_PEER')
     }
     this.fallbackRelays = normalizeFallbackRelays(fallbackRelays)
     this.fallbackDelayMs = normalizeFallbackDelay(fallbackDelayMs)
@@ -387,6 +391,7 @@ export class PrivateMessenger {
     this.onMessageQueued = onMessageQueued
     this.onDebug = onDebug
     this.resolveInboundCoalescing = resolveInboundCoalescing
+    this.admitInboundPeer = admitInboundPeer
     this._privateMessage = _privateMessage.createPrivateMessageSession?.() ?? _privateMessage
     this._privateChannel = _privateChannel
     this._getRelaysByPubkey = _getRelaysByPubkey
@@ -1332,13 +1337,18 @@ export class PrivateMessenger {
           privateChannelReaderSigner: channel.readerSigner,
           privateChannelReaderPubkey: channel.readerPubkey,
           mode: channel.mode,
-          onAsk: message => this.receive(pubkey, () => this.handleAsk(pubkey, message), message),
-          onReply: message => this.receive(pubkey, () => this.handleReply(pubkey, message), message),
-          onTell: message => this.receive(pubkey, () => this.handleTell(pubkey, message), message),
-          onYell: message => this.receive(pubkey, () => this.handleYell(pubkey, message), message),
-          onNym: message => this.receive(pubkey, () => this.handleNym(pubkey, message), message),
-          onMessage: message => this.receive(pubkey, () => this.handleMessage(pubkey, message), message),
-          onSeed: seed => this.receive(pubkey, () => this.enqueueSeed(pubkey, seed), seed),
+          onAsk: message => this.receive(pubkey, () => this.handleAsk(pubkey, message), message, { inboundType: 'ask' }),
+          onReply: message => this.receive(pubkey, () => this.handleReply(pubkey, message), message, { inboundType: 'reply' }),
+          onTell: message => this.receive(pubkey, () => this.handleTell(pubkey, message), message, { inboundType: 'tell' }),
+          onYell: message => this.receive(pubkey, () => this.handleYell(pubkey, message), message, { inboundType: 'yell' }),
+          onNym: message => this.receive(pubkey, () => this.handleNym(pubkey, message), message, { inboundType: 'nym' }),
+          onMessage: message => {
+            const type = eventType(message.event)
+            if (type !== 'message' && message.provenance !== 'hearsay' &&
+                (!message.senderPubkey || message.senderPubkey === message.event.pubkey)) return Promise.resolve()
+            return this.receive(pubkey, () => this.handleMessage(pubkey, message), message, { inboundType: 'message' })
+          },
+          onSeed: seed => this.receive(pubkey, () => this.enqueueSeed(pubkey, seed), seed, { inboundType: 'seed' }),
           onContentKeyUsage: usage => this.handleContentKeyUsage(pubkey, usage),
           onDecryptionFailure: failure => this.deferDecryption(failure),
           _onProcessing: pubkey => this.decryptionScheduler.activity(pubkey),
@@ -2102,7 +2112,44 @@ export class PrivateMessenger {
     return jobs
   }
 
-  receive (pubkey, operation, message = {}, { trackActivity = true } = {}) {
+  #admitInboundPeer (pubkey, inboundType, message) {
+    if (!this.admitInboundPeer) return true
+    const type = inboundType || 'message'
+    const context = {
+      type,
+      channelPubkey: pubkey,
+      senderPubkey: inboundSenderPubkey(message),
+      code: messageCode(message) || message?.recordType || '',
+      bytes: inboundMessageBytes(message),
+      now: this._now()
+    }
+    let admitted
+    try {
+      admitted = this.admitInboundPeer(
+        { ...message, type, channelPubkey: pubkey },
+        context
+      )
+      if (admitted != null && typeof admitted.then === 'function') {
+        throw new Error('INBOUND_PEER_ADMISSION_MUST_BE_SYNCHRONOUS')
+      }
+    } catch (cause) {
+      this.onError?.(inboundPeerAdmissionError(cause))
+      return true
+    }
+    if (admitted === false) {
+      this.debug('inbound-peer-dropped', {
+        type,
+        code: context.code
+      })
+      return false
+    }
+    if (admitted !== true) {
+      this.onError?.(inboundPeerAdmissionError(new ValidationError('INVALID_INBOUND_PEER_ADMISSION')))
+    }
+    return true
+  }
+
+  receive (pubkey, operation, message = {}, { trackActivity = true, inboundType = 'message' } = {}) {
     if (this.closePromise) {
       if (this.storageActive) this.recordInterruption([pubkey], messageTime(message))
       return Promise.reject(new Error('PRIVATE_MESSENGER_CLOSED'))
@@ -2113,6 +2160,7 @@ export class PrivateMessenger {
         this.recordInterruption([pubkey], messageTime(message))
         throw this.pausedError()
       }
+      if (!this.#admitInboundPeer(pubkey, inboundType, message)) return
       return operation()
     }).finally(releaseActivity)
   }
@@ -3373,9 +3421,9 @@ export class PrivateMessenger {
       modeByPubkey: { [channelPubkey]: channel.mode },
       receivedChunkTtlMs: this.receivedChunkTtlMsFor(channel),
       receivedChunkIndexedDB: this._indexedDB,
-      onEvent: (event, outer, meta) => this.receive(channelPubkey, () => this.enqueueRumor(eventType(event), channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }),
-      onNymEvent: (event, outer, meta) => this.receive(channelPubkey, () => this.enqueueRumor('nym', channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }),
-      onSeedEvent: seed => this.receive(channelPubkey, () => this.enqueueSeed(channelPubkey, seed), seed),
+      onEvent: (event, outer, meta) => this.receive(channelPubkey, () => this.enqueueRumor(eventType(event), channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }, { inboundType: eventType(event) }),
+      onNymEvent: (event, outer, meta) => this.receive(channelPubkey, () => this.enqueueRumor('nym', channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }, { inboundType: 'nym' }),
+      onSeedEvent: seed => this.receive(channelPubkey, () => this.enqueueSeed(channelPubkey, seed), seed, { inboundType: 'seed' }),
       onContentKeyUsage: usage => this.handleContentKeyUsage(channelPubkey, usage),
       onDecryptionFailure: failure => this.deferDecryption(failure),
       _onProcessing: pubkey => this.decryptionScheduler.activity(pubkey),
@@ -3731,13 +3779,13 @@ export class PrivateMessenger {
               },
               onEvent: (event, outer, meta) => {
                 current()
-                return this.receive(channelPubkey, () => this.enqueueRumor(eventType(event), channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }, { trackActivity: false })
+                return this.receive(channelPubkey, () => this.enqueueRumor(eventType(event), channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }, { trackActivity: false, inboundType: eventType(event) })
               },
               onNymEvent: (event, outer, meta) => {
                 current()
-                return this.receive(channelPubkey, () => this.enqueueRumor('nym', channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }, { trackActivity: false })
+                return this.receive(channelPubkey, () => this.enqueueRumor('nym', channelPubkey, { event, outer, meta, payload: parseEventContent(event) }), { event, outer }, { trackActivity: false, inboundType: 'nym' })
               },
-              onSeedEvent: seed => { current(); return this.receive(channelPubkey, () => this.enqueueSeed(channelPubkey, seed), seed, { trackActivity: false }) },
+              onSeedEvent: seed => { current(); return this.receive(channelPubkey, () => this.enqueueSeed(channelPubkey, seed), seed, { trackActivity: false, inboundType: 'seed' }) },
               onRecovered: async record => {
                 current()
                 await callbacks.onRecovered?.(record)
@@ -4056,6 +4104,31 @@ function debugMessageInfo (type, channelPubkey, message) {
 
 function messageTime (message) {
   return message.outer?.created_at || message.event?.created_at || nowSeconds()
+}
+
+function inboundSenderPubkey (message) {
+  return message?.senderPubkey ||
+    message?.event?.pubkey ||
+    message?.meta?.senderPubkey ||
+    message?.router?.tags?.find(tag => tag[0] === 'f')?.[1] ||
+    ''
+}
+
+function inboundMessageBytes (message) {
+  const value = message?.event
+    ? message.event
+    : message?.recordType ? message : message?.router || message
+  try {
+    return encoder.encode(JSON.stringify(value)).byteLength
+  } catch {
+    return 0
+  }
+}
+
+function inboundPeerAdmissionError (cause) {
+  return Object.assign(new Error(cause?.message || 'INVALID_INBOUND_PEER_ADMISSION', { cause }), {
+    code: 'INVALID_INBOUND_PEER_ADMISSION'
+  })
 }
 
 function oldestCreatedAt (events) {

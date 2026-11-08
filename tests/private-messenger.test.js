@@ -1559,6 +1559,86 @@ test('private messenger reports invalid ask coalescing resolvers and preserves a
   assert.equal((await takeMessage(messenger)).event.id, 'reply')
 })
 
+test('inbound peer admission runs once before typed handlers and can drop', async () => {
+  assert.throws(
+    () => new PrivateMessenger({ _privateMessage: fakePrivateMessage(), admitInboundPeer: true }),
+    { code: 'INVALID_ADMIT_INBOUND_PEER' }
+  )
+  const pm = fakePrivateMessage()
+  const calls = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    admitInboundPeer: (message, context) => {
+      calls.push({ message, context })
+      return false
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const ask = inboxRumor('ask', 'ask-id', 10, { code: 'ask-code' })
+
+  await pm.watchCalls[0].onAsk(ask)
+  await pm.watchCalls[0].onMessage(ask)
+
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].message.type, 'ask')
+  assert.equal(calls[0].message.channelPubkey, 'channel')
+  assert.deepEqual({
+    ...calls[0].context,
+    bytes: typeof calls[0].context.bytes,
+    now: typeof calls[0].context.now
+  }, {
+    type: 'ask',
+    channelPubkey: 'channel',
+    senderPubkey: 'alice',
+    code: 'ask-code',
+    bytes: 'number',
+    now: 'number'
+  })
+  assert.ok(calls[0].context.bytes > 0)
+  assert.equal(await takeMessage(messenger), null)
+
+  await pm.watchCalls[0].onSeed({
+    channelPubkey: 'channel',
+    recordType: 'routerRow_v1',
+    router: { tags: [['f', 'alice']] },
+    jsonl: ''
+  })
+  assert.equal(calls.length, 2)
+  assert.equal(calls[1].context.type, 'seed')
+  assert.equal(calls[1].context.senderPubkey, 'alice')
+  assert.equal(calls[1].context.code, 'routerRow_v1')
+})
+
+test('inbound peer admission fails open for errors, promises and invalid results', async () => {
+  const pm = fakePrivateMessage()
+  const errors = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    onError: error => errors.push(error),
+    admitInboundPeer: message => {
+      if (message.payload.code === 'throw') throw new Error('guard failed')
+      if (message.payload.code === 'promise') return Promise.resolve(false)
+      if (message.payload.code === 'invalid') return undefined
+      return true
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  await deliverInboxRumor(pm, 'tell', inboxRumor('tell', 'throw', 10, { code: 'throw' }))
+  await deliverInboxRumor(pm, 'tell', inboxRumor('tell', 'promise', 20, { code: 'promise' }))
+  await deliverInboxRumor(pm, 'tell', inboxRumor('tell', 'invalid', 30, { code: 'invalid' }))
+
+  assert.deepEqual(
+    (await Array.fromAsync(messenger.queue.storedItems())).map(item => item.event.id),
+    ['throw', 'promise', 'invalid']
+  )
+  assert.equal(errors.filter(error => error.code === 'INVALID_INBOUND_PEER_ADMISSION').length, 3)
+})
+
 test('generic receive coalescing applies D only to stable control types', async () => {
   const pm = fakePrivateMessage()
   const observed = []
