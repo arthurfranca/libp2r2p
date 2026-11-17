@@ -441,6 +441,18 @@ export async function createQueue ({
     return (await p.promise).result
   }
 
+  async function firstEligibleRecord (tx, { indexName = null, query = [], now }) {
+    const p = deferred()
+    const args = indexName ? [query, 'next'] : [undefined, 'next']
+    let cursor = (await run('openCursor', args, ITEMS_STORE, indexName, { tx, p })).result
+    while (cursor) {
+      const record = cursor.value
+      if (!record.reservation || record.reservation.until <= now) return record
+      cursor = await nextCursor(cursor, p)
+    }
+    return null
+  }
+
   async function storedRecordAtEnd (tx, state, direction, excludedPositions = new Set()) {
     // Queue positions are the object-store primary key, so an end cursor finds
     // an eviction candidate without reading every queued record into memory.
@@ -886,7 +898,9 @@ export async function createQueue ({
   async function reserve ({
     leaseMs = 30000,
     now = Date.now(),
-    nackCoalescingIndex
+    nackCoalescingIndex,
+    priorityIndex,
+    priorities
   } = {}) {
     if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0 || !Number.isSafeInteger(now) || now < 0) throw new ValidationError('QUEUE_INVALID_LEASE')
     const nackDefinition = nackCoalescingIndex == null ? null : indexDefinition(nackCoalescingIndex)
@@ -894,20 +908,41 @@ export async function createQueue ({
         (!nackDefinition || nackDefinition.unique || nackDefinition.multiEntry)) {
       throw new ValidationError('QUEUE_NACK_COALESCE_INDEX_INVALID')
     }
+    const priorityDefinition = priorityIndex == null ? null : indexDefinition(priorityIndex)
+    if (priorityIndex != null && (!priorityDefinition || priorityDefinition.multiEntry)) {
+      throw new ValidationError('QUEUE_PRIORITY_INDEX_INVALID')
+    }
+    if (priorityDefinition && (!Array.isArray(priorities) || priorities.length === 0)) {
+      throw new ValidationError('QUEUE_PRIORITY_VALUES_INVALID')
+    }
+    if (!priorityDefinition && priorities != null) {
+      throw new ValidationError('QUEUE_PRIORITY_INDEX_REQUIRED')
+    }
+    const orderedPriorities = []
+    for (const value of priorities || []) {
+      assertValidIndexKey(value, 'QUEUE_PRIORITY_VALUE_INVALID')
+      if (orderedPriorities.some(existing => indexedDB.cmp(existing, value) === 0)) continue
+      orderedPriorities.push(value)
+    }
     const token = globalThis.crypto.randomUUID()
     const reserved = await mutate(async tx => {
-      const p = deferred()
-      let cursor = (await run('openCursor', [], ITEMS_STORE, null, { tx, p })).result
-      while (cursor) {
-        const record = cursor.value
-        if (!record.reservation || record.reservation.until <= now) {
-          record.reservation = { token, until: now + leaseMs }
-          await putRecord(tx, record)
-          return record
+      let candidate = null
+      if (priorityDefinition) {
+        for (const value of orderedPriorities) {
+          candidate = await firstEligibleRecord(tx, {
+            indexName: priorityIndex,
+            query: value,
+            now
+          })
+          if (candidate) break
         }
-        cursor = await nextCursor(cursor, p)
+      } else {
+        candidate = await firstEligibleRecord(tx, { now })
       }
-      return null
+      if (!candidate) return null
+      candidate.reservation = { token, until: now + leaseMs }
+      await putRecord(tx, candidate)
+      return candidate
     })
     if (!reserved) return null
     let settled = false

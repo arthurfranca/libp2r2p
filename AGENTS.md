@@ -121,7 +121,11 @@ suite pass; report independently scoped problems separately.
 
 - Version 0.11.22 migrates only the known message-queue three-field provenance
   index, atomically preserving rows/order/accounting. Keep generic queue schema
-  rejection strict. Pending decryption uses its own 16 MiB FIFO ciphertext queue,
+  rejection strict. Version 0.12.16 separately backfills missing or invalid
+  `deliveryPriority` values to `normal`, recomputing logical byte accounting,
+  only while `byDeliveryPriority` is still absent; later opens skip the full
+  backfill scan. `createQueue` adds the index after the backfill. Pending
+  decryption uses its own 16 MiB FIFO ciphertext queue,
   without TTL; explicit channel/identity cleanup includes it. Only missing keys
   and MAC failures are deferrable, and commits precede history coverage.
   Retry on initialization/resume/key notifications, never polling. Three MAC
@@ -140,6 +144,19 @@ suite pass; report independently scoped problems separately.
   code and provenance. A valid resolver or `D` key precedes the automatic
   Nostr-identity fallback. It never replaces trust checks, pause/capacity gates
   or ACK/NACK ownership.
+- `PrivateMessenger` accepts optional synchronous `resolveInboundPriority`.
+  Return `normal`, `lower`, `lowest` or null. Persist the rank only as internal
+  queue metadata, include it before coalescing order, and remove it before app
+  delivery. Older rows remain `normal`. Invalid, unknown or asynchronous results
+  report and fall back to `normal`; remote payload interpretation may only lower
+  priority. `idb-queue.reserve({ priorityIndex, priorities })` selects an exact
+  index lane with a `next` cursor, preserving FIFO by primary-key position
+  without materializing the queue or evaluating a priority callback. Missing
+  index values are not candidates; messenger initialization backfills legacy
+  rows to `normal` before adding `byDeliveryPriority`. Active reservations are
+  never interrupted. Capacity pressure blocks new admission only: already
+  persisted inbox rows remain reservable and ACK/NACKable, and capacity
+  transitions notify `onMessageQueued` so durable consumers can drain.
 - Automatic inbox identity applies to ask, reply, tell, yell, message and nym
   after resolver and `D` fallbacks. Keep channel and type in scope. Use the first
   string `d` tag as address; replaceable/addressable events without one use

@@ -206,3 +206,30 @@ test('reservations are exclusive, renewable, recoverable and token checked', asy
     assert.equal((await b.reserve()).item.id, 'two')
   } finally { await a.close(); await b.close() }
 })
+
+test('reservations select priority before FIFO while preserving FIFO within a priority', async () => {
+  const queue = await queueFor(new IDBFactory(), 'priority', {
+    evictionPolicy: 'reject',
+    indexes: { priority: 'priority' }
+  })
+  try {
+    await queue.push({ id: 'lowest', priority: 1 })
+    await queue.push({ id: 'lower', priority: 2 })
+    await queue.push({ id: 'normal-one', priority: 3 })
+    await queue.push({ id: 'normal-two', priority: 3 })
+    const selection = { priorityIndex: 'priority', priorities: [3, 2, 1] }
+
+    const first = await queue.reserve(selection)
+    const second = await queue.reserve(selection)
+    assert.equal(first.item.id, 'normal-one')
+    assert.equal(second.item.id, 'normal-two')
+    assert.equal(await first.ack(), true)
+    assert.equal(await second.ack(), true)
+    assert.equal((await queue.reserve(selection)).item.id, 'lower')
+    assert.equal((await queue.reserve(selection)).item.id, 'lowest')
+    await assert.rejects(() => queue.reserve({ priorityIndex: 'missing', priorities: [3] }), /QUEUE_PRIORITY_INDEX_INVALID/)
+    await assert.rejects(() => queue.reserve({ priorityIndex: 'priority' }), /QUEUE_PRIORITY_VALUES_INVALID/)
+    await assert.rejects(() => queue.reserve({ priorities: [3] }), /QUEUE_PRIORITY_INDEX_REQUIRED/)
+    await assert.rejects(() => queue.reserve({ priorityIndex: 'priority', priorities: [{}] }), /QUEUE_PRIORITY_VALUE_INVALID/)
+  } finally { await queue.close() }
+})

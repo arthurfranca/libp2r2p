@@ -19,6 +19,7 @@ const signer = () => Signer.getOrCreate(bytesToHex(generateSecretKey()))
 const currentIndexes = {
   byChannel: 'channelPubkey',
   byCoalescingKey: 'coalescingKey',
+  byDeliveryPriority: 'deliveryPriority',
   byChannelTypeEventId: { keyPath: ['channelPubkey', 'type', 'event.id', 'provenance'], unique: true }
 }
 globalThis.IDBKeyRange = IDBKeyRange
@@ -39,7 +40,10 @@ test('migrates only the known three-field index and preserves order, provenance 
   const queue = await createQueue({ prefix, indexedDB, indexes: currentIndexes })
   const items = []
   for await (const item of queue.storedItems()) items.push(item)
-  assert.deepEqual(items.map(item => [item.event.id, item.provenance]), [['one', 'direct'], ['two', 'hearsay']])
+  assert.deepEqual(items.map(item => [item.event.id, item.provenance, item.deliveryPriority]), [
+    ['one', 'direct', 2],
+    ['two', 'hearsay', 2]
+  ])
   assert.ok(await queue.someBy('byChannelTypeEventId', ['channel', 'message', 'one', 'direct']))
   const capacity = await queue.getCapacity()
   assert.ok(capacity.usedBytes > 0)
@@ -52,6 +56,44 @@ test('migrates only the known three-field index and preserves order, provenance 
   await wrong.close()
   await migrateMessageQueue(indexedDB, 'unknown')
   await assert.rejects(createQueue({ prefix: 'unknown', indexedDB, indexes: currentIndexes }), /QUEUE_INDEX_SCHEMA_MISMATCH/)
+})
+
+test('backfills legacy delivery lanes before adding the priority index', async () => {
+  const indexedDB = new IDBFactory()
+  const prefix = 'priority-backfill'
+  const legacyIndexes = {
+    byChannel: 'channelPubkey',
+    byCoalescingKey: 'coalescingKey',
+    byChannelTypeEventId: currentIndexes.byChannelTypeEventId
+  }
+  const legacy = await createQueue({ prefix, indexedDB, indexes: legacyIndexes })
+  await legacy.enqueue({ id: 'normal' })
+  await legacy.enqueue({ id: 'lower', deliveryPriority: 'lower' })
+  await legacy.enqueue({ id: 'invalid', deliveryPriority: 'unknown' })
+  await legacy.close()
+
+  await migrateMessageQueue(indexedDB, prefix)
+  const queue = await createQueue({ prefix, indexedDB, indexes: currentIndexes })
+  const items = []
+  for await (const item of queue.storedItems()) items.push(item)
+  assert.deepEqual(items.map(item => [item.id, item.deliveryPriority]), [
+    ['normal', 2],
+    ['lower', 1],
+    ['invalid', 2]
+  ])
+  const selection = {
+    priorityIndex: 'byDeliveryPriority',
+    priorities: [2, 1, 0]
+  }
+  assert.equal((await queue.reserve(selection)).item.id, 'normal')
+  assert.equal((await queue.reserve(selection)).item.id, 'invalid')
+  assert.equal((await queue.reserve(selection)).item.id, 'lower')
+  const capacity = await queue.getCapacity()
+  await queue.close()
+  await migrateMessageQueue(indexedDB, prefix)
+  const reopened = await createQueue({ prefix, indexedDB, indexes: currentIndexes })
+  assert.deepEqual(await reopened.getCapacity(), capacity)
+  await reopened.close()
 })
 
 test('ciphertext pending queue survives restart, deduplicates, caps MAC attempts and evicts FIFO', async () => {

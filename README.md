@@ -415,6 +415,29 @@ Coalescing does not provide an ingress rate limit or per-peer quota. Exact
 event deduplication, authorization, quarantine, global inbox capacity,
 pause/ACK/NACK ownership and existing storage policy remain independent.
 
+### Inbound delivery priority
+
+`PrivateMessenger` accepts an optional synchronous
+`resolveInboundPriority(message, context)` callback. The callback returns
+`"normal"`, `"lower"`, `"lowest"` or `null`; `normal` is the default. The
+resolved class is stored as internal IndexedDB queue metadata, is included in
+the coalescing comparator, and is removed before delivery to the app. Existing
+records without priority are backfilled as `normal` during messenger
+initialization.
+
+Queue reservation selects `normal` before `lower` before `lowest` through the
+`byDeliveryPriority` index, preserving FIFO within each class and never
+interrupting an active reservation. Capacity
+pressure blocks new inbox admission but does not block reservation,
+acknowledgment or NACK of records already persisted. `onMessageQueued` is
+called when capacity pressure begins and after the queue changes in a way that
+can wake a durable consumer.
+
+An invalid or asynchronous resolver result is reported as
+`INVALID_INBOUND_PRIORITY` and falls back to `normal`. Callers that interpret
+remote payload fields should only permit fields to lower priority; a peer must
+not be able to promote itself by supplying a value.
+
 ### Inbound peer admission
 
 `PrivateMessenger` accepts an optional synchronous
@@ -1310,7 +1333,7 @@ Opening a reject-policy queue under a smaller budget preserves existing items.
 Positional replacement and insertion follow the same rule: they reject instead
 of evicting when the resulting queue would exceed the limit.
 
-`queue.reserve({ leaseMs = 30000, nackCoalescingIndex })` returns `null` or
+`queue.reserve({ leaseMs = 30000, nackCoalescingIndex, priorityIndex, priorities })` returns `null` or
 `{ item, ack, nack, renew }`. Reservation token/deadline are internal record
 metadata, persisted atomically in the same IndexedDB transaction as selection.
 `renew()` extends a still-valid lease. Low-level callers own renewal and release;
@@ -1319,6 +1342,15 @@ position-shifting queue operations on the same queue except explicit removal.
 A stale token cannot acknowledge a newly reserved or replaced record.
 `nackCoalescingIndex` names a non-unique index: when another matching item is
 pending, NACK deletes the superseded active item instead of requeueing it.
+`priorityIndex` names a scalar, non-multiEntry index and `priorities` is the
+ordered list of index keys to try. Within a lane, an index cursor starts at the
+smallest queue `position`, so FIFO is preserved without reading the rest of the
+queue into memory. Duplicate priority values are ignored. Missing index values
+are not candidates; callers migrating an existing queue must backfill them.
+Invalid selectors reject with `QUEUE_PRIORITY_INDEX_INVALID`,
+`QUEUE_PRIORITY_VALUES_INVALID` or `QUEUE_PRIORITY_VALUE_INVALID`. Without a
+priority index, reservation uses a FIFO primary-key cursor. This extension
+belongs only to `idb-queue`.
 
 `queue.getCapacity()` is part of the common API and returns
 `{ usedBytes, maxBytes }`; capacity rejections also expose `requiredBytes` and

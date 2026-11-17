@@ -2,6 +2,8 @@ import { deliveryInfo } from '../../private-channel/helpers/rumor.js'
 
 const encoder = new TextEncoder()
 const indexName = 'byChannelTypeEventId'
+const deliveryPriorityProperty = 'deliveryPriority'
+const deliveryPriorityNormal = 2
 const oldPath = ['item.channelPubkey', 'item.type', 'item.event.id']
 const newPath = [...oldPath, 'item.provenance']
 const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b)
@@ -35,20 +37,101 @@ function matchesLegacy (items) {
     !items.index('byChannel').unique && !items.index('byChannel').multiEntry
 }
 
+function normalizedDeliveryPriority (value) {
+  if (Number.isSafeInteger(value) && value >= 0 && value <= deliveryPriorityNormal) return value
+  if (value === 'lowest') return 0
+  if (value === 'lower') return 1
+  return deliveryPriorityNormal
+}
+
+function itemByteSize (item) {
+  let byteSize = 0
+  while (true) {
+    const size = encoder.encode(JSON.stringify({ byteSize, item })).length
+    if (size === byteSize) return byteSize
+    byteSize = size
+  }
+}
+
+async function backfillDeliveryPriority (indexedDB, name) {
+  const db = await open(indexedDB, name)
+  if (!db.objectStoreNames.contains('items') || !db.objectStoreNames.contains('state')) {
+    db.close()
+    return
+  }
+  if (db.transaction('items', 'readonly').objectStore('items').indexNames.contains('byDeliveryPriority')) {
+    db.close()
+    return
+  }
+  const tx = db.transaction(['items', 'state'], 'readwrite')
+  const done = new Promise((resolve, reject) => {
+    tx.oncomplete = resolve
+    tx.onabort = () => reject(tx.error || new Error('IDB_TRANSACTION_ABORTED'))
+    tx.onerror = () => reject(tx.error || new Error('IDB_TRANSACTION_FAILED'))
+  })
+  const items = tx.objectStore('items')
+  const state = tx.objectStore('state')
+  let delta = 0
+  const cursor = items.openCursor()
+  cursor.onsuccess = () => {
+    try {
+      const row = cursor.result
+      if (!row) {
+        const request = state.get('queue')
+        request.onsuccess = () => {
+          if (!request.result || !delta) return
+          state.put({
+            ...request.result,
+            usedBytes: Math.max(0, request.result.usedBytes + delta)
+          })
+        }
+        return
+      }
+      const record = row.value
+      if (!record.item || typeof record.item !== 'object' || Array.isArray(record.item)) {
+        row.continue()
+        return
+      }
+      const current = record.item[deliveryPriorityProperty]
+      const priority = normalizedDeliveryPriority(current)
+      if (current === priority) {
+        row.continue()
+        return
+      }
+      const item = { ...record.item, [deliveryPriorityProperty]: priority }
+      const byteSize = itemByteSize(item)
+      delta += byteSize - (record.byteSize || 0)
+      row.update({ ...record, item, byteSize })
+      row.continue()
+    } catch {
+      tx.abort()
+    }
+  }
+  try {
+    await done
+  } finally {
+    db.close()
+  }
+}
+
 // The generic queue remains strict. Only this historical messenger schema is
-// migrated, atomically with its records and capacity accounting.
+// migrated. Legacy records then receive the default normal delivery lane before
+// createQueue adds its byDeliveryPriority index.
 export async function migrateMessageQueue (indexedDB, prefix) {
   if (!indexedDB?.open) throw new Error('IDB_UNAVAILABLE')
   const name = `${prefix}:idb-queue`
   for (let attempt = 0; attempt < 3; attempt++) {
     const db = await open(indexedDB, name)
-    if (!db.objectStoreNames.contains('items') || !db.objectStoreNames.contains('state')) { db.close(); return }
+    if (!db.objectStoreNames.contains('items') || !db.objectStoreNames.contains('state')) {
+      db.close()
+      break
+    }
     const tx = db.transaction(['items', 'state'], 'readonly')
     const legacy = matchesLegacy(tx.objectStore('items')) && tx.objectStore('state').keyPath === 'key'
     const version = db.version + 1
     await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onabort = () => reject(tx.error) })
     db.close()
-    if (!legacy) return
+    if (!legacy) break
     try {
       const upgraded = await open(indexedDB, name, version, (_db, tx) => {
         const items = tx.objectStore('items')
@@ -87,9 +170,10 @@ export async function migrateMessageQueue (indexedDB, prefix) {
         }
       })
       upgraded.close()
-      return
+      break
     } catch (error) {
       if (error?.name !== 'VersionError' || attempt === 2) throw error
     }
   }
+  await backfillDeliveryPriority(indexedDB, name)
 }

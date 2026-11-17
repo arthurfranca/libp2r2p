@@ -129,9 +129,16 @@ const MESSAGE_QUEUE_LOW_WATER_RATIO = 0.5
 const SEED_KEY = '__p2r2pSeedKey'
 const SEED_TIME = '__p2r2pSeedTime'
 const COALESCING_INDEX = 'byCoalescingKey'
+const DELIVERY_PRIORITY_INDEX = 'byDeliveryPriority'
 const COALESCING_DIGEST = /^[0-9a-f]{64}$/
 const COALESCING_KEEP = new Set(['oldest', 'latest'])
 const DEDUPE_TYPES = new Set(['ask', 'reply', 'tell', 'yell'])
+const DELIVERY_PRIORITY = Object.freeze({
+  lowest: 0,
+  lower: 1,
+  normal: 2
+})
+const DELIVERY_PRIORITY_NAMES = new Set(Object.keys(DELIVERY_PRIORITY))
 const PROVENANCE_PRIORITY = {
   signed: 2,
   direct: 1,
@@ -145,6 +152,7 @@ const TIMESTAMPED_PRIVATE_MESSAGE_KINDS = new Set([
 const MESSAGE_QUEUE_INDEXES = {
   byChannel: 'channelPubkey',
   [COALESCING_INDEX]: 'coalescingKey',
+  [DELIVERY_PRIORITY_INDEX]: 'deliveryPriority',
   byChannelTypeEventId: {
     keyPath: ['channelPubkey', 'type', 'event.id', 'provenance'],
     unique: true
@@ -324,6 +332,7 @@ export class PrivateMessenger {
     onDebug,
     onError = defaultOnError,
     resolveInboundCoalescing,
+    resolveInboundPriority,
     admitInboundPeer,
     _privateMessage = privateMessage,
     _privateChannel = privateChannel,
@@ -348,6 +357,9 @@ export class PrivateMessenger {
     if (typeof pendingDecryptionReady !== 'boolean') throw new ValidationError('INVALID_PENDING_DECRYPTION_READY')
     if (resolveInboundCoalescing != null && typeof resolveInboundCoalescing !== 'function') {
       throw new ValidationError('INVALID_RESOLVE_INBOUND_COALESCING')
+    }
+    if (resolveInboundPriority != null && typeof resolveInboundPriority !== 'function') {
+      throw new ValidationError('INVALID_RESOLVE_INBOUND_PRIORITY')
     }
     if (admitInboundPeer != null && typeof admitInboundPeer !== 'function') {
       throw new ValidationError('INVALID_ADMIT_INBOUND_PEER')
@@ -397,6 +409,7 @@ export class PrivateMessenger {
     this.onMessageQueued = onMessageQueued
     this.onDebug = onDebug
     this.resolveInboundCoalescing = resolveInboundCoalescing
+    this.resolveInboundPriority = resolveInboundPriority
     this.admitInboundPeer = admitInboundPeer
     this._privateMessage = _privateMessage.createPrivateMessageSession?.() ?? _privateMessage
     this._privateChannel = _privateChannel
@@ -2038,6 +2051,7 @@ export class PrivateMessenger {
     this.automaticPauses.delete(reason)
     if (!this.pauseReasons.size && this.sendRoutingPause.signal.aborted) this.sendRoutingPause = new AbortController()
     this.notifyStatus()
+    if (removed) this.onMessageQueued?.()
     if (reason === 'capacity' && removed) {
       clearInterval(this.capacityTimer)
       this.capacityTimer = null
@@ -2266,6 +2280,29 @@ export class PrivateMessenger {
     await this.enqueueRumor('message', channelPubkey, message)
   }
 
+  #deliveryPriority (type, channelPubkey, message) {
+    if (!this.resolveInboundPriority) return DELIVERY_PRIORITY.normal
+    let resolved
+    try {
+      resolved = this.resolveInboundPriority(
+        { ...message, type, channelPubkey },
+        { type, channelPubkey }
+      )
+      if (resolved != null && typeof resolved?.then === 'function') {
+        throw new Error('INBOUND_PRIORITY_MUST_BE_SYNCHRONOUS')
+      }
+    } catch (cause) {
+      this.onError?.(inboundPriorityError(cause))
+      return DELIVERY_PRIORITY.normal
+    }
+    if (resolved == null) return DELIVERY_PRIORITY.normal
+    if (typeof resolved === 'string' && DELIVERY_PRIORITY_NAMES.has(resolved)) {
+      return DELIVERY_PRIORITY[resolved]
+    }
+    this.onError?.(inboundPriorityError(new ValidationError('INVALID_INBOUND_PRIORITY')))
+    return DELIVERY_PRIORITY.normal
+  }
+
   #coalescingMetadata (type, channelPubkey, message, info) {
     const supportsIdempotencyTag = DEDUPE_TYPES.has(type)
     const tagged = supportsIdempotencyTag
@@ -2383,6 +2420,7 @@ export class PrivateMessenger {
       type,
       channelPubkey,
       receivedAt: nowSeconds(),
+      deliveryPriority: this.#deliveryPriority(type, channelPubkey, message),
       event: message.event,
       ...info,
       payload: message.payload,
@@ -2647,6 +2685,8 @@ export class PrivateMessenger {
     const pause = this.pauseReasons.has('capacity') ? null : this.pause('capacity')
     pause?.catch(error => this.onError?.(error))
     this.startCapacityMonitor()
+    this.wakeDeliveries()
+    this.onMessageQueued?.()
     let summary
     try { summary = await this.inboxCapacitySummary() } catch {}
     return Object.assign(new Error('PRIVATE_MESSENGER_CAPACITY_PRESSURE'), {
@@ -2714,7 +2754,15 @@ export class PrivateMessenger {
     this.assertOpen()
     this.touchStorageActivity().catch(err => this.onError?.(err))
     await this.queueOperationTail
-    const reservation = await this.queue.reserve({ nackCoalescingIndex: COALESCING_INDEX })
+    const reservation = await this.queue.reserve({
+      nackCoalescingIndex: COALESCING_INDEX,
+      priorityIndex: DELIVERY_PRIORITY_INDEX,
+      priorities: [
+        DELIVERY_PRIORITY.normal,
+        DELIVERY_PRIORITY.lower,
+        DELIVERY_PRIORITY.lowest
+      ]
+    })
     if (!reservation) return null
     if (this.closePromise) { await reservation.nack(); return null }
     let finish
@@ -4150,6 +4198,9 @@ function compareLegacyCoalescingOrder (left, right) {
 }
 
 function compareCoalescingItems (left, right) {
+  const leftPriority = left?.deliveryPriority ?? DELIVERY_PRIORITY.normal
+  const rightPriority = right?.deliveryPriority ?? DELIVERY_PRIORITY.normal
+  if (leftPriority !== rightPriority) return leftPriority - rightPriority
   return compareCoalescingOrder(left?.coalescingOrder, right?.coalescingOrder)
 }
 
@@ -4164,6 +4215,13 @@ function coalescingDigest (value) {
 function coalescingError (cause) {
   return Object.assign(new Error('INVALID_INBOUND_COALESCING_KEY'), {
     code: 'INVALID_INBOUND_COALESCING_KEY',
+    cause
+  })
+}
+
+function inboundPriorityError (cause) {
+  return Object.assign(new Error('INVALID_INBOUND_PRIORITY'), {
+    code: 'INVALID_INBOUND_PRIORITY',
     cause
   })
 }
@@ -4285,6 +4343,7 @@ function withoutQueueMetadata (item) {
   delete value.coalescingKey
   delete value.coalescingKeep
   delete value.coalescingOrder
+  delete value.deliveryPriority
   delete value[SEED_KEY]
   delete value[SEED_TIME]
   return value

@@ -1936,6 +1936,37 @@ test('invalid semantic resolvers fall back to automatic Nostr identity', async (
   assert.equal((await takeMessage(messenger)).provenance, 'signed')
 })
 
+test('inbound priority is validated, ordered and removed before delivery', async () => {
+  const pm = fakePrivateMessage()
+  const errors = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    onError: error => errors.push(error),
+    resolveInboundPriority: message => {
+      if (message.payload.code === 'lowest') return 'lowest'
+      if (message.payload.code === 'lower') return 'lower'
+      if (message.payload.code === 'invalid') return 'high'
+      if (message.payload.code === 'promise') return Promise.resolve('lower')
+      return 'normal'
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  await deliverInboxRumor(pm, 'message', inboxRumor('message', 'lowest', 10, { code: 'lowest' }))
+  await deliverInboxRumor(pm, 'message', inboxRumor('message', 'lower', 20, { code: 'lower' }))
+  await deliverInboxRumor(pm, 'message', inboxRumor('message', 'normal', 30, { code: 'normal' }))
+  await deliverInboxRumor(pm, 'message', inboxRumor('message', 'invalid', 40, { code: 'invalid' }))
+  await deliverInboxRumor(pm, 'message', inboxRumor('message', 'promise', 50, { code: 'promise' }))
+
+  for (const id of ['normal', 'invalid', 'promise', 'lower', 'lowest']) {
+    const message = await takeMessage(messenger)
+    assert.equal(message.event.id, id)
+    assert.equal(Object.hasOwn(message, 'deliveryPriority'), false)
+  }
+  assert.equal(errors.filter(error => error.code === 'INVALID_INBOUND_PRIORITY').length, 2)
+})
+
 test('private messenger reports content key usage changes for sent and received messages', async () => {
   const pm = fakePrivateMessage()
   const changes = []
@@ -2629,8 +2660,8 @@ test('clearChannel removes queued items and channel state without clearing other
       { pubkey: 'two', signer: signer('two'), relays: ['wss://relay.example'] }
     ]
   })
-  messenger.queue.enqueue({ type: 'tell', channelPubkey: 'one', event: { id: 'one' } })
-  messenger.queue.enqueue({ type: 'tell', channelPubkey: 'two', event: { id: 'two' } })
+  messenger.queue.enqueue({ type: 'tell', channelPubkey: 'one', event: { id: 'one' }, deliveryPriority: 2 })
+  messenger.queue.enqueue({ type: 'tell', channelPubkey: 'two', event: { id: 'two' }, deliveryPriority: 2 })
 
   await messenger.clearChannel('one')
 
@@ -3852,8 +3883,10 @@ test('capacity pauses ingestion without eviction and ack resumes durable recover
   const pm = fakePrivateMessage()
   let recovered = 0
   const errors = []
+  let queuedWakes = 0
   const messenger = await new PrivateMessenger({
     _privateMessage: pm, messageQueueMaxBytes: 1200, onError: err => errors.push(err),
+    onMessageQueued: () => { queuedWakes++ },
     _privateChannel: { fetchHistory: async () => { recovered++; return [] } }
   }).init({
     userSigner: signer('owner'), channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
@@ -3872,6 +3905,7 @@ test('capacity pauses ingestion without eviction and ack resumes durable recover
       return true
     })
     assert.equal(messenger.pauseReasons.has('capacity'), true)
+    assert.ok(queuedWakes > 0)
     assert.ok(messenger.readState().channels.channel.openOfflineStart)
     const first = await messenger.nextMessage()
     assert.equal(first.message.event.id, 'one')
