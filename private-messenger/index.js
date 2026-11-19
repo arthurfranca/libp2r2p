@@ -316,6 +316,7 @@ export class PrivateMessenger {
     priorityTtlMs = DEFAULT_PRIORITY_TTL_MS,
     priorityHedgeDelayMs = DEFAULT_PRIORITY_HEDGE_DELAY_MS,
     priorityHedgeRelays = DEFAULT_PRIORITY_HEDGE_RELAYS,
+    deferColdRecovery = false,
     maxDynamicRecoverySeeders = DEFAULT_MAX_DYNAMIC_RECOVERY_SEEDERS,
     messageQueueMaxBytes = DEFAULT_MESSAGE_QUEUE_MAX_BYTES,
     seedQueueMaxBytes = DEFAULT_SEED_QUEUE_MAX_BYTES,
@@ -386,6 +387,8 @@ export class PrivateMessenger {
     this.priorityHedgeRelays = Number.isSafeInteger(hedgeRelays) && hedgeRelays >= 1
       ? Math.min(hedgeRelays, 3)
       : DEFAULT_PRIORITY_HEDGE_RELAYS
+    if (typeof deferColdRecovery !== 'boolean') throw new ValidationError('INVALID_DEFER_COLD_RECOVERY')
+    this.deferColdRecovery = deferColdRecovery
     this.maxDynamicRecoverySeeders = maxDynamicRecoverySeeders
     this.messageQueueMaxBytes = messageQueueMaxBytes
     this.seedQueueMaxBytes = seedQueueMaxBytes
@@ -476,6 +479,8 @@ export class PrivateMessenger {
     this.liveInterruptions = new Map()
     this.liveRecoveryTimers = new Map()
     this.subscriptionDebugKeys = new Set()
+    this.channelDebugRefs = new Map()
+    this.nextChannelDebugRef = 0
     this.watchRevisionByChannel = new Map()
     this.presenceTimers = new Map()
     this.presenceJobs = new Map()
@@ -555,6 +560,7 @@ export class PrivateMessenger {
         prefix: this.prefix, indexedDB: this._indexedDB,
         report: detail => this.debug('pending-decryption', detail)
       })
+      try { await this.pendingDecryption.cleanupSuspended?.() } catch (error) { this.onError?.(error) }
       this.seedQueue = this.seedStorage
         ? null
         : await createQueue({
@@ -741,6 +747,7 @@ export class PrivateMessenger {
       })
       await this.refreshAndApplyStoragePolicy()
       await this.cleanupStaleChannels()
+      try { await this.pendingDecryption?.cleanupSuspended?.() } catch (error) { this.onError?.(error) }
       await this.pruneStoredSeeds()
     })().catch(err => {
       try { this.onError?.(err) } catch {}
@@ -823,6 +830,15 @@ export class PrivateMessenger {
     this.debug(action, detail)
   }
 
+  channelDebugRef (pubkey) {
+    let ref = this.channelDebugRefs.get(pubkey)
+    if (!ref) {
+      ref = `channel-${++this.nextChannelDebugRef}`
+      this.channelDebugRefs.set(pubkey, ref)
+    }
+    return ref
+  }
+
   debugSend (method, channelPubkey, detail = {}) {
     const receiverPubkeys = uniq(detail.receiverPubkeys || (detail.receiverPubkey ? [detail.receiverPubkey] : []))
     this.debug('send', {
@@ -900,7 +916,10 @@ export class PrivateMessenger {
 
     if (removedPubkeys.length) {
       await this.stampChannelActivity(removedPubkeys)
-      for (const pubkey of removedPubkeys) this.dropRecoveryState(pubkey)
+      for (const pubkey of removedPubkeys) {
+        this.dropRecoveryState(pubkey)
+        this.channelDebugRefs.delete(pubkey)
+      }
     }
 
     const storageSnapshot = await activatePrivateMessengerStorage({
@@ -1318,7 +1337,7 @@ export class PrivateMessenger {
     this.writeState(state)
   }
 
-  async watch (channels = [...this.channels.keys()], { scheduleReloadGap = true, signal } = {}) {
+  async watch (channels = [...this.channels.keys()], { scheduleReloadGap = true, signal, _onWatchScheduled } = {}) {
     this.assertOpen()
     const channelPubkeys = uniq(channels)
     for (const pubkey of channelPubkeys) {
@@ -1334,6 +1353,12 @@ export class PrivateMessenger {
     for (const pubkey of channelPubkeys) {
       const channel = this.channels.get(pubkey)
       if (!channel) throw new ValidationError('UNKNOWN_CHANNEL')
+      const channelRef = this.channelDebugRef(pubkey)
+      this.debug('prepare-start', {
+        channelRef,
+        mode: channel.mode,
+        seederCount: channel.seeders.length
+      })
       const revision = (this.watchRevisionByChannel.get(pubkey) || 0) + 1
       this.watchRevisionByChannel.set(pubkey, revision)
       // Persist the pending interval before live delivery can advance lastSeenAt.
@@ -1375,6 +1400,7 @@ export class PrivateMessenger {
           receivedChunkTtlMs: this.receivedChunkTtlMsFor(channel),
           receivedChunkIndexedDB: this._indexedDB,
           onSubscriptionState: state => this.handleSubscriptionState(pubkey, state),
+          _onWatchScheduled,
           onError: err => {
             if (!isExpectedRecoveryPause(err)) this.onError?.(err)
           }
@@ -1419,8 +1445,8 @@ export class PrivateMessenger {
         seeders: channel.seeders,
         offlineRecoverySeconds: channel.offlineRecoverySeconds
       })
-      this.debug('watch', {
-        channelPubkey: pubkey,
+      this.debug('watch-ready', {
+        channelRef,
         relays: watchRelays,
         mode: channel.mode,
         seeders: channel.seeders,
@@ -1454,6 +1480,7 @@ export class PrivateMessenger {
       this.addOfflineRange(pubkey, Math.max(0, start - this.offlineSkewSeconds), nowSeconds())
       const diagnosticRelay = safeDiagnosticRelay(relay)
       this.debugOnce(`subscription-interrupted:${diagnosticRelay || ''}:${start}:${safeDiagnosticToken(error?.code) || ''}`, 'subscription-interrupted', {
+        channelRef: this.channelDebugRef(pubkey),
         relay: diagnosticRelay,
         rangeStart: start,
         ...subscriptionErrorDiagnostic(error)
@@ -1469,6 +1496,7 @@ export class PrivateMessenger {
       interrupted.delete(relay)
       if (!interrupted.size) this.liveInterruptions.delete(pubkey)
       this.debugOnce(`subscription-recovered:${safeDiagnosticRelay(relay) || ''}:${start}`, 'subscription-recovered', {
+        channelRef: this.channelDebugRef(pubkey),
         relay: safeDiagnosticRelay(relay),
         rangeStart: start,
         rangeEnd: until,
@@ -1656,6 +1684,9 @@ export class PrivateMessenger {
     if (!entries.some(entry => entry.start === start && entry.end === end && entry.type === type)) {
       entries.push({ start, end, type, createdAt, expiresAt: createdAt + ttl })
       this.recoveryPriority.set(channelPubkey, entries)
+    }
+    if (this.deferColdRecovery && this.stopByChannel.has(channelPubkey) && !this.pauseReasons.size) {
+      this.scheduleOfflineRecovery(channelPubkey, { startDelayMs: 0 })
     }
     return true
   }
@@ -2098,11 +2129,20 @@ export class PrivateMessenger {
       const work = Promise.resolve().then(async () => {
         if (!this.initialized) await this.initSettledPromise
         if (!active()) return
-        const release = await this.channelSetupAdmission.acquire(controller.signal)
+        let release = await this.channelSetupAdmission.acquire(controller.signal)
+        const releaseSetup = () => {
+          const current = release
+          release = null
+          current?.()
+        }
         try {
           if (!active()) return
-          await this.watch([pubkey], { scheduleReloadGap: !recover, signal: controller.signal })
-        } finally { release() }
+          await this.watch([pubkey], {
+            scheduleReloadGap: !recover,
+            signal: controller.signal,
+            _onWatchScheduled: releaseSetup
+          })
+        } finally { releaseSetup() }
         if (!active()) return
         phase = 'presence'
         if (doesModeStoreRecoverySeeds(channel.mode)) await this.startPresencePublisher(pubkey)
@@ -2281,7 +2321,8 @@ export class PrivateMessenger {
   }
 
   #deliveryPriority (type, channelPubkey, message) {
-    if (!this.resolveInboundPriority) return DELIVERY_PRIORITY.normal
+    const protocolPriority = protocolDeliveryPriority(message)
+    if (!this.resolveInboundPriority) return protocolPriority
     let resolved
     try {
       resolved = this.resolveInboundPriority(
@@ -2293,14 +2334,14 @@ export class PrivateMessenger {
       }
     } catch (cause) {
       this.onError?.(inboundPriorityError(cause))
-      return DELIVERY_PRIORITY.normal
+      return protocolPriority
     }
-    if (resolved == null) return DELIVERY_PRIORITY.normal
+    if (resolved == null) return protocolPriority
     if (typeof resolved === 'string' && DELIVERY_PRIORITY_NAMES.has(resolved)) {
-      return DELIVERY_PRIORITY[resolved]
+      return Math.min(protocolPriority, DELIVERY_PRIORITY[resolved])
     }
     this.onError?.(inboundPriorityError(new ValidationError('INVALID_INBOUND_PRIORITY')))
-    return DELIVERY_PRIORITY.normal
+    return protocolPriority
   }
 
   #coalescingMetadata (type, channelPubkey, message, info) {
@@ -2493,7 +2534,10 @@ export class PrivateMessenger {
     this.markSeen(channelPubkey, message.outer?.created_at || message.event?.created_at || nowSeconds())
     this.wakeDeliveries()
     if (!record.coalescingKey || coalesced?.status === 'inserted') {
-      this.debug('enqueue', debugMessageInfo(type, channelPubkey, message))
+      this.debug('message-received', {
+        channelRef: this.channelDebugRef(channelPubkey),
+        ...debugMessageInfo(type, channelPubkey, message)
+      })
     }
     this.onMessageQueued?.()
   }
@@ -3236,10 +3280,28 @@ export class PrivateMessenger {
       if (this.closePromise || !this.channels.has(pubkey) || !this.stopByChannel.has(pubkey)) return
       if ((this.watchRevisionByChannel.get(pubkey) || 0) !== revision) return
       if (start != null) this.addOfflineRange(pubkey, Math.max(0, start - this.offlineSkewSeconds), nowSeconds())
-      try { await this.recoverOfflineRanges([pubkey]) } catch (err) {
+      const priority = this.recoveryPriorities(pubkey)
+      const backgroundOnly = this.deferColdRecovery && priority.length === 0
+      if (backgroundOnly) {
+        const ranges = this.readState().channels[pubkey]?.offlineRanges || []
+        const range = ranges.toSorted((left, right) => right.end - left.end)[0]
+        if (range) {
+          const end = Math.min(range.end, nowSeconds())
+          const entry = {
+            start: Math.max(range.start, end - this.priorityTailSeconds),
+            end,
+            type: 'tail',
+            background: true,
+            createdAt: Date.now(),
+            expiresAt: Date.now() + this.priorityTtlMs
+          }
+          this.recoveryPriority.set(pubkey, [entry])
+        }
+      }
+      try { await this.recoverOfflineRanges([pubkey], { priorityOnly: backgroundOnly }) } catch (err) {
         if (!isExpectedRecoveryPause(err)) this.onError?.(err)
       }
-      if (!this.closePromise && !this.pauseReasons.size && this.desiredChannels.has(pubkey) && this.hasPendingRecovery(pubkey)) {
+      if (!backgroundOnly && !this.closePromise && !this.pauseReasons.size && this.desiredChannels.has(pubkey) && this.hasPendingRecovery(pubkey)) {
         this.scheduleOfflineRecovery(pubkey, { startDelayMs: 1000 })
       }
     }, this.reloadGapDelayMs)
@@ -3267,12 +3329,12 @@ export class PrivateMessenger {
     }
   }
 
-  async askSeedersForMissingRange (channelPubkey, since, until) {
-    const { asks } = await this.#askSeedersForMissingRangeAttempt(channelPubkey, since, until)
+  async askSeedersForMissingRange (channelPubkey, since, until, { priority = 'lower' } = {}) {
+    const { asks } = await this.#askSeedersForMissingRangeAttempt(channelPubkey, since, until, { priority })
     return asks
   }
 
-  async #askSeedersForMissingRangeAttempt (channelPubkey, since, until, { seeders } = {}) {
+  async #askSeedersForMissingRangeAttempt (channelPubkey, since, until, { seeders, priority = 'lower' } = {}) {
     if (this.pauseReasons.size) throw this.pausedError()
     if (!this.offlineRecoverySecondsFor(channelPubkey)) return { asks: [], failures: [] }
     if (!this.channels.get(channelPubkey)?.signer) return { asks: [], failures: [] }
@@ -3288,8 +3350,12 @@ export class PrivateMessenger {
           channelPubkey,
           receiverPubkey: seeder,
           code: MISSING_MESSAGES_ASK_CODE,
-          payload: { since, until },
-          useBulkPacing: true
+          payload: {
+            since,
+            until,
+            ...(priority === 'normal' ? {} : { priority })
+          },
+          useBulkPacing: priority !== 'normal'
         })
         asks.push(ask)
         await assertMessagePublished(ask, ask.question)
@@ -3323,12 +3389,16 @@ export class PrivateMessenger {
     const payload = isPlainObject(message.payload?.payload) ? message.payload.payload : {}
     const since = Number.isFinite(payload.since) ? payload.since : undefined
     const until = Number.isFinite(payload.until) ? payload.until : undefined
+    const priority = payload.priority === 'lower' || payload.priority === 'lowest'
+      ? payload.priority
+      : 'normal'
     const packer = this.createMissingMessageReplyPacker({
       channelPubkey,
       question: message.event,
       receiverPubkey: message.event?.pubkey,
       since,
       until,
+      priority,
       sendEmptyReply: !this.offlineRecoverySecondsFor(channelPubkey)
     })
 
@@ -3456,13 +3526,13 @@ export class PrivateMessenger {
     }
   }
 
-  async recoverOfflineRanges (channels = [...this.stopByChannel.keys()]) {
+  async recoverOfflineRanges (channels = [...this.stopByChannel.keys()], { priorityOnly = false } = {}) {
     const failures = []
     for (const pubkey of uniq(channels)) {
       if (this.pauseReasons.size || this.closePromise || !this.desiredChannels.has(pubkey)) continue
       let work = this.recoveries.get(pubkey)
       if (!work) {
-        work = this.recoverChannelRanges([pubkey])
+        work = this.recoverChannelRanges([pubkey], { priorityOnly })
         this.recoveries.set(pubkey, work)
       }
       try { failures.push(...await work) } finally { if (this.recoveries.get(pubkey) === work) this.recoveries.delete(pubkey) }
@@ -3561,7 +3631,7 @@ export class PrivateMessenger {
     }
   }
 
-  async askPrioritySeeders (channelPubkey, intervals) {
+  async askPrioritySeeders (channelPubkey, intervals, { priority = 'normal' } = {}) {
     if (!intervals.length) return []
     if (this.pauseReasons.size) throw this.pausedError()
     if (!await this.checkRecoveryOnline()) return []
@@ -3571,7 +3641,10 @@ export class PrivateMessenger {
     const claimed = []
     for (const interval of mergeRanges(intervals)) {
       if (this.pauseReasons.size) throw this.pausedError()
-      const attempt = await this.#askSeedersForMissingRangeAttempt(channelPubkey, interval.start, interval.end, { seeders })
+      const attempt = await this.#askSeedersForMissingRangeAttempt(channelPubkey, interval.start, interval.end, {
+        seeders,
+        priority
+      })
       failures.push(...attempt.failures.map(failure => failure.error))
       if (!attempt.failures.length) claimed.push(interval)
     }
@@ -3588,6 +3661,13 @@ export class PrivateMessenger {
   async runPriorityLane (channelPubkey, channel, ranges) {
     const priorities = this.recoveryPriorities(channelPubkey)
     if (!priorities.length) return
+    const windowsFor = background => mergeRanges(
+      priorities
+        .filter(entry => Boolean(entry.background) === background)
+        .map(entry => ({ start: entry.start, end: entry.end }))
+    )
+    const normalWindows = windowsFor(false)
+    const backgroundWindows = windowsFor(true)
     const fetchRelays = await this.resolveWatchRelays(channel)
     for (const range of ranges) {
       if (this.pauseReasons.size || this.closePromise) throw this.pausedError()
@@ -3619,13 +3699,19 @@ export class PrivateMessenger {
         }
       }
       if (this.pauseReasons.size || this.closePromise) throw this.pausedError()
-      const uncovered = intersectRanges(wanted, subtractRanges({ start: range.start, end: range.end }, record.covered))
-      if (uncovered.length) await this.askPrioritySeeders(channelPubkey, uncovered)
+      const currentUncovered = () => intersectRanges(
+        wanted,
+        subtractRanges({ start: range.start, end: range.end }, record.covered)
+      )
+      const normalUncovered = intersectRanges(currentUncovered(), normalWindows)
+      if (normalUncovered.length) await this.askPrioritySeeders(channelPubkey, normalUncovered, { priority: 'normal' })
+      const backgroundUncovered = intersectRanges(currentUncovered(), backgroundWindows)
+      if (backgroundUncovered.length) await this.askPrioritySeeders(channelPubkey, backgroundUncovered, { priority: 'lower' })
     }
     this.prunePriorityEntries(channelPubkey)
   }
 
-  async recoverChannelRanges (channels) {
+  async recoverChannelRanges (channels, { priorityOnly = false } = {}) {
     const failures = []
     const state = this.readState()
     const now = nowSeconds()
@@ -3651,6 +3737,8 @@ export class PrivateMessenger {
           if (!isExpectedRecoveryPause(error)) this.onError?.(error)
         }
       }
+
+      if (priorityOnly) continue
 
       const remaining = []
       let recoveredThrough = current.recoveredThrough || 0
@@ -3716,8 +3804,15 @@ export class PrivateMessenger {
             continue
           }
           const recoveryStartedAt = this._now()
+          this.debug('range-recovery-start', {
+            channelRef: this.channelDebugRef(pubkey),
+            rangeStart: range.start,
+            rangeEnd: range.end,
+            tier: record.tier || 'bulk'
+          })
           const result = await this.finalizeRecoveryRange({ channelPubkey: pubkey, range, record })
           this.debug('recovery-range-complete', {
+            channelRef: this.channelDebugRef(pubkey),
             rangeStart: range.start,
             rangeEnd: range.end,
             complete: result.complete === true,
@@ -3759,6 +3854,7 @@ export class PrivateMessenger {
     await this._privateMessage.clearChannelState?.(pubkey)
     this.dropRecoveryState(pubkey)
     return this.runQueueOperation(async () => {
+      this.channelDebugRefs.delete(pubkey)
       this.channels.delete(pubkey)
       this.decryptionReadyChannels?.delete(pubkey)
       this.removeChannelState(pubkey)
@@ -4224,6 +4320,18 @@ function inboundPriorityError (cause) {
     code: 'INVALID_INBOUND_PRIORITY',
     cause
   })
+}
+
+function protocolDeliveryPriority (message) {
+  const code = message?.payload?.code
+  if (code === SEEDER_PRESENCE_CODE) return DELIVERY_PRIORITY.lowest
+  if (code !== MISSING_MESSAGES_ASK_CODE && code !== MISSING_MESSAGES_REPLY_CODE) {
+    return DELIVERY_PRIORITY.normal
+  }
+  const priority = message?.payload?.payload?.priority
+  return priority === 'lower' || priority === 'lowest'
+    ? DELIVERY_PRIORITY[priority]
+    : DELIVERY_PRIORITY.normal
 }
 
 function safeDiagnosticToken (value) {

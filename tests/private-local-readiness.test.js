@@ -160,6 +160,24 @@ test('remote setup is bounded without consuming local preparation or send readin
   held.resolve()
 })
 
+test('shared watch scheduling releases setup admission after request registration', async t => {
+  const held = gate(); let watches = 0
+  const f = fixture(t, {
+    watch: async options => {
+      watches++
+      options._onWatchScheduled?.()
+      await held.promise
+      return async () => {}
+    }
+  })
+  t.after(() => held.resolve())
+  await f.session.setPeers(Array.from({ length: 8 }, (_, index) => peer(index + 1)))
+  await f.session.setAvailable(true)
+  await f.session.preparePeer(peer(8))
+  await until(() => watches === 8)
+  held.resolve()
+})
+
 test('failed background history preserves its error without restoring signer', async t => {
   const f = fixture(t)
   await f.session.setPeers([peer(1)]); await f.session.setAvailable(true); await f.session.preparePeer(peer(1))

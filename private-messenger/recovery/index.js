@@ -12,6 +12,7 @@ export const NYM_CARRIER_SEED_RECORD_TYPE = 'nymCarrier_v1'
 
 export const DEFAULT_REPLY_BYTES_PER_CHUNK = 128 * 1024
 const DEFAULT_EVENTS_PER_CHUNK = 100
+const RECOVERY_PRIORITIES = new Set(['normal', 'lower', 'lowest'])
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 const HASH_PUBKEY = '0'.repeat(64)
@@ -113,6 +114,7 @@ export function compactSeedRouterRows (seed = {}) {
     const parsed = parseRouterRow(row)
     if (!parsed?.receiverPubkey) continue
     const innerEventId = innerEventIdsByRowIndex[index] || innerEventIdsByRowIndex[String(index)] || ''
+    const hash = rowHash(payloadRow, row)
     rows.push({
       type: 'seed',
       recordType: ROUTER_SEED_RECORD_TYPE,
@@ -120,7 +122,7 @@ export function compactSeedRouterRows (seed = {}) {
       receiverPubkey: parsed.receiverPubkey,
       iykcPubkey: parsed.iykcPubkey,
       innerEventId,
-      rowHash: innerEventId ? '' : rowHash(payloadRow, row),
+      rowHash: hash,
       payloadRow,
       row,
       firstSeenAt: createdAt,
@@ -137,7 +139,7 @@ export function routerSeedRowKey (seed = {}) {
   return [
     seed.channelPubkey || '',
     seed.receiverPubkey || row?.receiverPubkey || '',
-    innerEventId ? `event:${innerEventId}` : `row:${fallbackRowHash}`
+    fallbackRowHash ? `row:${fallbackRowHash}` : innerEventId ? `event:${innerEventId}` : ''
   ].join(':')
 }
 
@@ -314,10 +316,11 @@ export function createMissingMessageReplyPacker ({
   receiverPubkey = question?.pubkey,
   since,
   until,
+  priority = 'lower',
   eventsPerChunk = DEFAULT_EVENTS_PER_CHUNK,
   bytesPerChunk = DEFAULT_REPLY_BYTES_PER_CHUNK,
   sendEmptyReply = false,
-  useBulkPacing = true,
+  useBulkPacing,
   idempotencyKey
 }) {
   if (!messenger?.reply) throw new ValidationError('MESSENGER_REQUIRED')
@@ -325,6 +328,8 @@ export function createMissingMessageReplyPacker ({
   if (!receiverPubkey) throw new ValidationError('RECEIVER_PUBKEY_REQUIRED')
   if (!Number.isSafeInteger(eventsPerChunk) || eventsPerChunk < 1) throw new ValidationError('INVALID_EVENTS_PER_CHUNK')
   if (!Number.isSafeInteger(bytesPerChunk) || bytesPerChunk < 1) throw new ValidationError('INVALID_BYTES_PER_CHUNK')
+  if (!RECOVERY_PRIORITIES.has(priority)) throw new ValidationError('INVALID_RECOVERY_PRIORITY')
+  if (useBulkPacing !== undefined && typeof useBulkPacing !== 'boolean') throw new ValidationError('INVALID_USE_BULK_PACING')
   idempotencyKey ||= `${MISSING_MESSAGES_REPLY_CODE}:${question.id}`
 
   const range = backfillRequestRange(question, since, until)
@@ -334,11 +339,15 @@ export function createMissingMessageReplyPacker ({
     question,
     receiverPubkey,
     code: MISSING_MESSAGES_REPLY_CODE,
-    payload: { since: range.since, until: range.until },
+    payload: {
+      since: range.since,
+      until: range.until,
+      ...(priority === 'normal' ? {} : { priority })
+    },
     eventsPerChunk,
     bytesPerChunk,
     sendEmptyReply,
-    useBulkPacing,
+    useBulkPacing: useBulkPacing ?? priority !== 'normal',
     idempotencyKey,
     recordsFromInput: seed => compactRecordsFromSeed(seed, { receiverPubkey, since: range.since, until: range.until })
   })

@@ -269,6 +269,11 @@ evidence, while startup, resume and routine reconciliation retain normal retries
 Success enters the normal acknowledged inbox before removing the pending item.
 The session coordinator forwards this API.
 
+Messenger initialization and storage maintenance also perform a bounded cleanup
+of historical suspended records. Only `INVALID_MAC` packets with at least three
+MAC attempts and an outer timestamp older than 30 days are removed, at most 100
+per run. Recent MAC failures and every `CONTENT_KEY_NOT_FOUND` packet are kept.
+
 Pending recovery waits for 250 ms without channel setup, live/history processing
 or publication activity. Session foreground persistence/publication also delays
 it. After at most five seconds of eligible waiting, a busy channel may advance
@@ -437,6 +442,13 @@ An invalid or asynchronous resolver result is reported as
 `INVALID_INBOUND_PRIORITY` and falls back to `normal`. Callers that interpret
 remote payload fields should only permit fields to lower priority; a peer must
 not be able to promote itself by supplying a value.
+
+Protocol recovery messages enforce the same rule inside the messenger, even when
+an application resolver returns `normal` or another higher class. Seeder presence
+is always `lowest`; missing-message asks and replies accept only the additive
+payload values `lower` or `lowest`, while malformed or promoting values remain
+`normal`. Application resolvers can lower those protocol classes but cannot
+raise them.
 
 ### Inbound peer admission
 
@@ -735,6 +747,13 @@ messages. Applications still supply signers and desired channels on reopening;
 storage is scoped by origin and user pubkey, not the transient session ID.
 Failed ingestion or incomplete relay fetch reports never complete the gap.
 
+`deferColdRecovery` is opt-in and defaults to `false`. The session coordinator
+enables it so reopening many stored conversations first fetches only the recent
+six-hour tail and leaves the rest of the persisted range pending. A later
+`prioritizeRange()` request schedules the foreground recovery pass immediately;
+ordinary live watches remain active throughout, and local conversation summaries
+do not wait for the cold range to finish.
+
 `init()` and `createPrivateMessenger()` resolve after local preparation. Likewise,
 `update(options, { waitForBackground = false })` and
 `resume(reason, { waitForBackground = false })` wait for valid local channel
@@ -793,6 +812,11 @@ probes never consume the relay tier budget, and priorities/statistics are
 process-local: they expire after `priorityTtlMs` (ten minutes) or once covered,
 and clear with channel/recovery state. Presence payloads and persisted ranges
 are unchanged.
+
+With deferred cold recovery, the background recent-tail probe is sent as
+`lower`; app-directed ranges remain `normal`. Missing-message replies inherit
+the ask's additive priority, defaulting to `lower`, and all recovery traffic uses
+bulk pacing unless explicitly `normal`.
 
 `private-channel.fetchHistory(options)` (0.11.6) is the complete-interval API
 used by messenger recovery. It accepts the signers, processor/fragment options,

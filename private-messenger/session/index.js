@@ -259,6 +259,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     try {
       candidate = await Messenger({
         fallbackRelays, fallbackDelayMs, pendingDecryptionReady, seedStorage, _pendingSeedRecords: () => journal.pendingRows(), userSigner, channels: [], useContentKeys, _waitForForeground: foreground.wait, _observeForeground: foreground.observe,
+        deferColdRecovery: true,
         onMessageQueued: () => { if (messengerBinding === binding) return drain() },
         onStateChanged: state => {
           if (closed || messengerBinding !== binding) return

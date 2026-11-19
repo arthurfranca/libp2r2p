@@ -2,6 +2,7 @@ import { sha256 } from '@noble/hashes/sha2.js'
 import { bytesToHex } from '../../base16/index.js'
 import { base64ToBytes } from '../../base64/index.js'
 import { createQueue } from '../../idb-queue/index.js'
+import { ValidationError } from '../../error/index.js'
 import { isDeferredDecryptionError } from '../../private-channel/helpers/decryption-error.js'
 
 const encoder = new TextEncoder()
@@ -9,6 +10,8 @@ const decoder = new TextDecoder()
 const HEX64 = /^[0-9a-f]{64}$/i
 const CONTENT_KEY_FIELDS = ['receiverPubkey', 'ownContentPubkey', 'peerContentPubkey']
 export const PENDING_DECRYPTION_MAX_BYTES = 16 * 1024 * 1024
+export const PENDING_DECRYPTION_CLEANUP_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+export const PENDING_DECRYPTION_CLEANUP_LIMIT = 100
 
 function storedBytes (item) {
   let byteSize = 0
@@ -178,6 +181,37 @@ export async function createPendingDecryption ({ prefix, indexedDB, maxBytes = P
         if (updated.macAttempts >= 3 && item.macAttempts < 3) {
           notify('suspended', { id: item.id, code: error.code, channelPubkey: item.channelPubkey, ...createdAtMetadata(updated) })
         }
+      })
+    },
+    cleanupSuspended ({
+      now = Math.floor(Date.now() / 1000),
+      maxAgeSeconds = PENDING_DECRYPTION_CLEANUP_MAX_AGE_SECONDS,
+      limit = PENDING_DECRYPTION_CLEANUP_LIMIT
+    } = {}) {
+      if (!Number.isSafeInteger(now) || now < 0 ||
+          !Number.isSafeInteger(maxAgeSeconds) || maxAgeSeconds < 0 ||
+          !Number.isSafeInteger(limit) || limit <= 0) {
+        return Promise.reject(new ValidationError('INVALID_PENDING_DECRYPTION_CLEANUP_OPTIONS'))
+      }
+      return serial(async () => {
+        const selected = []
+        for await (const item of queue.storedItems()) {
+          const createdAt = item?.packet?.outer?.created_at ?? item?.outer?.created_at
+          if (item.code !== 'INVALID_MAC' || item.macAttempts < 3 ||
+              !Number.isSafeInteger(createdAt) || createdAt >= now - maxAgeSeconds) continue
+          selected.push(item.id)
+          if (selected.length >= limit) break
+        }
+        for (const id of selected) await queue.removeBy('byId', id)
+        if (selected.length) {
+          notify('cleaned', {
+            reason: 'suspended-age',
+            code: 'INVALID_MAC',
+            count: selected.length,
+            maxAgeSeconds
+          })
+        }
+        return selected.length
       })
     },
     clearChannel: channel => serial(() => queue.removeBy('byChannel', channel)),

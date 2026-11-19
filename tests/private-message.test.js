@@ -701,6 +701,26 @@ test('consumer sessions isolate a shared channel and hearsay cannot dispatch con
   await b.unwatch(); await c.unwatch()
 })
 
+test('concurrent channel watches coalesce into one relay subscription rebuild', async () => {
+  const { createPrivateMessageSession } = await import('../private-message/index.js')
+  const session = createPrivateMessageSession()
+  const { calls, fakeSubscribe } = fakeSubscribeFactory()
+  const common = {
+    relays: ['wss://example.test'],
+    receiverSigner: signer('owner'),
+    _subscribe: fakeSubscribe,
+    onMessage: () => {}
+  }
+  await Promise.all([
+    session.watch({ ...common, channels: ['one'] }),
+    session.watch({ ...common, channels: ['two'] }),
+    session.watch({ ...common, channels: ['three'] })
+  ])
+  assert.equal(calls.length, 1)
+  assert.deepEqual(calls[0].privateChannelPubkeys, ['one', 'two', 'three'])
+  await session.unwatch()
+})
+
 test('stopping an old watch handle cannot remove its replacement', async () => {
   const { createPrivateMessageSession } = await import('../private-message/index.js')
   const session = createPrivateMessageSession()

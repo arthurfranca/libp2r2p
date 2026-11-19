@@ -39,7 +39,7 @@ function fixture () {
       }
       const key = event.tags[0][1]
       if (deleted.has(key)) return { result: { ok: false, code: 'blocked' } }
-      const tags = [['k', '30078'], ['c', '|'], ['v', '1'], ...event.tags.filter(t => t[0] === 'expiration'), ...event.tags.filter(t => t[0].length === 1).map(t => ['o', `#${t[0]}|${t[1]}`])]
+      const tags = [['k', '30078'], ['c', '|'], ['v', '1'], ...event.tags.filter(t => t[0] === 'expiration'), ...event.tags.filter(t => t[0].length === 1 || t[0] === 'row').map(t => ['o', `#${t[0]}|${t[1]}`])]
       const wrapper = { id: key, pubkey: a, kind: 1006, created_at: event.created_at, content: JSON.stringify(event), tags }
       rows.set(key, wrapper)
       return { event: wrapper, result: { ok: true, stored: true } }
@@ -121,6 +121,21 @@ test('batched recovery checks use OR mirrors and preserve immutable write result
   const expired = createPersonalCopyRecoveryStorage({ ...f, now: () => seed.expiresAt })
   assert.deepEqual(await expired.seeds.hasMany(rows.slice(0, 3)), [false, false, false])
   expired.close()
+  storage.close()
+})
+
+test('seed deduplication uses channel, receiver and encrypted row hash without collapsing variants', async () => {
+  const f = fixture(), storage = createPersonalCopyRecoveryStorage({ ...f, now: () => 200 })
+  const rowHash = 'e'.repeat(64)
+  const first = { ...seed, rowHash, firstSeenAt: 100, lastSeenAt: 100 }
+  const repeated = { ...first, firstSeenAt: 120, lastSeenAt: 180 }
+  assert.ok((await storage.seeds.put(first)).recordId)
+  const result = await storage.seeds.put(repeated)
+  assert.equal(f.calls.length, 1)
+  assert.equal(result.rowHash, rowHash)
+  await storage.seeds.put({ ...first, receiverPubkey: d, row: JSON.stringify([d, 'encrypted-key', a, 'proof']) })
+  await storage.seeds.put({ ...first, rowHash: 'f'.repeat(64) })
+  assert.equal(f.calls.length, 3)
   storage.close()
 })
 

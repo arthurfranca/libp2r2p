@@ -51,6 +51,7 @@ function body (type, row) {
       })
       add('payload', payload[0]); add('key', envelope[1])
       if (envelope.length > 2) add('iykc', ...envelope.slice(2))
+      if (row.rowHash) add('row', hex(row.rowHash))
       if (row.innerEventId) add('event', hex(row.innerEventId))
       const first = integer(row.firstSeenAt ?? row.router.created_at), last = integer(row.lastSeenAt ?? row.router.created_at)
       if (first > last) fail()
@@ -114,6 +115,7 @@ export function decodeRecord (event) {
         row.payloadRow = JSON.stringify(one('payload'))
         const envelope = [row.receiverPubkey, ...one('key'), ...(one('iykc', false) || [])]
         row.row = JSON.stringify(envelope); row.iykcPubkey = envelope[2] || ''
+        row.rowHash = one('row', false)?.[0] || ''
         row.innerEventId = one('event', false)?.[0] || ''
         const file = one('file', false)
         if (file) Object.assign(row, { controlChannelPubkey: file[0], peerPubkey: file[1], root: file[2], fileChannelPubkey: row.channelPubkey, chunkIndex: integer(row.router.tags.find(t => t[0] === 'i')?.[1]), receivedAt: integer(one('received')[0]) })

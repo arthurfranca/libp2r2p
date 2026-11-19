@@ -125,6 +125,32 @@ test('ciphertext pending queue survives restart, deduplicates, caps MAC attempts
   await pending.close()
 })
 
+test('pending cleanup removes only old suspended MAC failures within its bound', async () => {
+  const indexedDB = new IDBFactory()
+  const now = 2_000_000_000
+  const pending = await createPendingDecryption({ prefix: 'cleanup-old-mac', indexedDB })
+  const failure = (id, code = 'INVALID_MAC', createdAt = now - 31 * 86400) => ({
+    error: new ValidationError(code),
+    record: { format: 'outer_v1', channelPubkey: 'channel', outer: { id, content: `ciphertext-${id}`, created_at: createdAt } }
+  })
+  for (const id of ['old-one', 'old-two']) {
+    await pending.save(failure(id))
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const item = (await pending.records({ force: true })).find(value => value.packet.outer.id === id)
+      await pending.failed(item, new ValidationError('INVALID_MAC'))
+    }
+  }
+  await pending.save(failure('recent-mac', 'INVALID_MAC', now - 10))
+  const oldMissing = failure('old-missing-key', 'CONTENT_KEY_NOT_FOUND')
+  await pending.save(oldMissing)
+
+  assert.equal(await pending.cleanupSuspended({ now, maxAgeSeconds: 30 * 86400, limit: 1 }), 1)
+  assert.equal(await pending.cleanupSuspended({ now, maxAgeSeconds: 30 * 86400, limit: 100 }), 1)
+  const remaining = await pending.records({ force: true })
+  assert.deepEqual(new Set(remaining.map(item => item.packet.outer.id)), new Set(['recent-mac', 'old-missing-key']))
+  await pending.close()
+})
+
 test('pending diagnostics expose one sample and the outer timestamp without ciphertext', async () => {
   const indexedDB = new IDBFactory()
   const reports = []

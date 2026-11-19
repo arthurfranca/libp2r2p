@@ -134,6 +134,29 @@ export function createPersonalCopyRecoveryStorage ({ eventStore, signer, now = n
       }
     }
   }
+  async function existingLogicalRows (rows) {
+    const byHash = new Map()
+    const logicalKey = row => row.rowHash ? `${row.channelPubkey}:${row.receiverPubkey || ''}:${row.rowHash}` : ''
+    for (const row of rows) {
+      if (row.rowHash) byHash.set(row.rowHash, row)
+    }
+    if (!byHash.size) return new Map()
+    const hashes = [...byHash.keys()]
+    const mirrors = new Map(await Promise.all(hashes.map(async hash => [await mirror('row', hash), hash])))
+    const found = new Map()
+    for (const batch of chunks([...mirrors.keys()])) {
+      const filter = await exactFilterFor('seed')
+      filter['#o'] = batch
+      for await (const wrapper of pages(eventStore, filter)) {
+        const expiry = Number(wrapper.tags?.find(tag => Array.isArray(tag) && tag[0] === 'expiration')?.[1])
+        if (!Number.isSafeInteger(expiry) || expiry <= now()) continue
+        const { row } = await read(wrapper)
+        const hash = mirrors.get(wrapper.tags?.find(tag => Array.isArray(tag) && tag[0] === 'o' && mirrors.has(tag[1]))?.[1])
+        if (hash && logicalKey(byHash.get(hash)) === logicalKey(row)) found.set(hash, row)
+      }
+    }
+    return found
+  }
   function store (type) {
     async function putMany (rows, options = {}) {
       return serializeMutation(eventStore, () => putManyNow(rows, options))
@@ -154,7 +177,22 @@ export function createPersonalCopyRecoveryStorage ({ eventStore, signer, now = n
           if (record) stored.set(recordId, { ...record.row, recordId })
         }
       }
-      const existingCount = stored.size
+      let existingCount = stored.size
+      if (type === 'seed') {
+        const pendingRows = [...unique.entries()]
+          .filter(([recordId]) => !stored.has(recordId))
+          .map(([, record]) => record.row)
+        const logical = await existingLogicalRows(pendingRows)
+        for (const [recordId, record] of unique) {
+          if (stored.has(recordId) || !record.row.rowHash) continue
+          const hash = record.row.rowHash
+          if (logical.has(hash) && logical.get(hash).channelPubkey === record.row.channelPubkey &&
+              (logical.get(hash).receiverPubkey || '') === (record.row.receiverPubkey || '')) {
+            stored.set(recordId, logical.get(hash))
+          }
+        }
+        existingCount = stored.size
+      }
       let insertedCount = 0
       let blockedCount = 0
       for (const [recordId, record] of unique) {

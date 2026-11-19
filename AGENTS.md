@@ -132,6 +132,10 @@ suite pass; report independently scoped problems separately.
   attempts persist across visits; force is explicit. A successful retry admits
   the normal inbox before deleting ciphertext. Pause/close fence late results.
   Keep unknown/storage/permission errors operational, with unchanged ACK/NACK.
+  Initialization and storage maintenance may remove at most 100 historical
+  `INVALID_MAC` records per run only after three MAC attempts and when the outer
+  event is older than 30 days. Preserve recent failures and all
+  `CONTENT_KEY_NOT_FOUND` records.
 - `PrivateMessenger` accepts optional synchronous `resolveInboundCoalescing`.
   It receives the decrypted message enriched with `type`/`channelPubkey` plus
   `{ idempotencyKey, eventCreatedAtMs }`, and returns null or
@@ -149,7 +153,9 @@ suite pass; report independently scoped problems separately.
   queue metadata, include it before coalescing order, and remove it before app
   delivery. Older rows remain `normal`. Invalid, unknown or asynchronous results
   report and fall back to `normal`; remote payload interpretation may only lower
-  priority. `idb-queue.reserve({ priorityIndex, priorities })` selects an exact
+  priority. Seeder presence is always `lowest`; missing-message ask/reply payloads
+  may lower only through additive `lower`/`lowest`. An app resolver may lower a
+  protocol class but never promote it. `idb-queue.reserve({ priorityIndex, priorities })` selects an exact
   index lane with a `next` cursor, preserving FIFO by primary-key position
   without materializing the queue or evaluating a priority callback. Missing
   index values are not candidates; messenger initialization backfills legacy
@@ -265,6 +271,11 @@ suite pass; report independently scoped problems separately.
 - Persist the initial recovery interval before starting a watch. Empty successful
   scans advance recoveredThrough; live progress never clears pending ranges.
   First watches use the bounded recovery window, and crashes need no close hook.
+  `deferColdRecovery` defaults to false for direct messenger construction and is
+  enabled by the session coordinator. A deferred cold pass fetches only the
+  recent `priorityTailSeconds` window from the newest pending range, then leaves
+  older history pending. `prioritizeRange()` schedules the foreground recovery
+  workflow immediately; live watches and local summaries never wait for it.
 
 ## Read admission
 
@@ -416,7 +427,9 @@ NIP-46 against the real pool with controlled transport and injected controls.
   history, order relays by recent EOSE/latency, hedge only the first priority page,
   and use seeders only as fallback with recent presence; a successful ask counts as
   coverage and probes never consume tier budgets. Keep presence payloads and
-  persisted ranges unchanged.
+  persisted ranges unchanged. Deferred background probes use `lower`; app-directed
+  probes remain `normal`. Missing-message reply packers inherit the ask priority,
+  default to `lower`, and bulk-pace every class except `normal`.
 
 - Share `parseRelayRetryAdvice` through the public relay export. Accept only
   temporal advice on leading rate-limited CLOSED/OK: canonical positive safe
@@ -572,6 +585,11 @@ NIP-46 against the real pool with controlled transport and injected controls.
   `preparePeer` prioritizes navigation/send/download. Deduplicate signer work,
   register channels incrementally and never prune still-preparing stored channels
   as part of incremental updates. Retention remains owned by maintenance.
+- Concurrent private-message watches coalesce into one microtask-level
+  subscription rebuild. Channel setup releases its admission once the real
+  watch registers that intent; custom `Messenger` factories without the internal
+  signal remain admitted until their own watch resolves, preserving the remote
+  setup bound.
 - Only actual account unavailability creates `signer`. Late local writes/resumes
   cannot release a newer pause. Unrelated preparation must not block local saves
   or ready conversations; removal/close cancels tasks and fences late signer results.

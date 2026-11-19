@@ -212,6 +212,9 @@ export function createPrivateMessageSession ({ _setTimeout = setTimeout, _clearT
   let requestSequence = 0
   const watchRequests = new Map()
   let identity
+  let rebuildScheduled = false
+  let rebuildOptions
+  let rebuildWaiters = []
   const receivedChunkScope = globalThis.crypto.randomUUID()
   let subscribe = privateChannel.subscribe
   function assertWatching (channelPubkey) {
@@ -553,6 +556,27 @@ export function createPrivateMessageSession ({ _setTimeout = setTimeout, _clearT
     return Promise.allSettled(closing)
   }
 
+  function scheduleSubscriptionRebuild (options = {}) {
+    rebuildOptions = { ...(rebuildOptions || {}), ...options }
+    const result = new Promise((resolve, reject) => rebuildWaiters.push({ resolve, reject }))
+    if (rebuildScheduled) return result
+    rebuildScheduled = true
+    Promise.resolve().then(async () => {
+      rebuildScheduled = false
+      const current = rebuildOptions || {}
+      const waiters = rebuildWaiters
+      rebuildOptions = undefined
+      rebuildWaiters = []
+      try {
+        const value = await rebuildSubscriptions(current)
+        for (const waiter of waiters) waiter.resolve(value)
+      } catch (error) {
+        for (const waiter of waiters) waiter.reject(error)
+      }
+    })
+    return result
+  }
+
   async function watch ({
     channels,
     relays,
@@ -581,6 +605,7 @@ export function createPrivateMessageSession ({ _setTimeout = setTimeout, _clearT
     ignoredGroupTtlMs,
     ignoredGroupMaxEntries,
     since = nowSeconds(),
+    _onWatchScheduled,
     _subscribe = privateChannel.subscribe
   }) {
     if (!relays?.length) throw new ValidationError('NO_RELAYS')
@@ -640,7 +665,8 @@ export function createPrivateMessageSession ({ _setTimeout = setTimeout, _clearT
       watchesByChannel.set(channel, next)
     }
 
-    await rebuildSubscriptions({ _subscribe })
+    _onWatchScheduled?.()
+    await scheduleSubscriptionRebuild({ _subscribe })
     return () => {
       const owned = channelList.filter(channel => watchRequests.get(channel) === request)
       return unwatch(owned)
@@ -653,7 +679,7 @@ export function createPrivateMessageSession ({ _setTimeout = setTimeout, _clearT
       watchRequests.set(channel, ++requestSequence)
       watchesByChannel.delete(channel)
     }
-    return rebuildSubscriptions({ gracefulClose: false })
+    return scheduleSubscriptionRebuild({ gracefulClose: false })
   }
 
   function clearChannelState (channelPubkey) {

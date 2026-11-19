@@ -1967,6 +1967,34 @@ test('inbound priority is validated, ordered and removed before delivery', async
   assert.equal(errors.filter(error => error.code === 'INVALID_INBOUND_PRIORITY').length, 2)
 })
 
+test('protocol recovery priority cannot be promoted by an app resolver', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    resolveInboundPriority: () => 'normal'
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const lowerAsk = inboxRumor('ask', 'ask-lower', 10, { code: MISSING_MESSAGES_ASK_CODE })
+  lowerAsk.payload.payload.priority = 'lower'
+  const lowerReply = inboxRumor('reply', 'reply-lower', 20, { code: MISSING_MESSAGES_REPLY_CODE })
+  lowerReply.payload.payload.priority = 'lower'
+  await deliverInboxRumor(pm, 'ask', lowerAsk)
+  await deliverInboxRumor(pm, 'ask', lowerReply)
+  await deliverInboxRumor(pm, 'message', inboxRumor('message', 'normal-message', 30, { code: 'message-code' }))
+  await deliverInboxRumor(pm, 'message', inboxRumor('message', 'presence-lowest', 40, { code: SEEDER_PRESENCE_CODE }))
+
+  for (const [priority, expected] of [[2, ['normal-message']], [1, ['ask-lower', 'reply-lower']], [0, ['presence-lowest']]]) {
+    const lane = []
+    for await (const item of messenger.queue.storedItemsBy('byDeliveryPriority', priority)) lane.push(item.event.id)
+    assert.deepEqual(lane, expected)
+  }
+  for (const id of ['normal-message', 'ask-lower', 'reply-lower', 'presence-lowest']) {
+    assert.equal((await takeMessage(messenger)).event.id, id)
+  }
+})
+
 test('private messenger reports content key usage changes for sent and received messages', async () => {
   const pm = fakePrivateMessage()
   const changes = []
@@ -2576,8 +2604,9 @@ test('private messenger debug reports send and enqueue events without payload se
   })
 
   const send = debugEvents.find(event => event.action === 'send' && event.method === 'yell')
-  const enqueue = debugEvents.find(event => event.action === 'enqueue' && event.type === 'reply')
-  assert.ok(debugEvents.some(event => event.action === 'watch'))
+  const enqueue = debugEvents.find(event => event.action === 'message-received' && event.type === 'reply')
+  assert.ok(debugEvents.some(event => event.action === 'watch-ready' && /^channel-\d+$/.test(event.channelRef)))
+  assert.ok(debugEvents.filter(event => event.action === 'watch-ready').every(event => !Object.hasOwn(event, 'channelPubkey')))
   assert.equal(send.code, 'contentKeys_reply_v1')
   assert.deepEqual(send.receiverPubkeys, ['alice', 'bob'])
   assert.equal(send.receiverCount, 2)
@@ -2986,8 +3015,8 @@ test('local router seed updates preserve timestamp bounds across concurrent writ
   })
 
   await Promise.all([
-    messenger.enqueueSeed('channel', createSeed(now, JSON.stringify(['user', 'old-ciphertext']))),
-    messenger.enqueueSeed('channel', createSeed(now + 20, JSON.stringify(['user', 'new-ciphertext'])))
+    messenger.enqueueSeed('channel', createSeed(now, JSON.stringify(['user', 'ciphertext']))),
+    messenger.enqueueSeed('channel', createSeed(now + 20, JSON.stringify(['user', 'ciphertext'])))
   ])
 
   const storedSeeds = []
@@ -2995,7 +3024,7 @@ test('local router seed updates preserve timestamp bounds across concurrent writ
   assert.equal(storedSeeds.filter(item => item.recordType === ROUTER_SEED_RECORD_TYPE).length, 1)
   assert.equal(storedSeeds[0].firstSeenAt, now)
   assert.equal(storedSeeds[0].lastSeenAt, now + 20)
-  assert.equal(storedSeeds[0].row, JSON.stringify(['user', 'new-ciphertext']))
+  assert.equal(storedSeeds[0].row, JSON.stringify(['user', 'ciphertext']))
 })
 
 test('local seed queue retries ConstraintError across messenger instances', async () => {
@@ -3085,7 +3114,7 @@ test('local seed queue bounds duplicate retries and remains usable after failure
   await messenger.enqueueSeed('channel', otherSeed)
 })
 
-test('router seed rows dedupe by proven inner id without content-key pubkey', async () => {
+test('router seed rows preserve distinct encrypted variants for one inner id', async () => {
   const pm = fakePrivateMessage()
   const now = Math.floor(Date.now() / 1000)
   const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
@@ -3111,11 +3140,12 @@ test('router seed rows dedupe by proven inner id without content-key pubkey', as
   const storedSeeds = []
   for await (const seed of messenger.seedQueue.storedItems()) storedSeeds.push(seed)
 
-  assert.equal(storedSeeds.filter(seed => seed.recordType === ROUTER_SEED_RECORD_TYPE).length, 1)
-  assert.equal(storedSeeds[0].receiverPubkey, 'user')
-  assert.equal(storedSeeds[0].innerEventId, 'same-inner-id')
-  assert.equal(storedSeeds[0].iykcPubkey, 'new-content-key')
-  assert.equal(storedSeeds[0].row, newContentRow)
+  const routerSeeds = storedSeeds.filter(seed => seed.recordType === ROUTER_SEED_RECORD_TYPE)
+  assert.equal(routerSeeds.length, 2)
+  assert.ok(routerSeeds.every(seed => seed.innerEventId === 'same-inner-id'))
+  assert.ok(routerSeeds.every(seed => /^[0-9a-f]{64}$/.test(seed.rowHash)))
+  assert.equal(new Set(routerSeeds.map(seed => seed.rowHash)).size, 2)
+  assert.deepEqual(new Set(routerSeeds.map(seed => seed.row)), new Set([oldContentRow, newContentRow]))
 })
 
 test('watchtower channels store router seeds without consuming normal messages', async () => {
@@ -3698,6 +3728,7 @@ test('missing-message reply packer streams compact seed routers only', async () 
   assert.equal(replies[0].receiverPubkey, 'user')
   assert.equal(replies[0].payload.since, 5)
   assert.equal(replies[0].payload.until, 20)
+  assert.equal(replies[0].payload.priority, 'lower')
   assert.equal(replies[0].payload.isLast, true)
   assert.equal(replies[0].idempotencyKey, `${MISSING_MESSAGES_REPLY_CODE}:question-id:0`)
   const lines = replies[0].payload.jsonl.trim().split('\n')
@@ -4306,6 +4337,54 @@ test('failed reload-gap recovery schedules an automatic retry', async () => {
   assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [])
 })
 
+test('deferred cold recovery fetches only the recent tail until a priority range is requested', async t => {
+  const channel = '11'.repeat(32)
+  const now = 1_800_000_000
+  t.mock.method(Date, 'now', () => now * 1000)
+  await seedMessengerState({
+    [channel]: {
+      lastSeenAt: now - 8 * 3600,
+      recoveredThrough: now - 8 * 3600
+    }
+  })
+  const timers = []
+  const fetches = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    deferColdRecovery: true,
+    _setTimeout: (fn, delay) => {
+      const timer = { fn, delay }
+      timers.push(timer)
+      return timer
+    },
+    _clearTimeout: timer => { timer.cancelled = true },
+    _privateChannel: {
+      fetchHistory: async args => {
+        fetches.push({ since: args.since, until: args.until })
+        return []
+      }
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: channel, signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  const cold = timers.find(timer => timer.delay === 500)
+  assert.ok(cold)
+  await cold.fn()
+  assert.equal(fetches.length, 1)
+  assert.equal(fetches[0].since, now - 6 * 3600)
+  assert.ok(fetches[0].until >= now - 1 && fetches[0].until <= now)
+  assert.ok(messenger.readState().channels[channel].offlineRanges.length)
+
+  assert.equal(await messenger.prioritizeRange(channel, { since: now - 7 * 3600, ttlMs: 60_000 }), true)
+  const priority = timers.findLast(timer => timer.delay === 0)
+  assert.ok(priority)
+  await priority.fn()
+  assert.equal(fetches[1].since, now - 7 * 3600)
+  assert.ok(fetches[1].until >= now - 6 * 3600 - 1 && fetches[1].until <= now - 6 * 3600)
+})
+
 test('prioritized ranges resolve defaults from persisted recovery ranges', async () => {
   const channel = '11'.repeat(32)
   const now = Math.floor(Date.now() / 1000)
@@ -4494,7 +4573,7 @@ test('priority seeder fallback requires recent presence', async t => {
       allFailed: true
     }
   }
-  const run = async lastActiveAt => {
+  const run = async (lastActiveAt, { background = false } = {}) => {
     await seedMessengerState({
       [channel]: {
         offlineRanges: [{ start: now - 1000, end: now - 100 }],
@@ -4512,6 +4591,16 @@ test('priority seeder fallback requires recent presence', async t => {
     })
     const range = messenger.readState().channels[channel].offlineRanges[0]
     await messenger.prioritizeRange(channel, { since: range.end - 100, ttlMs: 60000 })
+    if (background) {
+      messenger.recoveryPriority.set(channel, [{
+        start: range.end - 100,
+        end: range.end,
+        type: 'tail',
+        background: true,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 60000
+      }])
+    }
     await messenger.runPriorityLane(channel, messenger.channels.get(channel), [range])
     const result = {
       asks: pm.sent.filter(entry => entry.method === 'ask'),
@@ -4524,8 +4613,12 @@ test('priority seeder fallback requires recent presence', async t => {
   assert.equal((await run(now - 3600)).asks.length, 0)
   const recent = await run(now)
   assert.equal(recent.asks.length, 1)
+  assert.equal(recent.asks[0].options.payload.priority, undefined)
   assert.ok(recent.asks[0].options.payload.since <= now && recent.asks[0].options.payload.until >= recent.asks[0].options.payload.since)
   assert.ok(recent.record.claimed.length)
+  const background = await run(now, { background: true })
+  assert.equal(background.asks.length, 1)
+  assert.equal(background.asks[0].options.payload.priority, 'lower')
 })
 
 test('recovery relay ordering prefers the most reliable relay', async () => {
@@ -4674,7 +4767,7 @@ test('all-failed relay attempts exhaust the larger budget before the seeder hand
   assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [])
   const asks = pm.sent.filter(entry => entry.method === 'ask')
   assert.equal(asks.length, 1)
-  assert.deepEqual(asks[0].options.payload, { since: range.start, until: range.end })
+  assert.deepEqual(asks[0].options.payload, { since: range.start, until: range.end, priority: 'lower' })
 })
 
 test('offline recovery leaves ranges and budgets untouched', async () => {
