@@ -35,6 +35,90 @@ async function connected () {
   return { relay, socket: FakeWebSocket.instances.at(-1) }
 }
 
+test('connection failures emit bounded diagnostics without native prose', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 10000 })
+  const logs = []
+  t.mock.method(console, 'debug', (...args) => logs.push(args))
+
+  const timeoutRelay = new RelayConnection('wss://timeout.example/', { WebSocket: FakeWebSocket })
+  const timedOut = assert.rejects(timeoutRelay.connect({ timeout: 3000 }), error => error.category === 'timeout')
+  t.mock.timers.tick(3000)
+  await timedOut
+  await tick()
+  let diagnostic = logs.at(-1)
+  assert.equal(diagnostic[0], 'relay connection failure')
+  assert.equal(diagnostic[1].relay, 'wss://timeout.example/')
+  assert.equal(diagnostic[1].event, 'connect-failed')
+  assert.equal(diagnostic[1].code, 'CONNECT_TIMEOUT')
+  assert.equal(diagnostic[1].category, 'timeout')
+  assert.equal(diagnostic[1].elapsedMs, 3000)
+  assert.equal(diagnostic[1].timeoutMs, 3000)
+
+  const errorRelay = new RelayConnection('wss://error.example/', { WebSocket: FakeWebSocket })
+  const errored = assert.rejects(errorRelay.connect(), error => error.category === 'connection')
+  const errorSocket = FakeWebSocket.instances.at(-1)
+  errorSocket.onerror({ error: new Error('sensitive native prose') })
+  await errored
+  await tick()
+  diagnostic = logs.at(-1)
+  assert.equal(diagnostic[0], 'relay connection failure')
+  assert.equal(diagnostic[1].relay, 'wss://error.example/')
+  assert.equal(diagnostic[1].event, 'connect-failed')
+  assert.equal(diagnostic[1].code, 'CONNECTION_ERROR')
+  assert.equal(diagnostic[1].category, 'connection')
+  assert.equal(diagnostic[1].elapsedMs, 0)
+  assert.equal(diagnostic[1].timeoutMs, 3000)
+  assert.doesNotMatch(JSON.stringify(diagnostic), /sensitive native prose/)
+
+  const closeRelay = new RelayConnection('wss://close.example/', { WebSocket: FakeWebSocket })
+  const closed = assert.rejects(closeRelay.connect(), error => error.category === 'connection')
+  const closeSocket = FakeWebSocket.instances.at(-1)
+  closeSocket.onclose({ code: 1006, reason: 'sensitive close prose', wasClean: false })
+  await closed
+  await tick()
+  diagnostic = logs.at(-1)
+  assert.equal(diagnostic[0], 'relay connection failure')
+  assert.equal(diagnostic[1].relay, 'wss://close.example/')
+  assert.equal(diagnostic[1].event, 'connect-failed')
+  assert.equal(diagnostic[1].code, 'CONNECTION_CLOSED')
+  assert.equal(diagnostic[1].category, 'connection')
+  assert.equal(diagnostic[1].closeCode, 1006)
+  assert.equal(diagnostic[1].wasClean, false)
+  assert.equal(diagnostic[1].elapsedMs, 0)
+  assert.equal(diagnostic[1].timeoutMs, 3000)
+  assert.doesNotMatch(JSON.stringify(diagnostic), /sensitive close prose/)
+
+  const { socket } = await connected()
+  logs.length = 0
+  const transportError = new Error('sensitive transport prose')
+  socket.onerror({ error: transportError })
+  socket.onclose({ code: 1013, reason: 'sensitive close-after-open', wasClean: true })
+  await tick()
+  assert.deepEqual(logs.map(([, value]) => ({
+    relay: value.relay,
+    event: value.event,
+    code: value.code,
+    category: value.category,
+    closeCode: value.closeCode
+  })), [
+    {
+      relay: 'wss://relay.example/',
+      event: 'transport-error',
+      code: 'CONNECTION_ERROR',
+      category: 'transport',
+      closeCode: undefined
+    },
+    {
+      relay: 'wss://relay.example/',
+      event: 'connection-closed',
+      code: 'CONNECTION_CLOSED',
+      category: 'transport',
+      closeCode: 1013
+    }
+  ])
+  assert.doesNotMatch(JSON.stringify(logs), /sensitive transport prose|sensitive close-after-open/)
+})
+
 test('RelayConnection validates and filters subscription events', async () => {
   const { relay, socket } = await connected()
   const valid = []

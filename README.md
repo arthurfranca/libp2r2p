@@ -161,6 +161,14 @@ checks are bounded and shared per pool; structured relay responses need no new
 internet probe unless the browser indicates offline. Cancelled readers release
 their own waits without cancelling another reader's recovery.
 
+Connection failures emit structured `console.debug` records under
+`relay connection failure`. They contain only the relay URL, event stage,
+canonical error code, category, WebSocket close code/cleanliness, elapsed
+connect time, the configured timeout and browser online state. Native error
+messages and relay close prose are intentionally omitted. These records let
+operators compare timeout frequency and close codes per device without logging
+event content, filters or credentials.
+
 Successful live EOSE and any required reconnect history reset the delay.
 Transient reconnect-history failures retry while retaining their original gap
 baseline; definitive failures stop that route without certifying its gap.

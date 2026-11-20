@@ -2,7 +2,7 @@ import { isValidEvent } from '../../event/index.js'
 import { ValidationError } from '../../error/index.js'
 import { maybeUnref } from '../helpers/timer.js'
 import { categorizeRelayError, relayCloseError, relayTimeoutError, relayRejectionError } from '../helpers/error.js'
-import { debugRateLimitRetry } from '../helpers/retry-debug.js'
+import { debugRateLimitRetry, debugRelayConnectionFailure } from '../helpers/retry-debug.js'
 import { DEFAULT_RATE_LIMIT_CAP_MS } from '../helpers/retry-advice.js'
 
 const DEFAULT_CONNECT_TIMEOUT = 3000
@@ -160,39 +160,93 @@ export class RelayConnection {
 
     this.#lastTransportError = null
     this.#connectPromise = new Promise((resolve, reject) => {
+      const startedAt = Date.now()
       let socket
       try { socket = new this.#WebSocket(this.url) } catch (error) {
-        reject(categorizeRelayError(error, 'connection'))
+        const reason = categorizeRelayError(error, 'connection')
+        debugRelayConnectionFailure({
+          relay: this.url,
+          event: 'connect-failed',
+          code: 'WEBSOCKET_CONSTRUCTOR',
+          category: reason.category,
+          elapsedMs: Date.now() - startedAt,
+          timeoutMs: timeout,
+          online: globalThis.navigator?.onLine
+        })
+        reject(reason)
         return
       }
       this.ws = socket
       let settled = false
-      const finish = (reason) => {
+      let opened = false
+      const finish = (reason, details = {}) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
         signal?.removeEventListener('abort', onAbort)
         if (reason) {
+          debugRelayConnectionFailure({
+            relay: this.url,
+            event: 'connect-failed',
+            code: details.code || reason.code || reason.message,
+            category: reason.category,
+            closeCode: details.closeCode,
+            wasClean: details.wasClean,
+            elapsedMs: Date.now() - startedAt,
+            timeoutMs: timeout,
+            online: globalThis.navigator?.onLine
+          })
           try { socket.close() } catch {}
           reject(reason)
         } else resolve()
       }
       const onAbort = () => finish(new Error('CONNECT_ABORTED'))
-      const timer = timeout === null ? null : maybeUnref(setTimeout(() => finish(relayTimeoutError('CONNECT_TIMEOUT')), timeout))
+      const timer = timeout === null ? null : maybeUnref(setTimeout(() => finish(relayTimeoutError('CONNECT_TIMEOUT'), { code: 'CONNECT_TIMEOUT' }), timeout))
       signal?.addEventListener('abort', onAbort, { once: true })
 
-      socket.onopen = () => finish()
+      socket.onopen = () => {
+        opened = true
+        finish()
+      }
       socket.onerror = event => {
         const reason = categorizeRelayError(event?.error, settled ? 'transport' : 'connection', 'CONNECTION_ERROR')
-        if (!settled) finish(reason)
+        if (!settled) finish(reason, { code: 'CONNECTION_ERROR' })
         else {
           this.#lastTransportError = reason
+          debugRelayConnectionFailure({
+            relay: this.url,
+            event: 'transport-error',
+            code: 'CONNECTION_ERROR',
+            category: reason.category,
+            elapsedMs: Date.now() - startedAt,
+            timeoutMs: timeout,
+            online: globalThis.navigator?.onLine
+          })
           this.onerror?.(reason)
         }
       }
       socket.onmessage = event => { this.#handleMessage(event).catch(reason => this.onerror?.(reason)) }
       socket.onclose = event => {
-        if (!settled) finish(relayCloseError(event, 'connection'))
+        const wasCurrent = this.ws === socket
+        if (!settled) {
+          finish(relayCloseError(event, 'connection'), {
+            code: event?.reason?.startsWith('rate-limited:') ? 'RATE_LIMITED' : 'CONNECTION_CLOSED',
+            closeCode: event?.code,
+            wasClean: event?.wasClean
+          })
+        } else if (opened && wasCurrent) {
+          debugRelayConnectionFailure({
+            relay: this.url,
+            event: 'connection-closed',
+            code: event?.reason?.startsWith('rate-limited:') ? 'RATE_LIMITED' : 'CONNECTION_CLOSED',
+            category: 'transport',
+            closeCode: event?.code,
+            wasClean: event?.wasClean,
+            elapsedMs: Date.now() - startedAt,
+            timeoutMs: timeout,
+            online: globalThis.navigator?.onLine
+          })
+        }
         if (this.ws === socket) this.ws = null
         this.#handleClose(event)
       }

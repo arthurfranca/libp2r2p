@@ -115,7 +115,43 @@ test('relay pool capacity closes keep the shared subscription retrying with rela
   assert.equal(f.calls[1].closed, false)
 })
 
-test('an unknown first-time subscription error still stops until an explicit rebuild', async t => {
+test('a transient first-time subscription failure retries with relay backoff', async t => {
+  const f = fixture(t)
+  await f.watch('a')
+  const connectionError = Object.assign(new Error('connection closed during handshake'), {
+    code: 'CONNECTION_ERROR',
+    category: 'connection'
+  })
+  f.calls[0].done.resolve({ status: 'failed', error: connectionError })
+  await until(() => f.timers.length === 1)
+  assert.equal(await f.retry(), 1000)
+  assert.equal(f.calls.length, 2, 'the initial relay failure reopens the shared subscription')
+  f.calls[1].ready.resolve({ relays: ['wss://a.example'] })
+  await tick()
+  assert.equal(f.calls[1].closed, false)
+})
+
+test('a transient relay error during initial readiness retries instead of retiring the relay', async t => {
+  const f = fixture(t)
+  await f.watch('a')
+  const connectionError = Object.assign(new Error('connection closed during handshake'), {
+    code: 'CONNECTION_ERROR',
+    category: 'connection'
+  })
+  f.calls[0].ready.resolve({
+    relays: [],
+    errors: [{ relay: 'wss://a.example', reason: connectionError }]
+  })
+  await until(() => f.timers.length === 1)
+  assert.equal(f.calls[0].closed, true)
+  assert.equal(await f.retry(), 1000)
+  assert.equal(f.calls.length, 2)
+  f.calls[1].ready.resolve({ relays: ['wss://a.example'] })
+  await tick()
+  assert.equal(f.calls[1].closed, false)
+})
+
+test('an unknown non-transient first-time subscription error still stops until an explicit rebuild', async t => {
   const f = fixture(t)
   await f.watch('a')
   f.calls[0].done.resolve({ status: 'failed', error: new Error('UNEXPECTED_RELAY_FAILURE') })

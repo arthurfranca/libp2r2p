@@ -2620,18 +2620,23 @@ test('simultaneous receivers and consumers independently process the same channe
   const sessions = [createPrivateMessageSession(), createPrivateMessageSession(), createPrivateMessageSession()]
   const receivers = [a, b, b]
   const got = [[], [], []]
+  const errors = [[], [], []]
   const finished = []
   try {
     for (const [index, session] of sessions.entries()) {
       await session.watch({
         channels: [await channelA.getPublicKey()], relays: ['wss://example.test'], receiverSigner: receivers[index], privateChannelSigner: index ? channelB : channelA,
-        onMessage: message => got[index].push(message), onError: error => { throw error },
+        onMessage: message => got[index].push(message), onError: error => errors[index].push(error),
         _subscribe: options => {
           const done = Promise.withResolvers()
           finished.push(done.promise)
           return subscribe({
-            ...options, _liveEventsGenerator: async function * () {
-              try { for (const event of outers) yield { type: 'event', event } } finally { done.resolve() }
+            ...options, _liveEventsGenerator: (_filter, relays) => {
+              const generator = (async function * () {
+                try { for (const event of outers) yield { type: 'event', event } } finally { done.resolve() }
+              })()
+              generator.ready = Promise.resolve({ relays, errors: [] })
+              return generator
             }
           })
         }
@@ -2639,8 +2644,13 @@ test('simultaneous receivers and consumers independently process the same channe
     }
     await Promise.all(finished)
     await Promise.all(sessions.map(session => session.unwatch()))
-    for (const messages of got) {
-      assert.equal(messages.length, 1)
+    assert.deepEqual(
+      got.map(messages => messages.length),
+      [1, 1, 1],
+      'each independent consumer should receive the event once'
+    )
+    for (const [index, messages] of got.entries()) {
+      assert.deepEqual(errors[index].map(error => error.message), [])
       assert.equal(messages[0].event.content, original.content)
       assert.equal(messages[0].senderPubkey, aPubkey)
       assert.equal(messages[0].provenance, 'direct')

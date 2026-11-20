@@ -5,6 +5,7 @@ import { generateKeypair, keypairFromSeckey } from '../key/index.js'
 import * as privateChannel from '../private-channel/index.js'
 import { normalizeRumor, deliveryInfo } from '../private-channel/helpers/rumor.js'
 import { normalizePreparedPublications } from '../private-channel/helpers/prepared.js'
+import { isRetryableReadFailure } from '../relay/helpers/read-retry.js'
 import { appendIdempotencyTag } from './helpers/idempotency.js'
 import { messageTimestamp, setMillisecondsTag } from './helpers/timestamp.js'
 
@@ -423,7 +424,10 @@ export function createPrivateMessageSession ({ _setTimeout = setTimeout, _clearT
       notified: new Map(), timer: null
     }
     const permanent = /^(auth-required:|restricted:|blocked:|invalid:|pow:)/.test(error.message || '') || error.name === 'ValidationError'
-    const retryable = error.code === 'RELAY_LIVE_BUFFER_FULL' || isRelayPoolCapacity(error) || Boolean(previous)
+    const retryable = error.code === 'RELAY_LIVE_BUFFER_FULL' ||
+      isRelayPoolCapacity(error) ||
+      isRetryableReadFailure(error) ||
+      Boolean(previous)
     if (permanent || !retryable) {
       cancelRelayRecovery(relay)
       notifyInterruption(relay, recovery).catch(error => reportSubscriptionError(entry.channels, error))
@@ -440,11 +444,9 @@ export function createPrivateMessageSession ({ _setTimeout = setTimeout, _clearT
     if (subsByRelay.get(relay) !== entry) return
     const recovery = relayRecoveries.get(relay)
     if (!ready?.relays?.includes(relay)) {
-      if (recovery) {
-        const error = ready?.errors?.[0]?.reason || Object.assign(new Error('RELAY_LIVE_NOT_READY'), { code: 'RELAY_LIVE_NOT_READY', relay })
-        subscriptionEnded(relay, entry, { status: 'failed', error })
-        await entry.sub.close()
-      }
+      const error = ready?.errors?.[0]?.reason || Object.assign(new Error('RELAY_LIVE_NOT_READY'), { code: 'RELAY_LIVE_NOT_READY', relay })
+      subscriptionEnded(relay, entry, { status: 'failed', error })
+      await entry.sub.close()
       return
     }
     entry.readyAt = _now()
