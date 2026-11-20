@@ -21,6 +21,8 @@
 // }
 // const { question } = await messenger.ask({ receiverPubkey, payload: { ping: true }, idempotencyKey: 'request:42' })
 // await messenger.reply({ question, payload: { ok: true }, idempotencyKey: 'reply:42' })
+// Optional expiresAt (Unix seconds) can only shorten the channel default:
+// await messenger.reply({ question, payload: { ok: true }, expiresAt: askExpiration })
 // await messenger.tell({ receiverPubkey, payload: { note: 'hello' }, idempotencyKey: 'notification:42' })
 // await messenger.yell({ receiverPubkeys, payload: { notice: 'hello all' }, idempotencyKey: 'notice:42' })
 // await messenger.broadcastRumor({ receiverPubkeys, rumor: { kind, tags: [], content } })
@@ -239,6 +241,16 @@ function defaultOnError (err) {
 
 function nowSeconds () {
   return Math.floor(Date.now() / 1000)
+}
+
+function replyExpirationSeconds (defaultSeconds, expiresAt, nowMs) {
+  if (expiresAt === undefined) return defaultSeconds
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0) {
+    throw new ValidationError('INVALID_EXPIRES_AT')
+  }
+  const now = Math.floor(nowMs / 1000)
+  if (expiresAt <= now) throw new ValidationError('QUESTION_EXPIRED')
+  return Math.min(defaultSeconds, expiresAt - now)
 }
 
 function normalizeOfflineRecoverySeconds (value) {
@@ -2870,11 +2882,16 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async reply ({ channelPubkey = this.defaultChannelPubkey(), question, receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, idempotencyKey, deletionPubkey, useBulkPacing = false }) {
+  async reply ({ channelPubkey = this.defaultChannelPubkey(), question, receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, idempotencyKey, deletionPubkey, expiresAt, useBulkPacing = false }) {
     idempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
     const channel = this.requireWritableChannel(channelPubkey)
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
+      const expirationSeconds = replyExpirationSeconds(
+        this.eventExpirationSecondsFor(channel),
+        expiresAt,
+        this._now()
+      )
       const resolvedReceiverPubkey = receiverPubkey || question?.pubkey || ''
       const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [resolvedReceiverPubkey], relays, relayToReceivers })
       this.debugSend('reply', channelPubkey, { code, receiverPubkey: receiverPubkey || question?.pubkey || '' })
@@ -2886,7 +2903,7 @@ export class PrivateMessenger {
         question,
         receiverPubkey,
         ...routing,
-        expirationSeconds: this.eventExpirationSecondsFor(channel),
+        expirationSeconds,
         temporaryStorageArea: this.temporaryStorageArea,
         deletionPubkey,
         autoDeletionCapability: this.autoDeletionCapabilityFor(channel),

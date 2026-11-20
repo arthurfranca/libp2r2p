@@ -2114,6 +2114,36 @@ test('private messenger delegates send helpers with scoped signers and relays', 
   )
 })
 
+test('private messenger caps replies at an optional absolute expiresAt without extending the default', async () => {
+  const nowMs = 1_700_000_000_000
+  const now = Math.floor(nowMs / 1000)
+  const defaultSeconds = 7 * 24 * 60 * 60
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    _now: () => nowMs
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const question = { id: 'q', pubkey: 'alice' }
+
+  await messenger.reply({ question, payload: 'short', expiresAt: now + 120 })
+  await messenger.reply({ question, payload: 'long', expiresAt: now + defaultSeconds * 2 })
+  assert.equal(pm.sent[0].options.expirationSeconds, 120)
+  assert.equal(pm.sent[1].options.expirationSeconds, defaultSeconds)
+
+  await assert.rejects(
+    messenger.reply({ question, payload: 'invalid', expiresAt: 1.5 }),
+    { code: 'INVALID_EXPIRES_AT' }
+  )
+  await assert.rejects(
+    messenger.reply({ question, payload: 'expired', expiresAt: now }),
+    { code: 'QUESTION_EXPIRED' }
+  )
+  assert.equal(pm.sent.length, 2)
+})
+
 test('private messenger configures automatic deletion capabilities and forwards caller pubkeys', async () => {
   const pm = fakePrivateMessage()
   const messenger = await new PrivateMessenger({ _privateMessage: pm, autoDeletionCapability: true }).init({
