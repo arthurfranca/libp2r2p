@@ -207,6 +207,26 @@ test('reservations are exclusive, renewable, recoverable and token checked', asy
   } finally { await a.close(); await b.close() }
 })
 
+test('nack can defer the same durable item without duplicating or renewing it', async () => {
+  const queue = await queueFor(new IDBFactory(), 'deferred-nack', { evictionPolicy: 'reject' })
+  try {
+    await queue.push({ id: 'one' })
+    const first = await queue.reserve()
+    assert.equal(await first.nack({ retryAfterMs: 30000 }), true)
+    assert.equal(await queue.reserve({ now: Date.now() + 1000 }), null)
+    assert.equal((await queue.getCapacity()).usedBytes > 0, true)
+    const retried = await queue.reserve({ now: Date.now() + 31000 })
+    assert.equal(retried.item.id, 'one')
+    assert.equal(await retried.ack(), true)
+    assert.equal((await queue.getCapacity()).usedBytes, 0)
+    const invalid = await queueFor(new IDBFactory(), 'invalid-deferred-nack')
+    await invalid.push({ id: 'invalid' })
+    const delivery = await invalid.reserve()
+    await assert.rejects(delivery.nack({ retryAfterMs: -1 }), /QUEUE_INVALID_RETRY_AFTER/)
+    await invalid.close()
+  } finally { await queue.close() }
+})
+
 test('reservations select priority before FIFO while preserving FIFO within a priority', async () => {
   const queue = await queueFor(new IDBFactory(), 'priority', {
     evictionPolicy: 'reject',

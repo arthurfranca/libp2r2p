@@ -82,9 +82,9 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
   catalog.ready.catch(onError)
   const keyFor = (control, root) => `${control}:${root}`
   const emit = job => { for (const listener of listeners) listener({ root: job.file.root, controlChannelPubkey: job.file.controlChannelPubkey, status: job.status, completed: job.completed, total: job.file.size, error: job.error }) }
-  const usable = file => {
+  const usable = (file, { capacityEgress } = {}) => {
     if (closed) throw new Error('FILE_TRANSFER_CLOSED')
-    messenger.requireWritableChannel(file.controlChannelPubkey)
+    messenger.requireWritableChannel(file.controlChannelPubkey, { capacityEgress })
     if (!messenger.desiredChannels.has(file.controlChannelPubkey)) throw new Error('FILE_TRANSFER_CHANNEL_UNWATCHED')
   }
   async function register ({ controlChannelPubkey, peerPubkey, root, size, sharedAt }) {
@@ -145,9 +145,9 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     if (decoded.root !== file.root || (index !== undefined && decoded.index !== index) || (file.size !== undefined && (decoded.total !== Math.ceil(file.size / IRFS_CHUNK_BYTES) || (decoded.index === decoded.total - 1 && decoded.contentBytes.length !== file.size - decoded.index * IRFS_CHUNK_BYTES)))) throw new ValidationError('FILE_CHUNK_DESCRIPTOR_MISMATCH')
     return decoded
   }
-  async function routing (file, receiverPubkey, signal, attemptStartedAt, onDebug) {
-    const parent = messenger.requireWritableChannel(file.controlChannelPubkey)
-    return messenger.resolveSendRouting({ channel: parent, receiverPubkeys: [receiverPubkey], signal, attemptStartedAt, onDebug })
+  async function routing (file, receiverPubkey, signal, attemptStartedAt, onDebug, { capacityEgress } = {}) {
+    const parent = messenger.requireWritableChannel(file.controlChannelPubkey, { capacityEgress })
+    return messenger.resolveSendRouting({ channel: parent, receiverPubkeys: [receiverPubkey], signal, attemptStartedAt, onDebug, capacityEgress })
   }
   function sendOptions (file, routes) {
     return { senderSigner: messenger.userSigner, imkcSigner: messenger.contentKeySigner, privateChannelSigner: file.signer, ...routes, temporaryStorageArea: messenger.temporaryStorageArea, expirationSeconds: messenger.eventExpirationSecondsFor(file.controlChannelPubkey), useBulkPacing: true, _getIykcProofs: messenger.contentKeyLookup() }
@@ -173,7 +173,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     await new Promise(resolve => setTimeout(resolve, 0))
     return result
   }
-  async function replyToRequest (controlChannelPubkey, message) {
+  async function replyToRequest (controlChannelPubkey, message, { capacityEgress } = {}) {
     if (message.payload?.code !== FILE_CHUNKS_REQUEST_CODE) return false
     const question = message.question || message.event
     if (message.provenance === 'hearsay' || message.senderPubkey !== question?.pubkey || question.tags?.find(tag => tag[0] === 'r')?.[1] !== messenger.userPubkey) return true
@@ -184,13 +184,13 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     const grant = await catalog.find(controlChannelPubkey, payload.fileChannelPubkey, question.pubkey)
     if (grant) {
       const file = await register(grant)
-      usable(file)
+      usable(file, { capacityEgress: capacityEgress?.token })
       if (file.fileChannelPubkey !== payload.fileChannelPubkey) throw new ValidationError('FILE_CHANNEL_MISMATCH')
-      const routes = await routing(file, question.pubkey)
+      const routes = await routing(file, question.pubkey, undefined, undefined, undefined, { capacityEgress: capacityEgress?.token })
       const packer = createEventReplyPacker({
         messenger: {
           reply: async options => {
-            usable(file)
+            usable(file, { capacityEgress: capacityEgress?.token })
             if (!await catalog.find(controlChannelPubkey, file.fileChannelPubkey, question.pubkey)) return
             return _messages.reply({ ...sendOptions(file, routes), ...options })
           }
@@ -202,7 +202,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
         recordsFromInput: record => [record]
       })
       for (const index of indices) {
-        usable(file)
+        usable(file, { capacityEgress: capacityEgress?.token })
         if (!await catalog.find(controlChannelPubkey, file.fileChannelPubkey, question.pubkey)) break
         const event = await storage.read(file.root, index, file)
         if (!event) continue
@@ -223,14 +223,14 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
       if (seed.expiresAt <= _now() || seed.receivedAt + messenger.offlineRecoverySecondsFor(controlChannelPubkey) <= _now() || (seedStorage && !await seedStorage.has(seed))) continue
       if (seed.controlChannelPubkey !== controlChannelPubkey || seed.receiverPubkey !== question.pubkey || !indices.has(seed.chunkIndex) || !seedEnabled(seed)) continue
       const file = await register(seed)
-      usable(file)
+      usable(file, { capacityEgress: capacityEgress?.token })
       if (file.fileChannelPubkey !== payload.fileChannelPubkey) throw new ValidationError('FILE_CHANNEL_MISMATCH')
       if (!packer) {
-        const routes = await routing(file, question.pubkey)
+        const routes = await routing(file, question.pubkey, undefined, undefined, undefined, { capacityEgress: capacityEgress?.token })
         packer = createEventReplyPacker({
           messenger: {
             reply: async options => {
-              usable(file)
+              usable(file, { capacityEgress: capacityEgress?.token })
               return _messages.reply({ ...sendOptions(file, routes), ...options })
             }
           },
@@ -457,21 +457,36 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
   function drainRequests () {
     if (closed) return
     while (replying < 2 && requests.length) {
-      const [channel, message] = requests.shift()
+      const [channel, message, capacityEgress] = requests.shift()
       replying++
-      const task = replyToRequest(channel, message).catch(error => { if (!(closed && error.message === 'FILE_TRANSFER_CLOSED')) onError(error) }).finally(() => { replying--; work.delete(task); drainRequests() })
+      const task = replyToRequest(channel, message, { capacityEgress })
+        .catch(error => { if (!(closed && error.message === 'FILE_TRANSFER_CLOSED')) onError(error) })
+        .finally(() => { capacityEgress?.release(); replying--; work.delete(task); drainRequests() })
       work.add(task)
     }
   }
   const extension = {
-    handleAsk (channel, message) {
+    handleAsk (channel, message, { capacityEgress } = {}) {
       if (message.payload?.code !== FILE_CHUNKS_REQUEST_CODE) return false
       // Never hold the DM dispatcher while publishing a batch of file bytes.
       // Bound both workers and queued requests; discarded excess is retryable.
-      if (!closed && requests.length < 16) { requests.push([channel, message]); drainRequests() }
+      if (!closed && requests.length < 16) {
+        requests.push([channel, message, capacityEgress])
+        drainRequests()
+      } else {
+        capacityEgress?.release()
+      }
       return true
     },
-    pause () { requests.length = 0; for (const job of jobs.values()) { if (!['complete', 'error', 'cancelled'].includes(job.status)) job.pauseRequested = true; cancelJob(job) } },
+    pause () {
+      for (const [, , capacityEgress] of requests) capacityEgress?.release()
+      requests.length = 0
+      for (const job of jobs.values()) {
+        if (['complete', 'error', 'cancelled'].includes(job.status)) continue
+        job.pauseRequested = true
+        cancelJob(job)
+      }
+    },
     async resume () {
       await Promise.allSettled([...work])
       for (const job of jobs.values()) if (job.pauseRequested && job.status !== 'complete') download(job.file, { manual: job.manual, thumbnail: job.thumbnail }).catch(onError)

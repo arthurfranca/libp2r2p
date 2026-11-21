@@ -949,7 +949,10 @@ export async function createQueue ({
     let completedAction
     let completedResult
     let tail = Promise.resolve()
-    const update = (action, at = Date.now()) => {
+    const update = (action, at = Date.now(), { retryAfterMs = 0 } = {}) => {
+      if (!Number.isSafeInteger(retryAfterMs) || retryAfterMs < 0 || retryAfterMs > 2147483647) {
+        return Promise.reject(new ValidationError('QUEUE_INVALID_RETRY_AFTER'))
+      }
       const operation = tail.then(async () => {
         if (settled) return action === completedAction ? completedResult : false
         const result = await mutate(async (tx, state) => {
@@ -982,7 +985,8 @@ export async function createQueue ({
                 state.usedBytes = Math.max(0, state.usedBytes - record.byteSize)
                 await trimBounds(tx, state)
               } else {
-                delete record.reservation
+                if (retryAfterMs > 0) record.reservation = { token, until: at + retryAfterMs }
+                else delete record.reservation
                 await putRecord(tx, record)
               }
             }
@@ -999,7 +1003,12 @@ export async function createQueue ({
       tail = operation.catch(() => {})
       return operation
     }
-    return { item: reserved.item, ack: () => update('ack'), nack: () => update('nack'), renew: () => update('renew') }
+    return {
+      item: reserved.item,
+      ack: () => update('ack'),
+      nack: options => update('nack', Date.now(), options),
+      renew: () => update('renew')
+    }
   }
 
   async function snapshotStoredItems () {

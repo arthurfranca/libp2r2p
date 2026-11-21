@@ -3980,6 +3980,57 @@ test('capacity pauses ingestion without eviction and ack resumes durable recover
   } finally { await messenger.close() }
 })
 
+test('capacity-scoped delivery sends bypass only capacity and expire with their reservation', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    _privateChannel: { fetchHistory: async () => [] }
+  }).init({
+    userSigner: signer('owner'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  try {
+    const now = Math.floor(Date.now() / 1000)
+    const rumor = id => ({ event: { kind: 9, id, pubkey: 'peer', tags: [], created_at: now, content: id }, outer: { created_at: now }, senderPubkey: 'peer' })
+    await pm.watchCalls[0].onMessage(rumor('one'))
+    await pm.watchCalls[0].onMessage(rumor('two'))
+    const first = await messenger.nextMessage()
+    const second = await messenger.nextMessage()
+    assert.equal(typeof first.capacityEgress.ask, 'function')
+    assert.equal(typeof first.capacityEgress.reply, 'function')
+    assert.equal(typeof first.capacityEgress.tell, 'function')
+    assert.equal(typeof first.capacityEgress.yell, 'function')
+
+    await messenger.pause('capacity')
+    await assert.rejects(
+      messenger.reply({ channelPubkey: 'channel', question: { id: 'question' }, payload: { ok: true } }),
+      error => error.code === 'PRIVATE_MESSENGER_CAPACITY_PAUSED'
+    )
+    await first.capacityEgress.reply({ channelPubkey: 'channel', question: { id: 'question' }, payload: { ok: true } })
+    assert.equal(pm.sent.at(-1).method, 'reply')
+
+    await messenger.pause('vault')
+    await assert.rejects(
+      first.capacityEgress.reply({ channelPubkey: 'channel', question: { id: 'question' }, payload: { ok: true } }),
+      error => error.code === 'PRIVATE_MESSENGER_PAUSED'
+    )
+    await messenger.resume('vault')
+
+    await first.ack()
+    await second.nack()
+    await assert.rejects(
+      first.capacityEgress.yell({ channelPubkey: 'channel', receiverPubkeys: ['peer'], payload: { ok: true } }),
+      error => error.code === 'INBOX_DELIVERY_EXPIRED'
+    )
+    await assert.rejects(
+      second.capacityEgress.tell({ channelPubkey: 'channel', receiverPubkey: 'peer', payload: { ok: true } }),
+      error => error.code === 'INBOX_DELIVERY_EXPIRED'
+    )
+  } finally {
+    await messenger.close()
+  }
+})
+
 test('inbox pressure pauses at high water, reports sanitized aggregates and resumes at low water', async () => {
   const pm = fakePrivateMessage()
   let recovered = 0

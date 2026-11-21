@@ -25,7 +25,7 @@ export function wireEvent (value, owner) {
 }
 // Relay rejection text must not be interpreted as a local signer denial.
 const retryable = error => error?.code === 'MESSAGE_NOT_PUBLISHED' || !/DENIED|PERMISSION|REVOKED|READ_ONLY|INVALID|BLOCKED|EXPIRED|NOT_IN_PERSONA/i.test(`${error?.code || ''} ${error?.message || ''}`)
-const unavailableSend = /PRIVATE_MESSENGER_PAUSED|CHAT_UNAVAILABLE|MESSENGER_UNAVAILABLE/i
+const unavailableSend = /PRIVATE_MESSENGER_(?:CAPACITY_)?PAUSED|CHAT_UNAVAILABLE|MESSENGER_UNAVAILABLE/i
 const isUnavailableSend = error => unavailableSend.test(`${error?.code || ''} ${error?.message || ''}`)
 const SEND_RETRY_MIN_MS = 1000
 const SEND_RETRY_MAX_MS = 30000

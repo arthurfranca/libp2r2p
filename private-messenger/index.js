@@ -134,6 +134,7 @@ const COALESCING_INDEX = 'byCoalescingKey'
 const DELIVERY_PRIORITY_INDEX = 'byDeliveryPriority'
 const COALESCING_DIGEST = /^[0-9a-f]{64}$/
 const COALESCING_KEEP = new Set(['oldest', 'latest'])
+const CAPACITY_EGRESS = Symbol('capacityEgress')
 const DEDUPE_TYPES = new Set(['ask', 'reply', 'tell', 'yell'])
 const DELIVERY_PRIORITY = Object.freeze({
   lowest: 0,
@@ -172,7 +173,25 @@ function isQueueCapacityError (error) {
 }
 
 function isPausedError (error) {
-  return error?.code === 'PRIVATE_MESSENGER_PAUSED' || error?.message === 'PRIVATE_MESSENGER_PAUSED'
+  return error?.code === 'PRIVATE_MESSENGER_PAUSED' ||
+    error?.code === 'PRIVATE_MESSENGER_CAPACITY_PAUSED' ||
+    error?.message === 'PRIVATE_MESSENGER_PAUSED' ||
+    error?.message === 'PRIVATE_MESSENGER_CAPACITY_PAUSED'
+}
+
+function capacityPausedError () {
+  return Object.assign(new Error('PRIVATE_MESSENGER_CAPACITY_PAUSED'), {
+    code: 'PRIVATE_MESSENGER_CAPACITY_PAUSED',
+    pauseReasons: ['capacity'],
+    retryWhenAvailable: true
+  })
+}
+
+function expiredCapacityEgress () {
+  return Object.assign(new Error('INBOX_DELIVERY_EXPIRED'), {
+    code: 'INBOX_DELIVERY_EXPIRED',
+    retryWhenAvailable: true
+  })
 }
 
 function isCapacityPressureError (error) {
@@ -1052,7 +1071,11 @@ export class PrivateMessenger {
     return uniq([...primary, ...this.fallbackRelays].map(normalizeRelayUrl))
   }
 
-  async resolveSendRouting ({ channel, receiverPubkeys, relays, relayToReceivers, signal, attemptStartedAt, onDebug }) {
+  async resolveSendRouting ({ channel, receiverPubkeys, relays, relayToReceivers, signal, attemptStartedAt, onDebug, capacityEgress }) {
+    this.capacityEgressFor({ capacityEgress })
+    const allowCapacity = Boolean(capacityEgress)
+    if (this.sendingPaused()) throw this.pausedError()
+    if (this.pauseReasons.has('capacity') && !allowCapacity) throw capacityPausedError()
     if (attemptStartedAt !== undefined && (!Number.isFinite(attemptStartedAt) || attemptStartedAt < 0)) throw new ValidationError('INVALID_ATTEMPT_STARTED_AT')
     const recoveryRelays = await this.recoveryMirrorRelays(channel.pubkey)
     const fixed = relayToReceivers ? null : relays?.length ? uniq(relays) : channel.sendRelays.length ? channel.sendRelays : channel.relays.length ? channel.relays : null
@@ -1060,7 +1083,11 @@ export class PrivateMessenger {
     const relaysByPubkey = fixed || relayToReceivers ? undefined : await this._getRelaysByPubkey(recipients)
     const routing = createSendRelayRouting({
       peers: fixed && !recipients.length ? [this.userPubkey] : recipients, relaysByPubkey, recoveryRelays, primaryRelays: fixed?.map(normalizeRelayUrl), primaryRelayToReceivers: relayToReceivers, fallbackRelays: this.fallbackRelays,
-      signal: signal ? AbortSignal.any([this.sendRoutingLifetime.signal, signal]) : this.sendRoutingLifetime.signal,
+      signal: capacityEgress
+        ? AbortSignal.any([this.sendRoutingLifetime.signal, capacityEgress.controller.signal, ...(signal ? [signal] : [])])
+        : signal
+          ? AbortSignal.any([this.sendRoutingLifetime.signal, signal])
+          : this.sendRoutingLifetime.signal,
       exclusions: new Map(),
       relayHealth: this.publicationRelayHealth,
       fallbackDelayMs: this.fallbackDelayMs, attemptStartedAt, pauseSignal: this.sendRoutingPause.signal,
@@ -1075,7 +1102,9 @@ export class PrivateMessenger {
         return result
       },
       isOnline: this._isOnline,
-      isCurrent: () => !this.closePromise && !this.pauseReasons.size && this.channels.has(channel.pubkey)
+      isCurrent: () => !this.closePromise && !this.sendingPaused() &&
+        this.channels.has(channel.pubkey) &&
+        (!capacityEgress || (capacityEgress.active && !capacityEgress.controller.signal.aborted))
     })
     if (routing.circuitOpen) throw relayCircuitError(routing.retryAt)
     if (!relayMapRelays(routing.relayToReceivers).length) throw new ValidationError('NO_RELAYS')
@@ -2069,12 +2098,14 @@ export class PrivateMessenger {
     if (typeof reason !== 'string' || !reason.trim()) throw new ValidationError('PAUSE_REASON_REQUIRED')
     this.assertOpen()
     this.pauseReasons.add(reason)
-    this.decryptionRetry?.controller.abort(this.pausedError())
     this.pauseRevisions.set(reason, (this.pauseRevisions.get(reason) || 0) + 1)
-    this.sendRoutingPause.abort(this.pausedError())
     const pausedError = this.pausedError()
     this.notifyStatus()
-    for (const extension of this.extensions) extension.pause?.()
+    if (reason !== 'capacity') {
+      this.decryptionRetry?.controller.abort(pausedError)
+      this.sendRoutingPause.abort(pausedError)
+      for (const extension of this.extensions) extension.pause?.()
+    }
     this.recordInterruption(this.desiredChannels)
     for (const controller of this.recoveryControllers) controller.abort(pausedError)
     return Promise.all([this.stopWatches([...this.desiredChannels], { reason: pausedError }), this.flushStateWrites()])
@@ -2110,7 +2141,7 @@ export class PrivateMessenger {
     if (this.pauseReasons.size || this.closePromise) return
     const jobs = removed ? this.startChannelBackground(channels, { recover: true }) : [...this.channelBackground.values()].map(job => job.work)
     if (removed) this.retryPendingDecryptions().catch(error => this.onError?.(error))
-    if (removed) {
+    if (removed && reason !== 'capacity') {
       for (const extension of this.extensions) {
         const work = Promise.resolve().then(() => { if (!this.pauseReasons.size && !this.closePromise) return extension.resume?.() })
         work.catch(error => this.onError?.(error))
@@ -2292,9 +2323,24 @@ export class PrivateMessenger {
   async handleAsk (channelPubkey, message) {
     if (message.provenance === 'hearsay') return this.enqueueRumor('message', channelPubkey, message)
     this.trackSeederActivity(channelPubkey, message)
-    for (const extension of this.extensions) if (await extension.handleAsk?.(channelPubkey, message)) return
+    for (const extension of this.extensions) {
+      if (!extension.handleAsk) continue
+      const capacityEgress = this.createCapacityEgress()
+      try {
+        if (await extension.handleAsk(channelPubkey, message, { capacityEgress })) return
+        capacityEgress.release()
+      } catch (error) {
+        capacityEgress.release(error)
+        throw error
+      }
+    }
     if (doesModeStoreRecoverySeeds(this.channels.get(channelPubkey)?.mode) && messageCode(message) === MISSING_MESSAGES_ASK_CODE) {
-      await this.replyWithStoredSeeds(channelPubkey, message)
+      const capacityEgress = this.createCapacityEgress()
+      try {
+        await this.replyWithStoredSeeds(channelPubkey, message, { messenger: capacityEgress.messenger })
+      } finally {
+        capacityEgress.release()
+      }
       return
     }
     await this.enqueueRumor('ask', channelPubkey, message)
@@ -2821,16 +2867,18 @@ export class PrivateMessenger {
     })
     if (!reservation) return null
     if (this.closePromise) { await reservation.nack(); return null }
+    const capacityEgress = this.createCapacityEgress()
     let finish
     const settled = new Promise(resolve => { finish = resolve })
     const done = () => {
       clearInterval(timer)
+      capacityEgress.release()
       this.deliveries.delete(delivery)
       finish()
       this.wakeDeliveries()
     }
-    const settle = async method => {
-      const result = await reservation[method]()
+    const settle = async (method, options) => {
+      const result = await reservation[method](options)
       done()
       if (method === 'ack' && result && !this.closePromise && this.pauseReasons.has('capacity')) {
         this.checkCapacity().catch(err => this.onError?.(err))
@@ -2840,7 +2888,8 @@ export class PrivateMessenger {
     const delivery = {
       message: withoutQueueMetadata(reservation.item),
       ack: () => settle('ack'),
-      nack: () => settle('nack')
+      nack: options => settle('nack', options),
+      capacityEgress: capacityEgress.messenger
     }
     Object.defineProperty(delivery, 'settled', { value: settled })
     this.deliveries.add(delivery)
@@ -2851,12 +2900,17 @@ export class PrivateMessenger {
     return delivery
   }
 
-  async ask ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, idempotencyKey, deletionPubkey, useBulkPacing = false }) {
-    idempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
-    const channel = this.requireWritableChannel(channelPubkey)
+  async ask (options = {}) {
+    const {
+      channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers,
+      message, code, payload, error, content, idempotencyKey, deletionPubkey, useBulkPacing = false
+    } = options
+    const capacityEgress = this.capacityEgressFor(options)
+    const normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
+    const channel = this.requireWritableChannel(channelPubkey, { capacityEgress })
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
-      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [receiverPubkey], relays, relayToReceivers })
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [receiverPubkey], relays, relayToReceivers, capacityEgress })
       this.debugSend('ask', channelPubkey, { code, receiverPubkey })
       return await this._privateMessage.ask({
         senderSigner: this.userSigner,
@@ -2874,7 +2928,7 @@ export class PrivateMessenger {
         payload,
         error,
         content,
-        idempotencyKey,
+        idempotencyKey: normalizedIdempotencyKey,
         useBulkPacing,
         onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
         _getIykcProofs: this.contentKeyLookup()
@@ -2882,9 +2936,14 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async reply ({ channelPubkey = this.defaultChannelPubkey(), question, receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, idempotencyKey, deletionPubkey, expiresAt, useBulkPacing = false }) {
-    idempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
-    const channel = this.requireWritableChannel(channelPubkey)
+  async reply (options = {}) {
+    const {
+      channelPubkey = this.defaultChannelPubkey(), question, receiverPubkey, relays, relayToReceivers,
+      message, code, payload, error, content, idempotencyKey, deletionPubkey, expiresAt, useBulkPacing = false
+    } = options
+    const capacityEgress = this.capacityEgressFor(options)
+    const normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
+    const channel = this.requireWritableChannel(channelPubkey, { capacityEgress })
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
       const expirationSeconds = replyExpirationSeconds(
@@ -2893,7 +2952,7 @@ export class PrivateMessenger {
         this._now()
       )
       const resolvedReceiverPubkey = receiverPubkey || question?.pubkey || ''
-      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [resolvedReceiverPubkey], relays, relayToReceivers })
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [resolvedReceiverPubkey], relays, relayToReceivers, capacityEgress })
       this.debugSend('reply', channelPubkey, { code, receiverPubkey: receiverPubkey || question?.pubkey || '' })
       return await this._privateMessage.reply({
         senderSigner: this.userSigner,
@@ -2912,7 +2971,7 @@ export class PrivateMessenger {
         payload,
         error,
         content,
-        idempotencyKey,
+        idempotencyKey: normalizedIdempotencyKey,
         useBulkPacing,
         onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
         _getIykcProofs: this.contentKeyLookup()
@@ -2920,12 +2979,17 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async tell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers, message, code, payload, error, content, idempotencyKey, deletionPubkey, useBulkPacing = false }) {
-    idempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
-    const channel = this.requireWritableChannel(channelPubkey)
+  async tell (options = {}) {
+    const {
+      channelPubkey = this.defaultChannelPubkey(), receiverPubkey, relays, relayToReceivers,
+      message, code, payload, error, content, idempotencyKey, deletionPubkey, useBulkPacing = false
+    } = options
+    const capacityEgress = this.capacityEgressFor(options)
+    const normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
+    const channel = this.requireWritableChannel(channelPubkey, { capacityEgress })
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
-      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [receiverPubkey], relays, relayToReceivers })
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: [receiverPubkey], relays, relayToReceivers, capacityEgress })
       this.debugSend('tell', channelPubkey, { code, receiverPubkey })
       return await this._privateMessage.tell({
         senderSigner: this.userSigner,
@@ -2943,7 +3007,7 @@ export class PrivateMessenger {
         payload,
         error,
         content,
-        idempotencyKey,
+        idempotencyKey: normalizedIdempotencyKey,
         useBulkPacing,
         onPreparedSeed: this.outgoingSeedHandler(channelPubkey),
         _getIykcProofs: this.contentKeyLookup()
@@ -2951,16 +3015,22 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async yell ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, message, code, payload, error, content, idempotencyKey, deletionPubkey, createdAt, createdAtMs, onPreparedSeed, preparedPublication, preparedPublications, useBulkPacing = false }) {
-    idempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
-    const channel = this.requireWritableChannel(channelPubkey)
+  async yell (options = {}) {
+    const {
+      channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers,
+      message, code, payload, error, content, idempotencyKey, deletionPubkey, createdAt, createdAtMs,
+      onPreparedSeed, preparedPublication, preparedPublications, useBulkPacing = false
+    } = options
+    const capacityEgress = this.capacityEgressFor(options)
+    const normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey) || undefined
+    const channel = this.requireWritableChannel(channelPubkey, { capacityEgress })
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
       const prepared = normalizePreparedPublications({ preparedPublication, preparedPublications })
       const receivers = uniq(receiverPubkeys?.length
         ? receiverPubkeys
         : prepared.flatMap(publication => publication.receiverPubkeys || []))
-      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: receivers, relays, relayToReceivers })
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: receivers, relays, relayToReceivers, capacityEgress })
       this.debugSend('yell', channelPubkey, { code, receiverPubkeys: receivers })
       return await this._privateMessage.yell({
         senderSigner: this.userSigner,
@@ -2978,7 +3048,7 @@ export class PrivateMessenger {
         payload,
         error,
         content,
-        idempotencyKey,
+        idempotencyKey: normalizedIdempotencyKey,
         createdAt,
         createdAtMs,
         useBulkPacing,
@@ -3187,9 +3257,45 @@ export class PrivateMessenger {
     return channel
   }
 
-  requireWritableChannel (pubkey) {
+  capacityEgressFor (options) {
+    const token = options?.[CAPACITY_EGRESS] || options?.capacityEgress
+    if (!token) return null
+    if (!token.active || token.controller?.signal?.aborted) throw expiredCapacityEgress()
+    return token
+  }
+
+  createCapacityEgress () {
+    const token = { active: true, controller: new AbortController() }
+    const scopedMethod = method => options => {
+      if (!token.active) return Promise.reject(expiredCapacityEgress())
+      return this[method]({ ...(options || {}), [CAPACITY_EGRESS]: token })
+    }
+    return {
+      messenger: Object.freeze({
+        ask: scopedMethod('ask'),
+        reply: scopedMethod('reply'),
+        tell: scopedMethod('tell'),
+        yell: scopedMethod('yell')
+      }),
+      token,
+      release (reason = expiredCapacityEgress()) {
+        if (!token.active) return
+        token.active = false
+        token.controller.abort(reason)
+      }
+    }
+  }
+
+  sendingPaused () {
+    return [...this.pauseReasons].some(reason => reason !== 'capacity')
+  }
+
+  requireWritableChannel (pubkey, { capacityEgress } = {}) {
+    this.capacityEgressFor({ capacityEgress })
+    const allowCapacity = Boolean(capacityEgress)
     this.assertOpen()
-    if (this.pauseReasons.size) throw this.pausedError()
+    if (this.sendingPaused()) throw this.pausedError()
+    if (this.pauseReasons.has('capacity') && !allowCapacity) throw capacityPausedError()
     const channel = this.requireChannel(pubkey)
     if (!channel.signer) throw new ValidationError('PRIVATE_CHANNEL_WRITER_REQUIRED')
     return channel
@@ -3402,14 +3508,15 @@ export class PrivateMessenger {
     return this.#askSeedersForMissingRangeAttempt(channelPubkey, range.start, until)
   }
 
-  async replyWithStoredSeeds (channelPubkey, message) {
+  async replyWithStoredSeeds (channelPubkey, message, { messenger = this } = {}) {
     const payload = isPlainObject(message.payload?.payload) ? message.payload.payload : {}
     const since = Number.isFinite(payload.since) ? payload.since : undefined
     const until = Number.isFinite(payload.until) ? payload.until : undefined
     const priority = payload.priority === 'lower' || payload.priority === 'lowest'
       ? payload.priority
       : 'normal'
-    const packer = this.createMissingMessageReplyPacker({
+    const packer = createMissingMessageReplyPacker({
+      messenger,
       channelPubkey,
       question: message.event,
       receiverPubkey: message.event?.pubkey,
@@ -3891,7 +3998,7 @@ export class PrivateMessenger {
   async deferDecryption (failure) {
     this.assertOpen()
     const pubkey = failure.record.channelPubkey
-    if (this.pauseReasons.size || !this.channels.has(pubkey)) throw this.pausedError()
+    if (this.sendingPaused() || !this.channels.has(pubkey)) throw this.pausedError()
     try { return await this.pendingDecryption.save(failure) } catch (error) {
       this.recordInterruption([pubkey], failure.record.outer?.created_at)
       if (isRecoverableStorageFailure(error)) this.pauseInternally('storage').catch(err => this.onError?.(err))
@@ -3912,7 +4019,7 @@ export class PrivateMessenger {
 
   retryPendingDecryptions ({ force = false } = {}) {
     if (typeof force !== 'boolean') throw new ValidationError('INVALID_FORCE')
-    if (this.closePromise || this.pauseReasons.size || !this.initialized) return Promise.resolve()
+    if (this.closePromise || this.sendingPaused() || !this.initialized) return Promise.resolve()
     if (this.decryptionRetry && !this.decryptionRetry.controller.signal.aborted) {
       // Before a pass reads its snapshot, new requests belong to that pass.
       if (this.decryptionRetry.started) this.decryptionRetry.again = true
@@ -3936,7 +4043,7 @@ export class PrivateMessenger {
           if (!channel || !this.desiredChannels.has(channelPubkey)) return
           const current = () => {
             signal.throwIfAborted()
-            if (this.pauseReasons.size || this.channels.get(channelPubkey) !== channel || !this.desiredChannels.has(channelPubkey)) throw new Error('PRIVATE_CHANNEL_CHANGED')
+            if (this.sendingPaused() || this.channels.get(channelPubkey) !== channel || !this.desiredChannels.has(channelPubkey)) throw new Error('PRIVATE_CHANNEL_CHANGED')
           }
           try {
             await this._privateChannel.replayDeferredDecryptions({
