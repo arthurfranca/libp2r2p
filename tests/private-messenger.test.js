@@ -2884,6 +2884,142 @@ test('seeder channels publish presence immediately and on interval', async () =>
   assert.deepEqual(cleared, intervals)
 })
 
+test('inbound seeder presence coalesces and can flush while capacity is paused', async () => {
+  const pm = fakePrivateMessage()
+  const timers = []
+  const admissions = []
+  const now = Math.floor(Date.now() / 1000)
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    _privateChannel: { fetchHistory: async () => [] },
+    admitInboundPeer: (message, admission) => {
+      admissions.push({ message, admission })
+      return true
+    },
+    _setTimeout: (fn, ms) => {
+      const timer = { fn, ms }
+      timers.push(timer)
+      return timer
+    },
+    _clearTimeout: timer => {
+      const index = timers.indexOf(timer)
+      if (index >= 0) timers.splice(index, 1)
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{
+      pubkey: 'channel',
+      signer: signer('channel'),
+      relays: ['wss://relay.example'],
+      seeders: ['alice']
+    }]
+  })
+  const presence = (id, createdAt, pubkey = 'alice') => ({
+    event: {
+      id,
+      kind: TELL_KIND,
+      pubkey,
+      created_at: createdAt,
+      tags: [['h', SEEDER_PRESENCE_CODE]],
+      content: '{}'
+    },
+    outer: { id: `outer-${id}`, created_at: createdAt },
+    meta: { channelPubkey: 'channel' },
+    payload: { code: SEEDER_PRESENCE_CODE, payload: {} },
+    senderPubkey: pubkey,
+    yell: { id }
+  })
+
+  try {
+    const timerCount = timers.length
+    await pm.watchCalls[0].onYell(presence('old', now - 20))
+    await pm.watchCalls[0].onYell(presence('new', now - 5))
+    await pm.watchCalls[0].onYell(presence('unexpected', now, 'mallory'))
+
+    assert.equal(admissions.length, 3)
+    assert.deepEqual(
+      [...messenger.pendingSeederPresence.values()].map(value => value.senderPubkey),
+      ['alice']
+    )
+    const presenceTimers = timers.slice(timerCount).filter(timer => timer.ms === 250)
+    assert.equal(presenceTimers.length, 1)
+    assert.equal(messenger.pendingSeederPresence.get(
+      messenger.seederPresenceKey('channel', 'alice')
+    ).at, now - 5)
+
+    await messenger.pause('capacity')
+    assert.equal(messenger.pendingSeederPresence.size, 1)
+    await presenceTimers[0].fn()
+
+    const activity = messenger.readState().channels.channel.seederActivity.alice
+    assert.equal(activity.lastActiveAt, now - 5)
+    assert.equal(activity.announcedAt, now - 5)
+    assert.equal(messenger.pendingSeederPresence.size, 0)
+    assert.equal(messenger.seederPresenceFlushTimer, null)
+  } finally {
+    await messenger.close()
+  }
+})
+
+test('explicit pauses and unwatch discard pending inbound seeder presence', async () => {
+  const pm = fakePrivateMessage()
+  const timers = []
+  const now = Math.floor(Date.now() / 1000)
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    _privateChannel: { fetchHistory: async () => [] },
+    _setTimeout: (fn, ms) => {
+      const timer = { fn, ms }
+      timers.push(timer)
+      return timer
+    },
+    _clearTimeout: timer => {
+      const index = timers.indexOf(timer)
+      if (index >= 0) timers.splice(index, 1)
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{
+      pubkey: 'channel',
+      signer: signer('channel'),
+      relays: ['wss://relay.example'],
+      seeders: ['alice']
+    }]
+  })
+  const deliverPresence = id => pm.watchCalls.at(-1).onYell({
+    event: {
+      id,
+      kind: TELL_KIND,
+      pubkey: 'alice',
+      created_at: now,
+      tags: [['h', SEEDER_PRESENCE_CODE]],
+      content: '{}'
+    },
+    outer: { id: `outer-${id}`, created_at: now },
+    meta: { channelPubkey: 'channel' },
+    payload: { code: SEEDER_PRESENCE_CODE, payload: {} },
+    senderPubkey: 'alice',
+    yell: { id }
+  })
+
+  try {
+    await deliverPresence('paused')
+    assert.equal(messenger.pendingSeederPresence.size, 1)
+    await messenger.pause('vault')
+    assert.equal(messenger.pendingSeederPresence.size, 0)
+    assert.equal(messenger.seederPresenceFlushTimer, null)
+
+    await messenger.resume('vault')
+    await deliverPresence('unwatched')
+    assert.equal(messenger.pendingSeederPresence.size, 1)
+    await messenger.unwatch('channel')
+    assert.equal(messenger.pendingSeederPresence.size, 0)
+    assert.equal(messenger.seederPresenceFlushTimer, null)
+  } finally {
+    await messenger.close()
+  }
+})
+
 test('seeder channels store router seeds separately, consume messages, and answer missing-message asks', async () => {
   const pm = fakePrivateMessage()
   const now = Math.floor(Date.now() / 1000)
@@ -3327,7 +3463,7 @@ test('event-store seed adapters batch writes and stored-answer checks', async ()
 test('recovery asks online seeders for the relay-uncovered left edge', async () => {
   const pm = fakePrivateMessage()
   const fetches = []
-  let scheduled = null
+  const timers = []
   const now = Math.floor(Date.now() / 1000)
   await seedMessengerState({
     channel: { lastSeenAt: now - 20, lastWatchedAt: now - 20 }
@@ -3348,13 +3484,19 @@ test('recovery asks online seeders for the relay-uncovered left edge', async () 
         return [{ id: 'outer-id', created_at: now - 5 }]
       }
     },
-    _setTimeout: fn => { scheduled = fn }
+    _setTimeout: (fn, ms) => {
+      const timer = { fn, ms }
+      timers.push(timer)
+      return timer
+    }
   }).init({
     userSigner: signer('user'),
     channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'], seeders: ['seeder'] }]
   })
 
-  pm.watchCalls[0].onYell({
+  const recoveryTimer = timers.findLast(timer => timer.ms === 500)
+  const timerCount = timers.length
+  await pm.watchCalls[0].onYell({
     event: { id: 'presence-id', kind: TELL_KIND, pubkey: 'seeder', created_at: now - 2, tags: [['h', SEEDER_PRESENCE_CODE]], content: '{}' },
     outer: { id: 'presence-outer-id', created_at: now - 2 },
     meta: { channelPubkey: 'channel' },
@@ -3364,7 +3506,11 @@ test('recovery asks online seeders for the relay-uncovered left edge', async () 
 
   assert.equal((await takeMessage(messenger)), null)
 
-  await scheduled()
+  const presenceTimer = timers.slice(timerCount).find(timer => timer.ms === 250)
+  assert.ok(presenceTimer)
+  await presenceTimer.fn()
+  assert.ok(recoveryTimer)
+  await recoveryTimer.fn()
 
   const ask = pm.sent.find(sent => sent.method === 'ask' && sent.options.code === MISSING_MESSAGES_ASK_CODE)
   assert.equal(fetches.length, 1)

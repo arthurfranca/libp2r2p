@@ -122,6 +122,8 @@ const STORAGE_POLICY_BROADCAST_CHANNEL = 'libp2r2p:private-messenger:storage-pol
 const DEFAULT_OFFLINE_SKEW_SECONDS = 30
 const DEFAULT_RELOAD_GAP_DELAY_MS = 500
 const DEFAULT_SEEDER_PRESENCE_INTERVAL_MS = 10 * 60 * 1000
+const SEEDER_PRESENCE_COALESCE_MS = 250
+const SEEDER_PRESENCE_MAX_PENDING = 4096
 const DEFAULT_SEEDER_ONLINE_SECONDS = 20 * 60
 const DEFAULT_MAX_DYNAMIC_RECOVERY_SEEDERS = 8
 const DEFAULT_MESSAGE_QUEUE_MAX_BYTES = 16 * 1024 * 1024 // 16 MiB
@@ -515,6 +517,8 @@ export class PrivateMessenger {
     this.watchRevisionByChannel = new Map()
     this.presenceTimers = new Map()
     this.presenceJobs = new Map()
+    this.pendingSeederPresence = new Map()
+    this.seederPresenceFlushTimer = null
     this.seedQueueOperationTail = Promise.resolve()
     this.stopRelayListWatcher = null
     this.relayListWatcherPubkey = ''
@@ -952,6 +956,10 @@ export class PrivateMessenger {
         this.channelDebugRefs.delete(pubkey)
       }
     }
+    this.discardSeederPresence([
+      ...removedPubkeys,
+      ...changed.map(channel => channel.pubkey)
+    ])
 
     const storageSnapshot = await activatePrivateMessengerStorage({
       userPubkey: this.userPubkey,
@@ -1274,6 +1282,78 @@ export class PrivateMessenger {
     return true
   }
 
+  seederPresenceKey (channelPubkey, senderPubkey) {
+    return JSON.stringify([channelPubkey, senderPubkey])
+  }
+
+  async receiveSeederPresence (channelPubkey, message) {
+    if (this.closePromise || this.sendingPaused() || message.provenance === 'hearsay' ||
+        !this.desiredChannels.has(channelPubkey)) return
+    if (!this.#admitInboundPeer(channelPubkey, 'yell', message)) return
+    const senderPubkey = message.senderPubkey || message.event?.pubkey
+    if (!senderPubkey) return
+    const channel = this.channels.get(channelPubkey)
+    if (!channel) return
+    if (channel.seeders?.length && !channel.seeders.includes(senderPubkey)) return
+    const at = messageTime(message)
+    const key = this.seederPresenceKey(channelPubkey, senderPubkey)
+    const current = this.pendingSeederPresence.get(key)
+    if (current && current.at >= at) return
+    if (current) this.pendingSeederPresence.delete(key)
+    if (!channel.seeders?.length) {
+      const maxDynamic = Number.isSafeInteger(this.maxDynamicRecoverySeeders) &&
+        this.maxDynamicRecoverySeeders > 0
+        ? this.maxDynamicRecoverySeeders
+        : 0
+      if (!maxDynamic) return
+      const channelEntries = [...this.pendingSeederPresence.entries()]
+        .filter(([, pending]) => pending.channelPubkey === channelPubkey)
+      if (channelEntries.length >= maxDynamic) {
+        channelEntries.sort((left, right) => left[1].at - right[1].at)
+        for (const [pendingKey] of channelEntries.slice(
+          0,
+          channelEntries.length - maxDynamic + 1
+        )) {
+          this.pendingSeederPresence.delete(pendingKey)
+        }
+      }
+    }
+    while (this.pendingSeederPresence.size >= SEEDER_PRESENCE_MAX_PENDING) {
+      this.pendingSeederPresence.delete(this.pendingSeederPresence.keys().next().value)
+    }
+    this.pendingSeederPresence.set(key, { channelPubkey, senderPubkey, at })
+    if (this.seederPresenceFlushTimer) return
+    this.seederPresenceFlushTimer = this._setTimeout(() => {
+      this.seederPresenceFlushTimer = null
+      this.flushSeederPresence()
+    }, SEEDER_PRESENCE_COALESCE_MS)
+    this.seederPresenceFlushTimer?.unref?.()
+  }
+
+  flushSeederPresence () {
+    const pending = [...this.pendingSeederPresence.values()]
+    this.pendingSeederPresence.clear()
+    for (const { channelPubkey, senderPubkey, at } of pending) {
+      if (this.closePromise || this.sendingPaused() || !this.desiredChannels.has(channelPubkey)) continue
+      const channel = this.channels.get(channelPubkey)
+      if (!channel) continue
+      const configuredSeeders = channel.seeders || []
+      if (configuredSeeders.length && !configuredSeeders.includes(senderPubkey)) continue
+      this.markSeederActive(channelPubkey, senderPubkey, { announced: true, at })
+    }
+  }
+
+  discardSeederPresence (channels) {
+    const channelSet = channels ? new Set(channels) : null
+    for (const [key, pending] of this.pendingSeederPresence) {
+      if (!channelSet || channelSet.has(pending.channelPubkey)) this.pendingSeederPresence.delete(key)
+    }
+    if (!this.pendingSeederPresence.size && this.seederPresenceFlushTimer) {
+      this._clearTimeout(this.seederPresenceFlushTimer)
+      this.seederPresenceFlushTimer = null
+    }
+  }
+
   contentKeyStatus (contentKeyPubkey) {
     if (!contentKeyPubkey) return 'none'
     return contentKeyPubkey === this.contentKeyPubkey ? 'known' : 'unknown'
@@ -1425,7 +1505,9 @@ export class PrivateMessenger {
           onAsk: message => this.receive(pubkey, () => this.handleAsk(pubkey, message), message, { inboundType: 'ask' }),
           onReply: message => this.receive(pubkey, () => this.handleReply(pubkey, message), message, { inboundType: 'reply' }),
           onTell: message => this.receive(pubkey, () => this.handleTell(pubkey, message), message, { inboundType: 'tell' }),
-          onYell: message => this.receive(pubkey, () => this.handleYell(pubkey, message), message, { inboundType: 'yell' }),
+          onYell: message => messageCode(message) === SEEDER_PRESENCE_CODE
+            ? this.receiveSeederPresence(pubkey, message)
+            : this.receive(pubkey, () => this.handleYell(pubkey, message), message, { inboundType: 'yell' }),
           onNym: message => this.receive(pubkey, () => this.handleNym(pubkey, message), message, { inboundType: 'nym' }),
           onMessage: message => {
             const type = eventType(message.event)
@@ -1972,6 +2054,7 @@ export class PrivateMessenger {
 
   unwatch (channels) {
     const pubkeys = channels ? uniq(Array.isArray(channels) ? channels : [channels]) : [...this.desiredChannels]
+    this.discardSeederPresence(pubkeys)
     for (const extension of this.extensions) extension.unwatch?.(pubkeys)
     for (const pubkey of pubkeys) {
       this.desiredChannels.delete(pubkey)
@@ -2099,6 +2182,7 @@ export class PrivateMessenger {
   applyPause (reason) {
     if (typeof reason !== 'string' || !reason.trim()) throw new ValidationError('PAUSE_REASON_REQUIRED')
     this.assertOpen()
+    if (reason !== 'capacity') this.discardSeederPresence()
     this.pauseReasons.add(reason)
     this.pauseRevisions.set(reason, (this.pauseRevisions.get(reason) || 0) + 1)
     const pausedError = this.pausedError()
@@ -4184,6 +4268,7 @@ export class PrivateMessenger {
         await (this.seedStorage ? this.seedStorage.removeLocal({ channelPubkey: pubkey }) : this.seedQueue?.removeBy('byChannel', pubkey))
       }
       for (const pubkey of stalePubkeys) this.dropRecoveryState(pubkey)
+      this.discardSeederPresence(stalePubkeys)
       this.state = state
       if (stalePubkeys.length) await this.removeChannelStates(stalePubkeys)
     })
@@ -4221,6 +4306,7 @@ export class PrivateMessenger {
     this.decryptionScheduler.close()
     this.stopDecryptionForeground?.()
     if (this.closePromise) return this.closePromise
+    this.discardSeederPresence()
     const initSettledPromise = this.initSettledPromise
     this.sendRoutingLifetime.abort()
     this.publicationRelayHealth.clear()
