@@ -1939,11 +1939,13 @@ export class PrivateMessenger {
   }
 
   recordInterruption (channels, at = nowSeconds()) {
+    const now = nowSeconds()
+    const eventTime = Number.isSafeInteger(at) && at >= 0 ? Math.min(at, now) : now
     const state = this.readState()
     for (const pubkey of channels) {
       if (!this.offlineRecoverySecondsFor(pubkey)) continue
       const current = state.channels[pubkey] || {}
-      const start = Math.max(0, at - this.offlineSkewSeconds)
+      const start = Math.max(0, eventTime - this.offlineSkewSeconds)
       current.openOfflineStart = Math.min(current.openOfflineStart ?? start, start)
       state.channels[pubkey] = current
     }
@@ -2513,7 +2515,10 @@ export class PrivateMessenger {
     if (this.pauseReasons.has('capacity')) throw this.pausedError()
     const capacity = await this.queue.getCapacity()
     if (capacity.usedBytes >= inboxCapacityLimits(capacity.maxBytes).highWaterBytes) {
-      throw await this.beginCapacityPressure(capacity)
+      throw await this.beginCapacityPressure(capacity, {
+        channelPubkey,
+        interruptionAt: messageTime(message)
+      })
     }
     const record = {
       type,
@@ -2782,7 +2787,8 @@ export class PrivateMessenger {
     }
   }
 
-  async beginCapacityPressure (capacity) {
+  async beginCapacityPressure (capacity, { channelPubkey, interruptionAt = nowSeconds() } = {}) {
+    if (channelPubkey) this.recordInterruption([channelPubkey], interruptionAt)
     this.applyCapacityRecoveryTarget(capacity)
     const pause = this.pauseReasons.has('capacity') ? null : this.pause('capacity')
     pause?.catch(error => this.onError?.(error))

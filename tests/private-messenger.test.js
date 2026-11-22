@@ -4034,25 +4034,33 @@ test('capacity-scoped delivery sends bypass only capacity and expire with their 
 test('inbox pressure pauses at high water, reports sanitized aggregates and resumes at low water', async () => {
   const pm = fakePrivateMessage()
   let recovered = 0
+  const fetches = []
   const errors = []
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
     messageQueueMaxBytes: 5000,
     onError: error => errors.push(error),
-    _privateChannel: { fetchHistory: async () => { recovered++; return [] } }
+    _privateChannel: {
+      fetchHistory: async options => {
+        recovered++
+        fetches.push(options)
+        return []
+      }
+    }
   }).init({
     userSigner: signer('owner'),
     channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
   })
   try {
     const now = Math.floor(Date.now() / 1000)
+    const eventCreatedAt = now - 20
     let pressure
     for (let index = 0; index < 20 && !pressure; index++) {
       const id = `${index}`.padStart(64, '0')
       try {
         await pm.watchCalls[0].onMessage({
-          event: { kind: 9, id, pubkey: 'peer', tags: [], created_at: now, content: `private-${index}-${'a'.repeat(500)}` },
-          outer: { created_at: now },
+          event: { kind: 9, id, pubkey: 'peer', tags: [], created_at: eventCreatedAt, content: `private-${index}-${'a'.repeat(500)}` },
+          outer: { created_at: eventCreatedAt },
           senderPubkey: 'peer',
           payload: { code: 'nostrDbSync_push_kpkr' }
         })
@@ -4078,6 +4086,11 @@ test('inbox pressure pauses at high water, reports sanitized aggregates and resu
     assert.equal(serialized.includes('private-'), false)
     assert.equal(serialized.includes('peer'), false)
     assert.equal(messenger.pauseReasons.has('capacity'), true)
+    assert.ok(
+      messenger.readState().channels.channel.openOfflineStart <= eventCreatedAt - messenger.offlineSkewSeconds,
+      'capacity interruption must include the rejected outer.created_at and offline skew'
+    )
+    assert.ok(pm.stopped.includes('channel'), 'capacity pressure must close the channel subscription')
     await assert.rejects(pm.watchCalls[0].onMessage({
       event: { kind: 9, id: 'f'.repeat(64), pubkey: 'peer', tags: [], created_at: now, content: 'later' },
       outer: { created_at: now },
@@ -4099,6 +4112,8 @@ test('inbox pressure pauses at high water, reports sanitized aggregates and resu
     if (messenger.capacityCheck) await messenger.capacityCheck
     assert.equal(messenger.pauseReasons.has('capacity'), false)
     assert.equal(recovered, 1)
+    assert.ok(fetches[0].since <= eventCreatedAt - messenger.offlineSkewSeconds)
+    assert.ok(fetches[0].until >= eventCreatedAt)
     assert.equal(errors.length, 1)
     assert.equal(errors[0].code, 'PRIVATE_MESSENGER_CAPACITY_PRESSURE')
   } finally { await messenger.close() }
@@ -4145,6 +4160,25 @@ test('an existing inbox above high water pauses before starting remote backgroun
     assert.equal(errors.length, 1)
     assert.equal(errors[0].code, 'PRIVATE_MESSENGER_CAPACITY_PRESSURE')
   } finally { await second.close() }
+})
+
+test('interruption timestamps from the future clamp to the local clock before applying skew', async () => {
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _privateChannel: { fetchHistory: async () => [] }
+  }).init({
+    userSigner: signer('owner'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  try {
+    const now = Math.floor(Date.now() / 1000)
+    messenger.recordInterruption(['channel'], now + 3600)
+    const start = messenger.readState().channels.channel.openOfflineStart
+    assert.ok(start <= now)
+    assert.ok(start >= now - messenger.offlineSkewSeconds - 1)
+  } finally {
+    await messenger.close()
+  }
 })
 
 test('failed recovery ingestion retains its range and does not advance lastSeenAt', async () => {
