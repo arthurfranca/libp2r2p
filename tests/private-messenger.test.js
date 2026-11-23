@@ -1695,6 +1695,81 @@ test('generic receive coalescing applies D only to stable control types', async 
   }
 })
 
+test('missing-message asks coalesce by exact range and priority before app delivery', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({ _privateMessage: pm }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const ask = (id, createdAt, { since = 10, until = 20, priority = 'normal' } = {}) => {
+    const message = inboxRumor('ask', id, createdAt, { code: MISSING_MESSAGES_ASK_CODE })
+    message.payload.payload = {
+      since,
+      until,
+      ...(priority === 'normal' ? {} : { priority })
+    }
+    return message
+  }
+
+  try {
+    await deliverInboxRumor(pm, 'ask', ask('old-range', 10))
+    await deliverInboxRumor(pm, 'ask', ask('new-range', 20))
+    assert.equal((await takeMessage(messenger)).event.id, 'new-range')
+    assert.equal(await messenger.nextMessage(), null)
+
+    await deliverInboxRumor(pm, 'ask', ask('normal-range', 30))
+    await deliverInboxRumor(pm, 'ask', ask('lower-range', 40, { priority: 'lower' }))
+    const delivered = []
+    for (let index = 0; index < 2; index++) {
+      const delivery = await messenger.nextMessage()
+      assert.ok(delivery)
+      delivered.push(delivery.message.event.id)
+      await delivery.ack()
+    }
+    assert.deepEqual(new Set(delivered), new Set(['normal-range', 'lower-range']))
+
+    await deliverInboxRumor(pm, 'ask', ask('range-a', 45, { since: 50, until: 60 }))
+    await deliverInboxRumor(pm, 'ask', ask('range-b', 46, { since: 51, until: 61 }))
+    assert.equal((await takeMessage(messenger)).event.id, 'range-a')
+    assert.equal((await takeMessage(messenger)).event.id, 'range-b')
+
+    await deliverInboxRumor(pm, 'ask', ask('invalid-since-a', 50, { since: 'invalid' }))
+    await deliverInboxRumor(pm, 'ask', ask('invalid-since-b', 60, { since: 'invalid' }))
+    assert.equal((await takeMessage(messenger)).event.id, 'invalid-since-a')
+    assert.equal((await takeMessage(messenger)).event.id, 'invalid-since-b')
+  } finally {
+    await messenger.close()
+  }
+})
+
+test('a custom coalescing resolver can override the built-in missing-ask range key', async () => {
+  const pm = fakePrivateMessage()
+  const sharedKey = 'd'.repeat(64)
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    resolveInboundCoalescing: message => message.payload.code === MISSING_MESSAGES_ASK_CODE
+      ? { key: sharedKey, keep: 'latest' }
+      : null
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  const ask = (id, createdAt, since) => {
+    const message = inboxRumor('ask', id, createdAt, { code: MISSING_MESSAGES_ASK_CODE })
+    message.payload.payload = { since, until: since + 10 }
+    return message
+  }
+
+  try {
+    await deliverInboxRumor(pm, 'ask', ask('custom-old', 10, 100))
+    await deliverInboxRumor(pm, 'ask', ask('custom-new', 20, 200))
+    assert.equal((await takeMessage(messenger)).event.id, 'custom-new')
+    assert.equal(await messenger.nextMessage(), null)
+  } finally {
+    await messenger.close()
+  }
+})
+
 test('generic resolver key overrides D and supports keep-oldest', async () => {
   const pm = fakePrivateMessage()
   const keys = {
@@ -3547,7 +3622,7 @@ test('recovery asks all configured seeders but caps discovered seeders', async (
   assert.deepEqual(discoveredAsks.map(sent => sent.options.receiverPubkey), discoveredSeeders.slice(0, 8))
 })
 
-test('recovery retains the full range until every seeder ask is delivered', async t => {
+test('recovery completes after at least one seeder ask is published', async t => {
   const now = Math.floor(Date.now() / 1000)
   const range = { start: now - 20, end: now - 10 }
   const cases = [
@@ -3573,7 +3648,7 @@ test('recovery retains the full range until every seeder ask is delivered', asyn
         question: { pubkey: 'a'.repeat(64), kind: ASK_KIND, created_at: now, tags: [], content: '' },
         delivery: { reports: [{ success: options.receiverPubkey === 'one' }] }
       }),
-      retained: true
+      retained: false
     },
     {
       name: 'all seeders delivered',
@@ -3594,7 +3669,12 @@ test('recovery retains the full range until every seeder ask is delivered', asyn
       pm.ask = scenario.ask
       const messenger = await new PrivateMessenger({
         _privateMessage: pm,
-        _privateChannel: { fetchHistory: async () => [] }
+        _privateChannel: {
+          fetchHistory: async () => ({
+            oldestCreatedAt: range.end,
+            receivedEventCount: 0
+          })
+        }
       }).init({
         userSigner: signer(userPubkey),
         channels: [{
@@ -3605,16 +3685,49 @@ test('recovery retains the full range until every seeder ask is delivered', asyn
         }]
       })
 
-      const pendingRanges = messenger.readState().channels.channel.offlineRanges
       await messenger.recoverOfflineRanges(['channel'])
-
-      assert.deepEqual(
-        messenger.readState().channels.channel.offlineRanges,
-        scenario.retained ? pendingRanges : []
+      const remaining = messenger.readState().channels.channel.offlineRanges
+      const requestedRangeRemains = remaining.some(rangeEntry =>
+        rangeEntry.start <= range.end && rangeEntry.end >= range.start
       )
+      assert.equal(requestedRangeRemains, scenario.retained)
       await messenger.close()
     })
   }
+})
+
+test('recovery keeps an uncovered range pending when no seeder ask can be published', async () => {
+  const now = Math.floor(Date.now() / 1000)
+  const range = { start: now - 20, end: now - 10 }
+  await seedMessengerState({ channel: { offlineRanges: [range] } }, 'no-seeder-user')
+  const fetches = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    _privateChannel: {
+      fetchHistory: async options => {
+        fetches.push(options)
+        return {
+          oldestCreatedAt: range.end,
+          receivedEventCount: 0
+        }
+      }
+    }
+  }).init({
+    userSigner: signer('no-seeder-user'),
+    channels: [{ pubkey: 'channel', signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  const errors = await messenger.recoverOfflineRanges(['channel'])
+  assert.deepEqual(errors, [])
+  assert.equal(fetches.length, 1)
+  const state = messenger.readState().channels.channel
+  assert.equal(state.recoveredThrough || 0, 0)
+  assert.equal(state.askedThrough, undefined)
+  assert.equal(
+    state.offlineRanges.some(entry => entry.start <= range.end && entry.end >= range.start),
+    true
+  )
+  await messenger.close()
 })
 
 test('recovery asks preserve classified publication failures for retry diagnostics', async t => {
@@ -3645,7 +3758,12 @@ test('recovery asks preserve classified publication failures for retry diagnosti
   const warn = t.mock.method(console, 'warn', () => {})
   const messenger = await new PrivateMessenger({
     _privateMessage: pm,
-    _privateChannel: { fetchHistory: async () => [] }
+    _privateChannel: {
+      fetchHistory: async () => ({
+        oldestCreatedAt: range.end,
+        receivedEventCount: 0
+      })
+    }
   }).init({
     userSigner: signer('diagnostic-user'),
     channels: [{
@@ -4747,6 +4865,7 @@ test('priority lane fetches the requested window before older history', async ()
 
   const record = [...messenger.recoveryRanges.values()].find(entry => entry.channelPubkey === channel)
   assert.ok(record.covered.length)
+  assert.deepEqual(record.asked, [])
   assert.ok([...record.relays.values()].every(state => state.attempts === 0))
   assert.equal(fetches[0].since, since)
   const priorityCoverage = record.covered[0]
@@ -4876,10 +4995,89 @@ test('priority seeder fallback requires recent presence', async t => {
   assert.equal(recent.asks.length, 1)
   assert.equal(recent.asks[0].options.payload.priority, undefined)
   assert.ok(recent.asks[0].options.payload.since <= now && recent.asks[0].options.payload.until >= recent.asks[0].options.payload.since)
-  assert.ok(recent.record.claimed.length)
+  assert.ok(recent.record.asked.length)
   const background = await run(now, { background: true })
   assert.equal(background.asks.length, 1)
   assert.equal(background.asks[0].options.payload.priority, 'lower')
+})
+
+test('tail asks remove their intervals before the full recovery lane runs', async () => {
+  const channel = '11'.repeat(32)
+  const seeder = '22'.repeat(32)
+  const now = Math.floor(Date.now() / 1000)
+  const start = now - 100
+  const tailStart = now - 50
+  await seedMessengerState({
+    [channel]: {
+      offlineRanges: [{ start, end: now }],
+      seederActivity: {
+        [seeder]: { lastActiveAt: now, announcedAt: now }
+      }
+    }
+  })
+  const fetches = []
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    offlineRecoverySeconds: 100,
+    _privateChannel: {
+      fetchHistory: async options => {
+        fetches.push(options)
+        return {
+          oldestCreatedAt: options.until,
+          receivedEventCount: 0
+        }
+      }
+    }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{
+      pubkey: channel,
+      signer: signer('channel'),
+      relays: ['wss://relay.example'],
+      seeders: [seeder]
+    }]
+  })
+
+  messenger.recoveryRangeRecord(channel, { start, end: now })
+  await messenger.askPrioritySeeders(channel, [{ start: tailStart, end: now }])
+  let state = messenger.readState().channels[channel]
+  assert.equal(state.askedThrough, now)
+  assert.deepEqual(state.offlineRanges, [{ start, end: tailStart - 1 }])
+  assert.deepEqual(
+    [...messenger.recoveryRanges.values()][0].asked,
+    [{ start: tailStart, end: now }]
+  )
+
+  fetches.length = 0
+  await messenger.recoverOfflineRanges([channel])
+  assert.equal(fetches[0].since, start)
+  assert.equal(fetches[0].until, tailStart - 1)
+  state = messenger.readState().channels[channel]
+  assert.deepEqual(state.offlineRanges, [])
+  await messenger.close()
+})
+
+test('askedThrough prevents a requested interval from being recreated after restart', async () => {
+  const channel = '11'.repeat(32)
+  const now = Math.floor(Date.now() / 1000)
+  await seedMessengerState({
+    [channel]: {
+      askedThrough: now,
+      offlineRanges: []
+    }
+  })
+  const messenger = await new PrivateMessenger({
+    _privateMessage: fakePrivateMessage(),
+    offlineRecoverySeconds: 60,
+    _privateChannel: { fetchHistory: async () => [] }
+  }).init({
+    userSigner: signer('user'),
+    channels: [{ pubkey: channel, signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+
+  assert.deepEqual(messenger.readState().channels[channel].offlineRanges, [])
+  assert.equal(messenger.readState().channels[channel].askedThrough, now)
+  await messenger.close()
 })
 
 test('recovery relay ordering prefers the most reliable relay', async () => {
@@ -4972,12 +5170,18 @@ test('partial recovery retries the failing relay then hands the left edge to see
   }
 
   assert.equal(fetches.length, limit)
-  assert.deepEqual(messenger.readState().channels.channel.offlineRanges, [])
   assert.equal(messenger.recoveryRanges.size, 0)
   const asks = pm.sent.filter(entry => entry.method === 'ask')
   assert.equal(asks.length, 1)
   assert.equal(asks[0].options.payload.until, now - 5)
   assert.ok(asks[0].options.payload.since < now - 5)
+  assert.equal(
+    messenger.readState().channels.channel.offlineRanges.some(range =>
+      range.start <= asks[0].options.payload.until &&
+      range.end >= asks[0].options.payload.since
+    ),
+    false
+  )
 })
 
 test('all-failed relay attempts exhaust the larger budget before the seeder handoff', async () => {
@@ -5146,7 +5350,7 @@ test('nym recipient maps derive fallback coverage without a separate receiverPub
   assert.equal(typeof pm.sent[0].options._publish, 'function')
 })
 
-test('paged recovery persists partial deliveries but retains the whole interval across restart', async t => {
+test('paged recovery retains a relay-unproven left edge when no seeder accepts it', async t => {
   const now = 1800000000
   t.mock.method(Date, 'now', () => now * 1000)
   let scheduled
@@ -5189,8 +5393,8 @@ test('paged recovery persists partial deliveries but retains the whole interval 
   await scheduled()
   assert.equal(reads[0].since, now - 60)
   const recovered = await second.stateStore.load()
-  assert.equal(recovered.channel.recoveredThrough, now)
-  assert.deepEqual(recovered.channel.offlineRanges, [])
+  assert.equal(recovered.channel.recoveredThrough, 0)
+  assert.deepEqual(recovered.channel.offlineRanges, [{ start: now - 60, end: now - 40 }])
 })
 
 test('event reply packer bounds UTF-8 bytes, sends oversized records alone and preserves order', async () => {

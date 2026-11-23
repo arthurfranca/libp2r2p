@@ -38,8 +38,11 @@
 // - Browser offline/online events add explicit offline ranges with a small skew.
 // - Recovery defaults to 7 days and can be overridden per channel; zero disables durable recovery.
 // - Channel state not actively leased or watched within the configured stale window is pruned.
-// - Seeders announce presence every 10min and are used for the relay-uncovered left edge of a missed range.
-// - Configured seeders are all asked; auto-discovered seeders are capped to the 8 most recently active.
+// - The recovering asker reads relays first, then asks seeders for relay-uncovered intervals and the unproven left edge.
+// - record.covered means relay/EOSE coverage; record.asked means an ask publication received at least one relay ACK.
+// - Asked ranges are removed from persisted offlineRanges and advance askedThrough; no reply is awaited.
+// - Priority/tail recovery uses only recently present seeders. Full recovery tries every configured seeder.
+// - Seeder presence announcements occur every 10min; auto-discovered seeders are capped to the 8 most recently active.
 // - Seeder/watchtower channels store reconstructed router events in a separate IndexedDB queue and auto-reply to recovery asks.
 // - Seeder replies stream compact routers with createMissingMessageReplyPacker({ messenger, question }).update(seed), then finalize(optionalLastSeed).
 // - For other event-list replies, use createEventReplyPacker({ messenger, question, code }).update(event).
@@ -1227,6 +1230,8 @@ export class PrivateMessenger {
     if (!this.offlineRecoverySecondsFor(pubkey)) return []
     const channel = this.channels.get(pubkey)
     const configuredSeeders = channel?.seeders || []
+    // Full recovery intentionally attempts all configured seeders even when
+    // recent presence has not been observed.
     if (configuredSeeders.length) return configuredSeeders.filter(seeder => seeder !== this.userPubkey)
 
     const activity = this.readState().channels[pubkey]?.seederActivity || {}
@@ -1663,7 +1668,7 @@ export class PrivateMessenger {
         start: range.start,
         end: range.end,
         covered: [],
-        claimed: [],
+        asked: [],
         oldestCreatedAt: null,
         relays: new Map(),
         tier: '',
@@ -1734,6 +1739,12 @@ export class PrivateMessenger {
       if (!state.dead && !state.eose && state.pending?.length) return true
     }
     return false
+  }
+
+  unhandledRecoveryRanges (record, range) {
+    return record
+      ? subtractRanges(range, record.asked)
+      : [range]
   }
 
   hasPendingRecovery (channelPubkey) {
@@ -1836,7 +1847,7 @@ export class PrivateMessenger {
       state.eose = done
       state.pending = done
         ? []
-        : subtractRanges({ start: record.start, end: record.end }, mergeRanges([...state.covered, ...record.claimed]))
+        : subtractRanges({ start: record.start, end: record.end }, this.recoveryCoverage(record, state))
       state.events += entry.events || 0
       if (Number.isFinite(entry.elapsedMs)) {
         state.latencyMs = state.latencyMs == null
@@ -1863,17 +1874,51 @@ export class PrivateMessenger {
     record.lastErrors = (history.relays || []).flatMap(entry => [...(entry.errors || []), ...(entry.error ? [entry.error] : [])])
   }
 
-  applyRecoveryCoverage (record, ranges) {
+  recoveryCoverage (record, relayState = null) {
+    return mergeRanges([
+      ...(relayState ? relayState.covered : record.covered),
+      ...record.asked
+    ])
+  }
+
+  applyRelayCoverage (record, ranges) {
     if (!ranges?.length) return
-    record.claimed = mergeRanges([...record.claimed, ...ranges])
     record.covered = mergeRanges([...record.covered, ...ranges])
     for (const state of record.relays.values()) {
       if (state.eose) continue
-      state.pending = subtractRanges({ start: record.start, end: record.end }, mergeRanges([...state.covered, ...record.claimed]))
+      state.pending = subtractRanges({ start: record.start, end: record.end }, this.recoveryCoverage(record, state))
     }
   }
 
+  async persistAskedCoverage (channelPubkey, ranges) {
+    const state = this.readState()
+    const current = state.channels[channelPubkey]
+    if (!current || !ranges.length) return
+    current.offlineRanges = mergeRanges((current.offlineRanges || [])
+      .flatMap(range => subtractRanges(range, ranges)))
+    current.askedThrough = Math.max(
+      Number.isSafeInteger(current.askedThrough) ? current.askedThrough : 0,
+      Math.max(...ranges.map(range => range.end))
+    )
+    state.channels[channelPubkey] = current
+    await this.writeState(state)
+  }
+
+  async applyAskedCoverage (record, ranges) {
+    if (!ranges?.length) return
+    record.asked = mergeRanges([...record.asked, ...ranges])
+    for (const state of record.relays.values()) {
+      if (state.eose) continue
+      state.pending = subtractRanges(
+        { start: record.start, end: record.end },
+        this.recoveryCoverage(record, state)
+      )
+    }
+    await this.persistAskedCoverage(record.channelPubkey, ranges)
+  }
+
   activeRecoverySeeders (channelPubkey) {
+    // Priority/tail recovery is the only path that requires recent presence.
     if (!this.offlineRecoverySecondsFor(channelPubkey)) return []
     const channel = this.channels.get(channelPubkey)
     if (!channel?.signer) return []
@@ -1901,7 +1946,7 @@ export class PrivateMessenger {
         )
         if (!parts.length) continue
         intersects = true
-        if (subtractRanges(parts[0], record.covered).length) return true
+        if (subtractRanges(parts[0], this.recoveryCoverage(record)).length) return true
       }
       return !intersects
     })
@@ -1958,22 +2003,27 @@ export class PrivateMessenger {
   async finalizeRecoveryRange ({ channelPubkey, range, record }) {
     if (this.pauseReasons.size) throw this.pausedError()
     if (!await this.checkRecoveryOnline()) return { complete: false, failures: [], offline: true }
-    const uncovered = subtractRanges({ start: range.start, end: range.end }, record.covered)
+    const uncovered = subtractRanges({ start: range.start, end: range.end }, this.recoveryCoverage(record))
     const oldest = record.oldestCreatedAt
-    const leftEdge = oldest == null
-      ? [{ start: range.start, end: range.end }]
-      : oldest > range.start
-        ? [{ start: range.start, end: Math.min(oldest, range.end) }]
-        : []
+    const leftEdge = oldest != null && oldest > range.start
+      ? [{ start: range.start, end: Math.min(oldest, range.end) }]
+      : []
     const seedRanges = mergeRanges([...uncovered, ...leftEdge])
+      .flatMap(seedRange => subtractRanges(seedRange, record.asked))
     const failures = []
+    const remaining = []
     for (const seedRange of seedRanges) {
       if (this.pauseReasons.size) throw this.pausedError()
       const attempt = await this.#askSeedersForMissingRangeAttempt(channelPubkey, seedRange.start, seedRange.end)
       failures.push(...attempt.failures.map(failure => failure.error))
+      if (!attempt.asks.length) {
+        remaining.push(seedRange)
+        continue
+      }
+      await this.applyAskedCoverage(record, [seedRange])
     }
     record.lastErrors = failures
-    return { complete: failures.length === 0, failures }
+    return { complete: remaining.length === 0, failures, remaining }
   }
 
   scheduleLiveRecovery (pubkey) {
@@ -2514,6 +2564,7 @@ export class PrivateMessenger {
     const messageCreatedAtMs = eventCreatedAtMs(message.event, {
       readMillisecondsTag: timestamped
     })
+    const protocolResolved = missingMessagesAskCoalescingHint(message)
 
     let resolved = null
     if (this.resolveInboundCoalescing) {
@@ -2551,7 +2602,11 @@ export class PrivateMessenger {
         this.onError?.(coalescingError(new ValidationError('INVALID_INBOUND_COALESCING_RESULT')))
       }
     }
-    if (!digest && tagged.key) {
+    if (!digest && protocolResolved) {
+      digest = protocolResolved.key
+      keep = protocolResolved.keep
+      policy = 'protocol'
+    } else if (!digest && tagged.key) {
       digest = idempotencyDigest(tagged.key)
       policy = 'idempotency'
     }
@@ -3473,8 +3528,16 @@ export class PrivateMessenger {
     if (!seconds) return
     const now = nowSeconds()
     const current = this.readState().channels[pubkey] || {}
-    const checkpoint = Math.max(current.lastSeenAt || 0, current.recoveredThrough || 0)
-    const since = checkpoint ? checkpoint - this.offlineSkewSeconds : now - seconds
+    const checkpoint = Math.max(
+      current.lastSeenAt || 0,
+      current.recoveredThrough || 0,
+      current.askedThrough || 0
+    )
+    const since = current.askedThrough
+      ? Math.max(current.askedThrough + 1, checkpoint - this.offlineSkewSeconds)
+      : checkpoint
+        ? checkpoint - this.offlineSkewSeconds
+        : now - seconds
     this.addOfflineRange(pubkey, Math.max(0, now - seconds, since), now)
   }
 
@@ -3570,8 +3633,8 @@ export class PrivateMessenger {
           },
           useBulkPacing: priority !== 'normal'
         })
-        asks.push(ask)
         await assertMessagePublished(ask, ask.question)
+        asks.push(ask)
       } catch (err) {
         const error = sanitizePublicationError(err, {
           operation: 'seeder-recovery-ask',
@@ -3852,7 +3915,7 @@ export class PrivateMessenger {
     const seeders = this.activeRecoverySeeders(channelPubkey)
     if (!seeders.length) return []
     const failures = []
-    const claimed = []
+    const asked = []
     for (const interval of mergeRanges(intervals)) {
       if (this.pauseReasons.size) throw this.pausedError()
       const attempt = await this.#askSeedersForMissingRangeAttempt(channelPubkey, interval.start, interval.end, {
@@ -3860,13 +3923,13 @@ export class PrivateMessenger {
         priority
       })
       failures.push(...attempt.failures.map(failure => failure.error))
-      if (!attempt.failures.length) claimed.push(interval)
+      if (attempt.asks.length) asked.push(interval)
     }
-    if (claimed.length) {
+    if (asked.length) {
       for (const record of this.recoveryRanges.values()) {
         if (record.channelPubkey !== channelPubkey) continue
-        const applied = intersectRanges(claimed, [{ start: record.start, end: record.end }])
-        if (applied.length) this.applyRecoveryCoverage(record, applied)
+        const applied = intersectRanges(asked, [{ start: record.start, end: record.end }])
+        if (applied.length) await this.applyAskedCoverage(record, applied)
       }
     }
     return failures
@@ -3892,7 +3955,7 @@ export class PrivateMessenger {
         [{ start: range.start, end: range.end }]
       )
       if (!priorityIntervals.length) continue
-      const pending = subtractRanges({ start: range.start, end: range.end }, record.covered)
+      const pending = subtractRanges({ start: range.start, end: range.end }, this.recoveryCoverage(record))
       const wanted = intersectRanges(priorityIntervals, pending)
       if (!wanted.length) continue
       const candidates = this.orderedRecoveryRelays(record)
@@ -3909,13 +3972,13 @@ export class PrivateMessenger {
         })
         if (winner?.history) {
           if (this.isPartialRecoveryHistory(winner.history)) this.updateRecoveryRecord(record, winner.history, { completeRelays: new Set() })
-          else this.applyRecoveryCoverage(record, wanted)
+          else this.applyRelayCoverage(record, wanted)
         }
       }
       if (this.pauseReasons.size || this.closePromise) throw this.pausedError()
       const currentUncovered = () => intersectRanges(
         wanted,
-        subtractRanges({ start: range.start, end: range.end }, record.covered)
+        subtractRanges({ start: range.start, end: range.end }, this.recoveryCoverage(record))
       )
       const normalUncovered = intersectRanges(currentUncovered(), normalWindows)
       if (normalUncovered.length) await this.askPrioritySeeders(channelPubkey, normalUncovered, { priority: 'normal' })
@@ -3993,7 +4056,7 @@ export class PrivateMessenger {
             } else {
               // Legacy fetch seam (tests/custom channels): resolves only when
               // the whole range was read, so treat it as fully relay-covered.
-              record.covered = mergeRanges([...record.covered, { start: range.start, end: range.end }])
+              this.applyRelayCoverage(record, [{ start: range.start, end: range.end }])
               if (history?.oldestCreatedAt != null) {
                 record.oldestCreatedAt = record.oldestCreatedAt == null
                   ? history.oldestCreatedAt
@@ -4010,11 +4073,11 @@ export class PrivateMessenger {
           const lifecycleChanged = controller.signal.aborted || this.closePromise || !this.channels.has(pubkey) || !this.stopByChannel.has(pubkey) ||
             (this.watchRevisionByChannel.get(pubkey) || 0) !== watchRevision
           if (lifecycleChanged) {
-            remaining.push(range)
+            remaining.push(...this.unhandledRecoveryRanges(record, range))
             continue
           }
           if (this.recoveryRecordActive(record)) {
-            remaining.push(range)
+            remaining.push(...this.unhandledRecoveryRanges(record, range))
             continue
           }
           const recoveryStartedAt = this._now()
@@ -4036,7 +4099,7 @@ export class PrivateMessenger {
           })
           failures.push(...result.failures)
           if (result.complete) recoveredThrough = Math.max(recoveredThrough, range.end)
-          else remaining.push(range)
+          else remaining.push(...(result.remaining || this.unhandledRecoveryRanges(record, range)))
         } catch (err) {
           const expectedPause = isExpectedRecoveryPause(err, controller)
           const record = this.recoveryRanges.get(this.recoveryRangeKey(pubkey, range))
@@ -4045,7 +4108,7 @@ export class PrivateMessenger {
           }
           if (!expectedPause && !(controller.liveInterrupted && err === controller.signal.reason)) this.onError?.(err)
           if (!expectedPause) failures.push(err)
-          remaining.push(range)
+          remaining.push(...this.unhandledRecoveryRanges(record, range))
         } finally { this.recoveryControllers.delete(controller) }
       }
       const fresh = this.readState()
@@ -4518,6 +4581,20 @@ function compareCoalescingItems (left, right) {
 
 function idempotencyDigest (idempotencyKey) {
   return coalescingDigest(['idempotency', idempotencyKey])
+}
+
+function missingMessagesAskCoalescingHint (message) {
+  if (messageCode(message) !== MISSING_MESSAGES_ASK_CODE) return null
+  const payload = message?.payload?.payload
+  const since = payload?.since
+  const until = payload?.until
+  if (!Number.isSafeInteger(since) || !Number.isSafeInteger(until) || until < since) return null
+  const priority = payload.priority == null ? 'normal' : payload.priority
+  if (!['normal', 'lower', 'lowest'].includes(priority)) return null
+  return {
+    key: coalescingDigest(['missing-messages-ask', since, until, priority]),
+    keep: 'latest'
+  }
 }
 
 function coalescingDigest (value) {
