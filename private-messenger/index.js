@@ -199,6 +199,14 @@ function expiredCapacityEgress () {
   })
 }
 
+function ownershipLostError (reason) {
+  return Object.assign(new Error('INBOX_DELIVERY_LOST'), {
+    code: 'INBOX_DELIVERY_LOST',
+    queueFailure: reason || '',
+    retryWhenAvailable: true
+  })
+}
+
 function isCapacityPressureError (error) {
   return error?.code === 'PRIVATE_MESSENGER_CAPACITY_PRESSURE'
 }
@@ -3015,16 +3023,16 @@ export class PrivateMessenger {
     const capacityEgress = this.createCapacityEgress()
     let finish
     const settled = new Promise(resolve => { finish = resolve })
-    const done = () => {
+    const done = reason => {
       clearInterval(timer)
-      capacityEgress.release()
+      capacityEgress.release(reason)
       this.deliveries.delete(delivery)
       finish()
       this.wakeDeliveries()
     }
     const settle = async (method, options) => {
       const result = await reservation[method](options)
-      done()
+      done(result ? undefined : ownershipLostError(reservation.lastFailure?.code))
       if (method === 'ack' && result && !this.closePromise && this.pauseReasons.has('capacity')) {
         this.checkCapacity().catch(err => this.onError?.(err))
       }
@@ -3034,12 +3042,23 @@ export class PrivateMessenger {
       message: withoutQueueMetadata(reservation.item),
       ack: () => settle('ack'),
       nack: options => settle('nack', options),
-      capacityEgress: capacityEgress.messenger
+      checkpoint: async progress => {
+        const result = await reservation.checkpoint(progress)
+        if (!result) done(ownershipLostError(reservation.lastFailure?.code))
+        return result
+      },
+      capacityEgress: capacityEgress.messenger,
+      ownershipSignal: capacityEgress.token.controller.signal,
+      get progress () { return reservation.progress },
+      get lastFailure () { return reservation.lastFailure }
     }
     Object.defineProperty(delivery, 'settled', { value: settled })
     this.deliveries.add(delivery)
     const timer = setInterval(() => {
-      reservation.renew().then(ok => { if (!ok) done() }, err => { done(); this.onError?.(err) })
+      reservation.renew().then(
+        ok => { if (!ok) done(ownershipLostError(reservation.lastFailure?.code)) },
+        err => { done(err); this.onError?.(err) }
+      )
     }, 10000)
     timer.unref?.()
     return delivery

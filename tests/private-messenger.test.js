@@ -4264,6 +4264,10 @@ test('capacity-scoped delivery sends bypass only capacity and expire with their 
     assert.equal(typeof first.capacityEgress.reply, 'function')
     assert.equal(typeof first.capacityEgress.tell, 'function')
     assert.equal(typeof first.capacityEgress.yell, 'function')
+    assert.equal(first.ownershipSignal.aborted, false)
+    assert.equal(first.progress, undefined)
+    assert.equal(await first.checkpoint({ processedEvents: 1 }), true)
+    assert.deepEqual(first.progress, { processedEvents: 1 })
 
     await messenger.pause('capacity')
     await assert.rejects(
@@ -4281,7 +4285,9 @@ test('capacity-scoped delivery sends bypass only capacity and expire with their 
     await messenger.resume('vault')
 
     await first.ack()
+    assert.equal(first.ownershipSignal.aborted, true)
     await second.nack()
+    assert.equal(second.ownershipSignal.aborted, true)
     await assert.rejects(
       first.capacityEgress.yell({ channelPubkey: 'channel', receiverPubkeys: ['peer'], payload: { ok: true } }),
       error => error.code === 'INBOX_DELIVERY_EXPIRED'
@@ -4293,6 +4299,34 @@ test('capacity-scoped delivery sends bypass only capacity and expire with their 
   } finally {
     await messenger.close()
   }
+})
+
+test('delivery checkpoints survive nack and are exposed to the retry', async () => {
+  const pm = fakePrivateMessage()
+  const messenger = await new PrivateMessenger({
+    _privateMessage: pm,
+    _privateChannel: { fetchHistory: async () => [] }
+  }).init({
+    userSigner: signer('owner'),
+    channels: [{ signer: signer('channel'), relays: ['wss://relay.example'] }]
+  })
+  try {
+    const now = Math.floor(Date.now() / 1000)
+    const message = {
+      event: { kind: 9, id: 'checkpoint', pubkey: 'peer', tags: [], created_at: now, content: 'checkpoint' },
+      outer: { created_at: now },
+      senderPubkey: 'peer'
+    }
+    await pm.watchCalls[0].onMessage(message)
+    const first = await messenger.nextMessage()
+    assert.equal(await first.checkpoint({ processedEvents: 3 }), true)
+    assert.equal(await first.nack(), true)
+
+    const retried = await messenger.nextMessage()
+    assert.equal(retried.message.event.id, 'checkpoint')
+    assert.deepEqual(retried.progress, { processedEvents: 3 })
+    assert.equal(await retried.ack(), true)
+  } finally { await messenger.close() }
 })
 
 test('inbox pressure pauses at high water, reports sanitized aggregates and resumes at low water', async () => {

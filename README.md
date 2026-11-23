@@ -673,10 +673,13 @@ handleMessages().catch(err => console.warn('private messenger messages failed', 
 ```
 
 For one-at-a-time consumption, `await messenger.nextMessage()` returns
-`{ message, ack, nack }` or `null` if no record is currently available. `ack()`
-removes the reserved record; `nack()` releases it for another attempt. Both
-return a boolean and are idempotent for the same reservation. An expired or
-superseded reservation returns `false` and cannot delete a later delivery.
+`{ message, progress, checkpoint, ownershipSignal, ack, nack, capacityEgress }`
+or `null` if no record is currently available. `ack()` removes the reserved
+record; `nack()` releases it for another attempt. Both return a boolean and are
+idempotent for the same reservation. `checkpoint(value)` stores resumable
+progress atomically with lease renewal. `ownershipSignal` aborts if the lease is
+taken over. A superseded reservation returns `false`, cannot delete a later
+delivery and exposes the safe reason through `lastFailure`.
 
 Delivery leases last 30 seconds and renew every 10 seconds while held. Closing
 the messenger or returning the iterator releases its unacknowledged deliveries;
@@ -1366,12 +1369,18 @@ Positional replacement and insertion follow the same rule: they reject instead
 of evicting when the resulting queue would exceed the limit.
 
 `queue.reserve({ leaseMs = 30000, nackCoalescingIndex, priorityIndex, priorities })` returns `null` or
-`{ item, ack, nack, renew }`. Reservation token/deadline are internal record
-metadata, persisted atomically in the same IndexedDB transaction as selection.
-`renew()` extends a still-valid lease. Low-level callers own renewal and release;
-PrivateMessenger supplies both. Do not mix reservations with destructive or
-position-shifting queue operations on the same queue except explicit removal.
-A stale token cannot acknowledge a newly reserved or replaced record.
+`{ item, progress, ack, nack, renew, checkpoint, lastFailure }`. Reservation
+token/deadline and optional checkpoint progress are persisted atomically in the
+same IndexedDB transaction as selection. `renew()` extends ownership when the
+token still matches, even if a delayed timer runs just after `until`.
+`checkpoint(value)` atomically stores structured-clone progress, updates logical
+byte accounting and renews the lease. Progress survives NACK and a later
+reservation, but not replacement of the queued item. Low-level callers own
+renewal and release; PrivateMessenger supplies both. Do not mix reservations with
+destructive or position-shifting queue operations on the same queue except
+explicit removal. A stale token cannot acknowledge a newly reserved or replaced
+record; after a failed operation `lastFailure.code` distinguishes taken-over,
+missing and settled reservations.
 `nackCoalescingIndex` names a non-unique index: when another matching item is
 pending, NACK deletes the superseded active item instead of requeueing it.
 `priorityIndex` names a scalar, non-multiEntry index and `priorities` is the

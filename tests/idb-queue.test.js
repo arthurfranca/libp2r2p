@@ -207,6 +207,65 @@ test('reservations are exclusive, renewable, recoverable and token checked', asy
   } finally { await a.close(); await b.close() }
 })
 
+test('reservation tokens survive delayed renew/ack until another consumer takes over', async () => {
+  const factory = new IDBFactory()
+  const a = await queueFor(factory, 'late-reservation', { evictionPolicy: 'reject' })
+  const b = await queueFor(factory, 'late-reservation', { evictionPolicy: 'reject' })
+  try {
+    await a.push({ id: 'one' })
+    const first = await a.reserve({ now: 1000, leaseMs: 10 })
+    assert.equal(await first.renew({ now: 1011 }), true)
+    assert.equal(await b.reserve({ now: 1020 }), null)
+    assert.equal(await first.ack({ now: 1025 }), true)
+
+    await a.push({ id: 'two' })
+    const delayed = await a.reserve({ now: 2000, leaseMs: 10 })
+    const takeover = await b.reserve({ now: 2011 })
+    assert.equal(takeover.item.id, 'two')
+    assert.equal(await delayed.renew({ now: 2012 }), false)
+    assert.equal(delayed.lastFailure.code, 'QUEUE_RESERVATION_TAKEN_OVER')
+    assert.equal(await takeover.ack({ now: 2013 }), true)
+  } finally { await a.close(); await b.close() }
+})
+
+test('checkpoint persists progress, renews ownership and keeps durable accounting', async () => {
+  const factory = new IDBFactory()
+  const queue = await queueFor(factory, 'checkpoint', { evictionPolicy: 'reject' })
+  try {
+    await queue.push({ id: 'one' })
+    const initialBytes = (await queue.getCapacity()).usedBytes
+    const first = await queue.reserve({ now: 1000, leaseMs: 10 })
+    assert.equal(await first.checkpoint({ processedEvents: 8 }, { now: 1005 }), true)
+    assert.deepEqual(first.progress, { processedEvents: 8 })
+    assert.ok((await queue.getCapacity()).usedBytes > initialBytes)
+    assert.equal(await queue.reserve({ now: 1014 }), null)
+    assert.equal(await first.nack({ retryAfterMs: 30, now: 1006 }), true)
+
+    const retried = await queue.reserve({ now: 1037 })
+    assert.deepEqual(retried.progress, { processedEvents: 8 })
+    assert.equal(await retried.checkpoint({ processedEvents: 9 }, { now: 1038 }), true)
+    assert.deepEqual(retried.progress, { processedEvents: 9 })
+    assert.equal(await retried.ack({ now: 1039 }), true)
+    assert.equal((await queue.getCapacity()).usedBytes, 0)
+  } finally { await queue.close() }
+})
+
+test('stale checkpoint cannot overwrite progress after takeover', async () => {
+  const factory = new IDBFactory()
+  const a = await queueFor(factory, 'stale-checkpoint', { evictionPolicy: 'reject' })
+  const b = await queueFor(factory, 'stale-checkpoint', { evictionPolicy: 'reject' })
+  try {
+    await a.push({ id: 'one' })
+    const stale = await a.reserve({ now: 1000, leaseMs: 10 })
+    const current = await b.reserve({ now: 1011 })
+    assert.equal(await stale.checkpoint({ processedEvents: 8 }, { now: 1012 }), false)
+    assert.equal(stale.lastFailure.code, 'QUEUE_RESERVATION_TAKEN_OVER')
+    assert.equal(current.progress, undefined)
+    assert.equal(await current.checkpoint({ processedEvents: 2 }, { now: 1013 }), true)
+    assert.deepEqual(current.progress, { processedEvents: 2 })
+  } finally { await a.close(); await b.close() }
+})
+
 test('nack can defer the same durable item without duplicating or renewing it', async () => {
   const queue = await queueFor(new IDBFactory(), 'deferred-nack', { evictionPolicy: 'reject' })
   try {

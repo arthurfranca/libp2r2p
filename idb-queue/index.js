@@ -17,6 +17,8 @@ items, keyPath "position"
   position  integer ordering key between the queue head and tail
   byteSize  logical serialized size used by the queue capacity limit
   item      caller-provided queued value
+  progress  optional structured-clone value checkpointed by a reservation
+  reservation  optional temporary { token, until } ownership claim
 
 items indexes
   Declared by each createQueue() caller. A requested keyPath such as "status"
@@ -235,7 +237,7 @@ async function openQueueDatabase (indexedDB, prefix, indexDefinitions) {
   throw new Error('QUEUE_SCHEMA_UPGRADE_FAILED')
 }
 
-function itemForStorage (position, item) {
+function itemForStorage (position, item, progress) {
   // IndexedDB does not expose portable per-record byte usage, so keep a stable
   // JSON byte estimate for the queue's logical capacity limit.
   // `position` is the ordering key; queued values remain caller payloads.
@@ -243,12 +245,21 @@ function itemForStorage (position, item) {
   let byteSize = 0
   let serialized = ''
   while (true) {
-    serialized = JSON.stringify({ byteSize, item: storedItem })
+    serialized = JSON.stringify({
+      byteSize,
+      item: storedItem,
+      ...(progress === undefined ? {} : { progress })
+    })
     const nextByteSize = byteLength(serialized)
     if (nextByteSize === byteSize) break
     byteSize = nextByteSize
   }
-  return { position, byteSize, item: storedItem }
+  return {
+    position,
+    byteSize,
+    item: storedItem,
+    ...(progress === undefined ? {} : { progress: structuredClone(progress) })
+  }
 }
 
 function assertIndex (index, length, { allowEnd = false } = {}) {
@@ -948,23 +959,67 @@ export async function createQueue ({
     let settled = false
     let completedAction
     let completedResult
+    let lastFailure = null
     let tail = Promise.resolve()
-    const update = (action, at = Date.now(), { retryAfterMs = 0 } = {}) => {
-      if (!Number.isSafeInteger(retryAfterMs) || retryAfterMs < 0 || retryAfterMs > 2147483647) {
+    const update = (action, {
+      now,
+      retryAfterMs = 0,
+      progress
+    } = {}) => {
+      const at = now === undefined ? Date.now() : now
+      if (!Number.isSafeInteger(at) || at < 0) {
+        return Promise.reject(new ValidationError('QUEUE_INVALID_TIME'))
+      }
+      if (action === 'nack' &&
+          (!Number.isSafeInteger(retryAfterMs) || retryAfterMs < 0 || retryAfterMs > 2147483647)) {
         return Promise.reject(new ValidationError('QUEUE_INVALID_RETRY_AFTER'))
       }
+      let checkpoint
+      if (action === 'checkpoint') {
+        if (progress === undefined) {
+          return Promise.reject(new ValidationError('QUEUE_CHECKPOINT_INVALID'))
+        }
+        try {
+          checkpoint = structuredClone(progress)
+        } catch {
+          return Promise.reject(new ValidationError('QUEUE_CHECKPOINT_INVALID'))
+        }
+      }
       const operation = tail.then(async () => {
-        if (settled) return action === completedAction ? completedResult : false
+        if (settled) {
+          if (action === completedAction) return completedResult
+          lastFailure = { code: 'QUEUE_RESERVATION_SETTLED' }
+          return false
+        }
+        lastFailure = null
         const result = await mutate(async (tx, state) => {
           const record = await getRecord(tx, reserved.position)
-          if (record?.reservation?.token !== token || record.reservation.until <= at) return false
+          if (!record) return { ok: false, code: 'QUEUE_RESERVATION_MISSING' }
+          if (record.reservation?.token !== token) {
+            return { ok: false, code: 'QUEUE_RESERVATION_TAKEN_OVER' }
+          }
           if (action === 'ack') {
             await deleteRecord(tx, record.position)
             state.usedBytes = Math.max(0, state.usedBytes - record.byteSize)
             await trimBounds(tx, state)
+          } else if (action === 'checkpoint') {
+            const stored = itemForStorage(record.position, record.item, checkpoint)
+            if (hasByteLimit() && state.usedBytes - record.byteSize + stored.byteSize > sessionMaxBytes) {
+              throw capacityError(stored.byteSize, state.usedBytes, sessionMaxBytes)
+            }
+            const previousByteSize = record.byteSize
+            record.progress = checkpoint
+            record.byteSize = stored.byteSize
+            record.reservation = { token, until: at + leaseMs }
+            await putRecord(tx, record)
+            state.usedBytes = Math.max(0, state.usedBytes - previousByteSize + stored.byteSize)
+            reserved.byteSize = stored.byteSize
+            reserved.progress = structuredClone(checkpoint)
           } else {
-            if (action === 'renew') record.reservation.until = at + leaseMs
-            else {
+            if (action === 'renew') {
+              record.reservation.until = at + leaseMs
+              await putRecord(tx, record)
+            } else {
               let superseded = false
               if (nackDefinition) {
                 try {
@@ -991,23 +1046,37 @@ export async function createQueue ({
               }
             }
           }
-          return true
-        }, { wakeWaiters: action !== 'renew' })
-        if (action !== 'renew' || !result) {
+          return { ok: true }
+        }, { wakeWaiters: action !== 'renew' && action !== 'checkpoint' })
+        if (!result.ok) {
+          lastFailure = { code: result.code }
           settled = true
           completedAction = action
-          completedResult = result
+          completedResult = false
+          return false
         }
-        return result
+        if (action !== 'renew' && action !== 'checkpoint') {
+          settled = true
+          completedAction = action
+          completedResult = true
+        }
+        return true
       })
       tail = operation.catch(() => {})
       return operation
     }
     return {
       item: reserved.item,
-      ack: () => update('ack'),
-      nack: options => update('nack', Date.now(), options),
-      renew: () => update('renew')
+      get progress () {
+        return reserved.progress === undefined ? undefined : structuredClone(reserved.progress)
+      },
+      get lastFailure () {
+        return lastFailure == null ? null : { ...lastFailure }
+      },
+      ack: options => update('ack', options),
+      nack: options => update('nack', options),
+      renew: options => update('renew', options),
+      checkpoint: (value, options = {}) => update('checkpoint', { ...options, progress: value })
     }
   }
 
