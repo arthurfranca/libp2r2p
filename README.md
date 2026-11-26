@@ -1416,6 +1416,10 @@ event after every relay terminally rejected the original with
 `auth-required:`/`restricted:`/`invalid:`. The replacement and its retry share the original
 deadline; mixed failures and ambiguous timeouts never invoke it.
 
+`MESSAGE_NOT_PUBLISHED` promotes the latest `retryAt` or `retryAfterMs` found in
+failed reports and their causes to the top-level error. Session storage can
+therefore honor relay cooldowns without parsing diagnostic-only report details.
+
 ## Private file channels (0.11)
 
 `libp2r2p/private-messenger/file` provides `createPrivateFileTransfer` for

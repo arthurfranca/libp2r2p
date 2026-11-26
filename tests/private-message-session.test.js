@@ -301,6 +301,33 @@ test('a publication circuit keeps the send pending until its absolute retry dead
   assert.ok(timers.some(timer => !timer.cancelled && timer.delay >= 5000))
 })
 
+test('report retry advice controls the session outbox deadline', async t => {
+  t.mock.method(Date, 'now', () => 1000)
+  const timers = []
+  const f = await fixture(t, {
+    _setTimeout: (fn, delay) => { const timer = { fn, delay, cancelled: false }; timers.push(timer); return timer },
+    _clearTimeout: timer => { timer.cancelled = true },
+    publish: async () => ({
+      delivery: {
+        reports: [{
+          success: false,
+          retryWhenAvailable: true,
+          promise: Promise.resolve({
+            errors: [{
+              relay: 'wss://relay.test',
+              reason: Object.assign(new Error('rate-limited: wait'), { retryAt: 7000 })
+            }]
+          })
+        }]
+      }
+    })
+  })
+  const id = await f.session.enqueue({ peer, event })
+  await until(() => f.records.get(id)?.failed)
+  assert.equal(f.records.get(id).status, 'pending')
+  assert.ok(timers.some(timer => !timer.cancelled && timer.delay >= 6000))
+})
+
 test('a paused messenger parks the send and wakes on state release without a retry timer', async t => {
   const timers = []
   let publications = 0

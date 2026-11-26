@@ -56,6 +56,8 @@ test('publication failures retain classified reports without logging arbitrary r
   assert.equal(error.code, 'MESSAGE_NOT_PUBLISHED')
   assert.equal(error.eventId, getEventHash(event))
   assert.equal(error.eventKind, 3560)
+  assert.equal(error.retryAt, 7000)
+  assert.equal(error.retryAfterMs, 6000)
   assert.equal(error.operation, 'seeder-recovery-ask')
   assert.equal(error.channelPubkey, 'channel')
   assert.equal(error.seederPubkey, 'b'.repeat(64))
@@ -122,5 +124,45 @@ test('publication diagnostics classify permanent and interrupted recovery report
     retryAt: 9000,
     retryWhenAvailable: true,
     reports: []
+  })
+})
+
+test('publication failures promote the latest report retry deadline', async t => {
+  t.mock.method(Date, 'now', () => 1000)
+  const event = {
+    pubkey: 'a'.repeat(64),
+    kind: 3560,
+    created_at: 10,
+    tags: [],
+    content: ''
+  }
+  const result = {
+    delivery: {
+      reports: [
+        {
+          success: false,
+          retryAfterMs: 2500,
+          promise: Promise.resolve({
+            errors: [{ relay: 'wss://one.example', reason: new Error('timeout') }]
+          })
+        },
+        {
+          success: false,
+          promise: Promise.resolve({
+            errors: [{
+              relay: 'wss://two.example',
+              reason: Object.assign(new Error('rate-limited: wait'), { retryAt: 9000 })
+            }]
+          })
+        }
+      ]
+    }
+  }
+
+  await assert.rejects(assertMessagePublished(result, event), error => {
+    assert.equal(error.code, 'MESSAGE_NOT_PUBLISHED')
+    assert.equal(error.retryAt, 9000)
+    assert.equal(error.retryAfterMs, 8000)
+    return true
   })
 })

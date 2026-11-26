@@ -47,6 +47,28 @@ function sanitizedReport (report, index) {
   }
 }
 
+function latestRetryAdvice (values, now) {
+  const pending = values.slice()
+  const seen = new Set()
+  let retryAt = 0
+  while (pending.length) {
+    const current = pending.pop()
+    if (!current || typeof current !== 'object' || seen.has(current)) continue
+    seen.add(current)
+    if (Array.isArray(current)) {
+      pending.push(...current)
+      continue
+    }
+    if (Number.isSafeInteger(current.retryAt)) retryAt = Math.max(retryAt, current.retryAt)
+    if (Number.isSafeInteger(current.retryAfterMs) && current.retryAfterMs >= 0) {
+      retryAt = Math.max(retryAt, now + current.retryAfterMs)
+    }
+    for (const key of ['cause', 'reason', 'error']) pending.push(current[key])
+    if (Array.isArray(current.errors)) pending.push(...current.errors)
+  }
+  return retryAt
+}
+
 const contextFields = ['operation', 'channelPubkey', 'seederPubkey', 'receiverPubkey', 'eventId']
 const contextNumbers = ['eventKind', 'since', 'until']
 
@@ -103,11 +125,13 @@ export async function assertMessagePublished (result, event) {
   const present = Array.isArray(reports) && reports.length > 0
   if (present && reports.every(report => report?.success === true)) return
 
+  const retrySources = []
   const failures = present
     ? await Promise.all(reports.map(async (report, index) => {
       if (report?.success === true) return null
       let settled
       try { settled = await report?.promise } catch (reason) { settled = { errors: [{ reason }] } }
+      retrySources.push(report, settled)
       // Never retain the broadcast result: it includes plaintext and may carry
       // delivery.deletionSeckey. Native relay errors retain transport causes.
       return {
@@ -128,9 +152,12 @@ export async function assertMessagePublished (result, event) {
     })
     return `report ${report.index + 1} (${report.total ?? '?'} relays): ${errors.join('; ') || (report.total === 0 ? 'NO_RELAYS' : 'NO_RELAY_ACKNOWLEDGEMENT')}`
   })
+  const now = Date.now()
+  const retryAt = latestRetryAdvice(retrySources, now)
   throw Object.assign(new Error(`MESSAGE_NOT_PUBLISHED: ${details.join(' | ') || reason}`), {
     code: 'MESSAGE_NOT_PUBLISHED',
     ...(failures.length && failures.every(report => report.retryWhenAvailable) ? { retryWhenAvailable: true, ...(failures.some(report => report.retryWhenOnline) ? { retryWhenOnline: true } : {}) } : {}),
+    ...(retryAt > 0 ? { retryAt, retryAfterMs: Math.max(0, retryAt - now) } : {}),
     reason,
     eventId: getEventHash(event),
     eventKind: event.kind,
