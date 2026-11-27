@@ -4264,6 +4264,8 @@ test('capacity-scoped delivery sends bypass only capacity and expire with their 
     assert.equal(typeof first.capacityEgress.reply, 'function')
     assert.equal(typeof first.capacityEgress.tell, 'function')
     assert.equal(typeof first.capacityEgress.yell, 'function')
+    assert.equal(typeof first.capacityEgress.broadcastRumor, 'function')
+    assert.equal(typeof first.capacityEgress.broadcastEvent, 'function')
     assert.equal(first.ownershipSignal.aborted, false)
     assert.equal(first.progress, undefined)
     assert.equal(await first.checkpoint({ processedEvents: 1 }), true)
@@ -4276,6 +4278,26 @@ test('capacity-scoped delivery sends bypass only capacity and expire with their 
     )
     await first.capacityEgress.reply({ channelPubkey: 'channel', question: { id: 'question' }, payload: { ok: true } })
     assert.equal(pm.sent.at(-1).method, 'reply')
+    await first.capacityEgress.broadcastRumor({
+      channelPubkey: 'channel',
+      receiverPubkeys: ['peer'],
+      rumor: { kind: 9001, created_at: 1, tags: [], content: 'rumor' }
+    })
+    assert.equal(pm.sent.at(-1).method, 'broadcastRumor')
+    await first.capacityEgress.broadcastEvent({
+      channelPubkey: 'channel',
+      receiverPubkeys: ['peer'],
+      event: {
+        id: 'signed',
+        kind: 9002,
+        pubkey: 'owner',
+        created_at: 2,
+        tags: [],
+        content: 'event',
+        sig: 'signature'
+      }
+    })
+    assert.equal(pm.sent.at(-1).method, 'broadcastEvent')
 
     await messenger.pause('vault')
     await assert.rejects(

@@ -47,6 +47,13 @@ function messengerStatusSnapshot (value) {
   return { closed: value.closed, paused: value.paused, pauseReasons: [...value.pauseReasons] }
 }
 
+function isCapacityOnlyStatus (status) {
+  return status?.paused === true &&
+    Array.isArray(status.pauseReasons) &&
+    status.pauseReasons.length === 1 &&
+    status.pauseReasons[0] === 'capacity'
+}
+
 export function createPrivateMessageSession ({ owner, signer, eventStore, messageStorage, chunkStorage, recoveryStorage, fallbackRelays = [], fallbackDelayMs = null, mode = 'seeder', seedersForPeer = peer => [peer], allowedKinds = [5, 9, 1063, 34601], useContentKeys = true, pendingDecryptionReady = true, onMedia = () => {}, onOutbox = () => {}, onError = () => {}, onSendError = () => {}, onDebug, Messenger = createPrivateMessenger, openOutbox = createChatOutbox, FileTransfer = createPrivateFileTransfer, _onOnline = onOnline, _isOnline = isOnline, _getIykcProofs = getIykcProofs, _setTimeout = setTimeout, _clearTimeout = clearTimeout, _random = Math.random, _now = () => performance.now(), openDownloads = options => createChatOutbox({ ...options, namespace: 'downloads' }) }) {
   fallbackRelays = normalizeFallbackRelays(fallbackRelays)
   fallbackDelayMs = normalizeFallbackDelay(fallbackDelayMs)
@@ -93,6 +100,10 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
   let networkConfirmed = false
   let messengerBinding
   let storageBlocked = false
+  const allowsCapacityEgress = entry => entry?.peer !== owner &&
+    entry.allowCapacityEgress === true &&
+    isCapacityOnlyStatus(messengerStatus) &&
+    typeof messenger?.createCapacityEgress === 'function'
   const inboxRecovery = createPauseRecovery({
     attempt: async signal => { signal.throwIfAborted(); await drain(); if (storageBlocked) throw inboxError },
     retryable: isRecoverableStorageFailure, onError: reportError,
@@ -111,9 +122,12 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     if (!available || state.closed) return
     if (state.paused) {
       for (const entry of entries.values()) {
-        if (entry.peer !== owner && entry.failed && entry.status === 'pending') pausedSends.add(entry.id)
+        if (entry.peer === owner || !entry.failed || entry.status !== 'pending') continue
+        if (allowsCapacityEgress(entry)) pausedSends.delete(entry.id)
+        else pausedSends.add(entry.id)
       }
       if (![...entries.values()].some(entry => !unadmitted.has(entry) && ((entry.localFailed && entry.localRetryable) || (pendingRetryable(entry) && !pausedSends.has(entry.id))))) clearSendRetry()
+      else scheduleSendRetry()
       watchOfflineSends()
       return
     }
@@ -471,7 +485,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       if (again && !storageBlocked && !closed && available) queueMicrotask(() => drain())
     }
   }
-  async function publish (entry, event, signal) {
+  async function publish (entry, event, signal, capacityEgress) {
     const peer = entry.peer
     if (preparation.error(peer)) throw preparation.error(peer)
     if (!available || !peers.has(peer) || !channels.has(peer)) throw unavailableError(new Error('CHAT_UNAVAILABLE'), signal)
@@ -481,6 +495,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     const options = {
       channelPubkey, receiverPubkeys: [peer], signal, attemptStartedAt: attemptStarts.get(entry.id),
       onDebug: onDebug ? value => debug(entry, value.stage, undefined, value) : undefined,
+      capacityEgress,
       preparedPublications: entry.prepared?.publications,
       onPreparedSeed: async (seed, { replace = false } = {}) => {
         debug(entry, 'envelope-prepared', preparationStartedAt, { publicationId: seed.publication.events[0].id })
@@ -574,7 +589,17 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
     entry.status = 'pending'; emit()
     const controller = new AbortController()
     sendControllers.set(entry.id, controller)
+    let capacityEgress = null
+    let capacityEgressToken
     try {
+      if (allowsCapacityEgress(entry)) {
+        capacityEgress = messenger.createCapacityEgress()
+        capacityEgressToken = capacityEgress?.token
+        if (!capacityEgressToken || typeof capacityEgress.release !== 'function') {
+          throw new Error('INVALID_CAPACITY_EGRESS')
+        }
+        debug(entry, 'capacity-egress', undefined, { pauseReason: 'capacity' })
+      }
       const active = async () => {
         if (storage.has && !await storage.has(entry.id)) { cancelled.add(entry.id); sendControllers.get(entry.id)?.abort() }
         if (closed || !available || cancelled.has(entry.id) || (entry.peer !== owner && !peers.has(entry.peer))) throw new Error('CHAT_UNAVAILABLE')
@@ -584,7 +609,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         preparation.request(entry.peer).catch(() => {})
         return
       }
-      if (entry.peer !== owner && messengerStatus?.paused) {
+      if (entry.peer !== owner && messengerStatus?.paused && !capacityEgress) {
         throw unavailableError(Object.assign(new Error('PRIVATE_MESSENGER_PAUSED'), { pauseReasons: [...messengerStatus.pauseReasons] }), controller.signal)
       }
       if (entry.prepared?.accepted) { journal.wake(); return }
@@ -593,7 +618,11 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         const file = entry.files[entry.fileIndex]
         const descriptor = { controlChannelPubkey: channels.get(entry.peer).pubkey, peerPubkey: entry.peer, root: file.root, size: file.size }
         await active()
-        await fileTransfers.authorizeSeeding(descriptor, { receiverPubkeys: [entry.peer], sharedAt: entry.event.created_at })
+        await fileTransfers.authorizeSeeding(descriptor, {
+          receiverPubkeys: [entry.peer],
+          sharedAt: entry.event.created_at,
+          capacityEgress: capacityEgressToken
+        })
         while (entry.chunkIndex < Math.ceil(file.size / IRFS_CHUNK_BYTES)) {
           const chunkStartedAt = performance.now()
           await active()
@@ -602,7 +631,11 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
           const recover = mode === 'watchtower' ? messenger.offlineRecoverySecondsFor?.(descriptor.controlChannelPubkey) ?? 0 : 0
           const target = { file: descriptor, fileIndex: entry.fileIndex, chunkIndex: entry.chunkIndex }
           await fileTransfers.publishChunk(descriptor, wireEvent(chunk, owner), {
-            signal: controller.signal, attemptStartedAt: chunkStartedAt, onDebug: onDebug ? value => debug(entry, value.stage, undefined, value) : undefined, preparedPublications: entry.prepared?.publications,
+            signal: controller.signal,
+            attemptStartedAt: chunkStartedAt,
+            onDebug: onDebug ? value => debug(entry, value.stage, undefined, value) : undefined,
+            preparedPublications: entry.prepared?.publications,
+            capacityEgress: capacityEgressToken,
             onPreparedSeed: async (seed, { replace = false } = {}) => {
               await journal.stage(entry, seed, target, recover, { replace })
               controller.signal.throwIfAborted()
@@ -628,7 +661,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         await active()
         const event = entry.events[entry.index]
         const startedAt = Date.now()
-        await publish(entry, event, controller.signal)
+        await publish(entry, event, controller.signal, capacityEgressToken)
         debug(entry, 'publication-accepted', startedAt)
         await active()
         entry.index++
@@ -650,7 +683,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         if (!entry.deliveryConfirmed) entry.status = error.retryWhenAvailable ? 'pending' : 'error'
         entry.failed = true; entry.retryable = retryable(error)
         await journal.write(entry).catch(reportError)
-        if (entry.peer !== owner && error.retryWhenAvailable && messenger?.readStatus().paused) pausedSends.add(entry.id)
+        if (entry.peer !== owner && error.retryWhenAvailable && messenger?.readStatus().paused && !allowsCapacityEgress(entry)) pausedSends.add(entry.id)
         else if (isUnavailableSend(cause) && cause.pauseReasons?.length && available && !closed) {
           // Release can race persistence of the failed attempt. Do not lose
           // its notification and spend a retry delay after the pause is gone.
@@ -667,7 +700,11 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         if (!closed && !entry.deletion && !cancelled.has(entry.id) && !entry.deliveryConfirmed && !error.retryWhenAvailable) onSendError(error, { id: entry.id, peer: entry.peer })
       }
       emit()
-    } finally { sendControllers.delete(entry.id); releaseForeground() }
+    } finally {
+      capacityEgress?.release()
+      sendControllers.delete(entry.id)
+      releaseForeground()
+    }
   }
   function stopOnlineRetry () { stopOnline?.(); stopOnline = undefined; requestedUrgency = 0 }
   // Transient availability failures without an active messenger pause retain
@@ -951,9 +988,10 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
       if (!changed && messenger && !configurationFailed) { preparation.setAvailable(true); pump(); return configuring }
       return schedule()
     },
-    async enqueue ({ peer, event, context = [], requiredFiles = [], deletion = false, attemptStartedAt }) {
+    async enqueue ({ peer, event, context = [], requiredFiles = [], deletion = false, attemptStartedAt, allowCapacityEgress = false }) {
       if (closed || !available || (peer !== owner && !peers.has(peer))) throw new Error('CHAT_UNAVAILABLE')
       if (attemptStartedAt !== undefined && (!Number.isFinite(attemptStartedAt) || attemptStartedAt < 0)) throw new ValidationError('INVALID_ATTEMPT_STARTED_AT')
+      if (typeof allowCapacityEgress !== 'boolean') throw new ValidationError('INVALID_ALLOW_CAPACITY_EGRESS')
       const urgencyUntil = _now() + 30000
       const urgencyLifecycle = lifecycle
       const releaseForeground = foreground.enter()
@@ -964,7 +1002,7 @@ export function createPrivateMessageSession ({ owner, signer, eventStore, messag
         const id = getEventHash(main)
         const events = [...context.map(value => wireEvent(value, owner)), main]
         const files = events.filter(value => value.kind === 1063).map(value => ({ ...decodeFileMetadata(value), optional: !requiredFiles.includes(getEventHash(value)) })).filter(file => file.service === 'irfs').flatMap(file => [file, ...(file.thumbnail?.root ? [{ ...file.thumbnail, optional: file.optional }] : [])])
-        const entry = { id, peer, event: { ...main, id }, events, files, index: 0, fileIndex: 0, chunkIndex: 0, localSaved: context.map(() => true).concat(false), status: 'pending', deliveryConfirmed: false, deletion }
+        const entry = { id, peer, event: { ...main, id }, events, files, index: 0, fileIndex: 0, chunkIndex: 0, localSaved: context.map(() => true).concat(false), status: 'pending', deliveryConfirmed: false, deletion, allowCapacityEgress }
         const startedAt = Date.now()
         const earlyLocal = peer === owner
         if (earlyLocal) {

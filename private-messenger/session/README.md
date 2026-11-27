@@ -128,8 +128,14 @@ No message eviction or false historical coverage is introduced. Account
 unavailability stops its recovery timers; availability or explicit retry can
 reevaluate a local failure without clearing another owner's storage pause.
 
-`enqueue({ peer, event, context, requiredFiles, deletion })` preserves prepared
-identities. Local message commits and remote stages have independent checkpoints.
+`enqueue({ peer, event, context, requiredFiles, deletion, allowCapacityEgress })`
+preserves prepared identities. `allowCapacityEgress` defaults to `false` and is
+persisted with the encrypted outbox entry. When true, a remote user message may
+use a fresh `createCapacityEgress()` token while `capacity` is the only pause
+reason. The token covers every context event, file chunk and final event in that
+entry and is recreated on each retry. It never bypasses network, storage, signer,
+session-storage or another simultaneous pause. Local message commits and remote
+stages have independent checkpoints.
 Recovery archival waits up to five seconds for foreground work, then runs one
 durable batch and re-evaluates; postponement never drops packet rows.
 It sends original/thumbnail chunks before announcements, yields for small messages,
@@ -155,6 +161,10 @@ messages. Entering pressure emits one sanitized
 type/age buckets plus bounded counts by inner message code; it never exposes IDs,
 pubkeys, filters, ciphertext or payloads.
 Physical `QUEUE_CAPACITY_EXCEEDED` behavior remains unchanged.
+Capacity-only egress is opt-in per user work item. Protocol asks, replies,
+announcements, presence and recovery traffic remain blocked unless the active
+inbound handler receives the short-lived reservation token created by the
+messenger.
 
 Native `AbortError` values represent pause/teardown cancellation. The messenger
 reports the first occurrence in each 30-second window as

@@ -207,6 +207,13 @@ suite pass; report independently scoped problems separately.
   resumes at 50%. Emit one `PRIVATE_MESSENGER_CAPACITY_PRESSURE` per episode with
   used/high-water/resume/max bytes, aggregate type/age buckets and optional safe
   message-code counts; never evict pending rows or expose channel identities.
+- `createCapacityEgress()` is a short-lived token for existing delivery work and
+  covers ask/reply/tell/yell plus raw rumor/event broadcasts. It bypasses only
+  `capacity`; any other pause still rejects the operation, and release expires
+  the token. Session `enqueue({ allowCapacityEgress: true })` defaults to false,
+  persists the opt-in across encrypted outbox reloads, and applies one token to
+  every context event, file chunk and final event. Retries obtain a fresh token.
+  Protocol control, presence and recovery traffic does not receive this bypass.
 - Pending decryption admission is owned by `decryption-scheduler`: startup gate,
   250 ms channel quiet time, five-second maximum deferral, one overdue packet or
   at most four consecutive preferred records, and a task yield between records.

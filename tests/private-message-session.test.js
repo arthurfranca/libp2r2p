@@ -3,6 +3,9 @@ import { readFile } from 'node:fs/promises'
 import assert from 'node:assert/strict'
 import { createSessionMessenger } from './helpers/session-messenger.js'
 import { getEventHash } from '../event/index.js'
+import { prepareIrfsFile } from '../irfs/index.js'
+import { createFileMetadata } from '../nip94/index.js'
+import { nfileEncode } from '../nip19/index.js'
 import { createPrivateMessageSession } from '../private-messenger/session/index.js'
 
 const owner = 'a'.repeat(64)
@@ -12,22 +15,25 @@ const until = async predicate => {
   for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 2)) }
   assert.fail('condition not reached')
 }
-async function fixture (t, { publish, fallbackRelays, save = async () => ({ result: { ok: true } }), ...sessionOptions } = {}) {
-  const errors = []; const sendErrors = []; const records = new Map(); const onlineListeners = new Set(); const priorities = []
+async function fixture (t, { publish, fallbackRelays, save = async () => ({ result: { ok: true } }), messengerMethods = {}, initial = [], pausedBeforeReady = [], ...sessionOptions } = {}) {
+  const errors = []; const sendErrors = []; const records = new Map(initial.map(entry => [entry.id, structuredClone(entry)])); const onlineListeners = new Set(); const priorities = []
   const decryptionReady = []; const decryptionPriorities = []
-  const store = () => ({ list: async () => [], put: async entry => records.set(entry.id, structuredClone(entry)), remove: async id => records.delete(id), close () {} })
+  const store = () => ({ list: async () => [...records.values()].map(entry => structuredClone(entry)), put: async entry => records.set(entry.id, structuredClone(entry)), remove: async id => records.delete(id), close () {} })
   let messengerOptions; let messenger
   const session = createPrivateMessageSession({
     owner, fallbackRelays, signer: { withSharedKey: () => ({ getPublicKey: async () => peer }) },
     messageStorage: { save }, openOutbox: store, openDownloads: store,
     Messenger: async options => {
       messengerOptions = options
-      return (messenger = createSessionMessenger(options, {
+      messenger = createSessionMessenger(options, {
         broadcastRumor: publish,
+        ...messengerMethods,
         setPendingDecryptionReady: value => decryptionReady.push(value),
         setPendingDecryptionPriority: value => decryptionPriorities.push(value),
         prioritizeRange: async (channelPubkey, request) => { priorities.push({ channelPubkey, request }); return true }
-      }))
+      })
+      for (const reason of pausedBeforeReady) await messenger.pause(reason)
+      return messenger
     },
     FileTransfer: () => ({ observe () {} }),
     _onOnline: listener => { onlineListeners.add(listener); return () => onlineListeners.delete(listener) },
@@ -347,6 +353,203 @@ test('a paused messenger parks the send and wakes on state release without a ret
   assert.equal(publications, 1)
   assert.equal(f.sendErrors.length, 0)
   assert.equal(timers.length, 0)
+})
+
+test('capacity egress is opt-in per outbox entry and bypasses only a capacity pause', async t => {
+  let publications = 0
+  const tokens = []
+  const debug = []
+  const f = await fixture(t, {
+    onDebug: value => debug.push(value),
+    publish: async options => {
+      publications++
+      assert.equal(options.capacityEgress, tokens.at(-1))
+      return { delivery: { reports: [{ success: true }] } }
+    },
+    messengerMethods: {
+      createCapacityEgress () {
+        const token = { active: true, controller: new AbortController() }
+        tokens.push(token)
+        return { token, messenger: {}, release () { token.controller.abort() } }
+      }
+    }
+  })
+  await f.messenger().pause('capacity')
+  const blocked = await f.session.enqueue({ peer, event })
+  await until(() => f.records.get(blocked)?.failed === true)
+  assert.equal(publications, 0)
+  assert.equal(tokens.length, 0)
+
+  const allowed = await f.session.enqueue({
+    peer,
+    event: { ...event, created_at: 2 },
+    allowCapacityEgress: true
+  })
+  await until(() => !f.records.has(allowed))
+  assert.equal(publications, 1)
+  assert.equal(tokens.length, 1)
+  assert.equal(tokens[0].controller.signal.aborted, true)
+  assert.ok(debug.some(value => value.eventId === allowed && value.stage === 'capacity-egress'))
+
+  const other = await fixture(t, {
+    publish: async () => {
+      publications++
+      return { delivery: { reports: [{ success: true }] } }
+    },
+    messengerMethods: {
+      createCapacityEgress () {
+        throw new Error('must not create capacity egress for a compound pause')
+      }
+    }
+  })
+  await other.messenger().pause('capacity')
+  await other.messenger().pause('network')
+  const compound = await other.session.enqueue({
+    peer,
+    event,
+    allowCapacityEgress: true
+  })
+  await until(() => other.records.get(compound)?.failed === true)
+  assert.equal(publications, 1)
+})
+
+test('capacity egress follows context, attachment, and signed-file events', async t => {
+  const file = await prepareIrfsFile(new Uint8Array(51001).fill(9))
+  t.after(() => file.close())
+  const chunks = await Array.fromAsync(file.chunks())
+  const token = { active: true, controller: new AbortController() }
+  const seen = { authorize: [], chunks: [], events: [] }
+  const f = await fixture(t, {
+    chunkStorage: { read: async (_, index) => chunks[index] },
+    FileTransfer: () => ({
+      observe () {},
+      authorizeSeeding: async (_, options) => seen.authorize.push(options.capacityEgress),
+      publishChunk: async (_, _event, options) => seen.chunks.push(options.capacityEgress)
+    }),
+    publish: async options => {
+      seen.events.push(options.capacityEgress)
+      return { delivery: { reports: [{ success: true }] } }
+    },
+    messengerMethods: {
+      createCapacityEgress () {
+        return {
+          token,
+          messenger: {},
+          release () { token.controller.abort() }
+        }
+      }
+    }
+  })
+  const metadata = createFileMetadata({
+    root: file.root,
+    size: file.size,
+    mime: 'application/octet-stream',
+    filename: 'test.bin',
+    service: 'irfs',
+    url: `https://nostr.alt/${nfileEncode({ root: file.root })}`,
+    created_at: Math.floor(Date.now() / 1000)
+  })
+  await f.messenger().pause('capacity')
+  const context = { ...event, content: 'context' }
+  await f.session.enqueue({
+    peer,
+    event: metadata,
+    context: [context],
+    allowCapacityEgress: true
+  })
+  await until(() => seen.events.length === 2)
+  assert.deepEqual(seen.authorize, [token])
+  assert.deepEqual(seen.chunks, [token, token])
+  assert.deepEqual(seen.events, [token, token])
+  assert.equal(token.controller.signal.aborted, true)
+})
+
+test('capacity egress keeps ordinary publication retries active until capacity clears', async t => {
+  const timers = []
+  const tokens = []
+  let publications = 0
+  const f = await fixture(t, {
+    _random: () => 0.5,
+    _setTimeout: (fn, delay) => {
+      const timer = { fn, delay }
+      timers.push(timer)
+      return timer
+    },
+    _clearTimeout: timer => { timer.cancelled = true },
+    publish: async options => {
+      publications++
+      assert.equal(options.capacityEgress, tokens.at(-1))
+      if (publications === 1) {
+        throw Object.assign(new Error('RELAY_UNAVAILABLE'), {
+          code: 'RELAY_UNAVAILABLE',
+          retryWhenAvailable: true
+        })
+      }
+      return { delivery: { reports: [{ success: true }] } }
+    },
+    messengerMethods: {
+      createCapacityEgress () {
+        const token = { active: true, controller: new AbortController() }
+        tokens.push(token)
+        return { token, messenger: {}, release () { token.controller.abort() } }
+      }
+    }
+  })
+  await f.messenger().pause('capacity')
+  const id = await f.session.enqueue({ peer, event, allowCapacityEgress: true })
+  await until(() => f.records.get(id)?.failed === true)
+  assert.equal(publications, 1)
+  assert.equal(tokens.length, 1)
+  assert.equal(timers.length, 1)
+  assert.equal(timers[0].cancelled, undefined)
+
+  await timers[0].fn()
+  await until(() => !f.records.has(id))
+  assert.equal(publications, 2)
+  assert.equal(tokens.length, 2)
+  assert.equal(tokens[0].controller.signal.aborted, true)
+  assert.equal(tokens[1].controller.signal.aborted, true)
+})
+
+test('session rejects a non-boolean capacity egress authorization', async t => {
+  const f = await fixture(t)
+  await assert.rejects(
+    f.session.enqueue({ peer, event, allowCapacityEgress: 'yes' }),
+    { code: 'INVALID_ALLOW_CAPACITY_EGRESS' }
+  )
+})
+
+test('capacity egress authorization survives the encrypted outbox reload', async t => {
+  const first = await fixture(t, {
+    publish: async () => ({ delivery: { reports: [{ success: true }] } })
+  })
+  await first.messenger().pause('network')
+  const id = await first.session.enqueue({ peer, event, allowCapacityEgress: true })
+  await until(() => first.records.get(id)?.failed === true)
+  const checkpoint = structuredClone(first.records.get(id))
+  assert.equal(checkpoint.allowCapacityEgress, true)
+  await first.session.close()
+
+  const tokens = []
+  const seen = []
+  const second = await fixture(t, {
+    initial: [checkpoint],
+    pausedBeforeReady: ['capacity'],
+    publish: async options => {
+      seen.push(options.capacityEgress)
+      return { delivery: { reports: [{ success: true }] } }
+    },
+    messengerMethods: {
+      createCapacityEgress () {
+        const token = { active: true, controller: new AbortController() }
+        tokens.push(token)
+        return { token, messenger: {}, release () { token.controller.abort() } }
+      }
+    }
+  })
+  await until(() => !second.records.has(id))
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0], tokens[0])
 })
 
 test('a transient outage owns a fresh online listener and resumes without an account-state change', async t => {

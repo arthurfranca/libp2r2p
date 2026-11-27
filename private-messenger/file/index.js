@@ -110,11 +110,11 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     const parent = messenger.channels.get(file.controlChannelPubkey)
     return ['seeder', 'watchtower'].includes(parent?.mode) && messenger.offlineRecoverySecondsFor(parent) > 0
   }
-  async function authorizeSeeding (descriptor, { receiverPubkeys, sharedAt } = {}) {
+  async function authorizeSeeding (descriptor, { receiverPubkeys, sharedAt, capacityEgress } = {}) {
     if (!Array.isArray(receiverPubkeys) || !receiverPubkeys.length || !receiverPubkeys.every(key => typeof key === 'string' && HEX.test(key))) throw new ValidationError('INVALID_FILE_AUTHORIZATION_RECEIVERS')
     if (!Number.isSafeInteger(sharedAt) || sharedAt < 0) throw new ValidationError('INVALID_FILE_SHARED_AT')
     const file = await register(descriptor)
-    usable(file)
+    usable(file, { capacityEgress })
     await catalog.authorize(file, [...new Set(receiverPubkeys)], sharedAt)
   }
   async function prune () {
@@ -152,9 +152,9 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
   function sendOptions (file, routes) {
     return { senderSigner: messenger.userSigner, imkcSigner: messenger.contentKeySigner, privateChannelSigner: file.signer, ...routes, temporaryStorageArea: messenger.temporaryStorageArea, expirationSeconds: messenger.eventExpirationSecondsFor(file.controlChannelPubkey), useBulkPacing: true, _getIykcProofs: messenger.contentKeyLookup() }
   }
-  async function publishChunk (descriptor, event, { signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug } = {}) {
+  async function publishChunk (descriptor, event, { signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug, capacityEgress } = {}) {
     const file = await register(descriptor)
-    usable(file)
+    usable(file, { capacityEgress })
     const prepared = normalizePreparedPublications({ preparedPublication, preparedPublications })
     const decoded = checked(file, event)
     await catalog.ready
@@ -164,7 +164,7 @@ export function createPrivateFileTransfer ({ messenger, resolveChannel, storage,
     }
     let result
     try {
-      const options = { ...sendOptions(file, await routing(file, file.peerPubkey, signal, attemptStartedAt, onDebug)), receiverPubkeys: [file.peerPubkey], fileChunkIndex: decoded.index, preparedPublications: prepared.length ? prepared : undefined, ...(onPreparedSeed ? { onPreparedSeed } : messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? { onPreparedSeed: seed => saveSeed(file, seed) } : {}) }
+      const options = { ...sendOptions(file, await routing(file, file.peerPubkey, signal, attemptStartedAt, onDebug, { capacityEgress })), receiverPubkeys: [file.peerPubkey], fileChunkIndex: decoded.index, preparedPublications: prepared.length ? prepared : undefined, ...(onPreparedSeed ? { onPreparedSeed } : messenger.channels.get(file.controlChannelPubkey)?.mode === 'watchtower' ? { onPreparedSeed: seed => saveSeed(file, seed) } : {}) }
       result = event.sig ? await _messages.broadcastEvent({ ...options, event }) : await _messages.broadcastRumor({ ...options, rumor: event })
       await assertMessagePublished(result, result?.rumor || result?.event || { ...event, pubkey: event.pubkey || messenger.userPubkey })
     } catch (error) { await uploadLeases.get(file.root)?.(); uploadLeases.delete(file.root); throw error }

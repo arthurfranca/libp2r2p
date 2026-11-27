@@ -3223,15 +3223,16 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async broadcastRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug, useBulkPacing = false }) {
-    const channel = this.requireWritableChannel(channelPubkey)
+  async broadcastRumor ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, rumor, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug, useBulkPacing = false, capacityEgress, [CAPACITY_EGRESS]: scopedCapacityEgress }) {
+    const capacityEgressToken = this.capacityEgressFor({ capacityEgress: scopedCapacityEgress || capacityEgress })
+    const channel = this.requireWritableChannel(channelPubkey, { capacityEgress: capacityEgressToken })
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
       const prepared = normalizePreparedPublications({ preparedPublication, preparedPublications })
       const receivers = uniq(receiverPubkeys?.length
         ? receiverPubkeys
         : prepared.flatMap(publication => publication.receiverPubkeys || []))
-      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: receivers, relays, relayToReceivers, signal, attemptStartedAt, onDebug })
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: receivers, relays, relayToReceivers, signal, attemptStartedAt, onDebug, capacityEgress: capacityEgressToken })
       this.debugSend('broadcastRumor', channelPubkey, { receiverPubkeys: receivers })
       return await this._privateMessage.broadcastRumor({
         senderSigner: this.userSigner,
@@ -3253,15 +3254,16 @@ export class PrivateMessenger {
     } finally { releaseActivity() }
   }
 
-  async broadcastEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug, useBulkPacing = false }) {
-    const channel = this.requireWritableChannel(channelPubkey)
+  async broadcastEvent ({ channelPubkey = this.defaultChannelPubkey(), receiverPubkeys, relays, relayToReceivers, event, deletionPubkey, signal, attemptStartedAt, onPreparedSeed, preparedPublication, preparedPublications, onDebug, useBulkPacing = false, capacityEgress, [CAPACITY_EGRESS]: scopedCapacityEgress }) {
+    const capacityEgressToken = this.capacityEgressFor({ capacityEgress: scopedCapacityEgress || capacityEgress })
+    const channel = this.requireWritableChannel(channelPubkey, { capacityEgress: capacityEgressToken })
     const releaseActivity = this.decryptionScheduler.activity(channelPubkey)
     try {
       const prepared = normalizePreparedPublications({ preparedPublication, preparedPublications })
       const receivers = uniq(receiverPubkeys?.length
         ? receiverPubkeys
         : prepared.flatMap(publication => publication.receiverPubkeys || []))
-      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: receivers, relays, relayToReceivers, signal, attemptStartedAt, onDebug })
+      const routing = await this.resolveSendRouting({ channel, receiverPubkeys: receivers, relays, relayToReceivers, signal, attemptStartedAt, onDebug, capacityEgress: capacityEgressToken })
       this.debugSend('broadcastEvent', channelPubkey, { receiverPubkeys: receivers })
       return await this._privateMessage.broadcastEvent({
         senderSigner: this.userSigner,
@@ -3439,7 +3441,9 @@ export class PrivateMessenger {
         ask: scopedMethod('ask'),
         reply: scopedMethod('reply'),
         tell: scopedMethod('tell'),
-        yell: scopedMethod('yell')
+        yell: scopedMethod('yell'),
+        broadcastRumor: scopedMethod('broadcastRumor'),
+        broadcastEvent: scopedMethod('broadcastEvent')
       }),
       token,
       release (reason = expiredCapacityEgress()) {

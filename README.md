@@ -688,6 +688,14 @@ consumer's expired leases are reclaimable by another instance. Apps must save
 idempotently: a crash between their commit and `ack()` can repeat delivery.
 The queue is shared by identity, so concurrent consumers claim distinct records.
 
+An inbound reservation's `capacityEgress` can answer its own work while
+`capacity` is the sole pause reason. `createCapacityEgress()` provides the same
+short-lived scope to a durable sender and covers `ask`, `reply`, `tell`, `yell`,
+`broadcastRumor` and `broadcastEvent`. The scope expires on release. It never
+bypasses network, storage, signer, session-storage or another simultaneous pause.
+The session outbox exposes this only through opt-in
+`enqueue({ ..., allowCapacityEgress: true })`; the default is `false`.
+
 The app-message queue defaults to 16 MiB and rejects writes at capacity, without
 evicting pending messages. Capacity pressure pauses ingestion and records a
 recovery gap; successful acknowledgments resume it when possible. While capacity-paused, a
